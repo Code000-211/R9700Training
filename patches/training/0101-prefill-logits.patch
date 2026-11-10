@@ -256,10 +256,10 @@ index c4fde6a..4c11146 100644
              const StepEntry& e = plan.e[(size_t)i];
 diff --git a/core/train_prefill.cpp b/core/train_prefill.cpp
 new file mode 100644
-index 0000000..695fff6
+index 0000000..d546e72
 --- /dev/null
 +++ b/core/train_prefill.cpp
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,98 @@
 +/* train_prefill.cpp -- the training fixture's prefill on the Engine: a driver that replaces the
 + * HTTP server, as the KL mode does (core/engine_kld.cpp), but keeps the logits of every prompt
 + * position instead of scoring them. Config::prefill_prompts names the prompts and
@@ -267,6 +267,8 @@ index 0000000..695fff6
 + * emits a row per prompt position and score_rows copies them out. This is what the tests' tiny
 + * bf16 fixture (tests/support/fixture.h) runs through the same steps a serving request takes. */
 +#include "engine_priv.h"
++
++#include "train_prefill.h"
 +
 +#include "device/device.h"
 +#include "server/sink.h"
@@ -356,3 +358,20 @@ index 0000000..695fff6
 +}
 +
 +}  /* namespace rad */
+diff --git a/core/train_prefill.h b/core/train_prefill.h
+new file mode 100644
+index 0000000..aef78d4
+--- /dev/null
++++ b/core/train_prefill.h
+@@ -0,0 +1,11 @@
++/* train_prefill.h -- the training fixture's prefill mode is in this copy of radiance: the driver
++ * in core/train_prefill.cpp that Config::prefill_prompts/prefill_logits feed.
++ *
++ * The header exists so that code outside radiance can ask whether the mode is there without the
++ * build telling it: patches/training/0101-prefill-logits.patch adds this file and the serving
++ * patch set does not, so `__has_include("train_prefill.h")` over the copy's include path answers
++ * for the same build the compiler is reading. r97's tests/support/fixture.h asks that way and
++ * offers no run_prefill() in a serving build. */
++#pragma once
++
++#define RAD_TRAIN_PREFILL 1

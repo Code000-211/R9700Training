@@ -39,19 +39,15 @@ const r97::Fixture& f = r97::fixture();   // written and converted on first use
 `hidden`). The conversion runs `rad-convert` as a child process; a failure throws
 `std::runtime_error` with the command that failed, so a broken build says what is missing.
 
-The build tells the fixture where the pieces are, through the definitions it compiles the host
-tests with:
-
-| macro                | what it names                                                 |
-| -------------------- | ------------------------------------------------------------- |
-| `R97_RAD_CONVERT`    | `rad-convert` in the build tree                                |
-| `R97_RADIANCE_HOME`  | `radiance_home` in the build tree, holding `kernels/` and `architectures/` |
-
-A macro a build leaves empty falls back to the environment (`R97_RAD_CONVERT`,
-`RADIANCE_HOME`) and then to `rad-convert` on `PATH`, so the host test binary runs outside the
-build tree too when the plugins are installed. Building the host tier builds the converter, the
-plugins (`libref`, `libavx`) and the architecture plugin, so the definitions always point at
-something.
+The fixture finds the pieces beside the test binary instead of being told where they are: the build
+puts `r97_host_tests` in `<build>/` and radiance's own build in `<build>/radiance-build/`, so
+`<build>/radiance-build/bin/rad-convert` is the converter and `<build>/radiance-build/radiance_home`
+(holding `kernels/` and `architectures/`) is the plugin home. The environment wins over that guess —
+`R97_RAD_CONVERT` and `RADIANCE_HOME` — and then the converter falls back to `rad-convert` on
+`PATH`, so the host test binary runs outside the build tree too when the plugins are installed.
+Building the host tier builds the converter, the plugins (`libref`, `libavx`) and the architecture
+plugin, so the guess always finds something; when it does not, the exception names the directory it
+looked in.
 
 ## Running a prefill
 
@@ -83,6 +79,11 @@ The mode is radiance's `core/train_prefill.cpp`, added by
 server, as the KL mode (`core/engine_kld.cpp`) does. The host test binary must export the plugin
 ABI (`ENABLE_EXPORTS`), because the plugins are `dlopen`ed and call back into `rad_core`.
 
+`run_prefill` exists only in a build whose copy of radiance carries that patch, which the header
+asks with `__has_include("train_prefill.h")` — the patch's marker header — and reports as
+`R97_FIXTURE_PREFILL`. A test file that uses the helper wraps its contents in that macro, so a
+serving build compiles it to nothing without a build rule naming it.
+
 ## Notes
 
 - GCC 13 cannot compile radiance's architecture plugins: it refuses to take the address of a
@@ -90,9 +91,9 @@ ABI (`ENABLE_EXPORTS`), because the plugins are `dlopen`ed and call back into `r
   14 takes it. The configure builds the radiance subproject with `gcc-14`/`g++-14` (or newer) when
   the compiler it was configured with is older, and stops with a message naming the requirement
   when none is installed; the rest of the project keeps the configured compiler.
-- A serving build (`-DR97_PATCH_SET=serving`) applies no training patch, so it leaves
-  `tests/host/fixture_prefill.cpp` out of the host tests: the mode the helper drives is a training
-  hook, and the fixture exists only in the `all` build.
+- A serving build (`-DR97_PATCH_SET=serving`) applies no training patch, so it has no prefill mode
+  and `tests/host/fixture_prefill.cpp` compiles to nothing: the mode the helper drives is a training
+  hook, and the fixture's prefill exists only in the `all` build.
 - A host-only build (`-DR97_WITH_HIP=OFF`) serves on the CPU and prints a startup warning when the
   machine has a card; that is expected, and the fixture runs the same either way.
 - The fixture is deterministic but not small in time: each `run_prefill` starts and stops an

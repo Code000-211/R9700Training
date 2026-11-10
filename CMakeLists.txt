@@ -219,11 +219,6 @@ if(R97_BUILD_TESTS)
   # host tests, one binary; every source under tests/host/ joins it.
   file(GLOB R97_HOST_TEST_SOURCES CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_SOURCE_DIR}/tests/host/*.cpp)
-  # The fixture reads the scored-prefill mode that patches/training/ adds, so a serving build
-  # (which applies no training patch) leaves that test out.
-  if(NOT R97_PATCH_SET STREQUAL "all")
-    list(FILTER R97_HOST_TEST_SOURCES EXCLUDE REGEX "/fixture_prefill\\.cpp$")
-  endif()
   if(NOT R97_HOST_TEST_SOURCES STREQUAL "")
     add_executable(r97_host_tests ${R97_HOST_TEST_SOURCES})
     # The plugins are dlopen()ed and call back into rad_core, so its symbols must be in the
@@ -233,10 +228,7 @@ if(R97_BUILD_TESTS)
     target_include_directories(r97_host_tests PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/tests
       ${R97_RADIANCE_COPY}/tests)   # radiance's write_qwen35, the fixture's checkpoint writer
-    target_compile_definitions(r97_host_tests PRIVATE
-      R97_MODEL_RAD="${R97_MODEL_RAD}"
-      R97_RADIANCE_HOME="${CMAKE_BINARY_DIR}/radiance-build/radiance_home"
-      R97_RAD_CONVERT="${CMAKE_BINARY_DIR}/radiance-build/bin/rad-convert")
+    target_compile_definitions(r97_host_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
   endif()
 
   # gpu tests: need the card, run serially. Same shape as the host binary; empty until the device

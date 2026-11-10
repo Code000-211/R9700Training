@@ -14,8 +14,12 @@
 //
 // run_prefill() drives that container through rad_core in-process -- no HTTP server -- with the
 // host kernel libraries, one prefill step from position 0 and speculation off, and returns every
-// position's logits. The build tells this header where the converter and the plugin home are
-// (R97_RAD_CONVERT, R97_RADIANCE_HOME); docs/FIXTURES.md says how to build them.
+// position's logits. The mode it drives is patches/training/'s, so a serving build offers no
+// run_prefill() here (R97_FIXTURE_PREFILL below says why).
+//
+// The converter and the plugin home are found beside this test binary, where the build keeps
+// radiance-build/; R97_RAD_CONVERT and RADIANCE_HOME in the environment still win.
+// docs/FIXTURES.md says how the build makes both.
 //
 // Header-only, like the rest of tests/support/: one includer, no object file to collect.
 #pragma once
@@ -36,11 +40,20 @@
 #include "tiny_model.h"       // radiance's tests/; tiny::Qwen35, tiny::write_qwen35
 #include "util/stallwatch.h"  // radiance's core/; the watch serve() takes
 
-#ifndef R97_RAD_CONVERT
-#define R97_RAD_CONVERT ""
-#endif
-#ifndef R97_RADIANCE_HOME
-#define R97_RADIANCE_HOME ""
+// The prefill mode the fixture drives is patches/training/0101-prefill-logits.patch: it adds the
+// driver (core/train_prefill.cpp) and its marker header to the copy the build compiles. The
+// serving patch set adds neither, so the mode is asked for over the same include path the
+// compiler reads, and a serving build gets no run_prefill() -- no build rule has to know a test's
+// name to leave one out.
+#if __has_include("train_prefill.h")
+#define R97_FIXTURE_PREFILL 1
+#elif __has_include("train_prefill.cpp")
+// The tree keeps its patched copy of radiance until the patch set's file names change, so a build
+// directory made before the marker header existed has the mode but not the header. Say so rather
+// than compile these tests away and report success.
+#error "r97: stale radiance copy: no train_prefill.h -- delete <build>/radiance and reconfigure"
+#else
+#define R97_FIXTURE_PREFILL 0
 #endif
 
 namespace r97 {
@@ -54,6 +67,7 @@ struct Fixture {
     int32_t     hidden = 0;
 };
 
+#if R97_FIXTURE_PREFILL
 // The logits of one prefill, row-major: row `pos` holds the distribution for the token after
 // position `pos`, over `n_vocab` ids, in the order the plugin produced it.
 struct Prefill {
@@ -64,6 +78,7 @@ struct Prefill {
     const float* at(int32_t pos) const { return logits.data() + (std::ptrdiff_t)pos * n_vocab; }
     float        at(int32_t pos, int32_t token) const { return at(pos)[token]; }
 };
+#endif  // R97_FIXTURE_PREFILL
 
 namespace detail {
 
@@ -81,17 +96,39 @@ inline std::string shell_quote(const std::string& s) {
     return q + "'";
 }
 
-// The converter: the build's own rad-convert, else one the environment names, else PATH.
+// The directory this test binary sits in: <build>/, where the build also keeps radiance's own
+// build tree (<build>/radiance-build) and its plugins. Empty if the answer cannot be read.
+inline const std::string& build_dir() {
+    static const std::string dir = [] {
+        std::error_code ec;
+        const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+        return ec ? std::string() : exe.parent_path().string();
+    }();
+    return dir;
+}
+
+// A path in the build's radiance build tree, if it is there.
+inline std::string in_radiance_build(const char* first, const char* second = nullptr) {
+    if (build_dir().empty()) return {};
+    std::filesystem::path p = std::filesystem::path(build_dir()) / "radiance-build" / first;
+    if (second) p /= second;
+    std::error_code ec;
+    return std::filesystem::exists(p, ec) ? p.string() : std::string();
+}
+
+// The converter: one the environment names, else the build's own rad-convert, else PATH.
 inline std::string rad_convert() {
-    std::string p = R97_RAD_CONVERT;
-    if (p.empty()) p = env_or("R97_RAD_CONVERT");
+    std::string p = env_or("R97_RAD_CONVERT");
+    if (p.empty()) p = in_radiance_build("bin", "rad-convert");
     if (p.empty()) p = "rad-convert";
     return p;
 }
 
-// The plugin home: the build's radiance_home, else the environment's RADIANCE_HOME.
+// The plugin home: the environment's RADIANCE_HOME, else the build's radiance_home.
 inline std::string radiance_home() {
-    return R97_RADIANCE_HOME[0] ? std::string(R97_RADIANCE_HOME) : env_or("RADIANCE_HOME");
+    std::string h = env_or("RADIANCE_HOME");
+    if (h.empty()) h = in_radiance_build("radiance_home");
+    return h;
 }
 
 // The chat template the tokenizer configuration carries: ChatML, which the tiny tokenizer's
@@ -153,7 +190,13 @@ inline Fixture make() {
     std::string cmd = shell_quote(rad_convert()) + " " + shell_quote(f.checkpoint) + " -o " +
                       shell_quote(f.container) + " --kernels libavx,libref";
     const std::string home = radiance_home();
-    if (!home.empty()) cmd += " --home " + shell_quote(home);
+    if (home.empty())
+        throw std::runtime_error(
+            "fixture: no plugin home: the build makes one at "
+            "<build>/radiance-build/radiance_home and this binary found none beside itself (" +
+            (build_dir().empty() ? std::string("unknown directory") : build_dir()) +
+            "); set RADIANCE_HOME to say where it is");
+    cmd += " --home " + shell_quote(home);
     if (std::system(cmd.c_str()) != 0)
         throw std::runtime_error("fixture: rad-convert failed: " + cmd);
     std::error_code ec;
@@ -170,6 +213,7 @@ inline const Fixture& fixture() {
     return f;
 }
 
+#if R97_FIXTURE_PREFILL
 // Run `sequences` as one prefill: all are submitted together, each from position 0, with
 // speculation off, and each gets the logits of every position of its own prompt. The engine
 // batches what the scheduler admits; a sequence's rows do not depend on which others share its
@@ -223,5 +267,6 @@ inline Prefill run_prefill(const Fixture& f, const std::vector<int32_t>& token_i
     std::vector<Prefill> one = run_prefill(f, std::vector<std::vector<int32_t>>{token_ids});
     return one[0];
 }
+#endif  // R97_FIXTURE_PREFILL
 
 }  // namespace r97
