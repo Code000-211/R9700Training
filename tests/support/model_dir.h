@@ -2,8 +2,11 @@
 //
 // Tests that open the real model container (the label `model`) resolve it through this header:
 //
-//   auto rad = r97test::resolve_container(&why);
-//   if (!rad) { std::printf("%s\n", why.c_str()); return r97test::kSkip; }  // clear skip
+//   std::string why;
+//   auto rad = r97test::resolve_container(R97_MODEL_RAD, &why);
+//   if (!rad)
+//       throw r97test::Skip{why};   // main prints why; the binary exits kSkip (77) when nothing
+//                                   // failed and at least one test skipped
 //
 // Resolution order:
 //   1. $R97_MODEL_DIR when set: the variable may name a .rad file or a directory that holds the
@@ -24,8 +27,9 @@
 
 namespace r97test {
 
-// A skipped test's exit status (autotools convention; ctest records the run, not a failure) and
-// the MiB unit; shared with tests/support/gpu_guard.h, which includes this header.
+// The exit status a tier binary returns when no test failed and at least one skipped (autotools
+// convention; ctest records the run, not a failure), and the MiB unit; both are shared with
+// tests/support/gpu_guard.h, which includes this header.
 inline constexpr int kSkip = 77;
 
 inline constexpr int64_t kMiB = 1024 * 1024;
@@ -96,7 +100,7 @@ inline std::optional<std::string> resolve_container(const std::string& explicit_
     }
 
     if (why)
-        *why = "skip: no model container. Looked: " + looked
+        *why = "no model container. Looked: " + looked
                + ". Set R97_MODEL_DIR to the .rad or its directory, or fetch it:\n"
                  "  hf download StillDeadcode/qwen3.8-27b-iqr-v4 qwen3.8-27b-iq4r-s-v4.rad";
     return std::nullopt;

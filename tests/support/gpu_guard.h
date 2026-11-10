@@ -10,11 +10,12 @@
 //   The test declares the VRAM it needs in GuardOptions::need_vram. Before doing anything the
 //   guard reads /sys/class/drm/<card>/device/mem_info_vram_{total,used} for the selected card and
 //   refuses at once, naming the free and the needed amounts and the processes that hold the card
-//   (through amd-smi), rather than letting the test die with an allocation error halfway.
+//   (through `amd-smi process -g N --csv`), rather than letting the test die with an allocation
+//   error halfway.
 //
 //     r97test::GuardOptions o;
 //     o.device   = r97test::parse_device(getenv("R97_DEVICE") ? getenv("R97_DEVICE") : "0");
-//     o.bdf      = pci_bus_id_of_hip_device(o.device);   // support_bdf below
+//     o.bdf      = r97test::hip_bdf(o.device);           // HIP ordinal -> sysfs card
 //     o.need_vram = int64_t(1) << 30;                    // this test needs 1 GiB
 //     r97test::DeviceGuard guard(o);                     // locks, then checks; throws with detail
 //
@@ -27,6 +28,7 @@
 #pragma once
 
 #include <dirent.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -44,8 +46,8 @@
 #include <string>
 #include <vector>
 
-// kSkip and kMiB come from tests/support/model_dir.h.
-#include "support/model_dir.h"
+// kSkip and kMiB come from this directory's model_dir.h.
+#include "model_dir.h"
 
 namespace r97test {
 
@@ -200,9 +202,97 @@ struct Holder {
     int64_t vram = 0;   // bytes of vram_mem the process holds
 };
 
-// A row of `amd-smi process --csv`:
-//     gpu,name,pid,gtt_mem,cpu_mem,vram_mem,mem_usage,gfx,enc,sdma_usage,cu_occupancy,evicted_time
-// Header lines and rows without VRAM are dropped.
+// One comma-separated line -> its fields. A field holding commas or quotes is quoted, and a
+// literal quote inside it is doubled (RFC 4180), which is how the CSV writer amd-smi uses writes
+// its quoted records.
+inline std::vector<std::string> csv_fields(const std::string& line) {
+    std::vector<std::string> fields;
+    size_t i = 0;
+    while (true) {
+        std::string field;
+        if (i < line.size() && line[i] == '"') {
+            ++i;
+            while (i < line.size()) {
+                if (line[i] != '"') {
+                    field += line[i++];
+                    continue;
+                }
+                if (i + 1 < line.size() && line[i + 1] == '"') {  // an escaped quote
+                    field += '"';
+                    i += 2;
+                    continue;
+                }
+                ++i;  // the closing quote
+                break;
+            }
+        } else {
+            while (i < line.size() && line[i] != ',')
+                field += line[i++];
+        }
+        fields.push_back(field);
+        if (i >= line.size() || line[i] != ',')
+            return fields;
+        ++i;
+    }
+}
+
+// The value of `key` in amd-smi's per-process record, which is a Python dict repr:
+//     {'name': 'radiance', 'pid': 1543186, 'memory_usage': {'vram_mem': 34087321600, ...}}
+// A string comes back unquoted (Python picks either quote, and backslash-escapes the other); a
+// number as its digits; "" when the key is absent.
+inline std::string dict_value(const std::string& record, const char* key) {
+    for (char q : {'\'', '"'}) {
+        std::string needle = std::string(1, q) + key + q;
+        size_t at = record.find(needle);
+        if (at == std::string::npos)
+            continue;
+        size_t i = at + needle.size();
+        while (i < record.size() && std::isspace((unsigned char)record[i]))
+            ++i;
+        if (i >= record.size() || record[i] != ':')
+            continue;
+        ++i;
+        while (i < record.size() && std::isspace((unsigned char)record[i]))
+            ++i;
+        if (i < record.size() && (record[i] == '\'' || record[i] == '"')) {
+            const char quote = record[i++];
+            std::string out;
+            while (i < record.size() && record[i] != quote) {
+                if (record[i] == '\\' && i + 1 < record.size())
+                    ++i;
+                out += record[i++];
+            }
+            return out;
+        }
+        const size_t start = i;
+        while (i < record.size() && record[i] != ',' && record[i] != '}')
+            ++i;
+        std::string out = record.substr(start, i - start);
+        while (!out.empty() && std::isspace((unsigned char)out.back()))
+            out.pop_back();
+        return out;
+    }
+    return "";
+}
+
+// A record's number field; -1 when it is absent or not all digits.
+inline long long dict_number(const std::string& record, const char* key) {
+    const std::string v = dict_value(record, key);
+    if (v.empty())
+        return -1;
+    for (char c : v)
+        if (!std::isdigit((unsigned char)c))
+            return -1;
+    return std::strtoll(v.c_str(), nullptr, 10);
+}
+
+// `amd-smi process -g N --csv` writes one line per process, the per-process record nested in one
+// quoted field (amdsmi_cli's subcommands/process.py stores that dict under "process_info"):
+//     gpu,process_info
+//     0,"{'name': 'radiance', 'pid': 1543186, 'memory_usage': {'gtt_mem': 0, 'cpu_mem': 0,
+//         'vram_mem': 34087321600}, 'mem_usage': ..., 'usage': {...}, ...}"
+// A card nothing holds reads "0,No running processes detected". Lines that name no pid or no VRAM
+// are dropped, which drops the header and that line.
 inline std::vector<Holder> parse_holders(const std::string& amd_smi_csv) {
     std::vector<Holder> out;
     size_t pos = 0;
@@ -214,26 +304,19 @@ inline std::vector<Holder> parse_holders(const std::string& amd_smi_csv) {
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
 
-        std::vector<std::string> fields;
-        size_t p = 0;
-        while (true) {
-            size_t c = line.find(',', p);
-            fields.push_back(line.substr(p, c == std::string::npos ? std::string::npos
-                                                                   : c - p));
-            if (c == std::string::npos)
-                break;
-            p = c + 1;
-        }
-        if (fields.size() < 6 || fields[2].empty() || !std::isdigit((unsigned char)fields[2][0]))
+        std::vector<std::string> fields = csv_fields(line);
+        if (fields.size() < 2)
             continue;  // header or junk
-        long long pid = std::strtoll(fields[2].c_str(), nullptr, 10);
-        long long vram = std::strtoll(fields[5].c_str(), nullptr, 10);
-        if (vram <= 0)
+        const long long pid = dict_number(fields[1], "pid");
+        const long long vram = dict_number(fields[1], "vram_mem");
+        if (pid <= 0 || vram <= 0)
             continue;
         Holder h;
         h.gpu = (int)std::strtoll(fields[0].c_str(), nullptr, 10);
         h.pid = (int)pid;
-        h.name = fields[1] == "N/A" ? "" : fields[1];
+        h.name = dict_value(fields[1], "name");
+        if (h.name == "N/A")
+            h.name.clear();
         h.vram = vram;
         out.push_back(h);
     }
@@ -414,20 +497,31 @@ private:
 
 /* ------------------------------------------------------------------ HIP bus id */
 
-// The PCI bus id of a HIP device, HIP-style extern. gpu-tier tests need no ROCm include path for
-// this; __has_include prefers the real header when the build reaches one.
-#if defined(__has_include)
-#if __has_include(<hip/hip_runtime.h>)
-#include <hip/hip_runtime.h>
-#endif
-#endif
-#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP_PLATFORM_NVIDIA__)
-extern "C" int hipDeviceGetPCIBusId(char* pciBusId, int len, int device);
-#endif
+// The PCI bus id of a HIP device, which the guard turns into its sysfs card. HIP is not a link
+// dependency of the test binaries: the tree also builds with -DR97_WITH_HIP=OFF (README), and the
+// gpu binary has to link there too. So the symbol is looked up at run time -- from the process
+// when radiance is built with HIP, from libamdhip64 otherwise -- and a machine without HIP simply
+// has no bus id to offer ("").
+namespace detail {
+using hip_pci_bus_id_fn = int (*)(char*, int, int);
+
+inline hip_pci_bus_id_fn hip_pci_bus_id() {
+    if (void* p = dlsym(RTLD_DEFAULT, "hipDeviceGetPCIBusId"))
+        return reinterpret_cast<hip_pci_bus_id_fn>(p);
+    for (const char* name : {"libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so"})
+        if (void* lib = dlopen(name, RTLD_NOW | RTLD_LOCAL))
+            if (void* p = dlsym(lib, "hipDeviceGetPCIBusId"))
+                return reinterpret_cast<hip_pci_bus_id_fn>(p);
+    return nullptr;
+}
+}  // namespace detail
 
 inline std::string hip_bdf(int device) {
+    static const detail::hip_pci_bus_id_fn fn = detail::hip_pci_bus_id();
+    if (!fn)
+        return "";
     char bus[32] = {0};
-    if (hipDeviceGetPCIBusId(bus, sizeof bus, device) != 0)
+    if (fn(bus, sizeof bus, device) != 0)
         return "";
     return bus;
 }

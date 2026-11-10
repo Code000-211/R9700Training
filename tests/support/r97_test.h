@@ -38,4 +38,13 @@ public:
         r97test_##name##_body);                                                     \
     static void r97test_##name##_body()
 
+// A test that cannot run here -- the model container is absent, say -- throws Skip{why} with the
+// message that says what it looked for. main prints it and runs the tests that follow; the binary
+// exits kSkip (tests/support/model_dir.h) when no test failed and at least one skipped, so ctest
+// records the tier as skipped rather than failed. Do not call exit(): it would cut the registry
+// short and hide every test after this one.
+struct Skip {
+    std::string why;
+};
+
 }  // namespace r97test

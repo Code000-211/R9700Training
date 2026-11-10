@@ -11,7 +11,7 @@ registration order.
 |---|---|---|---|
 | `host` | `r97_host_tests` | no card | never — runs anywhere |
 | `gpu` | `r97_gpu_tests` | one card, under the guard | never — a missing card is a failure |
-| `model` | `r97_model_tests` | the real container | exit 77, with a message naming where it looked |
+| `model` | `r97_model_tests` | the real container | skipped, exit 77, naming where it looked |
 
 ```sh
 cmake -B build -G Ninja && cmake --build build
@@ -36,17 +36,17 @@ Several people and several agents run GPU tests on one machine. Every `gpu` test
   Before anything happens, the guard reads
   `/sys/class/drm/card*/device/mem_info_vram_{total,used}` for the selected card and, when free
   VRAM (total − used) is less than needed, fails at once naming the free and the needed amounts
-  and the processes that hold the card (from `amd-smi process`), instead of dying with an
-  allocation error halfway:
+  and the processes that hold the card (from `amd-smi process`, whose CSV nests one
+  per-process record per line under `process_info`, so its pid, name and `vram_mem` are read out
+  of that record), instead of dying with an allocation error halfway:
 
   ```
   card1: free VRAM 70 MiB, the test needs 1024 MiB. Processes that hold the card:
     gpu 0 pid 1543186 radiance 32500 MiB
   ```
 
-- **Model tests.** A test that opens the real container also resolves it through
-  `tests/support/model_dir.h` and skips with exit 77 and a clear message when the container is
-  absent.
+  A card nothing holds reads `0,No running processes detected`; the guard then says so instead of
+  listing holders.
 
 The guard's logic itself is tested in the `host` tier (`tests/host/gpu_guard.cpp`) against a fake
 sysfs tree, with a stub `amd-smi`, so it runs with no card at all.
@@ -67,7 +67,18 @@ r97test::DeviceGuard guard(o);                 // locks (queues), then checks VR
 ```
 
 `o.bdf` is how the guard maps the HIP device to its `/sys/class/drm` card: two cards with equal
-VRAM cannot be told apart by size. A single-card machine is unambiguous without it.
+VRAM cannot be told apart by size. A single-card machine is unambiguous without it. The guard
+finds HIP's `hipDeviceGetPCIBusId` at run time rather than linking to it, so a host-only
+configuration (`-DR97_WITH_HIP=OFF`) still builds and links the `gpu` binary — it has no card to
+run it on, but the `host` tests build and run there.
+
+## The model container
+
+A `model` test resolves the container through `tests/support/model_dir.h`: `R97_MODEL_DIR` when
+set, else the build's `R97_MODEL_RAD`, else `/srv/models/qwen3.8-27b-iqr-v4`. When the container is
+absent the test throws `r97test::Skip{why}` with a message naming what it looked for; the registry
+prints it, runs the tests that follow, and the binary exits 77 when nothing failed and something
+skipped. Present and passing, the test exits 0.
 
 ## Variables
 
@@ -87,6 +98,9 @@ hf download StillDeadcode/qwen3.8-27b-iqr-v4 qwen3.8-27b-iq4r-s-v4.rad
 ## Notes
 
 - A `gpu` test that cannot fit the card stops before opening it and says so; it does not retry.
+- `tests/gpu/gpu_guard_smoke.cpp` is the tier's smoke test: it opens the card through radiance's
+  device layer, allocates 1 GiB and frees it. Two copies started together run one after the other,
+  each waiting for the other's lock.
 - The guard holds a lock, never ownership: it never stops a process it did not start. If a stale
   holder is wedged, kill only processes you started.
 - The guard's `host` tests create their files under `/tmp/…` and clean up after themselves.

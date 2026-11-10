@@ -171,11 +171,17 @@ R97_TEST(lock_mutual_exclusion) {
 
 R97_TEST(vram_refusal) {
     std::string root = fake_sysfs();  // card1: 32644 MiB total, 32575 MiB used -> 70 MiB free
-    // A stub amd-smi, so the refusal can name a holder without a card.
+    // A stub amd-smi, printing what `amd-smi process -g 0 --csv` prints on a held card: one line
+    // per process, the record nested in one quoted field.
     std::string bin = "/tmp/r97-guard-stub-amd-smi";
     std::ofstream(bin) << "#!/bin/sh\n"
-                          "echo 'gpu,name,pid,gtt_mem,cpu_mem,vram_mem,mem_usage'\n"
-                          "echo '0,N/A,999,0,0,33280000000,0'\n";
+                          "cat <<'R97STUB'\n"
+                          "gpu,process_info\n"
+                          "0,\"{'name': 'radiance', 'pid': 999, 'memory_usage': {'gtt_mem': 0, "
+                          "'cpu_mem': 0, 'vram_mem': 33280000000}, 'mem_usage': 0, "
+                          "'usage': {'gfx': 0, 'enc': 0}, 'sdma_usage': 0, 'cu_occupancy': 0, "
+                          "'evicted_time': 0}\"\n"
+                          "R97STUB\n";
     assert(system(("chmod +x " + bin).c_str()) == 0);
 
     GuardOptions o;
@@ -204,17 +210,26 @@ R97_TEST(vram_refusal) {
 }
 
 R97_TEST(holder_parsing) {
+    // What `amd-smi process --csv` writes: the header, then one line per process with the record
+    // nested in one quoted Python-dict field; a card with no holders reads as the last row.
     std::string csv =
-        "gpu,name,pid,gtt_mem,cpu_mem,vram_mem,mem_usage\n"
-        "0,N/A,1543186,0,0,34087321600,0\n"
-        "1,radiance,42,0,0,8000000000,0\n"
-        "1,other,7,0,0,0,0\n"
+        "gpu,process_info\n"
+        "0,\"{'name': 'radiance', 'pid': 1543186, 'memory_usage': {'gtt_mem': 0, 'cpu_mem': 0, "
+        "'vram_mem': 34087321600}, 'mem_usage': 0, 'usage': {'gfx': 0, 'enc': 0}, 'sdma_usage': "
+        "0, 'cu_occupancy': 0, 'evicted_time': 0}\"\n"
+        "1,\"{'name': 'other', 'pid': 42, 'memory_usage': {'gtt_mem': 0, 'cpu_mem': 0, "
+        "'vram_mem': 8000000000}, 'mem_usage': 0, 'usage': {'gfx': 0, 'enc': 0}, 'sdma_usage': "
+        "0, 'cu_occupancy': 0, 'evicted_time': 0}\"\n"
+        "1,\"{'name': 'idle', 'pid': 7, 'memory_usage': {'gtt_mem': 0, 'cpu_mem': 0, "
+        "'vram_mem': 0}, 'mem_usage': 0, 'usage': {'gfx': 0, 'enc': 0}, 'sdma_usage': 0, "
+        "'cu_occupancy': 0, 'evicted_time': 0}\"\n"
+        "0,No running processes detected\n"
         "not,a,parser\n";
     std::vector<Holder> holders = r97test::parse_holders(csv);
     assert(holders.size() == 2);
     assert(holders[0].pid == 1543186 && holders[0].vram == 34087321600LL);
-    assert(holders[0].name.empty() && holders[0].gpu == 0);
-    assert(holders[1].name == "radiance" && holders[1].gpu == 1);
+    assert(holders[0].name == "radiance" && holders[0].gpu == 0);
+    assert(holders[1].pid == 42 && holders[1].name == "other" && holders[1].gpu == 1);
     // The refusal text names an unknown holder's process when /proc has it, "?" when not.
     std::string text = r97test::vram_short_text("card1", 70 * r97test::kMiB,
                                                 1024 * r97test::kMiB, holders);
@@ -224,6 +239,16 @@ R97_TEST(holder_parsing) {
     std::string none = r97test::vram_short_text("card1", 70 * r97test::kMiB,
                                                 1024 * r97test::kMiB, {});
     assert(none.find("amd-smi") != std::string::npos);
+
+    // A name with an apostrophe makes Python repr the string with double quotes, which the CSV
+    // writer escapes as ""; both the field and the record still parse.
+    std::string quoted =
+        "gpu,process_info\n"
+        "0,\"{'name': \"\"don't panic\"\", 'pid': 5, 'memory_usage': {'vram_mem': 1234}}\"\n";
+    holders = r97test::parse_holders(quoted);
+    assert(holders.size() == 1);
+    assert(holders[0].pid == 5 && holders[0].vram == 1234);
+    assert(holders[0].name == "don't panic");
 }
 
 R97_TEST(model_container) {
