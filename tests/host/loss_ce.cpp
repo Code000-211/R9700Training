@@ -5,7 +5,6 @@
 
 #include "r97/loss.h"
 
-#include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -24,14 +23,14 @@ static void hand_computed() {
     {
         const float row[2] = {0.0f, 0.0f};
         const r97::CeSum s = r97::ce_loss(b, row, 2);
-        assert(s.scored == 1);
-        assert(near(s.loss, std::log(2.0), 1e-15));
+        CHECK(s.scored == 1);
+        CHECK(near(s.loss, std::log(2.0), 1e-15));
     }
     // Row {ln 2, 0}, target 0: p = 2/3, loss = ln(3/2).
     {
         const float row[2] = {std::log(2.0f), 0.0f};
         const r97::CeSum s = r97::ce_loss(b, row, 2);
-        assert(near(s.loss, std::log(3.0), 1e-6));  // target is ids[1] = 1, logit 0: p = 1/3
+        CHECK(near(s.loss, std::log(3.0), 1e-6));  // target is ids[1] = 1, logit 0: p = 1/3
     }
     // Two sequences concatenated: rows 0..2 predict tokens 1..3 of the first, rows 3..4 tokens
     // 1..2 of the second. The scored token 7 of the second sequence hangs off row 4.
@@ -53,8 +52,8 @@ static void hand_computed() {
         want += r97::ce_position(rows5[0], 3, 1);  // seq 1, token ids[1] = 1 (scored)
         want += r97::ce_position(rows5[2], 3, 1);  // seq 1, token ids[3] = 1 (scored)
         want += r97::ce_position(rows5[4], 3, 0);  // seq 2, token ids[2] = 0 (scored)
-        assert(s.scored == 3);
-        assert(near(s.loss, want, 1e-15));
+        CHECK(s.scored == 3);
+        CHECK(near(s.loss, want, 1e-15));
     }
     std::puts("loss_ce: hand-computed ok");
 }
@@ -89,11 +88,11 @@ static void grad_finite_differences() {
             xm[size_t(row * vocab + col)] -= float(h);
             const double fd = (mean_loss(xp) - mean_loss(xm)) / (2.0 * h);
             const double g = grad[size_t(row * vocab + col)];
-            assert(near(g, fd, 1e-4));
+            CHECK(near(g, fd, 1e-4));
         }
     // Unscored rows are exactly zero.
-    assert(grad[1 * vocab + 1] == 0.0f);  // row 1 predicts token 2, score 0
-    assert(grad[5 * vocab + 2] == 0.0f);  // row 5 predicts nothing scored
+    CHECK(grad[1 * vocab + 1] == 0.0f);  // row 1 predicts token 2, score 0
+    CHECK(grad[5 * vocab + 2] == 0.0f);  // row 5 predicts nothing scored
     std::puts("loss_ce: gradient vs finite differences ok");
 }
 
@@ -105,10 +104,10 @@ static void large_logits() {
     const float row[3] = {1e30f, 1e30f, 5.0f};
     float grad[3] = {0, 0, 0};
     const double loss = r97::ce_position(row, 3, 0, grad);
-    assert(std::isfinite(loss) && near(loss, std::log(2.0), 1e-6));
-    assert(near(grad[0], -0.5, 1e-6) && near(grad[1], 0.5, 1e-6) && near(grad[2], 0.0, 1e-6));
+    CHECK(std::isfinite(loss) && near(loss, std::log(2.0), 1e-6));
+    CHECK(near(grad[0], -0.5, 1e-6) && near(grad[1], 0.5, 1e-6) && near(grad[2], 0.0, 1e-6));
     const r97::CeSum s = r97::ce_loss(b, row, 3);
-    assert(std::isfinite(s.loss));
+    CHECK(std::isfinite(s.loss));
     std::puts("loss_ce: large logits ok");
 }
 
@@ -134,8 +133,8 @@ static void chunked_equals_whole() {
                                          1.0 / double(whole.scored));
         loss_sum += s.loss;
     }
-    assert(near(loss_sum, whole.loss, 1e-12 * std::max(1.0, std::fabs(whole.loss))));
-    for (size_t i = 0; i < gw.size(); ++i) assert(gw[i] == gc[i]);  // rows are independent
+    CHECK(near(loss_sum, whole.loss, 1e-12 * std::max(1.0, std::fabs(whole.loss))));
+    for (size_t i = 0; i < gw.size(); ++i) CHECK(gw[i] == gc[i]);  // rows are independent
     std::puts("loss_ce: chunked equals whole ok");
 }
 
@@ -147,7 +146,7 @@ static void bf16_matches_f32() {
     const uint16_t bf[2] = {0x3e80, 0xbf80};  // bf16 of 0.25 and -1.0
     const r97::CeSum sf = r97::ce_loss(b, row, 2);
     const r97::CeSum sb = r97::ce_loss(b, std::vector<uint16_t>(bf, bf + 2), 2);
-    assert(sf.loss == sb.loss && sb.scored == 1);
+    CHECK(sf.loss == sb.loss && sb.scored == 1);
     std::puts("loss_ce: bf16 input ok");
 }
 
