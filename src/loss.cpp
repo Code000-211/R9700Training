@@ -114,10 +114,14 @@ ObjectiveResult CeObjective(const ForwardTape& fwd, const ParamSet&) {
     fwd.window("logits", &lo, &hi);
     if (lo >= hi) return out;
 
-    // A differentiated read: the loss depends on these rows, so the backward gets a Seed on them.
-    const std::vector<float> data = fwd.read("logits", lo, hi, /*differentiated=*/true);
+    // Which rows the loss depends on, before anything is read: a differentiated read must be
+    // answered by a Seed, so a window with no scored row is not read at all. Chunked by position,
+    // such windows are routine (score[0] == 0, assistant-only score masks).
     const std::vector<ScoredRow> rows = scored_rows(fwd.batch(), lo, hi);
     if (rows.empty()) return out;
+
+    // A differentiated read: the loss depends on these rows, so the backward gets a Seed on them.
+    const std::vector<float> data = fwd.read("logits", lo, hi, /*differentiated=*/true);
 
     const double scale = fwd.total_scored() > 0 ? 1.0 / double(fwd.total_scored()) : 0.0;
     const int64_t span = hi - lo;

@@ -180,10 +180,17 @@ static void seed_range_is_the_scored_rows() {
                       grad[size_t(r * vocab + c)]);
     }
 
-    // A window with no scored row has no seed and no loss.
+    // A window with no scored row has no seed and no loss -- and is not read at all: a
+    // differentiated read must be answered by a seed, so reading rows the loss does not depend on
+    // would leave the tape with a read the backward cannot start from. Chunked by position, a
+    // walk lands on such windows routinely (score[0] == 0, assistant-only score masks).
     {
-        const r97::ObjectiveResult got = window_of(interior_sequence(), 2, shape, logits, 0, 2);
+        r97test::VectorTape tape;
+        tape.set_batch(interior_sequence()).set_scored(2).set_buffer("logits", shape, logits);
+        tape.set_window("logits", 0, 2);  // the scored rows of this batch are 2 and 3
+        const r97::ObjectiveResult got = r97::CeObjective(tape, r97::ParamSet{});
         CHECK(got.seeds.empty() && got.loss == 0.0 && got.scored == 0);
+        CHECK(tape.reads_of("logits").empty());  // no read, so no read left unseeded
     }
 
     // Window by window: the seeds are the scored rows, disjoint, and concatenate to the whole
@@ -191,12 +198,18 @@ static void seed_range_is_the_scored_rows() {
     {
         double loss = 0.0;
         std::vector<float> merged(size_t(5 * vocab), 0.0f);
-        // The two windows and the seed rows each must produce.
-        const int64_t spans[2][4] = {{0, 3, 2, 3}, {3, 5, 3, 4}};
+        // A walk of three windows, the first of them holding no scored row: it adds nothing and
+        // seeds nothing. The seed rows each of the other two must produce are in the last two
+        // columns.
+        const int64_t spans[3][4] = {{0, 2, 0, 0}, {2, 3, 2, 3}, {3, 5, 3, 4}};
         for (const auto& w : spans) {
             const r97::ObjectiveResult got =
                 window_of(interior_sequence(), 2, shape, logits, w[0], w[1]);
             loss += got.loss;
+            if (w[2] == w[3]) {  // no scored row in the window: nothing to seed
+                CHECK(got.seeds.empty() && got.loss == 0.0 && got.scored == 0);
+                continue;
+            }
             CHECK(got.seeds.size() == 1);
             const r97::Seed& s = got.seeds[0];
             CHECK(s.row_lo == w[2] && s.row_hi == w[3]);

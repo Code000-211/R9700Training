@@ -46,7 +46,8 @@ row falls in a window, with row offsets that accumulate `L - 1` per sequence.
 
 - reads the boundary `"logits"` in the window `fwd.window` gives, as a
   **differentiated** read (a read the loss depends on, so the backward gets a
-  Seed on it; a detached read would not carry one),
+  Seed on it; a detached read would not carry one); a window with no scored row
+  is not read at all, since there would be nothing to answer the read with,
 - takes ids and the score mask from `fwd.batch()`,
 - returns `ObjectiveResult`: the window's summed loss (f64), the window's
   scored count, and exactly one `Seed` on `"logits"` spanning the window's
@@ -55,7 +56,8 @@ row falls in a window, with row offsets that accumulate `L - 1` per sequence.
   `1 / fwd.total_scored()` — of the whole step, not of the window.
 
 Called window by window it gives the same sum and the same cotangent rows as
-called once; windows with no scored rows return an empty seed list.
+called once; windows with no scored rows are not read and return an empty seed
+list.
 
 ## Checked by
 
@@ -67,7 +69,8 @@ the gradient function's output, its read recorded as differentiated, and the
 chunked tape equal to the whole call; and the seed's row range is the window's
 span of scored rows — scored rows 2 and 3 of a five-row window give rows
 `[2, 4)`, and a window's unscored edge rows are outside it — with a zero row
-between two scored ones it spans.
+between two scored ones it spans, and a window with no scored row neither read
+nor seeded.
 
 Both run in the `host` tier, whose one binary takes every `tests/host/*.cpp`
 and whose entry point belongs to `tests/host/vector_tape.cpp` (issue #1), so a
