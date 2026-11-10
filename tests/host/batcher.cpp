@@ -93,6 +93,25 @@ std::vector<std::vector<int32_t>> id_order(const std::vector<std::vector<Batch>>
     return out;
 }
 
+// One epoch's whole shape: its steps, each step's sub-batches, each sub-batch's sequences by
+// token ids. Two runs are equal only when every batch hands out the same sequences in the same
+// order, which is what a tape reads back.
+using EpochShape = std::vector<std::vector<std::vector<std::vector<int32_t>>>>;
+
+EpochShape shape(const std::vector<std::vector<Batch>>& epoch) {
+    EpochShape out;
+    for (const auto& step : epoch) {
+        std::vector<std::vector<std::vector<int32_t>>> s;
+        for (const Batch& sub : step) {
+            std::vector<std::vector<int32_t>> b;
+            for (const TokenSeq& seq : sub) b.push_back(seq.ids);
+            s.push_back(std::move(b));
+        }
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
 std::vector<std::vector<Batch>> whole_run(Batcher& b, int64_t epochs) {
     std::vector<std::vector<Batch>> all;
     for (int64_t e = 0; e < epochs; ++e) {
@@ -271,43 +290,78 @@ void check_budget_is_per_batch() {
     assert(seen.size() == lens.size());  // every sequence appears once
 }
 
-// Grouping similar lengths may not collapse the epoch's order into one fixed sort: a dataset of a
-// few dozen sequences, every bucket well under the cap, must still change its batches with the
-// seed and with the epoch.
-void check_small_dataset_shuffles() {
-    for (const size_t n : {size_t(20), size_t(32)}) {
-        std::vector<int64_t> lens;  // distinct lengths, none over the budget
-        for (size_t i = 0; i < n; ++i) lens.push_back(17 + (int64_t)i * 3);
-        auto seqs = make_sequences(lens);
+// The shuffle must reach the batches at a realistic budget, not only when the budget is small
+// enough that the packing has to end a step early. Wherever a whole bucket fits one step -- a
+// dataset small next to the budget, a narrow length range, sequences all of one length -- the
+// step partition follows from the bucket edges alone; the shuffled order the packing places the
+// sequences in is then the only thing the seed and the epoch can change, and they must change it.
+// Each case is a shape the fixed-sort batcher handed out identically for every seed and epoch.
+void check_shuffle_reaches_the_batches() {
+    struct Case {
+        const char* what;  // for a reader of this file; the checks below do not print it
+        std::vector<int64_t> lens;
+        int64_t budget;
+        int devices;
+    };
+    std::vector<Case> cases;
+    {
+        Case c{"20 sequences of 17..74 tokens, one device", {}, 4096, 1};
+        for (size_t i = 0; i < 20; ++i) c.lens.push_back(17 + (int64_t)i * 3);
+        cases.push_back(std::move(c));
+    }
+    {
+        Case c{"100 sequences of one length, one device", {}, 4096, 1};
+        c.lens.assign(100, 100);
+        cases.push_back(std::move(c));
+    }
+    {
+        Case c{"1000 sequences of 50..80 tokens, two devices", {}, 4096, 2};
+        for (size_t i = 0; i < 1000; ++i) c.lens.push_back(50 + (int64_t)((i * 7) % 31));
+        cases.push_back(std::move(c));
+    }
 
+    for (const Case& c : cases) {
+        (void)c.what;
+        auto seqs = make_sequences(c.lens);
         r97::BatcherConfig cfg;
-        cfg.token_budget = 200;
-        cfg.devices = 2;
+        cfg.token_budget = c.budget;
+        cfg.devices = c.devices;
         cfg.seed = 1;
         Batcher b(seqs, cfg);
 
-        // Every epoch holds every sequence once, and each epoch is a new shuffle.
-        std::vector<std::vector<std::vector<int32_t>>> epochs;
+        std::vector<EpochShape> epochs;
         for (int64_t e = 0; e < 3; ++e) {
             b.seek({e, 0});
-            epochs.push_back(id_order(run_epoch(b)));
-            assert(epochs.back().size() == n);
-            std::set<int64_t> uniq;
-            for (const auto& ids : epochs.back()) uniq.insert((int64_t)ids[0]);
-            assert(uniq.size() == n);  // every sequence once, none twice
+            auto one = run_epoch(b);
+            // Every sequence once an epoch, and every sub-batch under the budget.
+            size_t seen = 0;
+            for (const auto& step : one) {
+                assert((int64_t)step.size() == c.devices);
+                for (const Batch& sub : step) {
+                    int64_t total = 0;
+                    for (const TokenSeq& s : sub) {
+                        total += tokens(s);
+                        ++seen;
+                    }
+                    assert(total <= c.budget);
+                }
+            }
+            assert(seen == c.lens.size());
+            epochs.push_back(shape(one));
         }
+        // Each epoch is a new shuffle.
         assert(epochs[0] != epochs[1] && epochs[1] != epochs[2]);
 
         // The same seed replays the same batches.
         Batcher replay(seqs, cfg);
         replay.seek({0, 0});
-        assert(id_order(run_epoch(replay)) == epochs[0]);
+        assert(shape(run_epoch(replay)) == epochs[0]);
 
         // Another seed does not.
         cfg.seed = 2;
         Batcher other(seqs, cfg);
         other.seek({0, 0});
-        assert(id_order(run_epoch(other)) != epochs[0]);
+        assert(shape(run_epoch(other)) != epochs[0]);
     }
 }
 
@@ -466,7 +520,7 @@ void check_reset_and_config_errors() {
 void run_checks() {
     check_budget_coverage_and_resume();
     check_budget_is_per_batch();
-    check_small_dataset_shuffles();
+    check_shuffle_reaches_the_batches();
     check_similar_lengths_are_grouped();
     check_single_step_split();
     check_reset_and_config_errors();

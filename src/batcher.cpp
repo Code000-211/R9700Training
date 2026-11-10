@@ -37,10 +37,10 @@ namespace {
 // then shuffled with the epoch's rng. The class cut is what keeps a step from mixing one long
 // sequence with many short ones: inside a bucket no two lengths differ by a factor of two or more.
 // The 32 cap keeps the buckets small enough that the shuffle inside one has a fine effect on the
-// steps' composition. Shuffling is what makes the order a function of (seed, epoch), including
-// when the whole dataset fits in a single bucket, where a shuffle followed by a sort by length
-// would leave no shuffle at all. (A sort and then a shuffle, rather than the other way round, is
-// therefore deliberate.)
+// order the packing hands out. Shuffling is what makes the order a function of (seed, epoch),
+// including when the whole dataset fits in a single bucket, where a shuffle followed by a sort by
+// length would leave no shuffle at all. (A sort and then a shuffle, rather than the other way
+// round, is therefore deliberate.)
 std::vector<std::vector<size_t>> epoch_buckets(const std::vector<size_t>& kept, uint64_t seed,
                                                int64_t epoch,
                                                const std::vector<int64_t>& lens) {
@@ -82,6 +82,11 @@ std::vector<std::vector<size_t>> epoch_buckets(const std::vector<size_t>& kept, 
 // between a step's fullest and emptiest sub-batch never exceeds the step's longest sequence. A
 // step with fewer sequences than devices -- a bucket's end can leave one -- has an empty
 // sub-batch and a spread of exactly one maximal sequence; no packing can avoid that.
+//
+// The sequences stay in the order the shuffle put them: that order is the epoch's shuffle, and it
+// is the only thing the seed and the epoch choose. A re-sort here (longest first, say) would erase
+// it whenever the packing's outcome is fixed -- a bucket that fits one step, all lengths equal --
+// leaving every seed and every epoch with byte-identical batches.
 std::vector<std::vector<std::vector<size_t>>> pack_bucket(
     const std::vector<size_t>& bucket, const std::vector<int64_t>& lens, int64_t budget,
     int devices) {
@@ -97,12 +102,6 @@ std::vector<std::vector<std::vector<size_t>>> pack_bucket(
                 break;
             }
         if (empty) return;
-        // Keep a stable order inside each sub-batch: longest first, input index to break ties.
-        for (auto& sub : subs)
-            std::sort(sub.begin(), sub.end(), [&](size_t a, size_t b) {
-                if (lens[a] != lens[b]) return lens[a] > lens[b];
-                return a < b;
-            });
         steps.push_back(subs);
         for (auto& sub : subs) sub.clear();
         std::fill(loads.begin(), loads.end(), int64_t{0});

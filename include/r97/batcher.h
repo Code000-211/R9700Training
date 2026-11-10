@@ -5,7 +5,9 @@
 // mixes one long sequence with many short ones, and packs each sub-batch's total token count
 // under the budget. Each step hands out `devices` sub-batches with balanced token counts, one per
 // device; the budget is per sub-batch, so a step may spend up to `devices * token_budget` tokens.
-// A sequence longer than the budget is reported (in `skipped()`) and never batched.
+// A sequence longer than the budget is reported (in `skipped()`) and never batched. A sub-batch
+// holds its sequences in the order the epoch's shuffle gave them, so the seed and the epoch reach
+// the batches even where the packing's outcome is fixed.
 //
 // Deterministic for a given seed: the same seed replays the same batches, each epoch is a new
 // shuffle, and a position (epoch, step) saved and restored resumes with the same batches.
@@ -55,8 +57,8 @@ public:
     const BatcherConfig& config() const;
 
 private:
-    // One planned epoch: steps[s][d] holds the sequence indices of step s, device d,
-    // longest first inside each sub-batch, so a tape reads them back in a stable order.
+    // One planned epoch: steps[s][d] holds the sequence indices of step s, device d, in the
+    // epoch's shuffled order inside each sub-batch, so a tape reads them back in a stable order.
     struct EpochPlan {
         std::vector<std::vector<std::vector<size_t>>> steps;
     };

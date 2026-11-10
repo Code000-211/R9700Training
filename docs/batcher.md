@@ -25,7 +25,11 @@ An epoch is planned on demand from `(seed, epoch)` and cached (`Batcher::plan`):
    next sequence the step closes, and it also closes at the bucket's end, so a step never draws
    from two buckets and all of a step's sequences are of similar length. The budget is per
    sub-batch, not per step: every `Batch` stays under `token_budget`, so a step may spend up to
-   `devices * token_budget` tokens.
+   `devices * token_budget` tokens. A sub-batch keeps its sequences in the order the shuffle put
+   them in; the packing does not re-sort them. A re-sort (longest first, say) would erase the
+   epoch's shuffle wherever the packing's outcome is fixed by the data — a bucket that fits one
+   step, sequences all of one length — leaving every seed and every epoch with byte-identical
+   batches.
 4. **Balance devices.** Least-loaded-first assignment keeps the token spread between the fullest
    and emptiest sub-batch of a step at most one maximal sequence of that step. When a step ends
    with fewer sequences than devices — a bucket edge can leave one — a sub-batch is necessarily
@@ -48,9 +52,11 @@ exactly the batches the original run produced from there.
 Everything rests on splitmix64 and a Fisher-Yates over it — no `rand`, no locale, no
 unordered containers. Same seed, same batches, every run; another seed, and every new epoch,
 shuffles each length bucket differently. Which sequences a bucket holds is fixed by the data
-(the grouping); what the seed and the epoch choose is the order inside the buckets, and with it
-the step boundaries and so the batches. For a dataset whose sequences all share one length class
-and fit one bucket (at most 32), the order is a plain shuffle.
+(the grouping); what the seed and the epoch choose is the order inside the buckets — the order
+the batches hand the sequences to a tape, and with it the step boundaries and so the batches. For
+a dataset whose sequences all share one length class and fit one bucket (at most 32), the order is
+a plain shuffle; for one small next to the budget, so that every step is one bucket wide, it is
+still the whole of what changes between seeds and epochs.
 
 ## Tests
 
@@ -62,9 +68,11 @@ sequence appears exactly once an epoch and the skipped one in no batch; the same
 another seed does not; a seek to a saved `(epoch, step)` continues identically; `reset()` returns
 to `(0, 0)` and replays the first epoch, even after a traversal has run out; a non-positive budget
 and fewer than one device are rejected; on the varied data a step's sub-batches differ by less
-than one maximal sequence; a dataset of 20 or 32 sequences still changes its batches with the seed
-and with the
-epoch; and a dataset of two length classes 40x apart, 32 long ones beside 32 shorts and
+than one maximal sequence; a dataset that fits one step per bucket — 20 sequences of 17..74
+tokens, 100 sequences of one length, 1000 sequences of 50..80 tokens on two devices — still
+changes its whole shape (steps, sub-batches and the order inside them) with the seed and with the
+epoch, at the realistic budget of 4096 rather than a small one that forces the packing to end a
+step early; and a dataset of two length classes 40x apart, 32 long ones beside 32 shorts and
 then 33 long ones beside 32 shorts, comes out in steps that hold one class only, the long ones
 first. The 32 case is exactly two buckets; the 33 case leaves a bucket that would hold one long
 and the shorts after it in the sorted order, so it is the case that mixes classes unless the
