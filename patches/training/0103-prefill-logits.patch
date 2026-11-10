@@ -368,7 +368,7 @@ index 0000000..aef78d4
 + * in core/train_prefill.cpp that Config::prefill_prompts/prefill_logits feed.
 + *
 + * The header exists so that code outside radiance can ask whether the mode is there without the
-+ * build telling it: patches/training/0101-prefill-logits.patch adds this file and the serving
++ * build telling it: patches/training/0103-prefill-logits.patch adds this file and the serving
 + * patch set does not, so `__has_include("train_prefill.h")` over the copy's include path answers
 + * for the same build the compiler is reading. r97's tests/support/fixture.h asks that way and
 + * offers no run_prefill() in a serving build. */

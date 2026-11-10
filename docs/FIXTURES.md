@@ -74,7 +74,7 @@ gives each sequence the logits that sequence gives alone, and two runs of the sa
 bit-identical.
 
 The mode is radiance's `core/train_prefill.cpp`, added by
-`patches/training/0101-prefill-logits.patch`: `Config::prefill_prompts` names the prompts,
+`patches/training/0103-prefill-logits.patch`: `Config::prefill_prompts` names the prompts,
 `Config::prefill_logits` receives the rows, and `Engine::serve()` runs the prefill instead of the
 server, as the KL mode (`core/engine_kld.cpp`) does. The host test binary must export the plugin
 ABI (`ENABLE_EXPORTS`), because the plugins are `dlopen`ed and call back into `rad_core`.

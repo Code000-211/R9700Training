@@ -40,7 +40,7 @@
 #include "tiny_model.h"       // radiance's tests/; tiny::Qwen35, tiny::write_qwen35
 #include "util/stallwatch.h"  // radiance's core/; the watch serve() takes
 
-// The prefill mode the fixture drives is patches/training/0101-prefill-logits.patch: it adds the
+// The prefill mode the fixture drives is patches/training/0103-prefill-logits.patch: it adds the
 // driver (core/train_prefill.cpp) and its marker header to the copy the build compiles. The
 // serving patch set adds neither, so the mode is asked for over the same include path the
 // compiler reads, and a serving build gets no run_prefill() -- no build rule has to know a test's
