@@ -85,12 +85,35 @@ endif()
 message(STATUS "r97: radiance at ${R97_RADIANCE_COPY}, commit ${R97_RADIANCE_COMMIT}, "
                "patch set ${R97_PATCH_SET}, ${R97_PATCH_FILES} patches applied")
 
-# Build rad_core out of tree: the subproject is configured (Ninja, like us) and rad_core only is
-# built; the radiance server and tools are not this build's business. An IMPORTED target hands
-# the archive to this project's consumers, with the include directories and link libraries
-# rad_core itself publishes (see third_party/core/CMakeLists.txt).
+# Build rad_core out of tree: the subproject is configured (Ninja, like us) and built for rad_core,
+# the two host kernel libraries, the qwen35_bf16 architecture plugin and rad-convert, which turns a
+# checkpoint into a container -- what a host test loads and runs. The radiance server and the other
+# tools are not this build's business. An IMPORTED target hands the archive to this project's
+# consumers, with the include directories and link libraries rad_core itself publishes (see
+# third_party/core/CMakeLists.txt).
 include(ExternalProject)
 find_package(Threads REQUIRED)
+
+# radiance's architecture plugins list their operands with a C compound literal holding run-time
+# values. GCC 13 refuses to take the address of that temporary array and `-fpermissive` does not
+# downgrade that error; GCC 14 takes it. So the subproject gets the parent's compiler, or the
+# newest GCC on the machine that will do when the parent's is too old. The archives it produces
+# link into the parent's C++ objects (the ABI is the platform's).
+set(R97_RADIANCE_C_COMPILER ${CMAKE_C_COMPILER})
+set(R97_RADIANCE_CXX_COMPILER ${CMAKE_CXX_COMPILER})
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14)
+  find_program(R97_RADIANCE_GCC NAMES gcc-16 gcc-15 gcc-14)
+  find_program(R97_RADIANCE_GXX NAMES g++-16 g++-15 g++-14)
+  if(NOT R97_RADIANCE_GCC OR NOT R97_RADIANCE_GXX)
+    message(FATAL_ERROR "r97: radiance's architecture plugins need GCC 14 or newer, and this "
+                        "compiler is GCC ${CMAKE_CXX_COMPILER_VERSION}; install gcc-14 or "
+                        "configure with CMAKE_C_COMPILER/CMAKE_CXX_COMPILER set to a newer one")
+  endif()
+  message(STATUS "r97: radiance builds with ${R97_RADIANCE_GXX} (GCC "
+                 "${CMAKE_CXX_COMPILER_VERSION} cannot build its plugins)")
+  set(R97_RADIANCE_C_COMPILER ${R97_RADIANCE_GCC})
+  set(R97_RADIANCE_CXX_COMPILER ${R97_RADIANCE_GXX})
+endif()
 
 if(R97_WITH_HIP STREQUAL "OFF")
   set(RAD_WITH_HIP OFF)
@@ -106,24 +129,33 @@ ExternalProject_Add(radiance_core
   CMAKE_ARGS
     -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
     -DCMAKE_GENERATOR=${CMAKE_GENERATOR}
+    -DCMAKE_C_COMPILER=${R97_RADIANCE_C_COMPILER}
+    -DCMAKE_CXX_COMPILER=${R97_RADIANCE_CXX_COMPILER}
     -DRAD_BUILD_TESTS=OFF
     -DRAD_WITH_FFMPEG=OFF
     -DRAD_WITH_HIP=${RAD_WITH_HIP}
     -DRAD_GPU_TARGETS=${RAD_GPU_TARGETS}
     -DR97_PATCH_STAMP=${R97_PATCH_STAMP}
-  BUILD_COMMAND ${CMAKE_COMMAND} --build . --target rad_core
+  BUILD_COMMAND ${CMAKE_COMMAND} --build . --target rad_core libref libavx rad-convert qwen35_bf16
   INSTALL_COMMAND ""
   BUILD_ALWAYS FALSE
   USES_TERMINAL_BUILD TRUE
-  BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/radiance-build/core/librad_core.a)
+  BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/radiance-build/core/librad_core.a
+                   ${CMAKE_BINARY_DIR}/radiance-build/vendor/librad_vendor_llama.a
+                   ${CMAKE_BINARY_DIR}/radiance-build/vendor/librad_vendor_httplib.a)
 
 set(R97_RADIANCE_LIB ${CMAKE_BINARY_DIR}/radiance-build/core/librad_core.a)
+# rad_core links the vendored llama (the tokeniser, the chat templates) and cpp-httplib, so a
+# consumer that pulls chat.cpp in needs both archives as well.
+set(R97_RADIANCE_VENDOR_LIBS
+  ${CMAKE_BINARY_DIR}/radiance-build/vendor/librad_vendor_llama.a
+  ${CMAKE_BINARY_DIR}/radiance-build/vendor/librad_vendor_httplib.a)
 add_library(rad_core STATIC IMPORTED GLOBAL)
 set_target_properties(rad_core PROPERTIES
   IMPORTED_LOCATION ${R97_RADIANCE_LIB}
   INTERFACE_INCLUDE_DIRECTORIES
     "${R97_RADIANCE_COPY}/core;${R97_RADIANCE_COPY}/core/format;${R97_RADIANCE_COPY}/abi;${R97_RADIANCE_COPY}/vendor"
-  INTERFACE_LINK_LIBRARIES "Threads::Threads;${CMAKE_DL_LIBS}")
+  INTERFACE_LINK_LIBRARIES "Threads::Threads;${CMAKE_DL_LIBS};${R97_RADIANCE_VENDOR_LIBS}")
 add_dependencies(rad_core radiance_core)
 
 if(NOT R97_WITH_HIP STREQUAL "OFF")
@@ -187,11 +219,24 @@ if(R97_BUILD_TESTS)
   # host tests, one binary; every source under tests/host/ joins it.
   file(GLOB R97_HOST_TEST_SOURCES CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_SOURCE_DIR}/tests/host/*.cpp)
+  # The fixture reads the scored-prefill mode that patches/training/ adds, so a serving build
+  # (which applies no training patch) leaves that test out.
+  if(NOT R97_PATCH_SET STREQUAL "all")
+    list(FILTER R97_HOST_TEST_SOURCES EXCLUDE REGEX "/fixture_prefill\\.cpp$")
+  endif()
   if(NOT R97_HOST_TEST_SOURCES STREQUAL "")
     add_executable(r97_host_tests ${R97_HOST_TEST_SOURCES})
+    # The plugins are dlopen()ed and call back into rad_core, so its symbols must be in the
+    # binary's dynamic table (the fixture loads the qwen35_bf16 plugin).
+    set_target_properties(r97_host_tests PROPERTIES ENABLE_EXPORTS TRUE)
     target_link_libraries(r97_host_tests PRIVATE r97)
-    target_include_directories(r97_host_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    target_compile_definitions(r97_host_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
+    target_include_directories(r97_host_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests
+      ${R97_RADIANCE_COPY}/tests)   # radiance's write_qwen35, the fixture's checkpoint writer
+    target_compile_definitions(r97_host_tests PRIVATE
+      R97_MODEL_RAD="${R97_MODEL_RAD}"
+      R97_RADIANCE_HOME="${CMAKE_BINARY_DIR}/radiance-build/radiance_home"
+      R97_RAD_CONVERT="${CMAKE_BINARY_DIR}/radiance-build/bin/rad-convert")
   endif()
 
   # gpu tests: need the card, run serially. Same shape as the host binary; empty until the device

@@ -1,0 +1,358 @@
+Concern: a training-fixture prefill that keeps every position's logits, driven through the engine
+Upstream: not-submitted
+diff --git a/core/engine.cpp b/core/engine.cpp
+index 3170856..c15b3a5 100644
+--- a/core/engine.cpp
++++ b/core/engine.cpp
+@@ -1069,7 +1069,7 @@ int Engine::step_loop() {
+         /* The step's sampler chain, verify op included, has returned: one line at the first
+          * coupled verify that actually completed. */
+         couple_verify_evidence(b->step);
+-        if (cfg_.kld()) {
++        if (cfg_.kld() || cfg_.prefill()) {
+             st = score_rows(b, so);
+             if (st < 0) return fail_loop(st);
+         }
+@@ -2311,11 +2311,14 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
+     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
+     std::thread stepper([this] { if (gen_) gen_loop(); else step_loop(); });
+ 
+-    if (cfg_.kld() || cfg_.calib()) {
++    if (cfg_.kld() || cfg_.calib() || cfg_.prefill()) {
+         print_startup_report(RAD_OK);
+         startup_watch_.reset();
+     }
+-    int s = cfg_.kld() ? run_kld() : cfg_.calib() ? run_calib() : run_server();
++    int s = cfg_.kld()       ? run_kld()
++            : cfg_.calib()   ? run_calib()
++            : cfg_.prefill() ? run_prefill()
++                             : run_server();
+     startup_watch_.reset();
+ 
+     /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,
+diff --git a/core/engine.h b/core/engine.h
+index c913d1c..b2a0168 100644
+--- a/core/engine.h
++++ b/core/engine.h
+@@ -599,6 +599,13 @@ private:
+      * requests and hands every step's scored rows, copied to the host, to `kld_`. One pinned
+      * block per rank, holding a step's tokens of that rank's logits columns. */
+     int  run_kld();
++    /* The training fixture's prefill (core/train_prefill.cpp), replacing run_server: submits
++     * Config::prefill_prompts as scoring requests in one hold, speculation off, and keeps every
++     * step's scored rows in Config::prefill_logits. */
++    int  run_prefill();
++    /* The logits-buffer check and the pinned host copy both row readers need: score_rows fills
++     * kld_vocab0_/kld_width_/kld_host_ for the ranks, and `what` names the mode in an error. */
++    int  open_scored_rows(const char* what);
+     int  run_docs(std::vector<std::unique_ptr<Request>>& reqs,
+                   std::vector<std::unique_ptr<server::Sink>>& sinks, bool fit_pool,
+                   const char* tag, int every_s,
+@@ -607,6 +614,10 @@ private:
+     std::unique_ptr<Kld> kld_;
+     std::vector<float*>  kld_host_;
+     std::vector<int64_t> kld_vocab0_, kld_width_;   /* per rank read: its logits columns */
++    /* The fixture's prefill: where score_rows keeps the rows, and the prompt each request id
++     * carries. prefill_rows_ is null in every other mode. */
++    std::vector<std::vector<float>>* prefill_rows_ = nullptr;
++    std::vector<int64_t>              prefill_prompt_;
+     /* --calib-corpus, replacing run_server: the corpus, loaded before declare so the plugin is told
+      * its token count (RadBuildCtx::calib_tokens), submitted as plain prefill requests. */
+     int  run_calib();
+diff --git a/core/engine_bringup.cpp b/core/engine_bringup.cpp
+index 076fd89..a258442 100644
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -1033,8 +1033,8 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
+     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
+     bc.max_audio_frames = cfg_.mm_audio_frames > 0 ? cfg_.mm_audio_frames : 0;
+     /* A row at every token of the step plus the sampler's one row per sequence before them
+-     * (core/kld.h); KL mode has no speculation. */
+-    bc.max_out_rows = cfg_.kld() ? max_tok + cfg_.max_seqs : 0;
++     * (core/kld.h); neither the KL mode nor the fixture's prefill speculates. */
++    bc.max_out_rows = (cfg_.kld() || cfg_.prefill()) ? max_tok + cfg_.max_seqs : 0;
+     /* Under --prefill-span every step but a lone prefill is planned at the shared budget
+      * (Scheduler::step), so a wider step is one sequence; 0 without a span. */
+     bc.max_mixed_tok = cfg_.prefill_span > 1 ? std::min(max_tok, prefill_shared_tok(cfg_)) : 0;
+@@ -1084,6 +1084,20 @@ int Engine::declare() {
+             "the KL mode: a prefix hit would start a document past positions the reference holds";
+         decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
+     }
++    /* The fixture's prefill reads the trunk's own rows the same way the KL mode does: a drafter
++     * writes none and a prefix hit would skip positions the caller is waiting for. */
++    if (cfg_.prefill()) {
++        if (cfg_.n_spec > 0) {
++            RAD_ERR("--num-speculative-tokens %d: the fixture's prefill reads the trunk's own rows "
++                    "and drafts nothing; leave it at 0", cfg_.n_spec);
++            return RAD_E_INVAL;
++        }
++        cfg_.n_spec = 0;
++        cfg_.prefix_cache = false;
++        prefix_off_why_ =
++            "the fixture's prefill: a prefix hit would start a prompt past positions it asks for";
++        decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
++    }
+     /* --calib-corpus: every token of the corpus through prefill exactly once, so no prefix hit
+      * skips any and no drafter adds rows; the corpus is loaded here, before the plugins declare,
+      * because they are told its size. */
+diff --git a/core/engine_kld.cpp b/core/engine_kld.cpp
+index 8c7bdff..cb0309e 100644
+--- a/core/engine_kld.cpp
++++ b/core/engine_kld.cpp
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdint>
++#include <cstring>
+ #include <functional>
+ #include <memory>
+ #include <thread>
+@@ -94,10 +95,11 @@ int Engine::run_docs(std::vector<std::unique_ptr<Request>>& reqs,
+     return RAD_OK;
+ }
+ 
+-int Engine::run_kld() {
+-    /* Each rank's logits buffer must hold a step's tokens after the sampler's rows
+-     * (RadBuildCtx::max_out_rows); a plugin that ignored the field is refused here rather than
+-     * overrun. */
++/* The logits-buffer check and the pinned host copy the row readers share: every rank's logits
++ * buffer must hold a step's tokens after the sampler's rows (RadBuildCtx::max_out_rows), and a
++ * plugin that ignored the field is refused here rather than overrun. `what` names the mode in an
++ * error, and the columns each rank's copy holds are kept in kld_vocab0_/kld_width_. */
++int Engine::open_scored_rows(const char* what) {
+     const int64_t need = cfg_.max_tok + cfg_.max_seqs;
+     const int64_t nv = meta_.n_vocab;
+     kld_vocab0_.clear();
+@@ -105,14 +107,14 @@ int Engine::run_kld() {
+     for (const auto& rk : ranks_) {
+         const Program& p = rk->program;
+         if (p.logits_buf == RAD_NULL_HANDLE || (size_t)p.logits_buf >= p.buffers.size()) {
+-            RAD_ERR("kld: rank %d declared no logits buffer", rk->index);
++            RAD_ERR("%s: rank %d declared no logits buffer", what, rk->index);
+             return RAD_E_UNSUPPORTED;
+         }
+         const RadBufDecl& d = p.buffers[p.logits_buf].decl;
+         if (d.dtype != RAD_F32 || d.rank != 2 || d.shape[0] < need) {
+-            RAD_ERR("kld: the '%s' plugin's logits buffer is %lld rows of %s; the KL mode needs "
++            RAD_ERR("%s: the '%s' plugin's logits buffer is %lld rows of %s; the mode needs "
+                     "f32 rows for a whole step, %lld (it reads RadBuildCtx::max_out_rows)",
+-                    plugins_.arch_plugin.c_str(), (long long)d.shape[0],
++                    what, plugins_.arch_plugin.c_str(), (long long)d.shape[0],
+                     d.dtype == RAD_F32 ? "f32" : "another dtype", (long long)need);
+             return RAD_E_UNSUPPORTED;
+         }
+@@ -131,7 +133,7 @@ int Engine::run_kld() {
+     int64_t cover = 0;
+     for (int64_t w : kld_width_) cover += w;
+     if (cover != nv) {
+-        RAD_ERR("kld: the ranks' logits columns add up to %lld of a %lld-token vocabulary",
++        RAD_ERR("%s: the ranks' logits columns add up to %lld of a %lld-token vocabulary", what,
+                 (long long)cover, (long long)nv);
+         return RAD_E_STATE;
+     }
+@@ -140,14 +142,20 @@ int Engine::run_kld() {
+         kld_host_[r] = static_cast<float*>(
+             rad_dev_alloc(cfg_.max_tok * kld_width_[r] * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
+         if (!kld_host_[r]) {
+-            RAD_ERR("kld: no pinned host memory for a step's logits (%lld MiB a rank); lower "
+-                    "--max-num-batched-tokens", (long long)(cfg_.max_tok * kld_width_[r] * 4 >> 20));
++            RAD_ERR("%s: no pinned host memory for a step's logits (%lld MiB a rank); lower "
++                    "--max-num-batched-tokens", what,
++                    (long long)(cfg_.max_tok * kld_width_[r] * 4 >> 20));
+             return RAD_E_NOMEM;
+         }
+     }
++    return RAD_OK;
++}
++
++int Engine::run_kld() {
++    RAD_TRY(open_scored_rows("kld"));
+ 
+     auto kld = std::make_unique<Kld>();
+-    RAD_TRY(kld->open(cfg_, vocab_, nv, cfg_.model));
++    RAD_TRY(kld->open(cfg_, vocab_, meta_.n_vocab, cfg_.model));
+     /* Published before add_all takes the scheduler's lock; the step loop reads it only on steps
+      * planned under that lock afterwards. */
+     kld_ = std::move(kld);
+@@ -321,6 +329,31 @@ int Engine::score_rows(const RadBatch* b, const StepOut& so) {
+     std::vector<KldShard> shards(kld_width_.size());
+     for (size_t r = 0; r < shards.size(); ++r)
+         shards[r] = { kld_host_[r], kld_vocab0_[r], kld_width_[r] };
++    if (prefill_rows_) {
++        /* The fixture's prefill: keep the rows instead of scoring them. A prompt the scheduler
++         * chunks arrives in more than one step, and ctx_len places each chunk in its prompt's rows;
++         * a prompt that was preempted is prefilled again with the same rows, so overwriting them
++         * is harmless. */
++        const int64_t nv = meta_.n_vocab;
++        for (const KldSpan& sp : spans) {
++            if (sp.id >= prefill_prompt_.size() || prefill_prompt_[(size_t)sp.id] < 0) {
++                RAD_ERR("prefill: request %llu names no prompt", (unsigned long long)sp.id);
++                return RAD_E_STATE;
++            }
++            std::vector<float>& dst = (*prefill_rows_)[(size_t)prefill_prompt_[(size_t)sp.id]];
++            if ((size_t)((sp.pos0 + sp.n) * nv) > dst.size()) {
++                RAD_ERR("prefill: request %llu's positions [%lld, %lld) leave its prompt's rows",
++                        (unsigned long long)sp.id, (long long)sp.pos0, (long long)(sp.pos0 + sp.n));
++                return RAD_E_STATE;
++            }
++            for (const KldShard& sh : shards)
++                for (int64_t t = 0; t < sp.n; ++t)
++                    std::memcpy(dst.data() + (sp.pos0 + t) * nv + sh.vocab0,
++                                sh.rows + (sp.row0 + t) * sh.width,
++                                (size_t)sh.width * sizeof(float));
++        }
++        return RAD_OK;
++    }
+     return kld_->score(spans, shards);
+ }
+ 
+diff --git a/core/rad_core.h b/core/rad_core.h
+index dbdc8dc..291de12 100644
+--- a/core/rad_core.h
++++ b/core/rad_core.h
+@@ -1052,6 +1052,17 @@ struct Config {
+     std::string kld_out;                /* --kld-out FILE: the report as JSON, rows beside it */
+     bool kld() const { return !kld_record.empty() || !kld_ref.empty(); }
+ 
++    /* ---------------- THE TRAINING FIXTURE'S PREFILL (core/train_prefill.cpp) ----------------
++     *
++     * A mode for tests, like the KL mode: the engine starts as for serving, then, instead of
++     * listening, runs these prompts through prefill with speculation off and keeps every position's
++     * logits in `prefill_logits`, one row of `meta_.n_vocab` f32 per token, one vector per prompt.
++     * The host tests' tiny fixture (tests/support/fixture.h) is its only caller; a serving
++     * deployment leaves both empty. */
++    std::vector<std::vector<int32_t>> prefill_prompts;
++    std::vector<std::vector<float>>   prefill_logits;
++    bool prefill() const { return !prefill_prompts.empty(); }
++
+     /* --mm-max-patches: the most patches one encoder pass carries, which bounds the largest image
+      * (one image is one pass) and sizes the encoder's activations. -1 is `auto`: the default below
+      * when the container carries a vision tower and 0 when it does not. 0 serves text only and
+diff --git a/core/sched/batch.cpp b/core/sched/batch.cpp
+index c4fde6a..4c11146 100644
+--- a/core/sched/batch.cpp
++++ b/core/sched/batch.cpp
+@@ -96,9 +96,9 @@ void BatchBuilder::carve(Set& s, char* h) {
+      * the plugin gathers into a buffer smaller than out_ids. */
+     int64_t O = S * (1 + (cfg_.n_spec > 0 ? (int64_t)cfg_.n_spec : 0));
+     if (O < T) O = T;
+-    /* KL mode adds a row at every token after the sampled ones (Request::score); keep in sync
+-     * with RadBuildCtx::max_out_rows. */
+-    if (cfg_.kld()) O = T + S;
++    /* KL mode and the fixture's prefill add a row at every token after the sampled ones
++     * (Request::score); keep in sync with RadBuildCtx::max_out_rows. */
++    if (cfg_.kld() || cfg_.prefill()) O = T + S;
+ 
+     int64_t oh = 0, od = 0;
+     auto pair = [&](int32_t** ph, int32_t** pd, int64_t n) {
+@@ -1121,7 +1121,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv,
+     /* Scored rows (Request::score): one per token of a scoring entry's prefill chunk, in entry
+      * order (the order Engine::score_rows maps back). Appended after the sampled rows so the
+      * sampler and the card's acceptance (dev_out) never see them. Trunk passes only. */
+-    if (cfg_.kld() && plan.draft_pass == 0 && plan.tok_shift == 0) {
++    if ((cfg_.kld() || cfg_.prefill()) && plan.draft_pass == 0 && plan.tok_shift == 0) {
+         int64_t at = 0;
+         for (int64_t i = 0; i < n_seq; ++i) {
+             const StepEntry& e = plan.e[(size_t)i];
+diff --git a/core/train_prefill.cpp b/core/train_prefill.cpp
+new file mode 100644
+index 0000000..695fff6
+--- /dev/null
++++ b/core/train_prefill.cpp
+@@ -0,0 +1,96 @@
++/* train_prefill.cpp -- the training fixture's prefill on the Engine: a driver that replaces the
++ * HTTP server, as the KL mode does (core/engine_kld.cpp), but keeps the logits of every prompt
++ * position instead of scoring them. Config::prefill_prompts names the prompts and
++ * Config::prefill_logits receives them; the requests are scoring requests, so the batch builder
++ * emits a row per prompt position and score_rows copies them out. This is what the tests' tiny
++ * bf16 fixture (tests/support/fixture.h) runs through the same steps a serving request takes. */
++#include "engine_priv.h"
++
++#include "device/device.h"
++#include "server/sink.h"
++
++#include <chrono>
++#include <cstdint>
++#include <memory>
++#include <vector>
++
++namespace rad {
++
++int Engine::run_prefill() {
++    const std::vector<std::vector<int32_t>>& prompts = cfg_.prefill_prompts;
++    RAD_TRY(open_scored_rows("prefill"));
++    const int64_t nv = meta_.n_vocab;
++
++    /* A prompt the KV pool cannot hold even alone would wait at the head of the queue forever:
++     * admission takes only a chunk the pool can hold, and nothing frees enough. Refused up front,
++     * naming the pool, as the KL mode does for its documents. */
++    {
++        const KVManager& kv = ranks_[0]->kv;
++        int64_t pool = INT64_MAX;
++        for (int32_t g = 0; g < kv.n_groups(); ++g) {
++            const KVGroupPlan* p = kv.plan(g);
++            if (p && p->paged() && p->window_blocks == 0)
++                pool = std::min<int64_t>(pool, p->n_blocks * p->block_size);
++        }
++        for (size_t d = 0; d < prompts.size(); ++d) {
++            const int64_t len = (int64_t)prompts[d].size();
++            if (len == 0) {
++                RAD_ERR("prefill: prompt %zu is empty", d);
++                return RAD_E_INVAL;
++            }
++            if (kv.can_ever_fit(len)) continue;
++            RAD_ERR("prefill: prompt %zu is %lld tokens and the KV pool holds %lld, so it can never "
++                    "be prefilled; lower --max-ctx or raise the cache", d, (long long)len,
++                    (long long)pool);
++            return RAD_E_FULL;
++        }
++    }
++
++    std::vector<std::vector<float>> rows(prompts.size());
++    prefill_prompt_.assign(prompts.size() + 1, -1);
++    for (size_t d = 0; d < prompts.size(); ++d) {
++        rows[d].assign(prompts[d].size() * (size_t)nv, 0.0f);
++        prefill_prompt_[d + 1] = (int64_t)d;   /* request ids start at 1, as in the KL mode */
++    }
++    prefill_rows_ = &rows;
++
++    std::vector<std::unique_ptr<server::Sink>> sinks(prompts.size());
++    std::vector<std::unique_ptr<Request>> reqs(prompts.size());
++    for (size_t d = 0; d < prompts.size(); ++d) {
++        sinks[d] = std::make_unique<server::Sink>(64);
++        auto r = std::make_unique<Request>();
++        r->id                    = d + 1;
++        r->prompt                = prompts[d];
++        r->max_tokens            = 1;      /* sampled from the last prefill row, never fed back */
++        r->ignore_eos            = true;
++        r->sp.temp               = 0.0f;
++        r->score                 = true;
++        r->sp.use_control_vector = cvec_default_on();
++        r->sink                  = sinks[d].get();
++        sinks[d]->id             = r->id;
++        reqs[d]                  = std::move(r);
++    }
++
++    /* All prompts are submitted under one hold of the queue, so the batching depends only on the
++     * prompts and the flags: a rerun batches identically. Preemption cannot change a row (the same
++     * positions are recomputed into the same place), so the rows a prompt gets are the rows it
++     * would have got alone, whatever share of the step it had. */
++    const auto t0 = std::chrono::steady_clock::now();
++    int bad = 0;
++    const int s = run_docs(reqs, sinks, false, "prefill", 30,
++                           [](size_t, double) {}, &bad);
++    prefill_rows_ = nullptr;
++    prefill_prompt_.clear();
++    RAD_TRY(s);
++    if (bad) return RAD_E_STATE;
++    int64_t positions = 0;
++    for (const auto& p : prompts) positions += (int64_t)p.size();
++    RAD_INFO("prefill: %zu prompts, %lld positions in %.0f s, %lld preemption(s)", prompts.size(),
++             (long long)positions,
++             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
++             (long long)sched_.metrics().preemptions);
++    cfg_.prefill_logits = std::move(rows);
++    return RAD_OK;
++}
++
++}  /* namespace rad */
