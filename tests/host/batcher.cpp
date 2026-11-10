@@ -252,6 +252,58 @@ void check_small_dataset_shuffles() {
     }
 }
 
+// Grouping: a batch does not mix one long sequence with many short ones. Two length classes 40x
+// apart, 32 of each -- exactly two length buckets -- and a budget that would happily hold one long
+// sequence beside dozens of shorts. Grouping keeps each step inside one class: the longs are
+// packed first, then the shorts, and no step straddles the bucket boundary.
+void check_similar_lengths_are_grouped() {
+    const int64_t kLong = 500;
+    const int64_t kShort = 12;
+    const size_t kEach = 32;  // one full bucket each, so the two classes never share a bucket
+    std::vector<int64_t> lens;
+    lens.reserve(2 * kEach);
+    for (size_t i = 0; i < kEach; ++i) lens.push_back(kLong);
+    for (size_t i = 0; i < kEach; ++i) lens.push_back(kShort);
+    auto seqs = make_sequences(lens);
+
+    r97::BatcherConfig cfg;
+    cfg.token_budget = 1000;  // one long and 41 shorts would fit, were they ever in one step
+    cfg.devices = 1;
+    cfg.seed = 5;
+    Batcher b(seqs, cfg);
+
+    for (int64_t e = 0; e < 4; ++e) {
+        b.seek({e, 0});
+        bool saw_long_step = false, saw_short_step = false;
+        size_t steps = 0, seen = 0;
+        std::vector<Batch> step;
+        while (b.next(&step)) {
+            assert(step.size() == 1);
+            assert(!step[0].empty());
+            ++steps;
+            int64_t longest = 0, shortest = kLong;
+            for (const TokenSeq& s : step[0]) {
+                longest = std::max(longest, tokens(s));
+                shortest = std::min(shortest, tokens(s));
+                ++seen;
+            }
+            // No step mixes the two classes: a batch is never one long and a crowd of shorts.
+            assert(longest == shortest);
+            if (longest == kLong) {
+                assert(!saw_short_step);  // grouped descending: every long step comes first
+                saw_long_step = true;
+            } else {
+                assert(longest == kShort);
+                saw_short_step = true;
+            }
+        }
+        assert(saw_long_step && saw_short_step);
+        assert(seen == 2 * kEach);
+        // 16 steps of two longs, then one of the 32 shorts.
+        assert(steps == kEach / 2 + 1);
+    }
+}
+
 // A step whose whole set fits one step: it is one step, split across all devices, every device
 // gets a sub-batch, and the spread stays below the maximal sequence.
 void check_single_step_split() {
@@ -290,6 +342,7 @@ void check_single_step_split() {
 void run_checks() {
     check_budget_coverage_and_resume();
     check_small_dataset_shuffles();
+    check_similar_lengths_are_grouped();
     check_single_step_split();
     std::puts("batcher ok");
 }
