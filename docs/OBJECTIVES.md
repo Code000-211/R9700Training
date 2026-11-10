@@ -50,7 +50,8 @@ themselves — the `Objective` owns the loss, the `Delta` owns the kind.
 
 `check_seeds(const ForwardTape&, const ObjectiveResult&)` runs before any walk. It reads
 the tape's record of what the objective read (`RecordedTape` in `include/r97/model.h`;
-`VectorTape` in tests implements it). It refuses, naming the buffer:
+`RecordedVectorTape` in `tests/support/` wraps the test `VectorTape` with it). It
+refuses, naming the buffer:
 
 1. a seed on a buffer that is not one of `ForwardTape::boundaries`;
 2. a seed whose row range lies outside the window the forward driver recorded for the

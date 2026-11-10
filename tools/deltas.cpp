@@ -3,14 +3,13 @@
 
 #include "r97/model.h"
 
-#include <cstdio>
 #include <iostream>
 
 namespace {
 
 int run_deltas(int /*argc*/, char** /*argv*/) {
-    std::puts("deltas registered:");
-    for (const std::string& kind : r97::delta_names()) std::printf("  %s\n", kind.c_str());
+    std::cout << "deltas registered:\n";
+    for (const std::string& kind : r97::delta_names()) std::cout << "  " << kind << "\n";
     return 0;
 }
 

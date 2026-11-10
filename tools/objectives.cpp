@@ -3,14 +3,13 @@
 
 #include "r97/model.h"
 
-#include <cstdio>
 #include <iostream>
 
 namespace {
 
 int run_objectives(int /*argc*/, char** /*argv*/) {
-    std::puts("objectives registered:");
-    for (const std::string& name : r97::objective_names()) std::printf("  %s\n", name.c_str());
+    std::cout << "objectives registered:\n";
+    for (const std::string& name : r97::objective_names()) std::cout << "  " << name << "\n";
     return 0;
 }
 

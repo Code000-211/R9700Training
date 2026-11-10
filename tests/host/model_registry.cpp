@@ -6,7 +6,7 @@
 
 #include "../support/bias_delta.h"
 #include "../support/sum_objective.h"
-#include "../support/vector_tape.h"
+#include "../support/recorded_vector_tape.h"
 
 #include <cassert>
 #include <stdexcept>
@@ -33,7 +33,7 @@ int main() {
     cfg.delta.kind = "test_bias";
     cfg.delta.rank = 3;
     r97::Model model = r97::make_model(cfg);
-    r97test::VectorTape tape;
+    r97test::RecordedVectorTape tape;
     tape.set_buffer("logits", {2, 4}, {1, 2, 3, 4, 5, 6, 7, 8});
     r97::ObjectiveResult result = model.objective(tape, {});
     assert(result.loss == 10.0);   // the sum of rows [0, 1): {1, 2, 3, 4}

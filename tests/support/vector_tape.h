@@ -5,7 +5,6 @@
 // which reads it claimed as differentiated.
 #pragma once
 
-#include "r97/model.h"
 #include "r97/objective.h"
 
 #include <cstdint>
@@ -17,11 +16,13 @@
 
 namespace r97test {
 
-// The read record's type; VectorTape exposes it through r97::RecordedTape so check_seeds can
-// audit what the objective read.
-using TapeRead = r97::TapeRead;
+struct TapeRead {
+    std::string buffer;
+    int64_t row_lo = 0, row_hi = 0;
+    bool differentiated = false;
+};
 
-class VectorTape : public r97::RecordedTape {
+class VectorTape : public r97::ForwardTape {
 public:
     // ------------------------------------------------------------ construction
     VectorTape& set_batch(r97::Batch b) {
@@ -80,7 +81,7 @@ public:
     }
 
     // ------------------------------------------------------------ the record
-    const std::vector<TapeRead>& reads() const override { return record_; }
+    const std::vector<TapeRead>& reads() const { return record_; }
     // All reads of one buffer, in order.
     std::vector<TapeRead> reads_of(const std::string& buffer) const {
         std::vector<TapeRead> out;
