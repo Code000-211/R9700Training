@@ -24,10 +24,14 @@ down to `lr * lr_floor_frac` at `total_steps`, flat at the floor beyond it. With
 
 ## Clipping and accumulation
 
-`clip_global_norm(grads, max_norm)` rescales the whole gradient set so its global norm
-(the square root of the sum of squares over all parameters, computed in double) is at most
-`max_norm`; it is deterministic — the cross-thread partial sums are combined in fixed chunk
-order, so a restart reproduces the same bits.
+`clip_global_norm(grads, max_norm, threads)` rescales the whole gradient set so its
+global norm (the square root of the sum of squares over all parameters, computed in
+double) is at most `max_norm`; it is deterministic — the flattened elements are cut into
+fixed 4096-element chunks, each chunk yields one double partial, and the partials are
+summed in chunk order, so the result is bit-identical for any thread count and a restart
+reproduces the same bits. The norm pass and the rescale pass both run on `threads`
+threads (`<= 0`: hardware concurrency); `Optimiser::step` passes its own `cfg.threads`,
+and skips the clip entirely when `clip_norm <= 0`.
 
 With `accum_steps = k` each `step()` call sums its gradients into a buffer; the k-th call
 applies the mean (`buffer/k`), clipped, as one AdamW step and clears the buffer. `step()`
@@ -44,7 +48,11 @@ by a host test, both mid-window and between updates.
 ## Threading
 
 Elements across all parameters are cut into chunks and dispatched to worker threads over
-both moments and weights in the same pass. `threads = 0` uses `std::thread::hardware_concurrency`.
+both moments and weights in the same pass; the global-norm clip uses the same thread count
+over its own fixed 4096-element chunks. `threads = 0` uses
+`std::thread::hardware_concurrency`. Because every element is updated independently and
+the clip's reduction order is fixed, the whole update is bit-identical for any thread
+count — a host test checks one thread against sixteen.
 
 ## Measured: one update at 10^8 parameters
 
@@ -63,7 +71,7 @@ It prints the time of one warm update. On this run's host:
 
 | machine                      | one AdamW update (warm) |
 | ---------------------------- | ----------------------- |
-| this run's host (48 threads) | 0.24 s                  |
+| this run's host (48 threads) | 0.20 s                  |
 
-Five runs after warm-up gave 0.232 s to 0.239 s, peak RSS 1.9 GB. Well under the
-one-second bar.
+Five runs after warm-up gave 0.198 s to 0.209 s on a quiet host (0.26 s to 0.29 s while
+other builds shared the machine), peak RSS 1.9 GB. Well under the one-second bar.

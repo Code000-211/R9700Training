@@ -43,8 +43,11 @@ struct AdamWConfig {
 float scheduled_lr(const AdamWConfig& cfg, int step);
 
 // Rescale `grads` in place so its global norm is at most `max_norm`; returns the norm
-// before clipping. `max_norm <= 0` is a no-op that still returns the norm.
-float clip_global_norm(ParamSet& grads, float max_norm);
+// before clipping. `max_norm <= 0` is a no-op that still returns the norm. Both the norm
+// and the rescale run on `threads` threads (`<= 0`: std::thread::hardware_concurrency()):
+// each thread sums fixed 4096-element chunks and the partials are added in chunk order,
+// so the result is bit-identical for any thread count and a restart reproduces it.
+float clip_global_norm(ParamSet& grads, float max_norm, int threads = 0);
 
 class Optimiser {
 public:

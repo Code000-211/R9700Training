@@ -2,10 +2,11 @@
 //
 // Threading: the element range across all parameters is cut into fixed chunks and each
 // chunk takes a global element index, decoded through the prefix-sum table into a
-// (parameter, local index) pair. Every pass (accumulate, scale, norm, update) runs the
-// same way. The only cross-element reduction, the global norm, collects one partial per
-// chunk and sums the partials in chunk order, so the result does not depend on thread
-// scheduling and a restart reproduces it bit for bit.
+// (parameter, local index) pair. Every pass (accumulate, scale, update) runs the same
+// way. The only cross-element reduction, the global norm, runs on the same threads over
+// fixed 4096-element chunks and sums one partial per chunk in chunk order, so the result
+// depends neither on thread count nor on scheduling and a restart reproduces it bit for
+// bit.
 #include "r97/optim.h"
 
 #include <algorithm>
@@ -40,11 +41,11 @@ Decoded decode(const size_t* offsets, size_t lo, size_t hi) {
     return d;
 }
 
-// Run body(begin_global, end_global) over [0, total) on nthreads threads. The body must
-// be safe to call concurrently on disjoint ranges.
+// Run body(lo, hi) over [0, total) split into a fixed number of ranges, on nthreads
+// threads. The body must be safe to call concurrently on disjoint ranges.
 template <class Body>
-void parallel_ranges(size_t total, int nthreads, const Body& body) {
-    if (nthreads <= 1 || total < 4096) {
+void parallel_split(size_t total, int nthreads, const Body& body) {
+    if (nthreads <= 1 || total <= 1) {
         body(size_t(0), total);
         return;
     }
@@ -64,6 +65,16 @@ void parallel_ranges(size_t total, int nthreads, const Body& body) {
     for (int i = 0; i < nthreads - 1; ++i) pool.emplace_back(worker);
     worker();  // the calling thread joins in
     for (auto& t : pool) t.join();
+}
+
+// The element passes: below this many elements the threads cost more than they save.
+template <class Body>
+void parallel_ranges(size_t total, int nthreads, const Body& body) {
+    if (total < 4096) {
+        body(size_t(0), total);
+        return;
+    }
+    parallel_split(total, nthreads, body);
 }
 
 constexpr char kMagic[] = "R97OPT";
@@ -114,26 +125,67 @@ float scheduled_lr(const AdamWConfig& cfg, int step) {
     return float(floor + (base - floor) * 0.5 * (1.0 + std::cos(angle)));
 }
 
-float clip_global_norm(ParamSet& grads, float max_norm) {
-    double sq = 0.0;
-    for (const auto& p : grads) {
-        // Deterministic chunked order, matching Optimiser's own reduction.
-        const float* x = p.value.data();
-        const size_t n = p.value.size();
-        for (size_t lo = 0; lo < n; lo += 4096) {
+namespace {
+
+// The norm and the rescale, with the thread count in hand: the optimiser passes its own,
+// the public clip_global_norm() asks the machine.
+float clip_impl(ParamSet& grads, float max_norm, int nthreads) {
+    std::vector<size_t> offs(grads.size() + 1, 0);
+    for (size_t i = 0; i < grads.size(); ++i) offs[i + 1] = offs[i] + grads[i].value.size();
+    const size_t total = offs.back();
+    if (total == 0) return 0.0f;
+    const size_t* off = offs.data();
+    auto* gd = grads.data();
+
+    // A fixed chunk size, so the reduction is the same on any thread count: one double
+    // partial per chunk, then the partials in chunk order. Small gradient sets do not pay
+    // for the threads, and the bits are the same either way.
+    constexpr size_t kChunk = 4096;
+    const size_t nchunks = (total + kChunk - 1) / kChunk;
+    if (total < 65536) nthreads = 1;
+    std::vector<double> parts(nchunks, 0.0);
+    parallel_split(nchunks, nthreads, [&](size_t c0, size_t c1) {
+        for (size_t c = c0; c < c1; ++c) {
+            const size_t lo = c * kChunk;
+            const size_t hi = std::min(total, lo + kChunk);
             double part = 0.0;
-            const size_t hi = std::min(n, lo + 4096);
-            for (size_t i = lo; i < hi; ++i) part += double(x[i]) * double(x[i]);
-            sq += part;
+            size_t i = lo;
+            while (i < hi) {
+                const Decoded d = decode(off, i, hi);
+                const float* x = gd[d.p].value.data() + d.off;
+                for (size_t k = 0; k < d.len; ++k) part += double(x[k]) * double(x[k]);
+                i += d.len;
+            }
+            parts[c] = part;
         }
-    }
+    });
+    double sq = 0.0;
+    for (size_t c = 0; c < nchunks; ++c) sq += parts[c];
     const float norm = float(std::sqrt(sq));
     if (max_norm > 0.0f && norm > max_norm && norm > 0.0f) {
         const float s = max_norm / norm;
-        for (auto& p : grads)
-            for (auto& v : p.value) v *= s;
+        parallel_split(nchunks, nthreads, [&](size_t c0, size_t c1) {
+            for (size_t c = c0; c < c1; ++c) {
+                const size_t lo = c * kChunk;
+                const size_t hi = std::min(total, lo + kChunk);
+                size_t i = lo;
+                while (i < hi) {
+                    const Decoded d = decode(off, i, hi);
+                    float* x = gd[d.p].value.data() + d.off;
+                    for (size_t k = 0; k < d.len; ++k) x[k] *= s;
+                    i += d.len;
+                }
+            }
+        });
     }
     return norm;
+}
+
+}  // namespace
+
+float clip_global_norm(ParamSet& grads, float max_norm, int threads) {
+    const int nthreads = threads > 0 ? threads : int(std::thread::hardware_concurrency());
+    return clip_impl(grads, max_norm, nthreads > 0 ? nthreads : 1);
 }
 
 Optimiser::Optimiser(ParamSet& params, AdamWConfig cfg) : params_(params), cfg_(std::move(cfg)) {
@@ -204,7 +256,7 @@ bool Optimiser::step(const ParamSet& grads) {
             i += d.len;
         }
     });
-    clip_global_norm(g_, cfg_.clip_norm);
+    if (cfg_.clip_norm > 0.0f) clip_impl(g_, cfg_.clip_norm, nthreads_);
 
     const int t = step_ + 1;
     const float lr = scheduled_lr(cfg_, t);

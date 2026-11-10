@@ -1,13 +1,15 @@
 // tests/host/optim.cpp -- host tests for r97::Optimiser (include/r97/optim.h).
 // Convex-quadratic convergence; the update over three steps matches a hand-computed AdamW
-// to 1e-6; schedule values; clipping; gradient accumulation over k steps; and serialise-and-
-// continue bit-identity. The update-time measurement behind docs/OPTIM.md lives here too,
+// to 1e-6; schedule values; clipping; gradient accumulation over k steps; serialise-and-
+// continue bit-identity; and thread-count invariance of both the clip and the update. The
+// update-time measurement behind docs/OPTIM.md lives here too,
 // but opt-in: at 10^8 parameters it allocates a few GB, and the host label runs anywhere, so
 // R97_OPTIM_BENCH=<parameter count> asks for it and the always-run suite never pays for it.
 #include "r97/optim.h"
 #include "r97/params.h"
 #include "support/test.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -178,6 +180,95 @@ void test_clipping() {
         R97_CHECK(max_abs(flat_of(params), w) < 1e-6);
     }
     std::printf("  clipping ok\n");
+}
+
+// A parameter set large enough that the clip's thread split is used (more than one
+// 4096-element chunk), with odd sizes so chunks cross parameter boundaries, and values
+// from a fixed LCG so every run starts from the same bits.
+ParamSet big_set() {
+    const size_t sizes[3] = {70000, 90001, 41000};
+    unsigned state = 12345u;
+    ParamSet set;
+    for (int p = 0; p < 3; ++p) {
+        std::vector<float> v(sizes[p]);
+        for (auto& x : v) {
+            state = state * 1664525u + 1013904223u;
+            x = float(int(state >> 8) % 2001 - 1000) / 500.0f;  // [-2, 2)
+        }
+        set.push_back(Param{"p" + std::to_string(p), {int64_t(sizes[p])}, v});
+    }
+    return set;
+}
+
+double flat_norm_sq(const std::vector<float>& x) {
+    double sq = 0.0;
+    for (size_t lo = 0; lo < x.size(); lo += 4096) {
+        double part = 0.0;
+        const size_t hi = std::min(x.size(), lo + 4096);
+        for (size_t i = lo; i < hi; ++i) part += double(x[i]) * double(x[i]);
+        sq += part;
+    }
+    return sq;
+}
+
+void test_clip_threading() {
+    // The clip is a parallel reduction and must still be deterministic: the same fixed
+    // 4096-element chunks, one double partial each, summed in chunk order, on any thread
+    // count. The norm and the clipped values must be bit-identical across thread counts.
+    const ParamSet base = big_set();
+    const std::vector<float> flat = flat_of(base);
+    R97_CHECK(flat.size() > 4096);
+    const float ref_norm = float(std::sqrt(flat_norm_sq(flat)));
+
+    ParamSet one = base, four = base, many = base;
+    const float n1 = r97::clip_global_norm(one, 1.0f, 1);
+    const float n4 = r97::clip_global_norm(four, 1.0f, 4);
+    const float n48 = r97::clip_global_norm(many, 1.0f, 48);
+    R97_CHECK(std::abs(n1 - ref_norm) <= 1e-6f * ref_norm);
+    R97_CHECK(n4 == n1);   // bit for bit, not just close
+    R97_CHECK(n48 == n1);
+
+    const std::vector<float> f1 = flat_of(one);
+    R97_CHECK(std::memcmp(f1.data(), flat_of(four).data(), sizeof(float) * f1.size()) == 0);
+    R97_CHECK(std::memcmp(f1.data(), flat_of(many).data(), sizeof(float) * f1.size()) == 0);
+    const double sq = flat_norm_sq(f1);
+    R97_CHECK(std::abs(std::sqrt(sq) - 1.0) < 1e-5);  // rescaled onto the cap
+    // A second call on the same (already clipped) set is a no-op with norm 1.
+    R97_CHECK(std::abs(r97::clip_global_norm(one, 1.0f, 8) - 1.0f) < 1e-5f);
+    R97_CHECK(std::memcmp(f1.data(), flat_of(one).data(), sizeof(float) * f1.size()) == 0);
+    std::printf("  clipping is thread-count invariant (%zu elements, norm %.6f)\n",
+                flat.size(), double(ref_norm));
+}
+
+void test_thread_count_invariance() {
+    // Through the optimiser, both the clip and the element passes: one thread and sixteen
+    // threads must agree bit for bit at the end of three updates.
+    ParamSet a = big_set(), b = big_set();
+    AdamWConfig one;
+    one.lr = 1e-3f;
+    one.weight_decay = 0.01f;
+    one.clip_norm = 1.0f;
+    one.threads = 1;
+    AdamWConfig many = one;
+    many.threads = 16;
+    Optimiser oa(a, one), ob(b, many);
+    for (int t = 0; t < 3; ++t) {
+        ParamSet ga, gb;
+        for (size_t i = 0; i < a.size(); ++i) {
+            std::vector<float> x = a[i].value;
+            for (auto& v : x) v = 0.5f * v + 0.1f * float(t + 1);
+            ga.push_back(Param{a[i].name, a[i].shape, x});
+            gb.push_back(Param{b[i].name, b[i].shape, x});
+        }
+        R97_CHECK(oa.step(ga));
+        R97_CHECK(ob.step(gb));
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        R97_CHECK(a[i].value.size() == b[i].value.size());
+        R97_CHECK(std::memcmp(a[i].value.data(), b[i].value.data(),
+                              sizeof(float) * a[i].value.size()) == 0);
+    }
+    std::printf("  update is thread-count invariant\n");
 }
 
 void test_accumulation() {
@@ -383,6 +474,8 @@ R97_TEST(optim) {
     test_three_steps_match_hand_computation();
     test_schedule_values();
     test_clipping();
+    test_clip_threading();
+    test_thread_count_invariance();
     test_accumulation();
     test_no_decay_list();
     test_bad_inputs_throw();
