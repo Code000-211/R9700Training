@@ -149,7 +149,11 @@ list(LENGTH R97_LIB_SOURCES n)
 if(n EQUAL 0)
   message(FATAL_ERROR "r97: src/ holds no sources; the r97 library needs at least one.")
 endif()
-add_library(r97 STATIC ${R97_LIB_SOURCES})
+# An OBJECT library, not a static archive: a new objective or delta is one source under src/
+# whose only export is its registration, and the linker pulls an archive member only to resolve
+# a symbol something references -- an archive would drop it and the registry would come up empty
+# in r97train and in the test binaries. An object library links every source under src/ whole.
+add_library(r97 OBJECT ${R97_LIB_SOURCES})
 target_include_directories(r97
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

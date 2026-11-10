@@ -78,9 +78,10 @@ refused, so a driver cannot pass the check unrecorded.
    `R97_REGISTER_OBJECTIVE(name, factory);` or `R97_REGISTER_DELTA(kind, factory);` — the
    factory takes `const Config&` and gives an `Objective` or a `std::shared_ptr<Delta>`.
    The `name`/`kind` must be a bare identifier; the same name twice is refused when the
-   binary starts. The file may live anywhere under `src/`: it is linked whole into
-   `r97train` and the test binaries, so nothing has to reference it for its registration
-   to run.
+   binary starts. The file may live anywhere under `src/`: every source there is linked
+   whole into `r97train` and the test binaries (the library is an object library, not an
+   archive, exactly so that a translation unit nothing references cannot be dropped), so
+   nothing has to reference it for its registration to run.
 3. **Document it.** Add the name and one line on what it does to the list below, and, for
    a new trainable kind, its meaning to `docs/ADAPTER.md`. Nothing else changes:
    `r97train objectives` and `r97train deltas` print whatever is registered, so the new
