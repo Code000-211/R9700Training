@@ -149,14 +149,7 @@ list(LENGTH R97_LIB_SOURCES n)
 if(n EQUAL 0)
   message(FATAL_ERROR "r97: src/ holds no sources; the r97 library needs at least one.")
 endif()
-# OBJECT, not STATIC: a static archive only hands the linker the members something already
-# referenced, and a registration is referenced by nothing -- R97_REGISTER_OBJECTIVE and
-# R97_REGISTER_DELTA (include/r97/model.h) fill the table from a static initialiser -- so the
-# linker would drop the file and its name would never reach make_model or `r97train objectives`.
-# An object library is linked whole into every consumer, so one new file in src/ is the whole
-# cost of a new loss or a new trainable kind. (Same concern as radiance's WHOLE_ARCHIVE links to
-# its tools; here it is one line instead of one per binary.)
-add_library(r97 OBJECT ${R97_LIB_SOURCES})
+add_library(r97 STATIC ${R97_LIB_SOURCES})
 target_include_directories(r97
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

@@ -19,3 +19,24 @@ R97_REGISTER_DELTA(test_bias, r97test::make_bias_delta);
 #include "../../tools/commands.cpp"
 #include "../../tools/deltas.cpp"
 #include "../../tools/objectives.cpp"
+
+#include "../support/command_table.h"
+
+namespace r97test {
+namespace {
+
+// Taken after the command files above have registered, on the heap so it outlives the command
+// table's own static destructor: the host tests read it from their exit-time handler.
+std::map<std::string, r97tool::Command>* command_copy = nullptr;
+
+struct CommandTableCopy {
+    CommandTableCopy() {
+        command_copy = new std::map<std::string, r97tool::Command>(r97tool::commands());
+    }
+} command_table_copy;
+
+}  // namespace
+
+const std::map<std::string, r97tool::Command>& command_table() { return *command_copy; }
+
+}  // namespace r97test

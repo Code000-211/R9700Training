@@ -3,10 +3,10 @@
 //
 // The command translation units are compiled into tests/host/test_registrations.cpp, because the
 // host tier links r97 but not tools/ while the test registrations live in this binary. The same
-// command table is what the r97train executable dispatches.
+// command translation units are what the r97train executable dispatches.
 #include "../support/test.h"
 
-#include "../../tools/commands.h"
+#include "../support/command_table.h"
 
 #include <iostream>
 #include <sstream>
@@ -15,8 +15,8 @@
 namespace {
 
 std::string run(const char* name) {
-    auto it = r97tool::commands().find(name);
-    R97_CHECK(it != r97tool::commands().end());
+    auto it = r97test::command_table().find(name);
+    R97_CHECK(it != r97test::command_table().end());
 
     std::ostringstream captured;
     std::streambuf* old = std::cout.rdbuf(captured.rdbuf());
