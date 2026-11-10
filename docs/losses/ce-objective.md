@@ -63,7 +63,12 @@ list.
 
 `tests/host/loss_ce.cpp`: hand-computed cases, the gradient against central
 finite differences, a row with 1e30 logits staying finite, chunked equals
-whole, bf16 equals f32. `tests/host/loss_ce_tape.cpp`: on a `VectorTape`
+whole, bf16 equals f32. `tests/host/loss_ce_objective_loss.cpp`:
+`CeObjective`'s returned loss and count are `ce_loss`'s on the same logits —
+hand-computed (ln 2, and 2 ln 2 with two scored rows), the whole call bit for
+bit, and each window against `ce_sum` over the rows `ce_grad_rows` names for
+it — so the sum is pinned, not zero, not the mean, and not scaled by the
+seed's `1 / total_scored`. `tests/host/loss_ce_tape.cpp`: on a `VectorTape`
 (`tests/support/vector_tape.h`) exactly one seed, on `logits`, bit-identical to
 the gradient function's output, its read recorded as differentiated, and the
 chunked tape equal to the whole call; and the seed's row range is the window's
