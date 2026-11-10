@@ -85,8 +85,9 @@ endif()
 message(STATUS "r97: radiance at ${R97_RADIANCE_COPY}, commit ${R97_RADIANCE_COMMIT}, "
                "patch set ${R97_PATCH_SET}, ${R97_PATCH_FILES} patches applied")
 
-# Build rad_core out of tree: the subproject is configured (Ninja, like us) and rad_core only is
-# built; the radiance server and tools are not this build's business. An IMPORTED target hands
+# Build rad_core out of tree: the subproject is configured (Ninja, like us) and rad_core is
+# built, with libref, the reference plugin the adjoint checks compare against; the radiance
+# server and tools are not this build's business. An IMPORTED target hands
 # the archive to this project's consumers, with the include directories and link libraries
 # rad_core itself publishes (see third_party/core/CMakeLists.txt).
 include(ExternalProject)
@@ -111,11 +112,12 @@ ExternalProject_Add(radiance_core
     -DRAD_WITH_HIP=${RAD_WITH_HIP}
     -DRAD_GPU_TARGETS=${RAD_GPU_TARGETS}
     -DR97_PATCH_STAMP=${R97_PATCH_STAMP}
-  BUILD_COMMAND ${CMAKE_COMMAND} --build . --target rad_core
+  BUILD_COMMAND ${CMAKE_COMMAND} --build . --target rad_core libref
   INSTALL_COMMAND ""
   BUILD_ALWAYS FALSE
   USES_TERMINAL_BUILD TRUE
-  BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/radiance-build/core/librad_core.a)
+  BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/radiance-build/core/librad_core.a
+                   ${CMAKE_BINARY_DIR}/radiance-build/radiance_home/kernels/libref.so)
 
 set(R97_RADIANCE_LIB ${CMAKE_BINARY_DIR}/radiance-build/core/librad_core.a)
 add_library(rad_core STATIC IMPORTED GLOBAL)
