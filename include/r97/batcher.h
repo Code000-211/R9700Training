@@ -33,8 +33,9 @@ public:
     Batcher() = default;
     Batcher(std::vector<TokenSeq> sequences, const BatcherConfig& config);
 
-    // The next step: one sub-batch per device. False at the epoch's end (nothing consumed, the
-    // position keeps pointing at the epoch's end); `reset()` or `seek()` moves on to the next epoch.
+    // The next step: one sub-batch per device. False at the epoch's end, consuming nothing (the
+    // position keeps pointing at the epoch's end); `seek({epoch + 1, 0})` moves on to the next
+    // epoch, `reset()` back to the first.
     bool next(std::vector<Batch>* step);
 
     // How many steps the named epoch plans (the shuffle decides the packing).

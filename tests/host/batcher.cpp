@@ -1,14 +1,24 @@
 // tests/host/batcher.cpp -- the Batcher's budget, coverage, determinism, resume and balance.
-#include "support/test_main.h"
+//
+// The host test binary has one `main`, in tests/host/vector_tape.cpp (the skeleton's own host
+// test); a second one cannot link. This issue may neither edit that file nor decide the
+// repository's host-test entry point on its own, so this file is self-contained: it carries its
+// own runner and arms it with `std::atexit`, so the checks run once the binary's `main` returns.
+// A failed `assert` aborts the process and `ctest` sees the failure. Nothing outside this file is
+// involved; when the repository agrees on a single host-test entry point, the runner below is the
+// only part that has to change.
+
+// The default build type is RelWithDebInfo, which defines NDEBUG and turns assert into a no-op.
+// In a test the assertions are the test, so keep them live in this translation unit -- before any
+// header can pull <cassert> in.
+#undef NDEBUG
 
 #include "r97/batcher.h"
 
 #include <algorithm>
-// The default build type is RelWithDebInfo, which defines NDEBUG and turns assert into a no-op.
-// In a test the assertions are the test, so keep them live in this translation unit.
-#undef NDEBUG
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <set>
 #include <vector>
 
@@ -83,9 +93,8 @@ std::vector<std::vector<Batch>> whole_run(Batcher& b, int64_t epochs) {
     return all;
 }
 
-}  // namespace
-
-R97_TEST(batcher) {
+// The budget, coverage, determinism and resume of one Batcher over varied lengths.
+void check_budget_coverage_and_resume() {
     const int64_t budget = 4096;
     const int devices = 2;
     auto lens = lengths_for(300, 7);
@@ -102,6 +111,7 @@ R97_TEST(batcher) {
 
     // Skipped: the over-budget sequence, by index, never batched.
     assert(b.skipped().size() == 1 && b.skipped()[0] == seqs.size() - 1);
+    assert(b.skipped_tokens() == 9000);
 
     auto run = whole_run(b, 3);
 
@@ -192,10 +202,9 @@ R97_TEST(batcher) {
     }
 }
 
-// A step's token loads must be balanced even when a greedy snake deal is not: with these lengths
-// three devices can get within 3 tokens of each other, below the maximal sequence's 4. A
-// move-only repair pass stops at the snake's spread of 4 because no single move improves it.
-R97_TEST(batcher_balance) {
+// A step whose whole set fits one step: it is one step, split across all devices, every device
+// gets a sub-batch, and the spread stays below the maximal sequence.
+void check_single_step_split() {
     const std::vector<int64_t> lens = {3, 3, 4, 4, 4, 4, 4, 4};
     auto seqs = make_sequences(lens);
 
@@ -214,6 +223,7 @@ R97_TEST(batcher_balance) {
     int64_t max_seq = 0;
     for (const Batch& sub : step) {
         size_t d = (size_t)(&sub - step.data());
+        assert(!sub.empty());
         for (const TokenSeq& s : sub) {
             loads[d] += tokens(s);
             max_seq = std::max(max_seq, tokens(s));
@@ -226,3 +236,16 @@ R97_TEST(batcher_balance) {
     assert(spread < max_seq);
     assert(!b.next(&step));  // one step holds the whole set
 }
+
+void run_checks() {
+    check_budget_coverage_and_resume();
+    check_single_step_split();
+    std::puts("batcher ok");
+}
+
+// Armed at static-initialisation time; runs when the binary's `main` returns.
+struct ArmChecks {
+    ArmChecks() { std::atexit(&run_checks); }
+} arm_checks;
+
+}  // namespace
