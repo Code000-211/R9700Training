@@ -1,4 +1,5 @@
 // tests/host/vector_tape.cpp -- VectorTape answers reads from its arrays and records them.
+#include "support/test_reg.h"
 #include "support/vector_tape.h"
 
 #include <cassert>
@@ -14,7 +15,7 @@ static Batch two_sequences() {
     return b;
 }
 
-int main() {
+static void test_vector_tape() {
     // A logits buffer of 5 rows x 3 cols: rows 0..2 for the first sequence, 3..4 for the second.
     std::vector<float> logits = {
         0, 1, 2,    // row 0
@@ -59,5 +60,6 @@ int main() {
     assert(tape.reads_of("other").empty());
 
     std::puts("vector_tape ok");
-    return 0;
 }
+
+R97_REGISTER_TEST("vector_tape", test_vector_tape)
