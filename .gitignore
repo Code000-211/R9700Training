@@ -23,3 +23,8 @@ wandb/
 .idea/
 .DS_Store
 .env
+
+# Build trees
+build/
+build-*/
+compile_commands.json
