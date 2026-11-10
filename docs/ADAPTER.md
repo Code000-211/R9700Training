@@ -4,7 +4,8 @@ This is the contract six parallel issues implement together: the two radiance pa
 filter's lifted refusals and the `radiance_input_basis` config key), the live training loop's
 adapter, the adapter files on disk, the host delta encoder, and the device LoRA adjoints. It is a
 document, not code. Every file reference below is into radiance at
-`451b136874084650992668bed9e8662deb58de88`.
+`451b136874084650992668bed9e8662deb58de88`. The line numbers are exact at that commit; newer
+revisions of radiance shift them.
 
 Nothing here changes what the base GEMM computes. The adapter adds a separate low-rank product to
 each targetable GEMM's output; the base path, its codes and its scales are untouched.
@@ -28,7 +29,7 @@ y = y_base + (alpha / r) * B * A * x
 - `A` is `[r, K]` bf16, `B` is `[out_rows, r]` bf16, both held at bf16 with the same round-off
   freedom any PEFT serving path has.
 - `alpha / r` is PEFT's `lora_alpha / r` (`rsLoRA`, `alpha / sqrt(r)`, is not this contract's
-  default; radiance carries the per-module scale either way — `core/lora/lora.h`, struct
+  default; radiance carries the per-module scale either way — `core/lora/lora.h:98`,
   `AdapterInfo::Module::scale`).
 
 Equivalently, in the natural (unrotated) weight domain the adapter is the familiar
@@ -37,8 +38,10 @@ encoding is stored under (`transform=fwht128`, `data/recipes/q38-27b-w8a8-df2.re
 
 ### 1.1 What `x` is, exactly, at every GEMM site of `qwen35_w8a8`
 
-`qwen35_w8a8` is `arch/qwen35_w8a8/qwen35_w8a8.cpp` (the whole file, four lines of `#define`s over
-`arch/qwen35_fp8/qwen35_fp8.cpp`). Every trunk linear is declared by
+`qwen35_w8a8` is `arch/qwen35_w8a8/qwen35_w8a8.cpp` (five lines of `#define` over
+`arch/qwen35_fp8/qwen35_fp8.cpp`, which carries the difference behind `#if QWEN35_W8A8`). The
+builder's quantiser-to-producer wiring for the whole trunk is stated in one comment block and the
+four declarations under it (`arch/qwen35_fp8/qwen35_fp8.cpp:871-889`). Every trunk linear is declared by
 `LinearFP8::declare` (`arch/common/rad_fp8.h:853`): with `i8_rot` set (`rad_fp8.h:768-771`) it
 issues `gemm_nt_q` at dtype **`i8a8h`** (`rad_fp8.h:1386`, `arch/common/rad_fp8.h:1991`) whose
 inputs are one buffer pair (the site's activation's `ActFP8::q8` / `ActFP8::s8`, `rad_fp8.h:57-70`),
@@ -53,22 +56,24 @@ The dequantisation of `x` at all eight sites, host and card:
 - `s8` is `[max_tok, n/128]` f32, one scale per (row, 128-column block).
 - `x[m, 128*b + c] = float(q8[m, 128*b + c]) * s8[m, b]`, rounded to bf16 for the adapter's use.
 
-The sites read these buffers of these activations (`arch/qwen35_fp8/qwen35_fp8.cpp:1159-1184`,
-the calibration mirror, states the same pairing):
+The sites read these buffers of these activations. The site/activation pairing is stated by the
+builder's `--calib-dir` mirror, which records exactly these (codes, scale) planes per site
+(`arch/qwen35_fp8/qwen35_fp8.cpp:1157-1184`, one site for `h` shared by q/k/v and in_proj_qkv/z,
+one for the attention or delta-net output, one for the ffn input, one for down):
 
 | site (declared weight)   | reads                     | codes producer |
 |--------------------------|---------------------------|----------------|
-| `blk.<l>.attn_qg`        | `m.a_h` (`a_h.q8`, `a_h.s8`)  | `rmsnorm_had_quant_i8g` (the boundary norm), `qwen35_fp8.cpp:874-876` |
+| `blk.<l>.attn_qg`        | `m.a_h` (`a_h.q8`, `a_h.s8`)  | the boundary norm (`rmsnorm_had_quant_i8g`), `qwen35_fp8.cpp:879-881` |
 | `blk.<l>.attn_k`, `blk.<l>.attn_v` | `m.a_h`         | same codes as `attn_qg` (`q8_fed`/`q8_rot`, one launch for q, k, v) |
-| `blk.<l>.attn_output`    | `m.a_attn`                    | `gate_had_quant_i8g`, `qwen35_fp8.cpp:887-888` |
+| `blk.<l>.attn_output`    | `m.a_attn`                    | the gated attention's output gate (`gate_had_quant_i8g`), `qwen35_fp8.cpp:888-889` |
 | `blk.<l>.ssm_inz`        | `m.a_h`                       | same codes as `attn_qg` |
-| `blk.<l>.ssm_out`        | `m.a_go`                      | `gdn_conv_recurrent_update_had` + `had_quant_act_i8g`, `qwen35_fp8.cpp:884-886` |
-| `blk.<l>.ffn_gate_up`    | `m.a_h` (the ffn norm's codes)| `rmsnorm_had_quant_i8g` |
-| `blk.<l>.ffn_down`       | `m.a_ffn`                     | `gated_had_quant_i8g`, `qwen35_fp8.cpp:882` |
+| `blk.<l>.ssm_out`        | `m.a_go`                      | the delta net's conv-fold epilogue `gdn_conv_recurrent_update_had` plus `had_quant_act_i8g` on the other rows, `qwen35_fp8.cpp:885-886` |
+| `blk.<l>.ffn_gate_up`    | `m.a_h` (the ffn norm's codes)| same codes as `attn_qg` — one norm feeds both the attention and the ffn (`rad_block_mlp_fp8.h:110`) |
+| `blk.<l>.ffn_down`       | `m.a_ffn`                     | the ffn's gated product (`gated_had_quant_i8g`), `qwen35_fp8.cpp:882` |
 
 Where a `_had_quant_i8g` form is not declared (an older device, the CPU kernels) the site
 quantises its own input from the bf16 plane with a plain `quant_act_i8g`
-(`qwen35_fp8.cpp:870-884`, `rad_fp8.h:1379-1386`); the codes then dequantise identically — the
+(`qwen35_fp8.cpp:871-889`, `rad_fp8.h:1379-1386`); the codes then dequantise identically — the
 bytes are the same rotated codes, whoever wrote them (`rad_fp8.h:71-74`).
 
 **The step order is not in play here, and the contract keeps it that way.** `core/lora/lora.cpp:604`
@@ -89,15 +94,15 @@ unexchanging the middle dwords when it builds `x`* for the step-order dtypes, an
 
 The recipes name the tensors `attn_qg`, `attn_k`, `attn_v`, `attn_output`, `ssm_inz`, `ssm_out`,
 `ffn_gate_up`, `ffn_down` (`data/recipes/q38-27b-w8a8-df2.recipe:30-37`), exactly the eight
-`block_weight` entries the plugin declares (`arch/common/rad_block_attn_gated_fp8.h:112`,
-`rad_block_gdn_fp8.h:247,360`, `rad_block_mlp_fp8.h:112,119`). Not part of the adapter's target
+`block_weight` entries the plugin declares (`arch/common/rad_block_attn_gated_fp8.h:280-288, 497`,
+`rad_block_gdn_fp8.h:247-252, 360-362`, `rad_block_mlp_fp8.h:112-114, 155-157`). Not part of the adapter's target
 set: the norms, the delta net's `conv1d`, `A_log`, `dt_bias`, `in_proj_a`/`in_proj_b`, the
 vocabulary edges (`output`/`lm_head`, a vocabulary weight, `core/lora/lora.cpp:87`), and the
 MTP head and `dflash` draft blocks — the adapter's `target_modules` names exactly the ten PEFT
 modules of the table below, so none of those ever enters a site.
 
 A declared weight is targeted when **one of its name-map sources** is `<prefix>.<leaf>.weight`
-with `leaf` in the target set (`core/lora/lora.h:23-24`, `core/lora/lora.cpp:147`). Targets are
+with `leaf` in the target set (`core/lora/lora.h:32-33`, `core/lora/lora.cpp:147`). Targets are
 checkpoint-tensor leaf names, i.e. PEFT's module names as HuggingFace spells them.
 
 | PEFT module (`qwen35_w8a8` and `qwen35_bf16` alike)      | declared weight it lands in | weight shape at 27B |
@@ -121,13 +126,14 @@ weight's rows**, in the order the plugin concatenated them:
 - `ffn_gate_up` holds PEFT's `gate_proj` and `up_proj` (`arch/common/rad_block_mlp.h:52`,
   `map_concat { gate, up }`): gate rows `[0, 17408)`, up rows `[17408, 34816)`.
 - `ssm_inz` holds `in_proj_qkv` (rows `[0, 10240)`, which is itself `[q|k|v]` =
-  `[2·k_dim | k_dim | v_dim]` = `[2048|2048|6144]`) and `in_proj_z` (rows `[10240, 16384)`)
-  (`arch/common/rad_block_gdn_fp8.h:77-79, 243-252`).
+  `[k_dim | k_dim | v_dim]` = `[2048 | 2048 | 6144]`: q and k 16 heads × 128 each, v 48 heads × 128)
+  and `in_proj_z` (rows `[10240, 16384)`); the declared weight's four row parts are
+  `{ k_dim, k_dim, v_dim, v_dim }` (`arch/common/rad_block_gdn_fp8.h:243-252`).
 - `attn_qg` is **not** split for PEFT: the checkpoint's `q_proj` tensor already carries query and
   gate interleaved per head (`docs/ARCHITECTURES.md:302, 330-337`), so `q_proj` is one module
   owning all 12288 rows of `attn_qg`. Targeting `q_proj` adapts query and gate together; a
   gate-only or query-only adapter is not expressible in the module set (the rows are strided,
-  head pitch 512, not contiguous runs, and `SitePart` is runs-based, `core/lora/lora.h:36-40`).
+  head pitch 512, not contiguous runs, and `SitePart` is runs-based, `core/lora/lora.h:35-44`).
 
 Radiance keeps one `Site` per declared weight, with `n_modules = |targeted sources|`, capacity
 `R = n_modules * max_rank`, and one t-offset slot per module in the sources' order
@@ -151,7 +157,7 @@ if (dt && (!std::strcmp(dt, "w4a8") || !std::strcmp(dt, "w8a8") || !std::strcmp(
                   "in the activation's column order", op.op.c_str(), dt));
 ```
 
-**Lifted, refusal 2 — `lora.cpp:620-623`** (the transform-basis check, the one that blocks the
+**Lifted, refusal 2 — `lora.cpp:619-621`** (the transform-basis check, the one that blocks the
 whole `fwht128` trunk today):
 
 ```c
@@ -164,14 +170,14 @@ The patch lifts them for sites that satisfy the conditions of §1 and §4: the a
 `"radiance_input_basis": "fwht128"` and every targeted site is an `i8a8h` (or, after patch 1,
 step-order) `gemm_nt_q`. **Staying** (no patch touches these):
 
-- the rotated-parts refusal `lora.cpp:598-601` — `gemm_nt_q` over rotated parts (`pb1`/`pb2`),
+- the rotated-parts refusal `lora.cpp:599-601` — `gemm_nt_q` over rotated parts (`pb1`/`pb2`),
   which is the IQR-style decode, not an adapter site;
-- the K-width check `lora.cpp:615-618` — a `gemm_nt_q` whose `K` is wider than the weight's
+- the K-width check `lora.cpp:615-617` — a `gemm_nt_q` whose `K` is wider than the weight's
   columns is a widened, rotated input the adapter frame does not describe;
 - `excluded_weight` (`lora.cpp:86-91`): vocabulary weights and anything that is not a rank-2
   weight; the draft (`dflash.`) and MTP weights are simply never named by a target set.
-- non-`LORA` adapters: the PEFT-type check `lora.cpp:818-824` and the suffix table of
-  `core/lora/adapter.cpp:233-284` (DoRA, LoHa, LoKr, ...), unchanged.
+- non-`LORA` adapters: the PEFT-type check `lora.cpp:821-825` and the suffix table of
+  `core/lora/adapter.cpp:230-263` (DoRA, LoHa, LoKr, ...), unchanged.
 
 ---
 
@@ -197,7 +203,7 @@ adapter/
 - The value names the Hadamard the weights were rotated with (`transform=fwht128` in the recipe,
   weight encoding `i8*bf16[1x128]/fwht128`). Its presence tells radiance: the `A` factors of this
   adapter are stored in the site's transformed-input basis, per §1, and the site filter's
-  transform-basis refusal (`lora.cpp:620-623`) may be lifted for these sites.
+  transform-basis refusal (`lora.cpp:619-621`) may be lifted for these sites.
 - **Without the key, radiance refuses the adapter on a transformed trunk, as today** — the
   refusal stays exactly as quoted in §3. The key on a non-transformed trunk (bf16, plain `i8a8`)
   must also be refused: the file claims a basis the sites do not have. Both checks live in the
@@ -220,7 +226,7 @@ model.layers.0.mlp.gate_proj.lora_B         [17408, 16]
 
 (The safetensors on disk keep PEFT's full spellings,
 `base_model.model.model.layers.<l>.self_attn.q_proj.lora_A.weight`, which radiance's
-`AdapterFile` suffix table reads, `core/lora/adapter.cpp:233-282`.)
+`AdapterFile` suffix table reads, `core/lora/adapter.cpp:230-263`.)
 
 ### 4.1 The same formula on a bf16 trunk
 
@@ -269,13 +275,16 @@ struct Site {                 // delta.h site record, one per <module> of §2
 
 - `weight_name` + `slot` is the address: radiance's `Site::sources` holds the targeted
   checkpoint tensors in declaration order, and `SitePart::t_off = slot * max_rank` places the
-  module's `A` rows and `B` columns (`core/lora/lora.h:36-40`). Two records of the same
+  module's `A` rows and `B` columns (`core/lora/lora.h:49-56`). Two records of the same
   `weight_name` (`ffn_gate_up`, `ssm_inz`) are merged by the host loader into one radiance site,
   one per module, in slot order.
 - `A`/`B` may be sent full-size; the loader slices to the rank's `[K_r]` columns and `[N_r]` rows
-  (`Site::K_r / k_lo / N_r`, `core/lora/lora.h`, struct `Site`). A sharded world
-  (`o_proj`, `down_proj`, `ffn_gate_up` are shard-COL/ROW on tensor-parallel setups) is a
-  per-rank slice of the same record, so the wire layout does not need world knowledge.
+  (`Site::K_r / k_lo / N_r`, `core/lora/lora.h`, struct `Site`). The row-shard weights
+  (`attn_qg`, `attn_k`, `attn_v`, `ssm_inz`, `ffn_gate_up` are `RAD_SHARD_ROW`,
+  `rad_block_attn_gated_fp8.h:280-285`, `rad_block_gdn_fp8.h:247-249`, `rad_block_mlp_fp8.h:113`)
+  slice `A` by K and `B` by its rows; the column-shard ones (`attn_output`, `ssm_out`, `ffn_down`)
+  slice `A` by its columns. The wire record is the whole module's factors either way, a per-rank
+  slice of it, so the layout needs no world knowledge.
 - Everything a module needs is per-module (`rank`, `scale`), because rank patterns and
   `alpha_pattern` make them differ (`core/lora/adapter.cpp`, `AdapterInfo::Module`).
 
@@ -291,8 +300,8 @@ linear, one-`(A,B)`-per-site shape the sketch implies.
 
 Qwen3.8-27B (`docs/ARCHITECTURES.md:260-270`): 64 layers, `full_attention_interval 4` — layers
 3, 7, …, 63 are gated attention (16), the other 48 are the gated delta net. `n_embd = 5120`,
-`n_ff = 17408`, head_dim 256, 24 attention heads, 8 KV heads; the delta net has 16 key heads
-(`k_dim = 2048`) and 48 value heads (`v_dim = 6144`). Defaults of §4: rank 16, alpha 32,
+`n_ff = 17408`, head_dim 256, 24 attention heads, 4 KV heads (GQA 6, `docs/ARCHITECTURES.md:266`); the delta net has 16 key
+heads and 48 value heads of 128 (`k_dim = 2048`, `v_dim = 6144`, `docs/ARCHITECTURES.md:357-360`). Defaults of §4: rank 16, alpha 32,
 `alpha / r = 2.0`, `A` random bf16, `B` zero.
 
 ### Full-attention layer `model.layers.3` (the base weight's shape first)
@@ -318,13 +327,13 @@ Layer total: 1,736,704. Over the 16 full-attention layers: 27,787,264.
 | `linear_attn.out_proj`    | `blk.1.ssm_out` | `[16, 6144]` | `[5120, 16]`  | 98,304 + 81,920 = 180,224 |
 | `mlp.gate_proj` / `up_proj` / `down_proj` | as layer 3 | | | 1,081,344 |
 
-Layer total: 1,687,552. Over the 48 delta-net layers: 80,982,496.
+Layer total: 1,687,552. Over the 48 delta-net layers: 81,002,496.
 
 ### Adapter total, all layers all modules, rank 16
 
-**108,769,760 parameters** — 27,787,264 on the attention layers, 80,982,496 on the delta-net
-layers — 217.5 MiB of bf16 held twice (base copy + gradient) plus fp32 master weights if the
-trainer keeps one, i.e. 435 MB of fp32 master. At training time the site's `R` for a layer with
+**108,789,760 parameters** — 27,787,264 on the attention layers, 81,002,496 on the delta-net
+layers — 218 MB (207.5 MiB) of bf16 per copy; held twice at training time (base copy + gradient),
+435 MB of fp32 if the trainer keeps a master. At training time the site's `R` for a layer with
 two targeted modules (`ssm_inz`, `ffn_gate_up`) is `2 * 16 = 32`, so the device adjoint sees
 `A` `[32, 5120]`-shaped slices and `B` `[N_r, 32]`-shaped slices with one module's block live per
 slot, exactly as `PackedSite` packs them (`core/lora/lora.h`).
