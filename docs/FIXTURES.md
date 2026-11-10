@@ -86,6 +86,14 @@ serving build compiles it to nothing without a build rule naming it.
 
 ## Notes
 
+- What the fixture needs from the build is in `CMakeLists.txt`, the one shared file this topic
+  touches, in four places, each of which the build skeleton's radiance block does not do for
+  `rad_core` alone: the radiance subproject's compiler (`gcc-14`, below), the subproject's
+  `BUILD_COMMAND` (it builds `libref`, `libavx`, `rad-convert` and `qwen35_bf16` beside
+  `rad_core`, and the host tier depends on them), the vendor archives `rad_core` needs once the
+  engine's chat and tokenizer code is linked in, and `r97_host_tests`'s `ENABLE_EXPORTS` plus the
+  radiance copy's `tests/` directory on its include path (for `write_qwen35`). A host test on its
+  own needs no build rule: the tiers are collected by directory glob.
 - GCC 13 cannot compile radiance's architecture plugins: it refuses to take the address of a
   compound literal holding run-time values, `-fpermissive` does not downgrade that error, and GCC
   14 takes it. The configure builds the radiance subproject with `gcc-14`/`g++-14` (or newer) when
