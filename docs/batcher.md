@@ -53,7 +53,8 @@ and fit one bucket (at most 32), the order is a plain shuffle.
 
 ## Tests
 
-`tests/host/batcher.cpp` holds the host tier's checks: the budget holds for every sub-batch;
+`tests/host/batcher.cpp` holds the host tier's checks: the budget holds for every step over all
+of its sub-batches (not merely inside each sub-batch);
 every step's lengths are within a factor of two; every kept sequence appears exactly once an
 epoch and the skipped one in no batch; the same seed replays and another seed does not; a seek to
 a saved `(epoch, step)` continues identically; `reset()` returns to `(0, 0)` and replays the first

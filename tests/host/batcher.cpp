@@ -104,7 +104,8 @@ std::vector<std::vector<Batch>> whole_run(Batcher& b, int64_t epochs) {
     return all;
 }
 
-// The budget, coverage, determinism and resume of one Batcher over varied lengths.
+// The budget (per step, over its sub-batches), coverage, determinism and resume of one Batcher
+// over varied lengths.
 void check_budget_coverage_and_resume() {
     const int64_t budget = 4096;
     const int devices = 2;
@@ -126,10 +127,14 @@ void check_budget_coverage_and_resume() {
 
     auto run = whole_run(b, 3);
 
-    // The budget holds for every sub-batch of every step, and a step's sequences are of similar
-    // length: all of them come from one length bucket, whose lengths are within a factor of two.
+    // The budget holds for every sub-batch, and for every step over all of its sub-batches:
+    // bounding each sub-batch alone would let one step spend up to devices * budget tokens.
+    // A step's sequences are of similar length: all of them come from one length bucket, whose
+    // lengths are within a factor of two. The largest step total must also exceed budget / devices
+    // on this data, otherwise the per-step check could pass for a per-sub-batch batcher.
+    int64_t largest_step_total = 0;
     for (const auto& step : run) {
-        int64_t longest = 0, shortest = INT64_MAX;
+        int64_t longest = 0, shortest = INT64_MAX, step_total = 0;
         for (const Batch& sub : step) {
             int64_t total = 0;
             for (const TokenSeq& s : sub) {
@@ -138,9 +143,13 @@ void check_budget_coverage_and_resume() {
                 shortest = std::min(shortest, tokens(s));
             }
             assert(total <= budget);
+            step_total += total;
         }
+        assert(step_total <= budget);
+        largest_step_total = std::max(largest_step_total, step_total);
         assert(shortest > 0 && longest < 2 * shortest);
     }
+    assert(largest_step_total > budget / devices);
 
     // Every kept sequence appears exactly once per epoch, and no two epochs are the same shuffle.
     std::vector<std::vector<size_t>> orders;
