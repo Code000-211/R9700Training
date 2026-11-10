@@ -2,7 +2,7 @@
 // over exactly the window's scored rows, bit-identical to the gradient function's output, and its
 // read recorded as differentiated. The chunked tape (a window) gives the same sum and cotangent
 // rows as the whole call. Label: host.
-#include "support/test_reg.h"
+#include "support/self_check.h"
 
 #include "support/vector_tape.h"
 
@@ -51,8 +51,8 @@ static void check_tape(const Batch& batch, const std::vector<int64_t>& shape,
                        const std::vector<float>& logits, const r97::ForwardTape& tape,
                        const r97::ObjectiveResult& got) {
     const int64_t vocab = shape[1];
-    const r97::Seed& seed = got.seeds.at(0);
     CHECK(got.seeds.size() == 1);
+    const r97::Seed& seed = got.seeds.at(0);
     CHECK(seed.buffer == "logits");
     CHECK(seed.row_lo < seed.row_hi);
 
@@ -235,5 +235,5 @@ static void seed_range_is_the_scored_rows() {
     std::puts("loss_ce_tape: seed range ok");
 }
 
-R97_REGISTER_TEST("loss_ce_tape", test_loss_ce_tape)
-R97_REGISTER_TEST("loss_ce_tape_range", seed_range_is_the_scored_rows)
+R97_SELF_CHECK(test_loss_ce_tape)
+R97_SELF_CHECK(seed_range_is_the_scored_rows)

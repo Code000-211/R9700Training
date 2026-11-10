@@ -68,3 +68,10 @@ chunked tape equal to the whole call; and the seed's row range is the window's
 span of scored rows — scored rows 2 and 3 of a five-row window give rows
 `[2, 4)`, and a window's unscored edge rows are outside it — with a zero row
 between two scored ones it spans.
+
+Both run in the `host` tier, whose one binary takes every `tests/host/*.cpp`
+and whose entry point belongs to `tests/host/vector_tape.cpp` (issue #1), so a
+loss test file brings no `main()` of its own: `R97_SELF_CHECK`
+(`tests/support/self_check.h`) runs the function from a static initializer,
+before that main, and a failed `CHECK` — live even where `-DNDEBUG` compiles
+`assert` out — aborts, which is what makes the binary exit non-zero.

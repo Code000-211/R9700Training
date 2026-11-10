@@ -1,7 +1,7 @@
 // tests/host/loss_ce.cpp -- the reference cross-entropy loss: hand-computed cases, the gradient
 // against finite differences, a row of very large logits stays finite, and the chunked call
 // equals the whole call. Label: host.
-#include "support/test_reg.h"
+#include "support/self_check.h"
 
 #include "r97/loss.h"
 
@@ -15,6 +15,14 @@ using r97::TokenSeq;
 
 static bool near(double a, double b, double tol) { return std::fabs(a - b) <= tol; }
 
+// -log softmax(row)[id], computed independently of the loss: no max subtraction (these logits are
+// small), so an expected value below is not the function under test run again.
+static double ce_direct(const float* row, int64_t vocab, int32_t id) {
+    double z = 0.0;
+    for (int64_t j = 0; j < vocab; ++j) z += std::exp(double(row[j]));
+    return std::log(z) - double(row[id]);
+}
+
 // ---------------------------------------------------------------- hand-computed cases
 static void hand_computed() {
     // One scored token, two-way softmax. Row {0, 0}, target 0: p = 1/2, loss = ln 2.
@@ -26,11 +34,12 @@ static void hand_computed() {
         CHECK(s.scored == 1);
         CHECK(near(s.loss, std::log(2.0), 1e-15));
     }
-    // Row {ln 2, 0}, target 0: p = 2/3, loss = ln(3/2).
+    // Row {ln 2, 0}, the scored token is ids[1] = 1, so target 1 with logit 0: p = 1/3 and the
+    // loss is ln 3 -- the row's larger logit is at the token that is not the target.
     {
         const float row[2] = {std::log(2.0f), 0.0f};
         const r97::CeSum s = r97::ce_loss(b, row, 2);
-        CHECK(near(s.loss, std::log(3.0), 1e-6));  // target is ids[1] = 1, logit 0: p = 1/3
+        CHECK(near(s.loss, std::log(3.0), 1e-6));
     }
     // Two sequences concatenated: rows 0..2 predict tokens 1..3 of the first, rows 3..4 tokens
     // 1..2 of the second. The scored token 7 of the second sequence hangs off row 4.
@@ -48,12 +57,14 @@ static void hand_computed() {
     for (auto& r : rows5) flat.insert(flat.end(), std::begin(r), std::end(r));
     {
         const r97::CeSum s = r97::ce_loss(two, flat, 3);
+        // The three positions the mask selects, added up: this pins which rows and tokens a batch
+        // reads, and ce_direct pins the value.
         double want = 0.0;
-        want += r97::ce_position(rows5[0], 3, 1);  // seq 1, token ids[1] = 1 (scored)
-        want += r97::ce_position(rows5[2], 3, 1);  // seq 1, token ids[3] = 1 (scored)
-        want += r97::ce_position(rows5[4], 3, 0);  // seq 2, token ids[2] = 0 (scored)
+        want += ce_direct(rows5[0], 3, 1);  // seq 1, token ids[1] = 1 (scored)
+        want += ce_direct(rows5[2], 3, 1);  // seq 1, token ids[3] = 1 (scored)
+        want += ce_direct(rows5[4], 3, 0);  // seq 2, token ids[2] = 0 (scored)
         CHECK(s.scored == 3);
-        CHECK(near(s.loss, want, 1e-15));
+        CHECK(near(s.loss, want, 1e-12));
     }
     std::puts("loss_ce: hand-computed ok");
 }
@@ -143,7 +154,8 @@ static void bf16_matches_f32() {
     Batch b;
     b.push_back(TokenSeq{{0, 1}, {0, 1}});
     const float row[2] = {0.25f, -1.0f};
-    const uint16_t bf[2] = {0x3e80, 0xbf80};  // bf16 of 0.25 and -1.0
+    // bf16 of 0.25 and -1.0: both exact in bf16, so the two paths must agree bit for bit.
+    const uint16_t bf[2] = {0x3e80, 0xbf80};
     const r97::CeSum sf = r97::ce_loss(b, row, 2);
     const r97::CeSum sb = r97::ce_loss(b, std::vector<uint16_t>(bf, bf + 2), 2);
     CHECK(sf.loss == sb.loss && sb.scored == 1);
@@ -159,4 +171,4 @@ static void test_loss_ce() {
     std::puts("loss_ce ok");
 }
 
-R97_REGISTER_TEST("loss_ce", test_loss_ce)
+R97_SELF_CHECK(test_loss_ce)
