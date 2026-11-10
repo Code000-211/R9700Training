@@ -1,8 +1,8 @@
 // r97/model.h -- the registry of objectives and trainable kinds by name, and the seed check.
 //
 // A new loss or a new trainable kind is one new file that registers itself here, like the op
-// registry does: nothing in the forward driver or the backward core ever names one. The registry
-// is filled by static registration, so both lists are complete before main runs.
+// registry does: nothing in the forward driver or the backward core ever names one. The
+// registry is filled by static registration, so both lists are complete before main runs.
 #pragma once
 
 #include <cstdint>
@@ -18,12 +18,10 @@
 
 namespace r97 {
 
-class Config;
-
 // ------------------------------------------------------------------ the registries by name
 
-using ObjectiveFactory = Objective (*)(const Config&);          // gives an Objective
-using DeltaFactory      = std::shared_ptr<Delta> (*)(const Config&);  // the trainable kind
+using ObjectiveFactory = Objective (*)(const Config&);                 // gives an Objective
+using DeltaFactory     = std::shared_ptr<Delta> (*)(const Config&);    // the trainable kind
 
 // What the registries hold, so listing (r97train objectives) and lookups (make_model) see the
 // same tables. Static registration happens before main, in any order.
@@ -37,7 +35,7 @@ std::vector<std::string> delta_names();
 
 // Registration happens at static-init time from each objective's (or delta's) own file. The
 // `name` must be a bare identifier; the same name twice is refused, since a duplicate would make
-// which of them resolves nondeterministic.
+// it nondeterministic which of them resolves a name.
 class ObjectiveRegistration {
 public:
     ObjectiveRegistration(const char* name, ObjectiveFactory factory);
@@ -47,11 +45,12 @@ public:
     DeltaRegistration(const char* kind, DeltaFactory factory);
 };
 
+// One line at file scope, with a semicolon, is the whole change to the trainer.
 #define R97_REGISTER_OBJECTIVE(name, factory)                                              \
-    static r97::ObjectiveRegistration r97_reg_objective_##name(#name, factory);
+    static r97::ObjectiveRegistration r97_reg_objective_##name(#name, factory)
 
 #define R97_REGISTER_DELTA(kind, factory)                                                  \
-    static r97::DeltaRegistration r97_reg_delta_##kind(#kind, factory);
+    static r97::DeltaRegistration r97_reg_delta_##kind(#kind, factory)
 
 // ------------------------------------------------------------------ Model by name
 
@@ -64,7 +63,7 @@ Model make_model(const Config& cfg);
 // The table from a boundary's name to the buffer id and the rows the forward driver recorded for
 // it, from which the backward core resolves a Seed and check_seeds enforces the window.
 struct BoundaryRecord {
-    int64_t id = 0;       // the boundary's position in ForwardTape::boundaries(), the id the driver recorded
+    int64_t id = 0;       // the boundary's position in ForwardTape::boundaries()
     int64_t row_lo = 0;   // the rows recorded for it, the window the backward walks
     int64_t row_hi = 0;
 };

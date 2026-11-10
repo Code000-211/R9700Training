@@ -2,9 +2,9 @@
 // boundary, seeded back onto it. Registered by name from the test binaries only (see
 // tests/host/model_registry.cpp and tests/host/listings.cpp).
 //
-// The objective reads rows [lo, hi) of `buffer` as differentiated and rows [hi, hi + 1) as
-// detached, so a test can see both kinds of read in the tape's record. Its seed covers [lo, hi)
-// and its loss is the sum of the differentiated rows' values.
+// The objective reads rows [lo, hi) of `buffer` as differentiated and, when the buffer has one,
+// the next row as detached, so a test can see both kinds of read in the tape's record. Its seed
+// covers [lo, hi) and its loss is the sum of the differentiated rows' values.
 #pragma once
 
 #include "r97/objective.h"
@@ -23,9 +23,10 @@ inline r97::ObjectiveResult sum_objective(const r97::ForwardTape& fwd, const r97
 
     r97::ObjectiveResult result;
     std::vector<float> rows = fwd.read(buffer, lo, hi, true);
-    std::vector<float> detached = fwd.read(buffer, hi, hi + 1, false);
+    // The detached read of the next row, when the window has one: a test can see both kinds of
+    // read in the tape's record, and the detached row is not part of the loss.
+    if (hi + 1 <= fwd.shape(buffer)[0]) (void)fwd.read(buffer, hi, hi + 1, false);
     result.loss = std::accumulate(rows.begin(), rows.end(), 0.0);
-    std::accumulate(detached.begin(), detached.end(), 0.0);   // the detached read is not summed
     result.scored = hi - lo;
 
     std::vector<int64_t> shape = fwd.shape(buffer);

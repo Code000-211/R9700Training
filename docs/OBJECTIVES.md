@@ -74,14 +74,21 @@ refused, so a driver cannot pass the check unrecorded.
    under your issue's area: a function `ObjectiveResult(const ForwardTape&, const
    ParamSet&)` and its seeds. A new trainable kind is one file implementing `Delta`. Never
    branch on the new name in the forward driver, the backward core, or any existing file.
-2. **Register it.** One line at file scope:
-   `R97_REGISTER_OBJECTIVE(name, factory)` or `R97_REGISTER_DELTA(kind, factory)` — the
+2. **Register it.** One line at file scope,
+   `R97_REGISTER_OBJECTIVE(name, factory);` or `R97_REGISTER_DELTA(kind, factory);` — the
    factory takes `const Config&` and gives an `Objective` or a `std::shared_ptr<Delta>`.
-   The `name`/`kind` must be a bare identifier; the same name twice is refused.
-3. **Document it.** Add a line to the second milestone's entry in this file (`docs/
-   OBJECTIVES.md`), and register the name in `r97train objectives` (or `r97train deltas`)
-   on its own, since the subcommands print whatever is registered — one `R97_
-   REGISTER_*` is the whole change to the trainer.
+   The `name`/`kind` must be a bare identifier; the same name twice is refused when the
+   binary starts.
+3. **Document it.** Add the name and one line on what it does to the list below, and, for
+   a new trainable kind, its meaning to `docs/ADAPTER.md`. Nothing else changes:
+   `r97train objectives` and `r97train deltas` print whatever is registered, so the new
+   name shows up there with no edit to the tools.
+
+## Registered today
+
+Nothing yet: the reference loss (`ce`) and the LoRA delta are the next milestone's, and
+whichever issue adds one adds its line here. `r97train objectives` and `r97train deltas`
+print the live list.
 
 The registries in `r97train` and in a test binary are separate: the test objective and
 test delta under `tests/support/` are registered only in the test binaries.

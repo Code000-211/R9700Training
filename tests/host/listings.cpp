@@ -2,6 +2,7 @@
 // print the test registrations (label: host). The registrations live in this binary, so the
 // subcommand implementations are linked in and called here; the same command table is what the
 // r97train executable dispatches.
+#undef NDEBUG   // the checks must survive the default RelWithDebInfo build's -DNDEBUG
 #include "../../tools/commands.h"
 
 #include "r97/model.h"
@@ -14,8 +15,8 @@
 #include <sstream>
 #include <string>
 
-R97_REGISTER_OBJECTIVE(test_sum, r97test::make_sum_objective)
-R97_REGISTER_DELTA(test_bias, r97test::make_bias_delta)
+R97_REGISTER_OBJECTIVE(test_sum, r97test::make_sum_objective);
+R97_REGISTER_DELTA(test_bias, r97test::make_bias_delta);
 
 static std::string run(const char* name) {
     auto it = r97tool::commands().find(name);

@@ -1,5 +1,6 @@
 // tests/host/model_registry.cpp -- objectives and deltas resolve by name, and an unknown name is
 // refused with the list of the registered ones (label: host).
+#undef NDEBUG   // the checks must survive the default RelWithDebInfo build's -DNDEBUG
 #include "r97/model.h"
 
 #include "r97/config.h"
@@ -13,8 +14,8 @@
 #include <string>
 #include <vector>
 
-R97_REGISTER_OBJECTIVE(test_sum, r97test::make_sum_objective)
-R97_REGISTER_DELTA(test_bias, r97test::make_bias_delta)
+R97_REGISTER_OBJECTIVE(test_sum, r97test::make_sum_objective);
+R97_REGISTER_DELTA(test_bias, r97test::make_bias_delta);
 
 static bool contains(const std::vector<std::string>& names, const std::string& name) {
     for (const std::string& n : names)

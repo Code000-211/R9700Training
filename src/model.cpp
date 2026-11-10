@@ -2,7 +2,6 @@
 #include "r97/model.h"
 
 #include <algorithm>
-#include <numeric>
 #include <sstream>
 #include <stdexcept>
 
@@ -149,9 +148,6 @@ void check_seeds(const ForwardTape& fwd, const ObjectiveResult& result) {
                 std::to_string(seed.row_lo) + ", " + std::to_string(seed.row_hi) +
                 ") has a cotangent of " + std::to_string(seed.cotangent.size()) +
                 " values, its rows " + std::to_string(need));
-        if (seed.row_lo > seed.row_hi)
-            throw std::runtime_error("r97: check_seeds: seed on '" + seed.buffer +
-                                     "' has its row range reversed");
     }
 
     // Two seeds of one result must not overlap on a buffer. (A seed here and the cotangent
