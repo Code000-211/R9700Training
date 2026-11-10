@@ -77,11 +77,14 @@ refused, so a driver cannot pass the check unrecorded.
 2. **Register it.** One line at file scope,
    `R97_REGISTER_OBJECTIVE(name, factory);` or `R97_REGISTER_DELTA(kind, factory);` — the
    factory takes `const Config&` and gives an `Objective` or a `std::shared_ptr<Delta>`.
-   The `name`/`kind` must be a bare identifier; the same name twice is refused when the
-   binary starts. The file may live anywhere under `src/`: every source there is linked
-   whole into `r97train` and the test binaries (the library is an object library, not an
-   archive, exactly so that a translation unit nothing references cannot be dropped), so
-   nothing has to reference it for its registration to run.
+   The `name`/`kind` must be a bare identifier; registering the same one twice is refused
+   when the binary starts. The file may live anywhere under `src/`: the glob collects it
+   into the `r97` library, so no existing file changes. A registration is a static
+   initialiser, so it runs when the binary starts, and `r97train objectives` (or
+   `r97train deltas`) is where you see it. `r97` is a static archive, so the linker keeps
+   only the members something references: a file whose only export is its registration has
+   to be linked whole for the registration to run, and a name that is missing from that
+   listing is that, not a registry fault.
 3. **Document it.** Add the name and one line on what it does to the list below, and, for
    a new trainable kind, its meaning to `docs/ADAPTER.md`. Nothing else changes:
    `r97train objectives` and `r97train deltas` print whatever is registered, so the new
@@ -89,9 +92,8 @@ refused, so a driver cannot pass the check unrecorded.
 
 ## Registered today
 
-Nothing yet: the reference loss (`ce`) and the LoRA delta are the next milestone's, and
-whichever issue adds one adds its line here. `r97train objectives` and `r97train deltas`
-print the live list.
+Nothing is registered yet: `r97train objectives` and `r97train deltas` print the live list,
+and the issue that registers a loss or a kind adds its line here and changes nothing else.
 
 The registries in `r97train` and in a test binary are separate: the test objective and
 test delta under `tests/support/` are registered only in the host test binary.
