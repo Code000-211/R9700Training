@@ -79,8 +79,10 @@ void twin_register(const char* op, TwinFn fn, ParamPred pred);
 void adjoint_register(const char* op, Side side, AdjointFn fn, const std::vector<int>& frozen,
                       ParamPred pred);
 
-// Lookup applies the first row of that side whose predicate accepts the parameters. When nothing
-// serves the op, `error` (when given) names the op and its parameters, and the lookup returns null.
+// Lookup applies the first row of that side whose predicate accepts the parameters. Rows for one
+// op are tried in registration order, which across translation units the link order decides, so
+// keep one op's predicates disjoint and register a catch-all row last. When nothing serves the op,
+// `error` (when given) names the op and its parameters, and the lookup returns null.
 TwinFn twin_find(const std::string& op, const std::vector<OpParam>& params, std::string* error);
 AdjointFn adjoint_find(const std::string& op, Side side, const std::vector<OpParam>& params,
                        std::string* error);
