@@ -184,39 +184,51 @@ if(R97_BUILD_TESTS)
   endif()
   message(STATUS "r97: model container ${R97_MODEL_RAD}")
 
-  # host tests, one binary; every source under tests/host/ joins it.
+  # host tests: one binary per file; every source under tests/host/ is its own test with its own
+  # main, so a parallel issue's new test file is a new test and no shared main is needed.
   file(GLOB R97_HOST_TEST_SOURCES CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_SOURCE_DIR}/tests/host/*.cpp)
-  if(NOT R97_HOST_TEST_SOURCES STREQUAL "")
-    add_executable(r97_host_tests ${R97_HOST_TEST_SOURCES})
-    target_link_libraries(r97_host_tests PRIVATE r97)
-    target_include_directories(r97_host_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    target_compile_definitions(r97_host_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
-  endif()
+  foreach(s ${R97_HOST_TEST_SOURCES})
+    get_filename_component(name ${s} NAME_WE)
+    add_executable(host_${name} ${s})
+    target_link_libraries(host_${name} PRIVATE r97)
+    target_include_directories(host_${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_definitions(host_${name} PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
+    # RelWithDebInfo defines NDEBUG, which would compile every assert in the tests out; the
+    # config flags come before the target's own options, so a later -U wins.
+    target_compile_options(host_${name} PRIVATE -UNDEBUG)
+    add_test(NAME host_${name} COMMAND host_${name})
+    set_tests_properties(host_${name} PROPERTIES LABELS host)
+  endforeach()
 
-  # gpu tests: need the card, run serially. Same shape as the host binary; empty until the device
-  # issues add sources.
+  # gpu tests: one binary per file, like the host tests; the card decides what can run.
   file(GLOB R97_GPU_TEST_SOURCES CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/*.cpp)
-  if(NOT R97_GPU_TEST_SOURCES STREQUAL "")
-    add_executable(r97_gpu_tests ${R97_GPU_TEST_SOURCES})
-    target_link_libraries(r97_gpu_tests PRIVATE r97)
-    target_include_directories(r97_gpu_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  endif()
+  foreach(s ${R97_GPU_TEST_SOURCES})
+    get_filename_component(name ${s} NAME_WE)
+    add_executable(gpu_${name} ${s})
+    target_link_libraries(gpu_${name} PRIVATE r97)
+    target_include_directories(gpu_${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_definitions(gpu_${name} PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
+    add_test(NAME gpu_${name} COMMAND gpu_${name})
+    set_tests_properties(gpu_${name} PROPERTIES LABELS gpu RUN_SERIAL TRUE)
+  endforeach()
 
   file(GLOB R97_MODEL_TEST_SOURCES CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_SOURCE_DIR}/tests/model/*.cpp)
-  if(NOT R97_MODEL_TEST_SOURCES STREQUAL "")
-    add_executable(r97_model_tests ${R97_MODEL_TEST_SOURCES})
-    target_link_libraries(r97_model_tests PRIVATE r97)
-    target_include_directories(r97_model_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(r97_model_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
-  endif()
+  foreach(s ${R97_MODEL_TEST_SOURCES})
+    get_filename_component(name ${s} NAME_WE)
+    add_executable(model_${name} ${s})
+    target_link_libraries(model_${name} PRIVATE r97)
+    target_include_directories(model_${name} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(model_${name} PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
+    add_test(NAME model_${name} COMMAND model_${name})
+    set_tests_properties(model_${name} PROPERTIES
+      LABELS model
+      SKIP_RETURN_CODE 77)   # the sources of the model tests skip when the container is absent
+  endforeach()
 
-  if(TARGET r97_host_tests)
-    add_test(NAME host_tests COMMAND r97_host_tests)
-    set_tests_properties(host_tests PROPERTIES LABELS host)
-  endif()
 
   # The contract headers compile on their own: one translation unit per header, include and main.
   file(GLOB R97_HEADER_TEST_SOURCES CONFIGURE_DEPENDS
@@ -237,15 +249,5 @@ if(R97_BUILD_TESTS)
                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/patch_sets_test.cmake)
   set_tests_properties(patch_sets PROPERTIES LABELS host)
 
-  if(TARGET r97_gpu_tests)
-    add_test(NAME gpu_tests COMMAND r97_gpu_tests)
-    set_tests_properties(gpu_tests PROPERTIES LABELS gpu RUN_SERIAL TRUE)
-  endif()
 
-  if(TARGET r97_model_tests)
-    add_test(NAME model_tests COMMAND r97_model_tests)
-    set_tests_properties(model_tests PROPERTIES
-      LABELS model
-      SKIP_RETURN_CODE 77)   # the sources of r97_model_tests skip when the container is absent
-  endif()
 endif()
