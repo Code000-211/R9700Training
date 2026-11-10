@@ -7,12 +7,16 @@ The trainer's loop asks a `Batcher` for one step at a time; each epoch is a new 
 
 An epoch is planned on demand from `(seed, epoch)` and cached (`Batcher::plan`):
 
-1. **Shuffle.** The kept sequences (those not skipped) are Fisher-Yates shuffled with a
-   splitmix64 stream derived from the config's seed and the epoch number. The same seed and
-   epoch always give the same order; a new epoch is a new shuffle.
-2. **Group similar lengths.** The shuffled list is cut into buckets of 32 sequences and each
-   bucket is sorted descending by token count. So a batch never mixes one long sequence with
-   many short ones, while the epoch's randomness is preserved across buckets.
+1. **Group similar lengths.** The kept sequences (those not skipped) are sorted descending by
+   token count, ties by input index, and cut into buckets of 32. Each bucket is therefore a
+   contiguous run of similar lengths, so a batch never mixes one long sequence with many short
+   ones.
+2. **Shuffle each bucket.** Every bucket is Fisher-Yates shuffled with a splitmix64 stream
+   derived from the config's seed and the epoch number. The same seed and epoch always give the
+   same order; a new epoch is a new shuffle. Grouping comes first and the shuffle second on
+   purpose: a shuffle followed by a sort by length would erase the shuffle entirely whenever the
+   whole dataset fits in one bucket (at most 32 sequences), leaving every seed and every epoch
+   with the same batches.
 3. **Pack steps.** Walking the order, a step closes when adding the next sequence would push
    its total token count over `token_budget`. The budget therefore holds for every step.
 4. **Balance devices.** Each step is dealt into `devices` sub-batches: longest first, each
@@ -36,15 +40,20 @@ exactly the batches the original run produced from there.
 ## Determinism
 
 Everything rests on splitmix64 and a Fisher-Yates over it — no `rand`, no locale, no
-unordered containers. Same seed, same batches, every run; another seed shuffles differently.
+unordered containers. Same seed, same batches, every run; another seed, and every new epoch,
+shuffles each length bucket differently. Which sequences a bucket holds is fixed by the data
+(the grouping); what the seed and the epoch choose is the order inside the buckets, and with it
+the step boundaries and so the batches. For a dataset of at most 32 sequences there is a single
+bucket, so the order is a plain shuffle.
 
 ## Tests
 
 `tests/host/batcher.cpp` holds the host tier's checks: the budget holds for every sub-batch;
 every kept sequence appears exactly once an epoch and the skipped one in no batch; the same seed
-replays and another seed does not; a seek to a saved `(epoch, step)` continues identically; and a
-step's sub-batches differ by less than one maximal sequence. `tests/headers/hdr_batcher.cpp` is
-the standalone-compile check of the header.
+replays and another seed does not; a seek to a saved `(epoch, step)` continues identically; a
+step's sub-batches differ by less than one maximal sequence; and a dataset of 20 or 32 sequences
+(the single-bucket case) still changes its batches with the seed and with the epoch.
+`tests/headers/hdr_batcher.cpp` is the standalone-compile check of the header.
 
 The host test binary has a single `main`, in `tests/host/vector_tape.cpp`; a second one cannot
 link. Rather than edit that test or settle the repository's host-test entry point from here, the

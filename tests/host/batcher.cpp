@@ -82,6 +82,16 @@ std::vector<std::vector<Batch>> run_epoch(Batcher& b) {
     return steps;
 }
 
+// One epoch flattened to its sequences' token ids, which say both which sequence it is and in
+// which order the batches hand it out.
+std::vector<std::vector<int32_t>> id_order(const std::vector<std::vector<Batch>>& epoch) {
+    std::vector<std::vector<int32_t>> out;
+    for (const auto& step : epoch)
+        for (const Batch& sub : step)
+            for (const TokenSeq& s : sub) out.push_back(s.ids);
+    return out;
+}
+
 std::vector<std::vector<Batch>> whole_run(Batcher& b, int64_t epochs) {
     std::vector<std::vector<Batch>> all;
     for (int64_t e = 0; e < epochs; ++e) {
@@ -202,6 +212,46 @@ void check_budget_coverage_and_resume() {
     }
 }
 
+// A dataset smaller than one length bucket must still be shuffled: grouping similar lengths may
+// not collapse the epoch's order into one fixed sort, or no seed and no epoch would ever change
+// the batches.
+void check_small_dataset_shuffles() {
+    for (const size_t n : {size_t(20), size_t(32)}) {
+        std::vector<int64_t> lens;  // distinct lengths, none over the budget
+        for (size_t i = 0; i < n; ++i) lens.push_back(17 + (int64_t)i * 3);
+        auto seqs = make_sequences(lens);
+
+        r97::BatcherConfig cfg;
+        cfg.token_budget = 200;
+        cfg.devices = 2;
+        cfg.seed = 1;
+        Batcher b(seqs, cfg);
+
+        // Every epoch holds every sequence once, and each epoch is a new shuffle.
+        std::vector<std::vector<std::vector<int32_t>>> epochs;
+        for (int64_t e = 0; e < 3; ++e) {
+            b.seek({e, 0});
+            epochs.push_back(id_order(run_epoch(b)));
+            assert(epochs.back().size() == n);
+            std::set<int64_t> uniq;
+            for (const auto& ids : epochs.back()) uniq.insert((int64_t)ids[0]);
+            assert(uniq.size() == n);  // every sequence once, none twice
+        }
+        assert(epochs[0] != epochs[1] && epochs[1] != epochs[2]);
+
+        // The same seed replays the same batches.
+        Batcher replay(seqs, cfg);
+        replay.seek({0, 0});
+        assert(id_order(run_epoch(replay)) == epochs[0]);
+
+        // Another seed does not.
+        cfg.seed = 2;
+        Batcher other(seqs, cfg);
+        other.seek({0, 0});
+        assert(id_order(run_epoch(other)) != epochs[0]);
+    }
+}
+
 // A step whose whole set fits one step: it is one step, split across all devices, every device
 // gets a sub-batch, and the spread stays below the maximal sequence.
 void check_single_step_split() {
@@ -239,6 +289,7 @@ void check_single_step_split() {
 
 void run_checks() {
     check_budget_coverage_and_resume();
+    check_small_dataset_shuffles();
     check_single_step_split();
     std::puts("batcher ok");
 }

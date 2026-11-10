@@ -30,22 +30,29 @@ uint64_t epoch_rng(uint64_t seed, int64_t epoch) {
 
 namespace {
 
-// The epoch's sequence order: a fresh shuffle, then sequences of similar length grouped -- the
-// shuffled list is cut into buckets of 32 sequences and each bucket is sorted by length, so a
-// batch never mixes one long sequence with many short ones. Deterministic for (seed, epoch).
+// The epoch's sequence order: sequences of similar length are grouped -- sorted by length and cut
+// into buckets of 32 -- and each bucket is then shuffled with the epoch's rng. Grouping first is
+// what keeps a step from mixing one long sequence with many short ones; shuffling inside the
+// bucket is what makes the order a function of (seed, epoch), including when the whole dataset
+// fits in a single bucket, where a shuffle followed by a sort by length would leave no shuffle at
+// all. (A sort and then a shuffle, rather than the other way round, is therefore deliberate.)
 std::vector<size_t> epoch_order(const std::vector<size_t>& kept, uint64_t seed, int64_t epoch,
                                 const std::vector<int64_t>& lens) {
     std::vector<size_t> order = kept;
-    uint64_t rng = epoch_rng(seed, epoch);
-    for (size_t i = order.size(); i > 1; --i) {
-        size_t j = (size_t)(splitmix64(&rng) % i);
-        std::swap(order[i - 1], order[j]);
-    }
+    // Descending by length, input index to break ties: a total order, so the grouping is the same
+    // on every platform.
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        if (lens[a] != lens[b]) return lens[a] > lens[b];
+        return a < b;
+    });
     constexpr size_t kBucket = 32;
+    uint64_t rng = epoch_rng(seed, epoch);
     for (size_t lo = 0; lo < order.size(); lo += kBucket) {
         size_t hi = std::min(order.size(), lo + kBucket);
-        std::sort(order.begin() + (long)lo, order.begin() + (long)hi,
-                  [&](size_t a, size_t b) { return lens[a] > lens[b]; });
+        for (size_t i = hi; i > lo + 1; --i) {
+            size_t j = lo + (size_t)(splitmix64(&rng) % (i - lo));
+            std::swap(order[i - 1], order[j]);
+        }
     }
     return order;
 }

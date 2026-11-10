@@ -1,10 +1,11 @@
 // r97/batcher.h -- token-budget batches over tokenised sequences.
 //
-// Given the training data (one `TokenSeq` per example) the Batcher plans the epoch: it shuffles
-// under the seed, groups similar lengths (sort within shuffled buckets) so a batch never mixes one
-// long sequence with many short ones, and packs steps whose total token count stays under the
-// budget. With `devices > 1` each step hands out N sub-batches with balanced token counts, one per
-// device. A sequence longer than the budget is reported (in `skipped()`) and never batched.
+// Given the training data (one `TokenSeq` per example) the Batcher plans the epoch: it groups
+// similar lengths (sorted into buckets, each bucket shuffled under the seed) so a batch never
+// mixes one long sequence with many short ones, and packs steps whose total token count stays
+// under the budget. With `devices > 1` each step hands out N sub-batches with balanced token
+// counts, one per device. A sequence longer than the budget is reported (in `skipped()`) and
+// never batched.
 //
 // Deterministic for a given seed: the same seed replays the same batches, each epoch is a new
 // shuffle, and a position (epoch, step) saved and restored resumes with the same batches.
