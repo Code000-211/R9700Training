@@ -19,17 +19,18 @@ An epoch is planned on demand from `(seed, epoch)` and cached (`Batcher::plan`):
    purpose: a shuffle followed by a sort by length would erase the shuffle entirely whenever the
    whole dataset fits in one bucket (at most 32 sequences), leaving every seed and every epoch
    with the same batches.
-3. **Pack steps.** Walking one bucket's shuffled order, a step closes when adding the next
-   sequence would push its total token count over `token_budget`, and at the bucket's end, so a
-   step never draws from two buckets and all of a step's sequences are of similar length. The
-   budget therefore holds for every step. A bucket edge can leave a step below the budget; that
-   is the price of not mixing classes.
-4. **Balance devices.** Each step is dealt into `devices` sub-batches: longest first, each
-   sequence handed to the least-loaded sub-batch at that point (ties to the lowest device). This
-   keeps the token spread between fullest and emptiest below one maximal sequence of the step. A
-   spread of exactly one maximal sequence can be forced (one sequence for two devices, or three
-   budget-length sequences into two devices) and is then the best any arrangement can do; the
-   tests assert strictly below it for varied data.
+3. **Pack each sub-batch under the budget.** Walking one bucket's shuffled order, each sequence
+   goes to the least-loaded of the `devices` sub-batches that still has room for it
+   (`load + length <= token_budget`), ties to the lowest device. When no sub-batch can take the
+   next sequence the step closes, and it also closes at the bucket's end, so a step never draws
+   from two buckets and all of a step's sequences are of similar length. The budget is per
+   sub-batch, not per step: every `Batch` stays under `token_budget`, so a step may spend up to
+   `devices * token_budget` tokens.
+4. **Balance devices.** Least-loaded-first assignment keeps the token spread between the fullest
+   and emptiest sub-batch of a step at most one maximal sequence of that step. When a step ends
+   with fewer sequences than devices — a bucket edge can leave one — a sub-batch is necessarily
+   empty and the spread is exactly one maximal sequence; no packing can fill it. The tests assert
+   the strict bound on their varied data.
 
 ## Skip, position, resume
 
@@ -53,15 +54,17 @@ and fit one bucket (at most 32), the order is a plain shuffle.
 
 ## Tests
 
-`tests/host/batcher.cpp` holds the host tier's checks: the budget holds for every step over all
-of its sub-batches (not merely inside each sub-batch);
-every step's lengths are within a factor of two; every kept sequence appears exactly once an
-epoch and the skipped one in no batch; the same seed replays and another seed does not; a seek to
-a saved `(epoch, step)` continues identically; `reset()` returns to `(0, 0)` and replays the first
-epoch, even after a traversal has run out; a non-positive budget and fewer than one device are
-rejected; a step's sub-batches differ by less than one
-maximal sequence; a dataset of 20 or 32 sequences still changes its batches with the seed and
-with the epoch; and a dataset of two length classes 40x apart, 32 long ones beside 32 shorts and
+`tests/host/batcher.cpp` holds the host tier's checks: the budget holds for every sub-batch (each
+`Batch`), not for a step over all of them, and on the varied data a step spends more than one
+budget; a run of four long sequences, none of which can share a sub-batch with another, still
+fills both devices of every step; every step's lengths are within a factor of two; every kept
+sequence appears exactly once an epoch and the skipped one in no batch; the same seed replays and
+another seed does not; a seek to a saved `(epoch, step)` continues identically; `reset()` returns
+to `(0, 0)` and replays the first epoch, even after a traversal has run out; a non-positive budget
+and fewer than one device are rejected; on the varied data a step's sub-batches differ by less
+than one maximal sequence; a dataset of 20 or 32 sequences still changes its batches with the seed
+and with the
+epoch; and a dataset of two length classes 40x apart, 32 long ones beside 32 shorts and
 then 33 long ones beside 32 shorts, comes out in steps that hold one class only, the long ones
 first. The 32 case is exactly two buckets; the 33 case leaves a bucket that would hold one long
 and the shorts after it in the sorted order, so it is the case that mixes classes unless the

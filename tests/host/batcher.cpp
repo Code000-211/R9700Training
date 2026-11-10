@@ -104,8 +104,8 @@ std::vector<std::vector<Batch>> whole_run(Batcher& b, int64_t epochs) {
     return all;
 }
 
-// The budget (per step, over its sub-batches), coverage, determinism and resume of one Batcher
-// over varied lengths.
+// The budget (per sub-batch), coverage, determinism and resume of one Batcher over varied
+// lengths.
 void check_budget_coverage_and_resume() {
     const int64_t budget = 4096;
     const int devices = 2;
@@ -127,13 +127,14 @@ void check_budget_coverage_and_resume() {
 
     auto run = whole_run(b, 3);
 
-    // The budget holds for every sub-batch, and for every step over all of its sub-batches:
-    // bounding each sub-batch alone would let one step spend up to devices * budget tokens.
-    // A step's sequences are of similar length: all of them come from one length bucket, whose
-    // lengths are within a factor of two. The largest step total must also exceed budget / devices
-    // on this data, otherwise the per-step check could pass for a per-sub-batch batcher.
+    // The budget holds for every Batch, not for a step over all of its sub-batches: a step can
+    // spend up to devices * budget tokens, and on this data the largest step does exceed a whole
+    // budget, so a batcher that bounded the step instead would fail here. A step's sequences are
+    // of similar length: all of them come from one length bucket, whose lengths are within a
+    // factor of two.
     int64_t largest_step_total = 0;
     for (const auto& step : run) {
+        assert((int64_t)step.size() == devices);
         int64_t longest = 0, shortest = INT64_MAX, step_total = 0;
         for (const Batch& sub : step) {
             int64_t total = 0;
@@ -145,11 +146,10 @@ void check_budget_coverage_and_resume() {
             assert(total <= budget);
             step_total += total;
         }
-        assert(step_total <= budget);
         largest_step_total = std::max(largest_step_total, step_total);
         assert(shortest > 0 && longest < 2 * shortest);
     }
-    assert(largest_step_total > budget / devices);
+    assert(largest_step_total > budget);
 
     // Every kept sequence appears exactly once per epoch, and no two epochs are the same shuffle.
     std::vector<std::vector<size_t>> orders;
@@ -228,6 +228,47 @@ void check_budget_coverage_and_resume() {
                          *std::min_element(loads.begin(), loads.end());
         assert(spread < max_seq);
     }
+}
+
+// The budget is per sub-batch, not per step: four sequences, each too long to share a sub-batch
+// with any other under the budget, still fill both devices of every step. A per-step budget would
+// put one sequence in each step with the other device idle, the case a long-sequence run hits.
+void check_budget_is_per_batch() {
+    const int64_t budget = 4096;
+    const int devices = 2;
+    const std::vector<int64_t> lens = {2800, 3000, 3500, 2200};
+    auto seqs = make_sequences(lens);
+
+    r97::BatcherConfig cfg;
+    cfg.token_budget = budget;
+    cfg.devices = devices;
+    cfg.seed = 17;
+    Batcher b(seqs, cfg);
+
+    auto run = run_epoch(b);
+    assert(run.size() == 2);  // no two of these fit one sub-batch together
+
+    std::set<size_t> seen;
+    for (const auto& step : run) {
+        assert((int64_t)step.size() == devices);
+        std::vector<int64_t> loads(devices, 0);
+        int64_t max_seq = 0, step_total = 0;
+        for (size_t d = 0; d < step.size(); ++d) {
+            assert(!step[d].empty());  // every device works on every step
+            for (const TokenSeq& s : step[d]) {
+                loads[d] += tokens(s);
+                max_seq = std::max(max_seq, tokens(s));
+                seen.insert((size_t)(s.ids[0] / 100003));
+            }
+            assert(loads[d] <= budget);  // the budget belongs to each sub-batch
+            step_total += loads[d];
+        }
+        assert(step_total > budget);  // a step may spend more than one sub-batch's budget
+        int64_t spread = *std::max_element(loads.begin(), loads.end()) -
+                         *std::min_element(loads.begin(), loads.end());
+        assert(spread < max_seq);
+    }
+    assert(seen.size() == lens.size());  // every sequence appears once
 }
 
 // Grouping similar lengths may not collapse the epoch's order into one fixed sort: a dataset of a
@@ -424,6 +465,7 @@ void check_reset_and_config_errors() {
 
 void run_checks() {
     check_budget_coverage_and_resume();
+    check_budget_is_per_batch();
     check_small_dataset_shuffles();
     check_similar_lengths_are_grouped();
     check_single_step_split();

@@ -75,31 +75,53 @@ std::vector<std::vector<size_t>> epoch_buckets(const std::vector<size_t>& kept, 
     return buckets;
 }
 
-// A step's sequences -> one sub-batch per device with balanced token counts. Longest first, each
-// sequence handed to the least-loaded device; this keeps the spread below the longest sequence of
-// the step. (A spread of exactly one maximal sequence can be forced -- one sequence for two
-// devices, or three budget-length sequences into two devices -- and no arrangement does better.)
-std::vector<std::vector<size_t>> balance(const std::vector<size_t>& idx,
-                                         const std::vector<int64_t>& lens, int devices) {
-    std::vector<size_t> sorted = idx;
-    std::sort(sorted.begin(), sorted.end(), [&](size_t a, size_t b) {
-        if (lens[a] != lens[b]) return lens[a] > lens[b];
-        return a < b;
-    });
+// A bucket's shuffled sequences -> steps of one sub-batch per device. Walking the shuffled order,
+// each sequence goes to the least-loaded sub-batch that can still hold it under the budget (ties
+// to the lowest device); when none can, the step closes and the next sequence starts a new one. So
+// every sub-batch stays under the budget, a step may spend up to devices * budget, and the spread
+// between a step's fullest and emptiest sub-batch never exceeds the step's longest sequence. A
+// step with fewer sequences than devices -- a bucket's end can leave one -- has an empty
+// sub-batch and a spread of exactly one maximal sequence; no packing can avoid that.
+std::vector<std::vector<std::vector<size_t>>> pack_bucket(
+    const std::vector<size_t>& bucket, const std::vector<int64_t>& lens, int64_t budget,
+    int devices) {
+    std::vector<std::vector<std::vector<size_t>>> steps;
     std::vector<std::vector<size_t>> subs((size_t)devices);
     std::vector<int64_t> loads((size_t)devices, 0);
-    for (size_t s : sorted) {
-        size_t d = (size_t)(std::min_element(loads.begin(), loads.end()) - loads.begin());
+    const size_t kNone = (size_t)devices;
+    auto close_step = [&]() {
+        bool empty = true;
+        for (const auto& sub : subs)
+            if (!sub.empty()) {
+                empty = false;
+                break;
+            }
+        if (empty) return;
+        // Keep a stable order inside each sub-batch: longest first, input index to break ties.
+        for (auto& sub : subs)
+            std::sort(sub.begin(), sub.end(), [&](size_t a, size_t b) {
+                if (lens[a] != lens[b]) return lens[a] > lens[b];
+                return a < b;
+            });
+        steps.push_back(subs);
+        for (auto& sub : subs) sub.clear();
+        std::fill(loads.begin(), loads.end(), int64_t{0});
+    };
+    for (size_t s : bucket) {
+        size_t d = kNone;
+        for (size_t k = 0; k < (size_t)devices; ++k) {
+            if (loads[k] + lens[s] > budget) continue;
+            if (d == kNone || loads[k] < loads[d]) d = k;
+        }
+        if (d == kNone) {
+            close_step();
+            d = 0;  // every sub-batch is empty again, and a kept sequence fits one
+        }
         subs[d].push_back(s);
         loads[d] += lens[s];
     }
-    // Keep a stable order inside each sub-batch: longest first, input index to break ties.
-    for (auto& sub : subs)
-        std::sort(sub.begin(), sub.end(), [&](size_t a, size_t b) {
-            if (lens[a] != lens[b]) return lens[a] > lens[b];
-            return a < b;
-        });
-    return subs;
+    close_step();
+    return steps;
 }
 
 }  // namespace
@@ -120,21 +142,9 @@ const Batcher::EpochPlan& Batcher::plan(int64_t epoch) const {
     std::vector<std::vector<size_t>> buckets = epoch_buckets(kept, config_.seed, epoch, lens);
     EpochPlan p;
     for (const std::vector<size_t>& bucket : buckets) {
-        std::vector<size_t> cur;
-        int64_t total = 0;
-        auto close_step = [&]() {
-            if (cur.empty()) return;
-            p.steps.push_back(balance(cur, lens, config_.devices));
-            cur.clear();
-            total = 0;
-        };
-        for (size_t s : bucket) {
-            if (!cur.empty() && total + lens[s] > config_.token_budget) close_step();
-            cur.push_back(s);
-            total += lens[s];
-        }
         // A step never crosses a bucket edge, so the classes never meet in one step.
-        close_step();
+        auto steps = pack_bucket(bucket, lens, config_.token_budget, config_.devices);
+        for (auto& step : steps) p.steps.push_back(std::move(step));
     }
     cached_plan_ = std::move(p);
     planned_epoch_ = epoch;

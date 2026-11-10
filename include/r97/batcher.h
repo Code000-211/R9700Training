@@ -2,10 +2,10 @@
 //
 // Given the training data (one `TokenSeq` per example) the Batcher plans the epoch: it groups
 // similar lengths (sorted into buckets, each bucket shuffled under the seed) so a batch never
-// mixes one long sequence with many short ones, and packs steps whose total token count stays
-// under the budget. With `devices > 1` each step hands out N sub-batches with balanced token
-// counts, one per device. A sequence longer than the budget is reported (in `skipped()`) and
-// never batched.
+// mixes one long sequence with many short ones, and packs each sub-batch's total token count
+// under the budget. Each step hands out `devices` sub-batches with balanced token counts, one per
+// device; the budget is per sub-batch, so a step may spend up to `devices * token_budget` tokens.
+// A sequence longer than the budget is reported (in `skipped()`) and never batched.
 //
 // Deterministic for a given seed: the same seed replays the same batches, each epoch is a new
 // shuffle, and a position (epoch, step) saved and restored resumes with the same batches.
@@ -19,7 +19,7 @@
 namespace r97 {
 
 struct BatcherConfig {
-    int64_t token_budget = 0;  // tokens per step, over all of a step's sub-batches
+    int64_t token_budget = 0;  // tokens per sub-batch, not per step
     int devices = 1;           // sub-batches per step
     uint64_t seed = 0;         // the shuffle's seed; same seed, same batches
 };
