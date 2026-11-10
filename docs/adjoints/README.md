@@ -55,7 +55,12 @@ kernel says so instead of passing quietly.
    when a predicate or a frozen operand applies. Nothing else edits: sources and
    tests are collected by directory glob, and the binaries that ask the registry
    link `r97` whole, so a row in a new file is in the registry on the next
-   build.
+   build. That link is what carries the row: `r97` is an archive, and an archive
+   drops the members nothing references, so a binary that links it plainly sees
+   only the ops it already calls. `r97train` and the host and gpu test tiers link
+   it whole (`R97_LINK_WHOLE` in `CMakeLists.txt`); a build that drops that says
+   `no twin registered for op 'add'` in `adjoint_add` rather than losing the op
+   quietly.
 4. **Test it**: a file under `tests/host/` -- say what the op asks the checker
    (`check_kernel` and `check_adjoint` at the shapes that matter) and include one
    case it must reject if the op has a failure mode worth pinning. The host tests
