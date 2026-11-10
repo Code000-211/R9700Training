@@ -1,0 +1,254 @@
+Concern: an optional issue observer and layer block brackets on the runtime context
+Upstream: not-submitted
+diff --git a/abi/rad_runtime.h b/abi/rad_runtime.h
+index c6f5d7b..b33f313 100644
+--- a/abi/rad_runtime.h
++++ b/abi/rad_runtime.h
+@@ -916,6 +916,56 @@ int rad_lane_join(RadCtx* c, int from, int to);
+ #define RAD_ISSUE(c, op, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), RAD_N_BATCH)
+ #define RAD_ISSUE_N(c, op, n, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), (n))
+ 
++/* ================================================================== issue observer */
++/* An optional observer on the context. With none set, issue() and the block brackets cost one
++ * branch each. A tool sets one to read the graph an architecture issues without changing the
++ * architecture; the core never reads what the observer does.
++ *
++ * The core owns the arrays passed to the callbacks: they are valid only for the duration of the
++ * call, and the observer must not issue an op from one. */
++typedef struct RadIssueOperand {
++    uint8_t  kind;         /* RAD_OPK_* */
++    uint32_t handle;       /* rad_buf, rad_weight or rad_kvgroup; 0 for RAW and NONE */
++    void*    raw;          /* RAD_OPK_RAW: the pointer as issued */
++    void*    data;         /* the pointer the kernel receives; for WTAB the pointer table */
++    int64_t  bytes;        /* bytes at data for this issue; 0 when they are not one span */
++    const char* name;      /* the declared name of a buffer or weight; null otherwise */
++    uint32_t dtype;        /* RadDType the kernel reads; RAD_DT_INVALID when it has none */
++    uint8_t  rank;
++    int64_t  shape[RAD_MAX_RANK]; /* the declared shape, before this issue narrows dim 0 */
++    int64_t  offset;       /* element offset into the buffer or weight, as issued */
++    int64_t  rows;         /* dim 0 extent this issue uses; 0 means the declared extent */
++    uint8_t  written;      /* 1 for RAD_OPD_OUT and RAD_OPD_INOUT, 0 otherwise */
++} RadIssueOperand;
++
++typedef struct RadIssueOp {
++    rad_op          op;         /* the op's handle */
++    const char*     name;       /* the schema's op name */
++    const RadParam* params;     /* the resolved geometry, ranges collapsed */
++    int             n_params;
++    const RadIssueOperand* operands; /* schema order, the trailing absent ones left out */
++    int             n_operands;
++    int64_t         n;          /* the ranged count this issue resolved to */
++} RadIssueOp;
++
++/* `block` is called with begin=1 before an architecture block (a layer) issues its ops and with
++ * begin=0 after its last one. `block` is the index the architecture names it by; the core does not
++ * interpret it. An observer must not call rad_issue: the issue path's per-issue storage does not
++ * nest. */
++typedef struct RadIssueObserver {
++    void* user;
++    void (*op)(void* user, RadCtx* c, const RadIssueOp* o);
++    void (*block)(void* user, RadCtx* c, int64_t block, int begin);
++} RadIssueObserver;
++
++/* Install `observer` (copied) and clear it with null. Not thread safe; set it between steps. */
++void rad_set_issue_observer(RadCtx* c, const RadIssueObserver* observer);
++
++/* Called by an architecture around one block of its forward. With no observer set both are one
++ * branch. */
++void rad_block_begin(RadCtx* c, int64_t block);
++void rad_block_end(RadCtx* c, int64_t block);
++
+ /* Fail the step with a reason. An architecture block's step() returns void, so this is how it
+  * refuses a batch shape it does not serve; the engine stops with `what` in the message. Returns
+  * the status it set, so a helper can `return rad_step_fail(...)`. */
+diff --git a/arch/qwen35_fp8/qwen35_fp8.cpp b/arch/qwen35_fp8/qwen35_fp8.cpp
+index 9c456f6..e75616a 100644
+--- a/arch/qwen35_fp8/qwen35_fp8.cpp
++++ b/arch/qwen35_fp8/qwen35_fp8.cpp
+@@ -1608,6 +1608,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
+ 
+     for (int64_t li = 0; li < L; ++li) {
+         const Layer& l = m.layers[(size_t)li];
++        rad_block_begin(c, li);
+         PipeHand h{c, &m, T, 2 * li};
+         ArPieces pc{};
+         pc.rows = R; pc.done = pipe_hand; pc.u = &h; pc.cu = pcu; pc.in_ready = true;
+@@ -1627,6 +1628,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
+         pipe_wait1(c);
+         pipe_taps(c, m, li, 0, R);
+         pipe_on1(c, [&] { pipe_boundary(c, m, T, 2 * li + 1, R, T - R); });
++        rad_block_end(c, li);
+     }
+     pipe_wait1(c);
+     if (L > 0) pipe_taps(c, m, L - 1, R, T - R);
+@@ -1716,6 +1718,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
+         batch->phase == RAD_PHASE_DECODE && batch->n_tok <= kPrefetchStepRows ? 1 : INT64_MAX;
+     for (int64_t li = 0; li < (int64_t)m.layers.size(); ++li) {
+         const Layer& l = m.layers[(size_t)li];
++        rad_block_begin(c, li);
+         if (l.full) l.attn.step(c, batch);
+         else        l.gdn.step(c, batch);
+         /* The calibration taps read the codes the block's GEMMs just read, before the next block's
+@@ -1737,6 +1740,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
+             RAD_ISSUE(c, m.op_tap, brows(m.b_x, batch->n_tok),
+                       bcol(m.b_dfsrc, (int64_t)t * m.g.n_embd, m.g.n_embd, batch->n_tok));
+         }
++        rad_block_end(c, li);
+     }
+ 
+     m.calib.after_step(c, batch->n_tok);
+diff --git a/core/runtime/ctx.h b/core/runtime/ctx.h
+index 2ec9f8e..d76be9b 100644
+--- a/core/runtime/ctx.h
++++ b/core/runtime/ctx.h
+@@ -262,6 +262,15 @@ public:
+     RadStream       stream()     const { return stream_; }
+     Program*        program()    const { return program_; }
+ 
++    /* The optional issue observer (rad_runtime.h); null clears it. */
++    void set_issue_observer(const RadIssueObserver* observer) {
++        issue_observer_ = observer ? *observer : RadIssueObserver{};
++    }
++    /* The block brackets a plugin calls: one branch when no observer is set. */
++    void block_event(int64_t block, int begin) {
++        if (issue_observer_.block) issue_observer_.block(issue_observer_.user, this, block, begin);
++    }
++
+     /* The lane subsequent issues launch on, and its stream. Lane 0 is `stream_`. See lane1_ for
+      * the constraints on a second lane. */
+     RadStream       cur_stream() const { return lane_ ? lane1_ : stream_; }
+@@ -619,6 +628,10 @@ public:
+ private:
+     [[noreturn]] void fatal_issue(rad_op h, int64_t n, const char* why) const;
+ 
++    /* Report this issue to the observer, when one is set. */
++    void observe_issue(rad_op h, const OpPlan& p, const RadParam* params, int n_params,
++                       const RadOperand* opd, const RadTensor* t, int n_opd, int64_t n);
++
+     /* ---- the op oracle (runtime/oracle.cpp), inert unless RADIANCE_OP_ORACLE names an op. Runs
+      * the host kernel for the same (op, band) on a host copy of the device kernel's operands and
+      * compares. `oracle_` is null otherwise, so the hot path pays one not-taken branch. */
+@@ -748,6 +761,8 @@ private:
+     /* Per-issue tensor storage, bound into every IssuePlan::args.t at prepare. One array, because
+      * issues do not nest. */
+     RadTensor tbuf_[MAX_OPERANDS];
++    /* The optional observer; zeroed when none is set, so the issue path pays one branch. */
++    RadIssueObserver issue_observer_{};
+ 
+     /* Prebuilt tensor templates by handle: a buffer's carries its arena pointer, dtype, shape and
+      * packed strides; a weight's carries WeightInfo::ptr. An issue copies one and patches at most
+diff --git a/core/runtime/issue.cpp b/core/runtime/issue.cpp
+index 8d18803..3495e1a 100644
+--- a/core/runtime/issue.cpp
++++ b/core/runtime/issue.cpp
+@@ -929,6 +929,9 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
+     p.issued    = true;
+     ++n_issues_;
+ 
++    /* The whole cost when no observer is set: one branch. */
++    if (issue_observer_.op) observe_issue(h, p, ip.args.p, ip.args.n_p, opd, t, n_opd, n);
++
+     /* All-reduce link accounting: `n` is the collective's numel (its ranged parameter) and operand
+      * 0's dtype is the wire element type. The op's `dtype` key ("w4a8") is not an element
+      * width. */
+@@ -1321,6 +1324,65 @@ void* Ctx::buf_ptr(rad_buf b) {
+     return buf_tmpl_[b].data;
+ }
+ 
++void Ctx::observe_issue(rad_op h, const OpPlan& p, const RadParam* params, int n_params,
++                        const RadOperand* opd, const RadTensor* t, int n_opd, int64_t n) {
++    if (!issue_observer_.op) return;
++    RadIssueOperand os[MAX_OPERANDS];
++    const int no = std::min(n_opd, (int)MAX_OPERANDS);
++    for (int i = 0; i < no; ++i) {
++        const RadOperand& o = opd[i];
++        RadIssueOperand& e = os[i];
++        e = RadIssueOperand{};
++        e.kind   = o.kind;
++        e.handle = o.handle;
++        e.raw    = o.raw;
++        e.data   = t[i].data;
++        e.dtype  = t[i].dtype;
++        e.rank   = (uint8_t)t[i].rank;
++        for (uint32_t d = 0; d < t[i].rank && d < RAD_MAX_RANK; ++d) e.shape[d] = t[i].shape[d];
++        e.offset = o.offset;
++        e.rows   = o.rows;
++        /* The declared shape and name live in the template the issue copied; the template also
++         * holds dim 0 before this issue narrowed it. */
++        const RadTensor* full = nullptr;
++        if (o.kind == RAD_OPK_BUF && o.handle < buf_tmpl_.size()) {
++            full = &buf_tmpl_[o.handle];
++            if (program_ && o.handle < program_->buffers.size())
++                e.name = program_->buffers[o.handle].name.c_str();
++        } else if ((o.kind == RAD_OPK_WEIGHT || o.kind == RAD_OPK_WTAB) &&
++                   o.handle < w_tmpl_.size()) {
++            full = &w_tmpl_[o.handle];
++            if (program_ && o.handle < program_->weights.size())
++                e.name = program_->weights[o.handle].name.c_str();
++        }
++        if (full) {
++            e.rank = (uint8_t)full->rank;
++            for (uint32_t d = 0; d < full->rank && d < RAD_MAX_RANK; ++d) e.shape[d] = full->shape[d];
++            if (o.kind == RAD_OPK_WTAB) {
++                /* The table's dim 0 is the run's length, not a row extent. */
++                e.rows = 0;
++            }
++        }
++        /* A KV operand's offset is its layer, not an element offset. */
++        if (o.kind == RAD_OPK_KV) e.offset = 0;
++        if (o.kind != RAD_OPK_WTAB && rad_tensor_is_contiguous(&t[i]))
++            e.bytes = rad_dtype_bytes(t[i].dtype, rad_tensor_numel(&t[i]));
++        const int role = (p.info && p.info->schema && i < p.info->schema->n_operands)
++                             ? p.info->schema->operands[i].role : RAD_OPD_IN;
++        e.written = (role == RAD_OPD_OUT || role == RAD_OPD_INOUT) ? 1 : 0;
++    }
++    RadIssueOp ev{};
++    ev.op         = h;
++    ev.name       = (p.info && p.info->schema) ? p.info->schema->op
++                   : (p.info ? p.info->op.c_str() : "?");
++    ev.params     = params;
++    ev.n_params   = n_params;
++    ev.operands   = os;
++    ev.n_operands = no;
++    ev.n          = n;
++    issue_observer_.op(issue_observer_.user, this, &ev);
++}
++
+ }  /* namespace rad */
+ 
+ /* ================================================================== the C surface */
+@@ -1333,6 +1395,18 @@ int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n)
+     return static_cast<rad::Ctx*>(c)->issue(op, opd, n_opd, n);
+ }
+ 
++void rad_set_issue_observer(RadCtx* c, const RadIssueObserver* observer) {
++    if (c) static_cast<rad::Ctx*>(c)->set_issue_observer(observer);
++}
++
++void rad_block_begin(RadCtx* c, int64_t block) {
++    if (c) static_cast<rad::Ctx*>(c)->block_event(block, 1);
++}
++
++void rad_block_end(RadCtx* c, int64_t block) {
++    if (c) static_cast<rad::Ctx*>(c)->block_event(block, 0);
++}
++
+ int rad_step_fail(RadCtx* c, const char* what) {
+     if (!c) rad::fatal("rad_step_fail: null RadCtx");
+     return static_cast<rad::Ctx*>(c)->step_fail(what);
+diff --git a/tests/arch_fakes.h b/tests/arch_fakes.h
+index db4587c..16b4a9f 100644
+--- a/tests/arch_fakes.h
++++ b/tests/arch_fakes.h
+@@ -490,6 +490,11 @@ extern "C" int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd,
+     c->issues.push_back(r);
+     return RAD_OK;
+ }
++/* The issue observer and block brackets: the arch tests record issues through rad_issue and do
++ * not observe them. */
++extern "C" void rad_set_issue_observer(RadCtx*, const RadIssueObserver*) {}
++extern "C" void rad_block_begin(RadCtx*, int64_t) {}
++extern "C" void rad_block_end(RadCtx*, int64_t) {}
+ /* The second lane, recorded: each issue's lane, and each join's position among the issues. */
+ extern "C" int rad_lane(RadCtx* c, int lane) {
+     if (lane != 0 && lane != 1) return RAD_E_INVAL;

@@ -28,6 +28,7 @@ struct OpRecord {
     std::vector<Operand> operands;  // in schema order
     int64_t block = -1;             // which transformer block, -1 outside one
     int64_t position = 0;           // position in the step, in append order
+    int64_t n = 0;                  // the ranged count this issue resolved to
 };
 
 }  // namespace r97
