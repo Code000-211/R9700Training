@@ -2,6 +2,8 @@
 #include "r97/batcher.h"
 
 #include <algorithm>
+#include <bit>
+#include <cstddef>
 #include <stdexcept>
 #include <utility>
 
@@ -30,14 +32,18 @@ uint64_t epoch_rng(uint64_t seed, int64_t epoch) {
 
 namespace {
 
-// The epoch's sequence order: sequences of similar length are grouped -- sorted by length and cut
-// into buckets of 32 -- and each bucket is then shuffled with the epoch's rng. Grouping first is
-// what keeps a step from mixing one long sequence with many short ones; shuffling inside the
-// bucket is what makes the order a function of (seed, epoch), including when the whole dataset
-// fits in a single bucket, where a shuffle followed by a sort by length would leave no shuffle at
-// all. (A sort and then a shuffle, rather than the other way round, is therefore deliberate.)
-std::vector<size_t> epoch_order(const std::vector<size_t>& kept, uint64_t seed, int64_t epoch,
-                                const std::vector<int64_t>& lens) {
+// The epoch's buckets: sequences of similar length are grouped -- sorted by token count and cut
+// into buckets of at most 32, where the power-of-two length class changes -- and each bucket is
+// then shuffled with the epoch's rng. The class cut is what keeps a step from mixing one long
+// sequence with many short ones: inside a bucket no two lengths differ by a factor of two or more.
+// The 32 cap keeps the buckets small enough that the shuffle inside one has a fine effect on the
+// steps' composition. Shuffling is what makes the order a function of (seed, epoch), including
+// when the whole dataset fits in a single bucket, where a shuffle followed by a sort by length
+// would leave no shuffle at all. (A sort and then a shuffle, rather than the other way round, is
+// therefore deliberate.)
+std::vector<std::vector<size_t>> epoch_buckets(const std::vector<size_t>& kept, uint64_t seed,
+                                               int64_t epoch,
+                                               const std::vector<int64_t>& lens) {
     std::vector<size_t> order = kept;
     // Descending by length, input index to break ties: a total order, so the grouping is the same
     // on every platform.
@@ -47,14 +53,26 @@ std::vector<size_t> epoch_order(const std::vector<size_t>& kept, uint64_t seed, 
     });
     constexpr size_t kBucket = 32;
     uint64_t rng = epoch_rng(seed, epoch);
-    for (size_t lo = 0; lo < order.size(); lo += kBucket) {
-        size_t hi = std::min(order.size(), lo + kBucket);
+    std::vector<std::vector<size_t>> buckets;
+    size_t lo = 0;
+    while (lo < order.size()) {
+        // std::bit_width is the length's power-of-two class: equal for lengths in [2^k, 2^(k+1)),
+        // so every pair inside a bucket is within a factor of two. Zero-length sequences share
+        // class 0. The sort keeps the class nonincreasing, so a change is always a cut.
+        const int cls = (int)std::bit_width((uint64_t)lens[order[lo]]);
+        size_t hi = lo;
+        while (hi < order.size() && hi - lo < kBucket &&
+               (int)std::bit_width((uint64_t)lens[order[hi]]) == cls)
+            ++hi;
         for (size_t i = hi; i > lo + 1; --i) {
             size_t j = lo + (size_t)(splitmix64(&rng) % (i - lo));
             std::swap(order[i - 1], order[j]);
         }
+        buckets.emplace_back(order.begin() + static_cast<std::ptrdiff_t>(lo),
+                             order.begin() + static_cast<std::ptrdiff_t>(hi));
+        lo = hi;
     }
-    return order;
+    return buckets;
 }
 
 // A step's sequences -> one sub-batch per device with balanced token counts. Longest first, each
@@ -99,22 +117,25 @@ const Batcher::EpochPlan& Batcher::plan(int64_t epoch) const {
         if (over) { ++skip; --nskip; continue; }
         kept.push_back(i);
     }
-    std::vector<size_t> order = epoch_order(kept, config_.seed, epoch, lens);
+    std::vector<std::vector<size_t>> buckets = epoch_buckets(kept, config_.seed, epoch, lens);
     EpochPlan p;
-    std::vector<size_t> cur;
-    int64_t total = 0;
-    auto close_step = [&]() {
-        if (cur.empty()) return;
-        p.steps.push_back(balance(cur, lens, config_.devices));
-        cur.clear();
-        total = 0;
-    };
-    for (size_t s : order) {
-        if (!cur.empty() && total + lens[s] > config_.token_budget) close_step();
-        cur.push_back(s);
-        total += lens[s];
+    for (const std::vector<size_t>& bucket : buckets) {
+        std::vector<size_t> cur;
+        int64_t total = 0;
+        auto close_step = [&]() {
+            if (cur.empty()) return;
+            p.steps.push_back(balance(cur, lens, config_.devices));
+            cur.clear();
+            total = 0;
+        };
+        for (size_t s : bucket) {
+            if (!cur.empty() && total + lens[s] > config_.token_budget) close_step();
+            cur.push_back(s);
+            total += lens[s];
+        }
+        // A step never crosses a bucket edge, so the classes never meet in one step.
+        close_step();
     }
-    close_step();
     cached_plan_ = std::move(p);
     planned_epoch_ = epoch;
     return cached_plan_;

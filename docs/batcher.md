@@ -8,17 +8,22 @@ The trainer's loop asks a `Batcher` for one step at a time; each epoch is a new 
 An epoch is planned on demand from `(seed, epoch)` and cached (`Batcher::plan`):
 
 1. **Group similar lengths.** The kept sequences (those not skipped) are sorted descending by
-   token count, ties by input index, and cut into buckets of 32. Each bucket is therefore a
-   contiguous run of similar lengths, so a batch never mixes one long sequence with many short
-   ones.
+   token count, ties by input index, and cut into buckets: a bucket holds at most 32 sequences,
+   all of one power-of-two length class (`std::bit_width` of the token count), and a change of
+   class always starts a new bucket. Any two lengths inside a bucket therefore differ by less
+   than a factor of two, which is what keeps a batch from mixing one long sequence with many
+   short ones.
 2. **Shuffle each bucket.** Every bucket is Fisher-Yates shuffled with a splitmix64 stream
    derived from the config's seed and the epoch number. The same seed and epoch always give the
    same order; a new epoch is a new shuffle. Grouping comes first and the shuffle second on
    purpose: a shuffle followed by a sort by length would erase the shuffle entirely whenever the
    whole dataset fits in one bucket (at most 32 sequences), leaving every seed and every epoch
    with the same batches.
-3. **Pack steps.** Walking the order, a step closes when adding the next sequence would push
-   its total token count over `token_budget`. The budget therefore holds for every step.
+3. **Pack steps.** Walking one bucket's shuffled order, a step closes when adding the next
+   sequence would push its total token count over `token_budget`, and at the bucket's end, so a
+   step never draws from two buckets and all of a step's sequences are of similar length. The
+   budget therefore holds for every step. A bucket edge can leave a step below the budget; that
+   is the price of not mixing classes.
 4. **Balance devices.** Each step is dealt into `devices` sub-batches: longest first, each
    sequence handed to the least-loaded sub-batch at that point (ties to the lowest device). This
    keeps the token spread between fullest and emptiest below one maximal sequence of the step. A
@@ -43,18 +48,22 @@ Everything rests on splitmix64 and a Fisher-Yates over it — no `rand`, no loca
 unordered containers. Same seed, same batches, every run; another seed, and every new epoch,
 shuffles each length bucket differently. Which sequences a bucket holds is fixed by the data
 (the grouping); what the seed and the epoch choose is the order inside the buckets, and with it
-the step boundaries and so the batches. For a dataset of at most 32 sequences there is a single
-bucket, so the order is a plain shuffle.
+the step boundaries and so the batches. For a dataset whose sequences all share one length class
+and fit one bucket (at most 32), the order is a plain shuffle.
 
 ## Tests
 
 `tests/host/batcher.cpp` holds the host tier's checks: the budget holds for every sub-batch;
-every kept sequence appears exactly once an epoch and the skipped one in no batch; the same seed
-replays and another seed does not; a seek to a saved `(epoch, step)` continues identically; a
-step's sub-batches differ by less than one maximal sequence; a dataset of 20 or 32 sequences
-(the single-bucket case) still changes its batches with the seed and with the epoch; and a
-dataset of two length classes 40x apart, 32 of each, comes out in steps that hold one class only,
-the long ones first -- the grouping, which a plain shuffle over every sequence would lose.
+every step's lengths are within a factor of two; every kept sequence appears exactly once an
+epoch and the skipped one in no batch; the same seed replays and another seed does not; a seek to
+a saved `(epoch, step)` continues identically; a step's sub-batches differ by less than one
+maximal sequence; a dataset of 20 or 32 sequences still changes its batches with the seed and
+with the epoch; and a dataset of two length classes 40x apart, 32 long ones beside 32 shorts and
+then 33 long ones beside 32 shorts, comes out in steps that hold one class only, the long ones
+first. The 32 case is exactly two buckets; the 33 case leaves a bucket that would hold one long
+and the shorts after it in the sorted order, so it is the case that mixes classes unless the
+bucket is cut at the length class and a step stops at the bucket edge — the grouping that a plain
+shuffle, or buckets of 32 without the class cut, would lose.
 `tests/headers/hdr_batcher.cpp` is the standalone-compile check of the header.
 
 The host test binary has a single `main`, in `tests/host/vector_tape.cpp`; a second one cannot

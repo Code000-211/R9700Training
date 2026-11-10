@@ -125,13 +125,21 @@ void check_budget_coverage_and_resume() {
 
     auto run = whole_run(b, 3);
 
-    // The budget holds for every sub-batch of every step.
-    for (const auto& step : run)
+    // The budget holds for every sub-batch of every step, and a step's sequences are of similar
+    // length: all of them come from one length bucket, whose lengths are within a factor of two.
+    for (const auto& step : run) {
+        int64_t longest = 0, shortest = INT64_MAX;
         for (const Batch& sub : step) {
             int64_t total = 0;
-            for (const TokenSeq& s : sub) total += tokens(s);
+            for (const TokenSeq& s : sub) {
+                total += tokens(s);
+                longest = std::max(longest, tokens(s));
+                shortest = std::min(shortest, tokens(s));
+            }
             assert(total <= budget);
         }
+        assert(shortest > 0 && longest < 2 * shortest);
+    }
 
     // Every kept sequence appears exactly once per epoch, and no two epochs are the same shuffle.
     std::vector<std::vector<size_t>> orders;
@@ -212,9 +220,9 @@ void check_budget_coverage_and_resume() {
     }
 }
 
-// A dataset smaller than one length bucket must still be shuffled: grouping similar lengths may
-// not collapse the epoch's order into one fixed sort, or no seed and no epoch would ever change
-// the batches.
+// Grouping similar lengths may not collapse the epoch's order into one fixed sort: a dataset of a
+// few dozen sequences, every bucket well under the cap, must still change its batches with the
+// seed and with the epoch.
 void check_small_dataset_shuffles() {
     for (const size_t n : {size_t(20), size_t(32)}) {
         std::vector<int64_t> lens;  // distinct lengths, none over the budget
@@ -253,65 +261,70 @@ void check_small_dataset_shuffles() {
 }
 
 // Grouping: a batch does not mix one long sequence with many short ones. Two length classes 40x
-// apart, 32 of each -- exactly two length buckets -- and a budget that would happily hold one long
-// sequence beside dozens of shorts. Grouping keeps each step inside one class: the longs are
-// packed first, then the shorts, and no step straddles the bucket boundary.
+// apart with a budget that would happily hold one long sequence beside dozens of shorts. The
+// counts matter: 32 longs are exactly one bucket by themselves, so they cannot expose a step that
+// crosses a bucket edge; 33 longs leave a bucket holding one long and the shorts that follow it in
+// the sorted order, which is the case that mixes classes unless the grouping cuts at the length
+// class and the packing stops at the bucket edge. Both counts are checked, over several epochs.
 void check_similar_lengths_are_grouped() {
     const int64_t kLong = 500;
     const int64_t kShort = 12;
-    const size_t kEach = 32;  // one full bucket each, so the two classes never share a bucket
-    std::vector<int64_t> lens;
-    lens.reserve(2 * kEach);
-    for (size_t i = 0; i < kEach; ++i) lens.push_back(kLong);
-    for (size_t i = 0; i < kEach; ++i) lens.push_back(kShort);
-    auto seqs = make_sequences(lens);
+    const size_t kShorts = 32;
+    for (const size_t kLongs : {size_t(32), size_t(33)}) {
+        std::vector<int64_t> lens;
+        lens.reserve(kLongs + kShorts);
+        for (size_t i = 0; i < kLongs; ++i) lens.push_back(kLong);
+        for (size_t i = 0; i < kShorts; ++i) lens.push_back(kShort);
+        auto seqs = make_sequences(lens);
 
-    r97::BatcherConfig cfg;
-    cfg.token_budget = 1000;  // one long and 41 shorts would fit, were they ever in one step
-    cfg.devices = 1;
-    cfg.seed = 5;
-    Batcher b(seqs, cfg);
+        r97::BatcherConfig cfg;
+        cfg.token_budget = 1000;  // one long and 41 shorts would fit, were they ever in one step
+        cfg.devices = 1;
+        cfg.seed = 5;
+        Batcher b(seqs, cfg);
 
-    for (int64_t e = 0; e < 4; ++e) {
-        b.seek({e, 0});
-        bool saw_long_step = false, saw_short_step = false;
-        size_t steps = 0, seen = 0;
-        std::vector<Batch> step;
-        while (b.next(&step)) {
-            assert(step.size() == 1);
-            assert(!step[0].empty());
-            ++steps;
-            int64_t longest = 0, shortest = kLong;
-            for (const TokenSeq& s : step[0]) {
-                longest = std::max(longest, tokens(s));
-                shortest = std::min(shortest, tokens(s));
-                ++seen;
+        for (int64_t e = 0; e < 4; ++e) {
+            b.seek({e, 0});
+            bool saw_long_step = false, saw_short_step = false;
+            size_t steps = 0, seen = 0;
+            std::vector<Batch> step;
+            while (b.next(&step)) {
+                assert(step.size() == 1);
+                assert(!step[0].empty());
+                ++steps;
+                int64_t longest = 0, shortest = kLong;
+                for (const TokenSeq& s : step[0]) {
+                    longest = std::max(longest, tokens(s));
+                    shortest = std::min(shortest, tokens(s));
+                    ++seen;
+                }
+                // No step mixes the two classes: a batch is never one long and a crowd of shorts.
+                assert(longest == shortest);
+                if (longest == kLong) {
+                    assert(!saw_short_step);  // grouped descending: every long step comes first
+                    saw_long_step = true;
+                } else {
+                    assert(longest == kShort);
+                    saw_short_step = true;
+                }
             }
-            // No step mixes the two classes: a batch is never one long and a crowd of shorts.
-            assert(longest == shortest);
-            if (longest == kLong) {
-                assert(!saw_short_step);  // grouped descending: every long step comes first
-                saw_long_step = true;
-            } else {
-                assert(longest == kShort);
-                saw_short_step = true;
-            }
+            assert(saw_long_step && saw_short_step);
+            assert(seen == kLongs + kShorts);
+            // Pairs of longs, the odd long alone when there is one, then one step of shorts.
+            assert(steps == (kLongs + 1) / 2 + 1);
         }
-        assert(saw_long_step && saw_short_step);
-        assert(seen == 2 * kEach);
-        // 16 steps of two longs, then one of the 32 shorts.
-        assert(steps == kEach / 2 + 1);
     }
 }
 
 // A step whose whole set fits one step: it is one step, split across all devices, every device
-// gets a sub-batch, and the spread stays below the maximal sequence.
+// gets a sub-batch, and the spread stays below the maximal sequence. All lengths share one length
+// class, so grouping puts them in one bucket and the whole set can indeed be one step.
 void check_single_step_split() {
-    const std::vector<int64_t> lens = {3, 3, 4, 4, 4, 4, 4, 4};
+    const std::vector<int64_t> lens = {4, 4, 5, 5, 6, 6, 7, 7};
     auto seqs = make_sequences(lens);
 
     r97::BatcherConfig cfg;
-    cfg.token_budget = 30;  // the whole set fits one step
+    cfg.token_budget = 50;  // the whole set fits one step
     cfg.devices = 3;
     cfg.seed = 99;
     Batcher b(seqs, cfg);
