@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <set>
+#include <stdexcept>
 #include <vector>
 
 using r97::Batch;
@@ -352,11 +353,72 @@ void check_single_step_split() {
     assert(!b.next(&step));  // one step holds the whole set
 }
 
+// reset() is the way back to the first epoch, and the constructor rejects a configuration that
+// could never plan an epoch: a budget of no tokens and a step with no devices.
+void check_reset_and_config_errors() {
+    auto lens = lengths_for(60, 11);
+    auto seqs = make_sequences(lens);
+
+    r97::BatcherConfig cfg;
+    cfg.token_budget = 700;
+    cfg.devices = 2;
+    cfg.seed = 2024;
+
+    auto rejects = [&](const r97::BatcherConfig& c) {
+        try {
+            Batcher b(seqs, c);
+            (void)b;
+        } catch (const std::invalid_argument&) {
+            return true;
+        }
+        return false;
+    };
+    assert(!rejects(cfg));  // a workable configuration is accepted
+    r97::BatcherConfig bad = cfg;
+    bad.token_budget = 0;
+    assert(rejects(bad));
+    bad.token_budget = -1;
+    assert(rejects(bad));
+    bad = cfg;
+    bad.devices = 0;
+    assert(rejects(bad));
+    bad.devices = -1;
+    assert(rejects(bad));
+
+    // One epoch from (0, 0), then the same epoch again after seeking elsewhere and resetting.
+    Batcher b(seqs, cfg);
+    auto first = run_epoch(b);
+    assert(!first.empty());
+    assert(b.position().epoch == 0 && b.position().step == (int64_t)first.size());
+
+    b.seek({1, 0});
+    assert(!run_epoch(b).empty());  // a different epoch, from a different shuffle
+    b.reset();
+    assert(b.position().epoch == 0 && b.position().step == 0);
+    auto again = run_epoch(b);
+    assert(again.size() == first.size());
+    assert(id_order(again) == id_order(first));  // same seed, same batches
+
+    // reset() also revives a finished traversal: the epoch's end consumes nothing, so the
+    // position still points there and the next epoch needs a seek; reset() is the way back.
+    std::vector<Batch> step;
+    assert(!b.next(&step));
+    assert(b.position().epoch == 0 && b.position().step == (int64_t)again.size());
+    b.reset();
+    assert(b.next(&step));
+    assert(b.position().epoch == 0 && b.position().step == 1);
+    assert(step.size() == again[0].size());
+    for (size_t d = 0; d < step.size(); ++d)
+        for (size_t i = 0; i < step[d].size(); ++i)
+            assert(step[d][i].ids == again[0][d][i].ids);
+}
+
 void run_checks() {
     check_budget_coverage_and_resume();
     check_small_dataset_shuffles();
     check_similar_lengths_are_grouped();
     check_single_step_split();
+    check_reset_and_config_errors();
     std::puts("batcher ok");
 }
 

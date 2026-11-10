@@ -56,7 +56,9 @@ and fit one bucket (at most 32), the order is a plain shuffle.
 `tests/host/batcher.cpp` holds the host tier's checks: the budget holds for every sub-batch;
 every step's lengths are within a factor of two; every kept sequence appears exactly once an
 epoch and the skipped one in no batch; the same seed replays and another seed does not; a seek to
-a saved `(epoch, step)` continues identically; a step's sub-batches differ by less than one
+a saved `(epoch, step)` continues identically; `reset()` returns to `(0, 0)` and replays the first
+epoch, even after a traversal has run out; a non-positive budget and fewer than one device are
+rejected; a step's sub-batches differ by less than one
 maximal sequence; a dataset of 20 or 32 sequences still changes its batches with the seed and
 with the epoch; and a dataset of two length classes 40x apart, 32 long ones beside 32 shorts and
 then 33 long ones beside 32 shorts, comes out in steps that hold one class only, the long ones
