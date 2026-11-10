@@ -13,6 +13,11 @@
 //   (through `amd-smi process -g N --csv`), rather than letting the test die with an allocation
 //   error halfway.
 //
+//   A missing card is a failure, not a skip: when the sysfs tree holds no card with VRAM the
+//   guard throws and names what it looked at, so a gpu test cannot pass on a machine that has no
+//   GPU. A build whose radiance falls back to its host backend is still possible on such a
+//   machine; the smoke test itself rejects that (tests/gpu/gpu_guard_smoke.cpp).
+//
 //     r97test::GuardOptions o;
 //     o.device   = r97test::parse_device(getenv("R97_DEVICE") ? getenv("R97_DEVICE") : "0");
 //     o.bdf      = r97test::hip_bdf(o.device);           // HIP ordinal -> sysfs card
@@ -21,10 +26,10 @@
 //
 // The pure parts -- parsing, card resolution, holder lists, the refusal text -- are free
 // functions over a sysfs root or a CSV string, so host tests (tests/host/gpu_guard.cpp) run the
-// guard's logic against a fake filesystem with no card at all.
+// guard's logic against a fake sysfs tree they built themselves.
 //
 // Everything here is POSIX (flock, /sys, amd-smi); the host tier still runs anywhere because host
-// tests exercise these functions, not the machine's own files.
+// tests exercise these functions on their own files, never the machine's.
 #pragma once
 
 #include <dirent.h>
@@ -379,9 +384,19 @@ public:
         mkdir(lock_dir.c_str(), 0777);  // exists is fine
         lock_path_ = lock_dir + "/r97-card" + std::to_string(o.device) + ".lock";
         fd_ = open(lock_path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+        if (fd_ < 0 && errno == EACCES) {
+            // Another user's run created the file with a umask this process cannot write
+            // through. flock(2) needs only an open descriptor, not write access, so read-only
+            // is enough to queue on the same card.
+            fd_ = open(lock_path_.c_str(), O_RDONLY | O_CLOEXEC);
+        }
         if (fd_ < 0)
             throw std::runtime_error("cannot open the card lock " + lock_path_ + ": "
                                      + std::strerror(errno));
+        // World-writable whatever this process's umask: the next user's run must open it too.
+        // (A file owned by someone else cannot be changed, and needs no change: it opens
+        // read-only above.)
+        (void)fchmod(fd_, 0666);
 
         int op = LOCK_EX;
         if (o.fail_fast)
@@ -438,7 +453,10 @@ private:
         }
         std::vector<std::string> cards = list_cards(o.sysfs_root);
         if (cards.empty())
-            return;  // no sysfs VRAM anywhere; the lock still serialises runs
+            throw std::runtime_error("no card with VRAM under " + o.sysfs_root + ": the gpu tier "
+                                     "needs a GPU (R97_DEVICE selects card "
+                                     + std::to_string(o.device)
+                                     + "); a machine without one cannot run it");
         if (cards.size() == 1) {
             card_ = cards[0];
             return;
@@ -475,7 +493,7 @@ private:
     }
 
     void check_vram(const GuardOptions& o) {
-        if (card_.empty() || o.need_vram <= 0)
+        if (o.need_vram <= 0)  // the card was resolved; the test asks for no VRAM
             return;
         CardVram v = read_card_vram(o.sysfs_root, card_);
         int64_t free_bytes = v.total - v.used;

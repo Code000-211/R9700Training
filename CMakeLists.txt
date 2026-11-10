@@ -186,8 +186,7 @@ if(R97_BUILD_TESTS)
 
   # host tests, one binary; every source under tests/host/ joins it.
   file(GLOB R97_HOST_TEST_SOURCES CONFIGURE_DEPENDS
-       ${CMAKE_CURRENT_SOURCE_DIR}/tests/host/*.cpp
-       ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/*.cpp)
+       ${CMAKE_CURRENT_SOURCE_DIR}/tests/host/*.cpp)
   if(NOT R97_HOST_TEST_SOURCES STREQUAL "")
     add_executable(r97_host_tests ${R97_HOST_TEST_SOURCES})
     target_link_libraries(r97_host_tests PRIVATE r97)
@@ -198,8 +197,7 @@ if(R97_BUILD_TESTS)
   # gpu tests: need the card, run serially. Same shape as the host binary; empty until the device
   # issues add sources.
   file(GLOB R97_GPU_TEST_SOURCES CONFIGURE_DEPENDS
-       ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/*.cpp
-       ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/*.cpp)
+       ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/*.cpp)
   if(NOT R97_GPU_TEST_SOURCES STREQUAL "")
     add_executable(r97_gpu_tests ${R97_GPU_TEST_SOURCES})
     target_link_libraries(r97_gpu_tests PRIVATE r97)
@@ -207,13 +205,11 @@ if(R97_BUILD_TESTS)
   endif()
 
   file(GLOB R97_MODEL_TEST_SOURCES CONFIGURE_DEPENDS
-       ${CMAKE_CURRENT_SOURCE_DIR}/tests/model/*.cpp
-       ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/*.cpp)
+       ${CMAKE_CURRENT_SOURCE_DIR}/tests/model/*.cpp)
   if(NOT R97_MODEL_TEST_SOURCES STREQUAL "")
     add_executable(r97_model_tests ${R97_MODEL_TEST_SOURCES})
     target_link_libraries(r97_model_tests PRIVATE r97)
-    target_include_directories(r97_model_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-                                                      ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_include_directories(r97_model_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(r97_model_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
   endif()
 

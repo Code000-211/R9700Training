@@ -2,15 +2,17 @@
 //
 // Tests that open the real model container (the label `model`) resolve it through this header:
 //
-//   std::string why;
-//   auto rad = r97test::resolve_container(R97_MODEL_RAD, &why);
-//   if (!rad)
-//       throw r97test::Skip{why};   // main prints why; the binary exits kSkip (77) when nothing
-//                                   // failed and at least one test skipped
+//   const std::string rad = r97test::container_or_skip(R97_MODEL_RAD);
+//
+// When the container is absent the run is skipped: the helper prints the message that says what
+// it looked for and how to fetch the file, then ends the process with kSkip (77). Every model
+// test needs the container, so skipping is all-or-nothing and ctest records the tier as skipped
+// (SKIP_RETURN_CODE in CMakeLists.txt) rather than failed. resolve_container() is the same
+// resolution without the exit, for a caller that wants to report the absence itself.
 //
 // Resolution order:
 //   1. $R97_MODEL_DIR when set: the variable may name a .rad file or a directory that holds the
-//      container (the first *.rad inside, sorted; a matching qwen3.8-27b-iq4r-s-v4-rad name wins).
+//      container (the first *.rad inside, sorted; a matching qwen3.8-27b-iq4r-s-v4.rad wins).
 //   2. the R97_MODEL_RAD macro the build resolved at configure time, when that file exists,
 //   3. the default directory /srv/models/qwen3.8-27b-iqr-v4.
 // Anything else skips the test: the message says what it looked for and how to fetch the file.
@@ -20,6 +22,8 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -27,8 +31,8 @@
 
 namespace r97test {
 
-// The exit status a tier binary returns when no test failed and at least one skipped (autotools
-// convention; ctest records the run, not a failure), and the MiB unit; both are shared with
+// The exit status a model binary returns when the container is absent (autotools convention;
+// ctest records the run as skipped, not as a failure), and the MiB unit; both are shared with
 // tests/support/gpu_guard.h, which includes this header.
 inline constexpr int kSkip = 77;
 
@@ -104,6 +108,23 @@ inline std::optional<std::string> resolve_container(const std::string& explicit_
                + ". Set R97_MODEL_DIR to the .rad or its directory, or fetch it:\n"
                  "  hf download StillDeadcode/qwen3.8-27b-iqr-v4 qwen3.8-27b-iq4r-s-v4.rad";
     return std::nullopt;
+}
+
+// Ends the run as skipped: the message names what was looked for, the status is kSkip.
+[[noreturn]] inline void skip(const std::string& why) {
+    std::fprintf(stderr, "skip: %s\n", why.c_str());
+    std::fflush(stderr);
+    std::_Exit(kSkip);
+}
+
+// The container's path, or -- when it is absent -- the skip above. This is what a model test
+// calls first; it never returns without a container on disk.
+inline std::string container_or_skip(const std::string& explicit_rad = "") {
+    std::string why;
+    const std::optional<std::string> rad = resolve_container(explicit_rad, &why);
+    if (!rad)
+        skip(why);
+    return *rad;
 }
 
 }  // namespace r97test
