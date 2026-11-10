@@ -4,6 +4,9 @@
 #include "r97/batcher.h"
 
 #include <algorithm>
+// The default build type is RelWithDebInfo, which defines NDEBUG and turns assert into a no-op.
+// In a test the assertions are the test, so keep them live in this translation unit.
+#undef NDEBUG
 #include <cassert>
 #include <cstdio>
 #include <set>
@@ -47,8 +50,7 @@ std::vector<TokenSeq> make_sequences(const std::vector<int64_t>& lens) {
 std::vector<size_t> coverage(const std::vector<std::vector<Batch>>& epoch,
                              const std::vector<int64_t>& lens) {
     std::vector<size_t> seen;
-    size_t steps = (size_t)epoch[0].size();
-    for (size_t step = 0; step < steps; ++step) {
+    for (size_t step = 0; step < epoch.size(); ++step) {
         for (const Batch& b : epoch[step]) {
             for (const TokenSeq& s : b) {
                 assert(!s.ids.empty());
@@ -73,10 +75,10 @@ std::vector<std::vector<Batch>> run_epoch(Batcher& b) {
 std::vector<std::vector<Batch>> whole_run(Batcher& b, int64_t epochs) {
     std::vector<std::vector<Batch>> all;
     for (int64_t e = 0; e < epochs; ++e) {
+        b.seek({e, 0});  // each epoch is its own shuffle
         auto one = run_epoch(b);
         assert((int64_t)one.size() == b.steps_in_epoch(e));
         for (auto& s : one) all.push_back(std::move(s));
-        b.reset();
     }
     return all;
 }
@@ -111,20 +113,28 @@ R97_TEST(batcher) {
             assert(total <= budget);
         }
 
-    // Every kept sequence appears exactly once per epoch.
+    // Every kept sequence appears exactly once per epoch, and no two epochs are the same shuffle.
+    std::vector<std::vector<size_t>> orders;
     {
-        std::vector<std::vector<Batch>> epoch0(run.begin(), run.begin() + b.steps_in_epoch(0));
-        auto seen = coverage(epoch0, lens);
-        std::set<size_t> uniq(seen.begin(), seen.end());
-        assert(seen.size() == 300 && uniq.size() == 300);
-        assert(uniq.find(300) == uniq.end());  // the skipped one is not in any batch
+        size_t lo = 0;
+        for (int64_t e = 0; e < 3; ++e) {
+            size_t hi = lo + (size_t)b.steps_in_epoch(e);
+            std::vector<std::vector<Batch>> epoch(run.begin() + (long)lo, run.begin() + (long)hi);
+            auto seen = coverage(epoch, lens);
+            std::set<size_t> uniq(seen.begin(), seen.end());
+            assert(seen.size() == 300 && uniq.size() == 300);
+            assert(uniq.find(300) == uniq.end());  // the skipped one is not in any batch
+            orders.push_back(std::move(seen));
+            lo = hi;
+        }
+        assert(orders[0] != orders[1] && orders[1] != orders[2]);
     }
 
     // Same seed gives the same batches; another seed does not.
     r97::BatcherConfig other = cfg;
     other.seed = 4321;
     Batcher b2(seqs, other);
-    auto run_other = whole_run(b2, 1);
+    auto run_other = whole_run(b2, 3);
     bool differs = false;
     for (size_t k = 0; k < std::min(run.size(), run_other.size()); ++k) {
         if (run[k].size() != run_other[k].size()) { differs = true; break; }
@@ -136,7 +146,7 @@ R97_TEST(batcher) {
     }
     assert(differs);
     Batcher b3(seqs, cfg);
-    auto run_again = whole_run(b3, 1);
+    auto run_again = whole_run(b3, 3);
     assert(run_again.size() == run.size());
     for (size_t k = 0; k < run.size(); ++k) {
         assert(run_again[k].size() == run[k].size());
@@ -180,4 +190,39 @@ R97_TEST(batcher) {
                          *std::min_element(loads.begin(), loads.end());
         assert(spread < max_seq);
     }
+}
+
+// A step's token loads must be balanced even when a greedy snake deal is not: with these lengths
+// three devices can get within 3 tokens of each other, below the maximal sequence's 4. A
+// move-only repair pass stops at the snake's spread of 4 because no single move improves it.
+R97_TEST(batcher_balance) {
+    const std::vector<int64_t> lens = {3, 3, 4, 4, 4, 4, 4, 4};
+    auto seqs = make_sequences(lens);
+
+    r97::BatcherConfig cfg;
+    cfg.token_budget = 30;  // the whole set fits one step
+    cfg.devices = 3;
+    cfg.seed = 99;
+    Batcher b(seqs, cfg);
+
+    std::vector<Batch> step;
+    assert(b.next(&step));
+    assert(step.size() == 3);
+
+    std::vector<int64_t> loads(3, 0);
+    size_t seen = 0;
+    int64_t max_seq = 0;
+    for (const Batch& sub : step) {
+        size_t d = (size_t)(&sub - step.data());
+        for (const TokenSeq& s : sub) {
+            loads[d] += tokens(s);
+            max_seq = std::max(max_seq, tokens(s));
+            ++seen;
+        }
+    }
+    assert(seen == lens.size());
+    int64_t spread = *std::max_element(loads.begin(), loads.end()) -
+                     *std::min_element(loads.begin(), loads.end());
+    assert(spread < max_seq);
+    assert(!b.next(&step));  // one step holds the whole set
 }

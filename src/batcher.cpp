@@ -50,57 +50,30 @@ std::vector<size_t> epoch_order(const std::vector<size_t>& kept, uint64_t seed, 
     return order;
 }
 
-// A step's sequences -> one sub-batch per device with balanced token counts. Sorted longest first
-// and dealt out in snake order (device 0..N-1, then back), which spreads similar lengths evenly;
-// a repair pass then moves the smallest sequence from the fullest to the emptiest device while the
-// spread is not below one maximal sequence. (A spread of exactly one maximal sequence can be
-// forced -- three budget-length sequences into two devices -- and no arrangement does better.)
+// A step's sequences -> one sub-batch per device with balanced token counts. Longest first, each
+// sequence handed to the least-loaded device; this keeps the spread below the longest sequence of
+// the step. (A spread of exactly one maximal sequence can be forced -- one sequence for two
+// devices, or three budget-length sequences into two devices -- and no arrangement does better.)
 std::vector<std::vector<size_t>> balance(const std::vector<size_t>& idx,
                                          const std::vector<int64_t>& lens, int devices) {
     std::vector<size_t> sorted = idx;
-    std::sort(sorted.begin(), sorted.end(),
-              [&](size_t a, size_t b) { return lens[a] > lens[b]; });
+    std::sort(sorted.begin(), sorted.end(), [&](size_t a, size_t b) {
+        if (lens[a] != lens[b]) return lens[a] > lens[b];
+        return a < b;
+    });
     std::vector<std::vector<size_t>> subs((size_t)devices);
     std::vector<int64_t> loads((size_t)devices, 0);
-    int d = 0, dir = 1;
     for (size_t s : sorted) {
-        subs[(size_t)d].push_back(s);
-        loads[(size_t)d] += lens[s];
-        int nd = d + dir;
-        if (nd < 0 || nd == devices) { dir = -dir; nd = d + dir; }
-        d = nd;
+        size_t d = (size_t)(std::min_element(loads.begin(), loads.end()) - loads.begin());
+        subs[d].push_back(s);
+        loads[d] += lens[s];
     }
-    const int64_t max_seq = lens[sorted[0]];
-    for (;;) {
-        size_t mx = (size_t)(std::max_element(loads.begin(), loads.end()) - loads.begin());
-        size_t mn = (size_t)(std::min_element(loads.begin(), loads.end()) - loads.begin());
-        if (loads[mx] - loads[mn] < max_seq) break;
-        // The smallest sequence of the fullest device, moved over: strict improvement or stop.
-        auto it = std::min_element(subs[mx].begin(), subs[mx].end(),
-                                   [&](size_t a, size_t b) { return lens[a] < lens[b]; });
-        int64_t len = lens[*it];
-        int64_t spread = loads[mx] - loads[mn];
-        // spread' = max(load anywhere) - (loads[mn] + len)
-        int64_t new_max = 0;
-        for (size_t k = 0; k < subs.size(); ++k) {
-            if (k == mx) continue;
-            new_max = std::max(new_max, loads[k]);
-        }
-        new_max = std::max({new_max, loads[mx] - len, loads[mn] + len});
-        int64_t new_min = loads[mn] + len;
-        for (size_t k = 0; k < subs.size(); ++k) {
-            if (k == mn) continue;
-            new_min = std::min(new_min, k == mx ? loads[mx] - len : loads[k]);
-        }
-        if (new_max - new_min >= spread) break;
-        subs[mn].push_back(*it);
-        subs[mx].erase(it);
-        loads[mn] += len;
-        loads[mx] -= len;
-    }
-    // Keep a stable order inside each sub-batch: longest first.
+    // Keep a stable order inside each sub-batch: longest first, input index to break ties.
     for (auto& sub : subs)
-        std::sort(sub.begin(), sub.end(), [&](size_t a, size_t b) { return lens[a] > lens[b]; });
+        std::sort(sub.begin(), sub.end(), [&](size_t a, size_t b) {
+            if (lens[a] != lens[b]) return lens[a] > lens[b];
+            return a < b;
+        });
     return subs;
 }
 
