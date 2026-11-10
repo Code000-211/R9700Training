@@ -30,7 +30,7 @@ struct ScoredRow {
     int32_t id = 0;
 };
 
-// bf16 bits (memory order: bf16_to_f32 of the two bytes little-endian) to f32.
+// bf16 bits to f32: the 16 bits are the high half of the f32's 32, and the widening is exact.
 inline float bf16_to_f32(uint16_t v) {
     const uint32_t u = uint32_t(v) << 16;
     float f;
@@ -67,10 +67,12 @@ CeSum ce_loss(const Batch& batch, const float* logits, int64_t vocab);
 CeSum ce_loss(const Batch& batch, const std::vector<float>& logits, int64_t vocab);
 CeSum ce_loss(const Batch& batch, const std::vector<uint16_t>& bf16_logits, int64_t vocab);
 
+// The rows lo..hi-1 of the batch's concatenated rows that are scored, as ce_sum takes them.
+std::vector<ScoredRow> ce_grad_rows(const Batch& batch, int64_t lo, int64_t hi);
+
 // The gradient of the summed loss scaled by `grad_scale` (pass 1.0/scored for the mean) with
 // respect to every logits row: softmax minus one-hot on the scored rows, zero elsewhere.
 // `out` must hold a zeroed buffer of rows*vocab; rows as in ce_loss.
-std::vector<ScoredRow> ce_grad_rows(const Batch& batch, int64_t lo, int64_t hi);
 void ce_grad(const Batch& batch, const float* logits, int64_t vocab, double grad_scale, float* out);
 
 // The Objective: reads the boundary "logits" in the window the tape gives (a differentiated
