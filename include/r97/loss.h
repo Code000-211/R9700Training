@@ -76,9 +76,10 @@ void ce_grad(const Batch& batch, const float* logits, int64_t vocab, double grad
 // The Objective: reads the boundary "logits" in the window the tape gives (a differentiated
 // read), takes ids and score mask from fwd.batch(), and returns the window's summed loss, its
 // scored count and one Seed on "logits" over the window's scored rows -- contiguous from the
-// first to the last scored row, zeros on unscored rows inside -- whose cotangent is the gradient
-// above scaled by 1/fwd.total_scored(). Called window by window it gives the same sum and the
-// same cotangent rows as called once.
+// first to the last scored row, in the buffer's own rows (the ones window/read count in), with
+// zeros on unscored rows inside -- whose cotangent is the gradient above scaled by
+// 1/fwd.total_scored(). Called window by window it gives the same sum and the same cotangent
+// rows as called once.
 ObjectiveResult CeObjective(const ForwardTape& fwd, const ParamSet& deltas);
 
 }  // namespace r97

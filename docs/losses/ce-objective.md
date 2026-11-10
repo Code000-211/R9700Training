@@ -50,7 +50,8 @@ row falls in a window, with row offsets that accumulate `L - 1` per sequence.
 - takes ids and the score mask from `fwd.batch()`,
 - returns `ObjectiveResult`: the window's summed loss (f64), the window's
   scored count, and exactly one `Seed` on `"logits"` spanning the window's
-  scored rows (first through last; zeros on unscored rows inside), scaled by
+  scored rows (first through last, in the buffer's own row numbers — the ones
+  `window` and `read` count in — with zeros on unscored rows inside), scaled by
   `1 / fwd.total_scored()` — of the whole step, not of the window.
 
 Called window by window it gives the same sum and the same cotangent rows as
@@ -63,4 +64,7 @@ finite differences, a row with 1e30 logits staying finite, chunked equals
 whole, bf16 equals f32. `tests/host/loss_ce_tape.cpp`: on a `VectorTape`
 (`tests/support/vector_tape.h`) exactly one seed, on `logits`, bit-identical to
 the gradient function's output, its read recorded as differentiated, and the
-chunked tape equal to the whole call.
+chunked tape equal to the whole call; and the seed's row range is the window's
+span of scored rows — scored rows 2 and 3 of a five-row window give rows
+`[2, 4)`, and a window's unscored edge rows are outside it — with a zero row
+between two scored ones it spans.
