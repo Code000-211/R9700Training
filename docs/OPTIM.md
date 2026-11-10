@@ -48,11 +48,22 @@ both moments and weights in the same pass. `threads = 0` uses `std::thread::hard
 
 ## Measured: one update at 10^8 parameters
 
-Single host test `optim` (`tests/host/optim.cpp`), threads=48, one 10^8-parameter tensor,
-f32 weights + moments + accumulation buffer (about 2 GB of state):
+The adapter's scale: one 10^8-parameter tensor on 48 threads (`threads = 0`, every core
+here), f32 weights + moments + accumulation buffer + gradients (about 2 GB of state),
+clipping on -- the step a training run takes, not a bare loop over weights.
 
-| machine                         | one AdamW update (warm) |
-| ------------------------------- | ----------------------- |
-| this run's host (48 threads)    | 0.23 s                  |
+`tests/host/optim.cpp` measures it, but only when asked: the `host` label runs anywhere and
+2 GB is not anywhere, so the measurement is opt-in and asserts nothing.
 
-Well under the one-second bar. The test asserts under 1 s and prints its own measurement.
+```
+R97_OPTIM_BENCH=100000000 ./build/r97_host_tests
+```
+
+It prints the time of one warm update. On this run's host:
+
+| machine                      | one AdamW update (warm) |
+| ---------------------------- | ----------------------- |
+| this run's host (48 threads) | 0.24 s                  |
+
+Five runs after warm-up gave 0.232 s to 0.239 s, peak RSS 1.9 GB. Well under the
+one-second bar.

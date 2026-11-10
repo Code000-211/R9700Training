@@ -77,12 +77,27 @@ void put(std::vector<uint8_t>& out, const T& v) {
 
 template <class T>
 const uint8_t* get(const uint8_t* p, const uint8_t* end, T& v) {
-    if (size_t(end - p) < sizeof(T)) throw std::runtime_error("r97::Optimiser::restore: truncated buffer");
+    if (size_t(end - p) < sizeof(T))
+        throw std::runtime_error("r97::Optimiser::restore: truncated buffer");
     std::memcpy(&v, p, sizeof(T));
     return p + sizeof(T);
 }
 
- }  // namespace
+// Bulk forms of the same bytes, so a checkpoint of 10^8 parameters is a memcpy per tensor
+// rather than 4*10^8 one-element appends.
+void put_floats(std::vector<uint8_t>& out, const float* src, size_t n) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(src);
+    out.insert(out.end(), p, p + n * sizeof(float));
+}
+
+const uint8_t* get_floats(const uint8_t* p, const uint8_t* end, float* dst, size_t n) {
+    if (size_t(end - p) < n * sizeof(float))
+        throw std::runtime_error("r97::Optimiser::restore: truncated buffer");
+    std::memcpy(dst, p, n * sizeof(float));
+    return p + n * sizeof(float);
+}
+
+}  // namespace
 
 float scheduled_lr(const AdamWConfig& cfg, int step) {
     if (step <= 0) return 0.0f;
@@ -95,7 +110,8 @@ float scheduled_lr(const AdamWConfig& cfg, int step) {
     const double floor = base * (cfg.lr_floor_frac >= 0.0f ? double(cfg.lr_floor_frac) : 0.0);
     const double horizon = double(cfg.total_steps - cfg.warmup_steps);
     const double t = std::min(double(step - cfg.warmup_steps), horizon);
-    return float(floor + (base - floor) * 0.5 * (1.0 + std::cos(3.14159265358979323846 * t / horizon)));
+    const double angle = 3.14159265358979323846 * t / horizon;
+    return float(floor + (base - floor) * 0.5 * (1.0 + std::cos(angle)));
 }
 
 float clip_global_norm(ParamSet& grads, float max_norm) {
@@ -122,12 +138,14 @@ float clip_global_norm(ParamSet& grads, float max_norm) {
 
 Optimiser::Optimiser(ParamSet& params, AdamWConfig cfg) : params_(params), cfg_(std::move(cfg)) {
     if (params_.empty()) throw std::invalid_argument("r97: Optimiser: empty parameter set");
-    if (cfg_.accum_steps <= 0) throw std::invalid_argument("r97: Optimiser: accum_steps must be >= 1");
+    if (cfg_.accum_steps <= 0)
+        throw std::invalid_argument("r97: Optimiser: accum_steps must be >= 1");
     for (const auto& p : params_) {
         size_t prod = 1;
         for (int64_t s : p.shape) prod *= size_t(s);
         if (prod != p.value.size())
-            throw std::invalid_argument("r97: Optimiser: shape and value size disagree for '" + p.name + "'");
+            throw std::invalid_argument("r97: Optimiser: shape and value size disagree for '" +
+                                        p.name + "'");
     }
     for (const auto& p : params_) {
         m_.push_back(Param{p.name, p.shape, std::vector<float>(p.value.size(), 0.0f)});
@@ -135,7 +153,8 @@ Optimiser::Optimiser(ParamSet& params, AdamWConfig cfg) : params_(params), cfg_(
         g_.push_back(Param{p.name, p.shape, std::vector<float>(p.value.size(), 0.0f)});
     }
     offsets_.resize(params_.size() + 1);
-    for (size_t i = 0; i < params_.size(); ++i) offsets_[i + 1] = offsets_[i] + params_[i].value.size();
+    for (size_t i = 0; i < params_.size(); ++i)
+        offsets_[i + 1] = offsets_[i] + params_[i].value.size();
     decay_.resize(params_.size(), 1);
     for (size_t i = 0; i < params_.size(); ++i)
         for (const auto& nd : cfg_.no_decay)
@@ -155,7 +174,8 @@ bool Optimiser::step(const ParamSet& grads) {
     for (size_t i = 0; i < params_.size(); ++i)
         if (grads[i].name != params_[i].name || grads[i].shape != params_[i].shape ||
             grads[i].value.size() != params_[i].value.size())
-            throw std::invalid_argument("r97: Optimiser step: grads do not match the parameter set");
+            throw std::invalid_argument(
+                "r97: Optimiser step: grads do not match the parameter set");
     const size_t total = offsets_.back();
     const auto* off = offsets_.data();
     const auto* gp = grads.data();
@@ -249,8 +269,7 @@ std::vector<uint8_t> Optimiser::serialise() const {
         put(out, uint64_t(n));
         const float* src[4] = {params_[i].value.data(), m_[i].value.data(), v_[i].value.data(),
                                g_[i].value.data()};
-        for (int a = 0; a < 4; ++a)
-            for (size_t j = 0; j < n; ++j) put(out, src[a][j]);
+        for (int a = 0; a < 4; ++a) put_floats(out, src[a], n);
     }
     return out;
 }
@@ -269,7 +288,8 @@ void Optimiser::restore(const std::vector<uint8_t>& bytes) {
         p = get(p, end, version);
         p = get(p, end, pad);
         if (version != kVersion)
-            throw std::runtime_error("r97::Optimiser::restore: unsupported version " + std::to_string(version));
+            throw std::runtime_error("r97::Optimiser::restore: unsupported version " +
+                                     std::to_string(version));
         int64_t step;
         int32_t accum_count, nparams;
         p = get(p, end, step);
@@ -284,10 +304,11 @@ void Optimiser::restore(const std::vector<uint8_t>& bytes) {
             uint64_t n;
             p = get(p, end, n);
             if (n != params_[i].value.size())
-                throw std::runtime_error("r97::Optimiser::restore: wrong size for '" + params_[i].name + "'");
-            float* dst[4] = {w[i].value.data(), m[i].value.data(), v[i].value.data(), g[i].value.data()};
-            for (int a = 0; a < 4; ++a)
-                for (size_t j = 0; j < n; ++j) p = get(p, end, dst[a][j]);
+                throw std::runtime_error("r97::Optimiser::restore: wrong size for '" +
+                                         params_[i].name + "'");
+            float* dst[4] = {w[i].value.data(), m[i].value.data(), v[i].value.data(),
+                             g[i].value.data()};
+            for (int a = 0; a < 4; ++a) p = get_floats(p, end, dst[a], n);
         }
         if (p != end) throw std::runtime_error("r97::Optimiser::restore: trailing bytes");
         params_ = std::move(w);

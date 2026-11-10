@@ -1,20 +1,19 @@
 // tests/host/optim.cpp -- host tests for r97::Optimiser (include/r97/optim.h).
 // Convex-quadratic convergence; the update over three steps matches a hand-computed AdamW
-// to 1e-6; schedule values; clipping; gradient accumulation over k steps; serialise-and-
-// continue bit-identity; and the single-update timing at 10^8 parameters.
-#include "r97/optim.h"
-#include "support/test.h"
-
+// to 1e-6; schedule values; clipping; gradient accumulation over k steps; and serialise-and-
+// continue bit-identity. The update-time measurement behind docs/OPTIM.md lives here too,
+// but opt-in: at 10^8 parameters it allocates a few GB, and the host label runs anywhere, so
+// R97_OPTIM_BENCH=<parameter count> asks for it and the always-run suite never pays for it.
 #include "r97/optim.h"
 #include "r97/params.h"
+#include "support/test.h"
 
-#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 using r97::AdamWConfig;
@@ -88,12 +87,12 @@ void test_quadratic_converges() {
     for (int it = 0; it < 400; ++it) {
         double loss = 0.0;
         ParamSet grads;
-        size_t i = 0;
+        size_t i = 0;  // flat index, for q and the loss
         for (const auto& p : params) {
             std::vector<float> g(p.value.size());
-            for (auto& x : g) {
-                x = float(q[i] * p.value[i]);
-                loss += 0.5 * q[i] * double(p.value[i]) * double(p.value[i]);
+            for (size_t j = 0; j < p.value.size(); ++j) {
+                g[j] = float(q[i] * p.value[j]);
+                loss += 0.5 * q[i] * double(p.value[j]) * double(p.value[j]);
                 ++i;
             }
             grads.push_back(Param{p.name, p.shape, g});
@@ -123,7 +122,8 @@ void test_three_steps_match_hand_computation() {
         reference_step(w, m, v, std::vector<double>(G[t], G[t] + 4), lr, cf, t + 1, true);
         const double err = max_abs(flat_of(params), w);
         R97_CHECK(err < 1e-6);
-        if (t == 2) std::printf("  three AdamW steps match the hand computation (max err %.2e)\n", err);
+        if (t == 2)
+            std::printf("  three AdamW steps match the hand computation (max err %.2e)\n", err);
     }
     R97_CHECK(opt.updates_done() == 3);
 }
@@ -140,7 +140,7 @@ void test_schedule_values() {
     R97_CHECK(std::abs(r97::scheduled_lr(cfg, 10) - 2e-3f) < 1e-6);        // warm-up ends at lr
     const double floor = 2e-3 * 0.1;
     R97_CHECK(std::abs(r97::scheduled_lr(cfg, 55) - 0.5 * (floor + 2e-3)) < 1e-6);  // mid cosine
-    R97_CHECK(std::abs(r97::scheduled_lr(cfg, 100) - floor) < 1e-6);       // the floor at the horizon
+    R97_CHECK(std::abs(r97::scheduled_lr(cfg, 100) - floor) < 1e-6);  // the floor at the horizon
     R97_CHECK(std::abs(r97::scheduled_lr(cfg, 500) - floor) < 1e-6);       // flat past the horizon
     AdamWConfig nocos;
     nocos.lr = 3e-3f;
@@ -342,27 +342,38 @@ void test_serialise_and_continue() {
     std::printf("  serialise-and-continue ok (%zu bytes)\n", bytes.size());
 }
 
-void test_single_update_timing() {
-    // 10^8 parameters, one huge parameter: the adapter-scale number the issue names.
-    const size_t n = 100000000;
+// The measurement docs/OPTIM.md records: one update over `R97_OPTIM_BENCH` parameters, the
+// adapter's scale at 10^8. It reports the time and passes no judgement on it -- the number
+// belongs in the doc, and a wall-clock assertion in the always-run suite would fail under
+// load or on a machine that cannot hold the state (about 2 GB at 10^8, weights + moments +
+// accumulation buffer + gradients).
+void bench_one_update() {
+    const char* asked = std::getenv("R97_OPTIM_BENCH");
+    if (asked == nullptr || *asked == '\0') return;
+    const size_t n = size_t(std::strtoull(asked, nullptr, 10));
+    if (n == 0) {
+        std::fprintf(stderr, "  bench: R97_OPTIM_BENCH is not a parameter count: '%s'\n", asked);
+        return;
+    }
     ParamSet params;
     params.push_back(make("model.layers.3.mlp.down_proj.lora_A", {int64_t(n)},
                           std::vector<float>(n, 0.01f)));
     AdamWConfig cfg;
     cfg.lr = 1e-3f;
     cfg.weight_decay = 0.01f;
-    cfg.clip_norm = 1.0f;
-    cfg.threads = 48;
+    cfg.clip_norm = 1.0f;  // the step the trainer takes: clip, then AdamW
+    cfg.threads = 0;       // every core the machine has
     Optimiser opt(params, cfg);
     ParamSet grads;
     grads.push_back(Param{"model.layers.3.mlp.down_proj.lora_A", {int64_t(n)},
                           std::vector<float>(n, 1e-4f)});
-    opt.step(grads);  // warm up the allocator and the pools
+    opt.step(grads);  // warm: first-touch the pages and the thread pool
     const auto t0 = std::chrono::steady_clock::now();
     opt.step(grads);
-    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::printf("  one AdamW update at %zu parameters: %.3f s on %d threads\n", n, secs, opt.threads());
-    R97_CHECK(secs < 1.0);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(t1 - t0).count();
+    std::printf("  bench: one AdamW update at %zu parameters: %.3f s on %d threads\n", n, secs,
+                opt.threads());
 }
 
 }  // namespace
@@ -376,6 +387,6 @@ R97_TEST(optim) {
     test_no_decay_list();
     test_bad_inputs_throw();
     test_serialise_and_continue();
-    test_single_update_timing();
+    bench_one_update();
 }
 
