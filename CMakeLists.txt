@@ -157,6 +157,11 @@ target_include_directories(r97
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(r97 PUBLIC rad_core)
 
+# An op's twin and adjoint register themselves from a static object in the op's own file, so no
+# file lists the ops (r97/adjoint.h). An archive link drops the members nothing references, so
+# every binary that asks the registry links r97 whole.
+set(R97_LINK_WHOLE "$<LINK_LIBRARY:WHOLE_ARCHIVE,r97>")
+
 if(NOT R97_PATCH_SET STREQUAL "all")
   message(STATUS "r97: R97_PATCH_SET=${R97_PATCH_SET}: serving build, no r97train")
 else()
@@ -168,7 +173,7 @@ else()
   target_compile_features(r97train PRIVATE cxx_std_20)
   target_include_directories(r97train PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools
                                               ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_link_libraries(r97train PRIVATE r97)
+  target_link_libraries(r97train PRIVATE ${R97_LINK_WHOLE})
 endif()
 
 # ------------------------------------------------------------------ tests
@@ -191,7 +196,7 @@ if(R97_BUILD_TESTS)
        ${CMAKE_CURRENT_SOURCE_DIR}/tests/host/*.cpp)
   if(NOT R97_HOST_TEST_SOURCES STREQUAL "")
     add_executable(r97_host_tests ${R97_HOST_TEST_SOURCES})
-    target_link_libraries(r97_host_tests PRIVATE r97)
+    target_link_libraries(r97_host_tests PRIVATE ${R97_LINK_WHOLE})
     target_include_directories(r97_host_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_compile_definitions(r97_host_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
   endif()
@@ -202,7 +207,7 @@ if(R97_BUILD_TESTS)
        ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/*.cpp)
   if(NOT R97_GPU_TEST_SOURCES STREQUAL "")
     add_executable(r97_gpu_tests ${R97_GPU_TEST_SOURCES})
-    target_link_libraries(r97_gpu_tests PRIVATE r97)
+    target_link_libraries(r97_gpu_tests PRIVATE ${R97_LINK_WHOLE})
     target_include_directories(r97_gpu_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   endif()
 
@@ -210,7 +215,7 @@ if(R97_BUILD_TESTS)
        ${CMAKE_CURRENT_SOURCE_DIR}/tests/model/*.cpp)
   if(NOT R97_MODEL_TEST_SOURCES STREQUAL "")
     add_executable(r97_model_tests ${R97_MODEL_TEST_SOURCES})
-    target_link_libraries(r97_model_tests PRIVATE r97)
+    target_link_libraries(r97_model_tests PRIVATE ${R97_LINK_WHOLE})
     target_include_directories(r97_model_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(r97_model_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
   endif()
