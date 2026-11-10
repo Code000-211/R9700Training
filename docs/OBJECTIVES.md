@@ -91,4 +91,4 @@ whichever issue adds one adds its line here. `r97train objectives` and `r97train
 print the live list.
 
 The registries in `r97train` and in a test binary are separate: the test objective and
-test delta under `tests/support/` are registered only in the test binaries.
+test delta under `tests/support/` are registered only in the host test binary.
