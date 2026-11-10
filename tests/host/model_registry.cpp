@@ -1,6 +1,6 @@
 // tests/host/model_registry.cpp -- objectives and deltas resolve by name, and an unknown name is
-// refused with the list of the registered ones (label: host). The names are registered once, by
-// tests/host/test_registrations.cpp, because the host tier is one binary.
+// refused with the list of the registered ones (label: host). The names used here are registered
+// once for the whole binary, by tests/host/test_registrations.cpp.
 #include "r97/config.h"
 #include "r97/model.h"
 
@@ -33,9 +33,7 @@ std::string refusal_of(const r97::Config& cfg) {
 
 }  // namespace
 
-// Called by tests/host/test_registrations.cpp, which places the test entry after every static
-// registration the test binary needs.
-void run_model_registry() {
+R97_TEST(model_registry) {
     // The test registrations are in the lists.
     R97_CHECK(contains(r97::objective_names(), "test_sum"));
     R97_CHECK(contains(r97::delta_names(), "test_bias"));

@@ -10,13 +10,18 @@ namespace r97 {
 // ------------------------------------------------------------------ the registries by name
 
 std::map<std::string, ObjectiveFactory>& objective_registry() {
-    static std::map<std::string, ObjectiveFactory> table;
-    return table;
+    // The table is deliberately never destroyed. Static registration fills it, and the host tests
+    // run from an exit handler: exit destroys each translation unit's statics in the reverse of
+    // the order they initialised in, and a test file whose translation unit happens to initialise
+    // before this one would then find the table torn down when the handler runs. A table that
+    // outlives the process is a table no reader can see destroyed.
+    static auto* table = new std::map<std::string, ObjectiveFactory>();
+    return *table;
 }
 
 std::map<std::string, DeltaFactory>& delta_registry() {
-    static std::map<std::string, DeltaFactory> table;
-    return table;
+    static auto* table = new std::map<std::string, DeltaFactory>();   // never destroyed: see above
+    return *table;
 }
 
 std::vector<std::string> objective_names() {

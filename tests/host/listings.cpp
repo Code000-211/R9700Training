@@ -32,9 +32,7 @@ std::string run(const char* name) {
 
 }  // namespace
 
-// Called by tests/host/test_registrations.cpp, which places the test entry after every static
-// registration the test binary needs.
-void run_listings() {
+R97_TEST(listings) {
     const std::string objectives = run("objectives");
     const std::string deltas = run("deltas");
 

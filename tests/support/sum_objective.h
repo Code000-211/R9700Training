@@ -1,6 +1,6 @@
 // tests/support/sum_objective.h -- a test objective: a sum of the chosen rows of a chosen
-// boundary, seeded back onto it. Registered by name from the test binaries only (see
-// tests/host/model_registry.cpp and tests/host/listings.cpp).
+// boundary, seeded back onto it. Registered by name from the test binaries only, by
+// tests/host/test_registrations.cpp.
 //
 // The objective reads rows [lo, hi) of `buffer` as differentiated and, when the buffer has one,
 // the next row as detached, so a test can see both kinds of read in the tape's record. Its seed

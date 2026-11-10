@@ -24,7 +24,8 @@ using ObjectiveFactory = Objective (*)(const Config&);                 // gives 
 using DeltaFactory     = std::shared_ptr<Delta> (*)(const Config&);    // the trainable kind
 
 // What the registries hold, so listing (r97train objectives) and lookups (make_model) see the
-// same tables. Static registration happens before main, in any order.
+// same tables. Static registration happens before main, in any order. A table lives until the
+// process exits, so a reader that runs at exit (the host test runner) always sees it whole.
 std::map<std::string, ObjectiveFactory>& objective_registry();
 std::map<std::string, DeltaFactory>& delta_registry();
 

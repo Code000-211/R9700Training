@@ -39,9 +39,7 @@ Seed ones(const char* buffer, int64_t lo, int64_t hi) {
 
 }  // namespace
 
-// Called by tests/host/test_registrations.cpp, which places the test entry after every static
-// registration the test binary needs.
-void run_seed_check() {
+R97_TEST(seed_check) {
     // 1. A seed on a buffer that is not a boundary of the tape.
     {
         r97test::RecordedVectorTape tape = tape_with_logits();
