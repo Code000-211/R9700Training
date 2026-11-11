@@ -6,8 +6,9 @@ from the safetensors specification and PEFT's naming rule, not by calling the wr
 tests/host/adapter_io.cpp comparing the writer's output to this directory says the writer follows
 the document and not only itself.
 
-The adapter is the tiny fixture container's (`tests/support/fixture.h`: hidden 64, ffn 128) one
-module at rank 2, `model.layers.0.mlp.down_proj`, so shapes are A [2, 128], B [64, 2]. Values are
+The adapter is the tiny fixture container's (`tests/support/fixture.h`: hidden 128, ffn 256) one
+module at rank 2, `model.layers.0.mlp.down_proj`, so shapes are A [2, 256], B [128, 2] -- the
+module is [hidden, ffn]. Values are
 exact integers, so an f32 round trip is exact and a mismatch is a layout error, not a rounding one.
 
 Run from this directory:  python3 make_fixture.py
@@ -19,8 +20,8 @@ import struct
 MODULE = "model.layers.0.mlp.down_proj"
 PREFIX = "base_model.model."
 RANK = 2
-K = 128   # down_proj's input: the ffn width
-N = 64    # down_proj's output: the hidden width
+K = 256   # down_proj's input: the ffn width
+N = 128   # down_proj's output: the hidden width
 
 
 def factors():

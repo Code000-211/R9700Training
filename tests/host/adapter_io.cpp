@@ -53,17 +53,18 @@ std::string slurp(const fs::path& p) {
 }
 
 // The reference adapter's factors, written from the same expressions as the fixture's
-// make_fixture.py: A[r][k] = r * 128 + k, B[n][r] = -(n * 2 + r + 1), all exact in f32.
+// make_fixture.py: A[r][k] = r * 256 + k, B[n][r] = -(n * 2 + r + 1), all exact in f32. The module
+// is the tiny model's down_proj, so A is [2, 256] and B [128, 2].
 ParamSet reference_params() {
     Param a;
     a.name = "model.layers.0.mlp.down_proj.lora_A";
-    a.shape = {2, 128};
+    a.shape = {2, 256};
     for (int64_t r = 0; r < 2; ++r)
-        for (int64_t k = 0; k < 128; ++k) a.value.push_back(float(r * 128 + k));
+        for (int64_t k = 0; k < 256; ++k) a.value.push_back(float(r * 256 + k));
     Param b;
     b.name = "model.layers.0.mlp.down_proj.lora_B";
-    b.shape = {64, 2};
-    for (int64_t n = 0; n < 64; ++n)
+    b.shape = {128, 2};
+    for (int64_t n = 0; n < 128; ++n)
         for (int64_t r = 0; r < 2; ++r) b.value.push_back(float(-(n * 2 + r + 1)));
     return {a, b};
 }
