@@ -701,7 +701,12 @@ R97_MODEL_TEST(iqr_decode) {
     if (head) time_case(plugin, f, *head, 256, "output.k3 head chunk");
     const RadFileEntry* emb = f.find("token_embd.weight");
     if (emb) time_case(plugin, f, *emb, 256, "token_embd head chunk");
-    if (draft) time_case(plugin, f, *draft, 8192, "draft head chunk");
+    if (draft) {
+        time_case(plugin, f, *draft, 8192, "draft head chunk");
+        // Half the head at once: 124160 affine runs, more than the card's grid.y holds, so this
+        // also times the run walk that a taller-than-the-limit launch needs.
+        time_case(plugin, f, *draft, draft->shape[0] / 2, "draft head half");
+    }
 
     dlclose(h);
 

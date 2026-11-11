@@ -10,8 +10,9 @@ for a range of output rows.
 - Host reference: `r97_iqr_decode_host` in `src/iqr_decode.h`, the same arithmetic as the kernel
   inline, for tests and the host tier.
 - Tests: `tests/host/iqr_decode.cpp` (synthetic forms of both kinds against libquant's
-  `grid_decode` / `grid_tcq_decode`) and `tests/gpu/iqr_decode.cpp` (the real container, every IQR
-  form, and the GEMM check).
+  `grid_decode` / `grid_tcq_decode`), `tests/gpu/iqr_decode.cpp` (the real container, every IQR
+  form, and the GEMM check) and `tests/gpu/iqr_decode_range.cpp` (a chunk taller than `grid.y`,
+  without the container).
 - Reference for the arithmetic: libquant `libquant/lq_grid.h`: `grid_tcq_decode` for the trellis
   forms and `grid_decode` for the affine one.
 
@@ -87,7 +88,7 @@ R97IqrDecodeDesc d{};
 //      out_codes, out_scale
 // the affine form instead sets affine = 1, zero, zero_bits and zero_row_bytes,
 // leaves state_bits, lut, mad and scale2 clear, and has run_rows = rb = 1
-r97_iqr_decode(&d, stream);   // asynchronous on `stream`; 0, or 1 outside the rules
+r97_iqr_decode(&d, stream);   // asynchronous on `stream`; 0, or 1 outside the rules or when the launch fails
 rad_stream_sync(stream);      // the caller's wait, on the stream it handed in
 ```
 
@@ -105,12 +106,17 @@ and its downloads.
 
 ## Layout of the launch
 
-One thread per column, one workgroup per trellis run: `grid = (ceil(cols/256), ceil(rows/T))`,
-block 256. Threads of a workgroup cover consecutive columns, so at each row they read consecutive
-packed codes of the same row; a column walks its run sequentially, seeded from the run's tail. An
-affine weight is the same launch with `T = 1`: a workgroup is one row and a thread its columns.
-There is no shared memory and no scratch beyond the two output buffers: the caller's scratch is
-exactly `rows × cols` int8 plus `rows × cols/128` bf16.
+One thread per column, one workgroup per run: `grid = (ceil(cols/256), min(ceil(rows/T), 65535))`,
+block 256. When the weight has more runs than the second dimension holds, a workgroup takes the
+runs `blockIdx.y`, `blockIdx.y + gridDim.y`, `blockIdx.y + 2 * gridDim.y`, ... in turn. The cap is
+the card's `grid.y` (65536 on gfx1201, which refuses a taller launch); an affine weight's run is
+one row (`T = 1`), so half the drafter's 248320-row head is 124160 runs and crosses it, while a
+trellis run covers `T` rows and stays far below. A run is still one workgroup's sequential walk;
+the cap only changes which workgroup takes which run. Threads of a workgroup cover consecutive
+columns, so at each row they read consecutive packed codes of the same row; a column walks its run
+sequentially, seeded from the run's tail. An affine weight has no seam above a row: a workgroup
+decodes a row's columns without one. There is no shared memory and no scratch beyond the two output
+buffers: the caller's scratch is exactly `rows × cols` int8 plus `rows × cols/128` bf16.
 
 ## Measured
 
@@ -120,20 +126,21 @@ and the caller's `rad_stream_sync` on that queue, best of five, with the planes 
 
 | weight | shape `[out, in]` | out | scales | decode |
 |---|---|---:|---:|---:|
-| `blk.0.ffn_gate_up.weight` (largest) | 5120 × 34816 | 170.0 MiB | 2.66 MiB | 1.47 ms (113 GiB/s) |
-| `blk.0.ffn_down.weight` | 5120 × 17408 | 85.0 MiB | 1.33 MiB | 0.97 ms (86 GiB/s) |
-| `blk.0.ssm_inz.weight` | 5120 × 16384 | 80.0 MiB | 1.25 MiB | 0.97 ms (81 GiB/s) |
-| `blk.0.ssm_out.weight` | 5120 × 6144 | 30.0 MiB | 0.47 MiB | 0.39 ms (75 GiB/s) |
-| `blk.3.attn_qg.weight` | 5120 × 12288 | 60.0 MiB | 0.94 MiB | 0.63 ms (92 GiB/s) |
-| `blk.3.attn_k.weight` | 5120 × 1024 | 5.0 MiB | 0.08 MiB | 0.138 ms (35 GiB/s) |
-| `blk.3.attn_v.weight` | 5120 × 1024 | 5.0 MiB | 0.08 MiB | 0.138 ms (35 GiB/s) |
-| `blk.3.attn_output.weight` | 5120 × 6144 | 30.0 MiB | 0.47 MiB | 0.38 ms (78 GiB/s) |
-| `output.k3.weight`, 256-row head chunk | 256 × 5120 | 1.2 MiB | 0.02 MiB | 0.137 ms (8.9 GiB/s) |
-| `token_embd.weight`, 256-row head chunk | 256 × 5120 | 1.2 MiB | 0.02 MiB | 0.201 ms (6.1 GiB/s) |
-| `dflash.draft_head.weight`, 8192-row chunk (affine) | 8192 × 5120 | 40.0 MiB | 0.62 MiB | 0.85 ms (46 GiB/s) |
+| `blk.0.ffn_gate_up.weight` (largest) | 5120 × 34816 | 170.0 MiB | 2.66 MiB | 1.43 ms (116 GiB/s) |
+| `blk.0.ffn_down.weight` | 5120 × 17408 | 85.0 MiB | 1.33 MiB | 0.95 ms (88 GiB/s) |
+| `blk.0.ssm_inz.weight` | 5120 × 16384 | 80.0 MiB | 1.25 MiB | 0.95 ms (82 GiB/s) |
+| `blk.0.ssm_out.weight` | 5120 × 6144 | 30.0 MiB | 0.47 MiB | 0.38 ms (78 GiB/s) |
+| `blk.3.attn_qg.weight` | 5120 × 12288 | 60.0 MiB | 0.94 MiB | 0.63 ms (93 GiB/s) |
+| `blk.3.attn_k.weight` | 5120 × 1024 | 5.0 MiB | 0.08 MiB | 0.141 ms (35 GiB/s) |
+| `blk.3.attn_v.weight` | 5120 × 1024 | 5.0 MiB | 0.08 MiB | 0.141 ms (35 GiB/s) |
+| `blk.3.attn_output.weight` | 5120 × 6144 | 30.0 MiB | 0.47 MiB | 0.37 ms (78 GiB/s) |
+| `output.k3.weight`, 256-row head chunk | 256 × 5120 | 1.2 MiB | 0.02 MiB | 0.140 ms (8.7 GiB/s) |
+| `token_embd.weight`, 256-row head chunk | 256 × 5120 | 1.2 MiB | 0.02 MiB | 0.204 ms (6.0 GiB/s) |
+| `dflash.draft_head.weight`, 8192-row chunk (affine) | 8192 × 5120 | 40.0 MiB | 0.62 MiB | 1.25 ms (31 GiB/s) |
+| `dflash.draft_head.weight`, 124160-row chunk (affine) | 124160 × 5120 | 606.2 MiB | 9.47 MiB | 11.80 ms (50 GiB/s) |
 
 A Mamba layer (blocks 0-2) decodes `ssm_inz`, `ssm_out`, `ffn_gate_up` and `ffn_down` in about
-3.8 ms; an attention layer (block 3 onward) decodes `attn_qg`, `attn_k`, `attn_v`,
+3.7 ms; an attention layer (block 3 onward) decodes `attn_qg`, `attn_k`, `attn_v`,
 `attn_output`, `ffn_gate_up` and `ffn_down` in about 3.7 ms. Decoded one weight at a time, which
 is what the backward does, the largest needs 173 MiB of scratch (170.0 + 2.66 MiB). The whole
 vocabulary projection would need 1.184 GiB + 18.96 MiB; a 256-row head chunk needs 1.25 MiB +
@@ -142,10 +149,13 @@ bandwidth-bound.
 
 The drafter's head is the same `248320 × 5120` shape in the affine form, so its whole width needs
 the same 1.184 GiB + 18.96 MiB and it is chunked the same way: the 8192-row chunk above is 40.0
-MiB + 0.62 MiB and runs at about half the trellis rate, because a 2-bit affine row is a short run
-(a row, decoded by one workgroup) whose codes are two bits an element, so the int8 write dominates
-and there is no trellis walk to spread a thread's work over. The last 512 rows are the short tail
-of the range, checked as its own chunk.
+MiB + 0.62 MiB and runs at about a third of the trellis rate, because a 2-bit affine row is a short
+run (a row, decoded by one workgroup) whose codes are two bits an element, so the int8 write
+dominates and there is no trellis walk to spread a thread's work over. Half the head at once is
+124160 runs, more than the card's `grid.y`; the launch caps at 65535 and each workgroup walks the
+extra runs, so the 124160-row chunk is 606.2 MiB + 9.47 MiB and 11.80 ms at 50 GiB/s -- the whole
+half is still one launch. The last 512 rows are the short tail of the range, checked as its own
+chunk.
 
 ## The tests
 
@@ -163,11 +173,17 @@ libquant's `grid_decode` over a constructed `Grid{asym}` and `BlockScale{s, zero
 and each linear kind, decodes a chunk starting inside the tensor and the short last chunk, and
 requires the device bytes to equal the host bytes exactly. The container's one affine tensor,
 `dflash.draft_head.weight` (u2 codes, u8 zero, f16 scale), gets the same treatment for an 8192-row
-chunk and its last 512 rows, and a timed pass over the chunk. It then runs radiance's
-`gemm_iqr_nt_m64` over `blk.0.ssm_out.weight`'s original planes and `gemm_i8a8_m16` over the
-decoded grid with the same activation, and requires the outputs to agree within bf16 tolerance
-(worst relative error 0.000977 on the reference card); both rows use `i8a8h`, because the stored
-grid is in the rotated basis.
+chunk and its last 512 rows, and a timed pass over the chunk and over half the head. It then runs
+radiance's `gemm_iqr_nt_m64` over `blk.0.ssm_out.weight`'s original planes and `gemm_i8a8_m16`
+over the decoded grid with the same activation, and requires the outputs to agree within bf16
+tolerance (worst relative error 0.000977 on the reference card); both rows use `i8a8h`, because
+the stored grid is in the rotated basis.
+
+`tests/gpu/iqr_decode_range.cpp` is the range on the card without the container: a synthetic u2
+codes / u8 zero / f16 scale affine weight of half the drafter head's rows (124160, more than the
+card's `grid.y`) starting at row 124160, with the output buffers primed to a sentinel so a launch
+that writes nothing cannot pass. On the reference card the launch before the run walk decoded the
+first 65536 runs and left the rest at the sentinel; it now equals the host decode exactly.
 
 The GEMM check needs `libr4d.so`. radiance makes that module only for a HIP build whose targets
 hold RDNA4 (`libr4d/CMakeLists.txt`), so the build asks for it on those same terms: when it does,
@@ -182,7 +198,7 @@ one environment variable. ctest runs it as `gpu_model_tests` (`LABELS gpu;model`
 and `SKIP_RETURN_CODE 77`), never as the plain `gpu_tests` run, which is the card's own cases and
 must not skip. Directly: `R97_MODEL_CASES=1 ./build/r97_gpu_tests`, which is also where the timings
 above come from. The forms a card can check without the container are covered synthetically in the
-host tier, above.
+host tier, above, and the range taller than `grid.y` in `tests/gpu/iqr_decode_range.cpp`.
 
 That the second label needs the card as well has a consequence for the shared machine: `ctest -L
 model` includes `gpu_model_tests`, so on a machine with the container and no card it fails on the
