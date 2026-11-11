@@ -1,23 +1,14 @@
 // tests/host/batcher.cpp -- the Batcher's budget, coverage, determinism, resume and balance.
 //
-// The host test binary has one `main`, in tests/host/vector_tape.cpp (the skeleton's own host
-// test); a second one cannot link. This issue may neither edit that file nor decide the
-// repository's host-test entry point on its own, so this file is self-contained: it carries its
-// own runner and arms it with `std::atexit`, so the checks run once the binary's `main` returns.
-// A failed `assert` aborts the process and `ctest` sees the failure. Nothing outside this file is
-// involved; when the repository agrees on a single host-test entry point, the runner below is the
-// only part that has to change.
-
-// The default build type is RelWithDebInfo, which defines NDEBUG and turns assert into a no-op.
-// In a test the assertions are the test, so keep them live in this translation unit -- before any
-// header can pull <cassert> in.
-#undef NDEBUG
+// The checks register themselves with `R97_TEST` and fail through `R97_CHECK` (tests/support/
+// test.h), so this file brings no `main` and no runner of its own: the host binary runs every
+// registered test once its `main` returns.
+#include "support/test.h"
 
 #include "r97/batcher.h"
 
 #include <algorithm>
-#include <cassert>
-#include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <set>
 #include <stdexcept>
@@ -64,11 +55,11 @@ std::vector<size_t> coverage(const std::vector<std::vector<Batch>>& epoch,
     for (size_t step = 0; step < epoch.size(); ++step) {
         for (const Batch& b : epoch[step]) {
             for (const TokenSeq& s : b) {
-                assert(!s.ids.empty());
+                R97_CHECK(!s.ids.empty());
                 // recover the index from the first token id (ids encode i * 100003 + t)
                 size_t i = (size_t)(s.ids[0] / 100003);
-                assert(tokens(s) == lens[i]);
-                for (int64_t t : s.ids) assert(t / 100003 == (int64_t)i);
+                R97_CHECK(tokens(s) == lens[i]);
+                for (int64_t t : s.ids) R97_CHECK(t / 100003 == (int64_t)i);
                 seen.push_back(i);
             }
         }
@@ -117,7 +108,7 @@ std::vector<std::vector<Batch>> whole_run(Batcher& b, int64_t epochs) {
     for (int64_t e = 0; e < epochs; ++e) {
         b.seek({e, 0});  // each epoch is its own shuffle
         auto one = run_epoch(b);
-        assert((int64_t)one.size() == b.steps_in_epoch(e));
+        R97_CHECK((int64_t)one.size() == b.steps_in_epoch(e));
         for (auto& s : one) all.push_back(std::move(s));
     }
     return all;
@@ -125,7 +116,7 @@ std::vector<std::vector<Batch>> whole_run(Batcher& b, int64_t epochs) {
 
 // The budget (per sub-batch), coverage, determinism and resume of one Batcher over varied
 // lengths.
-void check_budget_coverage_and_resume() {
+R97_TEST(batcher_budget_coverage_and_resume) {
     const int64_t budget = 4096;
     const int devices = 2;
     auto lens = lengths_for(300, 7);
@@ -141,8 +132,8 @@ void check_budget_coverage_and_resume() {
     Batcher b(seqs, cfg);
 
     // Skipped: the over-budget sequence, by index, never batched.
-    assert(b.skipped().size() == 1 && b.skipped()[0] == seqs.size() - 1);
-    assert(b.skipped_tokens() == 9000);
+    R97_CHECK(b.skipped().size() == 1 && b.skipped()[0] == seqs.size() - 1);
+    R97_CHECK(b.skipped_tokens() == 9000);
 
     auto run = whole_run(b, 3);
 
@@ -153,7 +144,7 @@ void check_budget_coverage_and_resume() {
     // factor of two.
     int64_t largest_step_total = 0;
     for (const auto& step : run) {
-        assert((int64_t)step.size() == devices);
+        R97_CHECK((int64_t)step.size() == devices);
         int64_t longest = 0, shortest = INT64_MAX, step_total = 0;
         for (const Batch& sub : step) {
             int64_t total = 0;
@@ -162,13 +153,13 @@ void check_budget_coverage_and_resume() {
                 longest = std::max(longest, tokens(s));
                 shortest = std::min(shortest, tokens(s));
             }
-            assert(total <= budget);
+            R97_CHECK(total <= budget);
             step_total += total;
         }
         largest_step_total = std::max(largest_step_total, step_total);
-        assert(shortest > 0 && longest < 2 * shortest);
+        R97_CHECK(shortest > 0 && longest < 2 * shortest);
     }
-    assert(largest_step_total > budget);
+    R97_CHECK(largest_step_total > budget);
 
     // Every kept sequence appears exactly once per epoch, and no two epochs are the same shuffle.
     std::vector<std::vector<size_t>> orders;
@@ -179,12 +170,12 @@ void check_budget_coverage_and_resume() {
             std::vector<std::vector<Batch>> epoch(run.begin() + (long)lo, run.begin() + (long)hi);
             auto seen = coverage(epoch, lens);
             std::set<size_t> uniq(seen.begin(), seen.end());
-            assert(seen.size() == 300 && uniq.size() == 300);
-            assert(uniq.find(300) == uniq.end());  // the skipped one is not in any batch
+            R97_CHECK(seen.size() == 300 && uniq.size() == 300);
+            R97_CHECK(uniq.find(300) == uniq.end());  // the skipped one is not in any batch
             orders.push_back(std::move(seen));
             lo = hi;
         }
-        assert(orders[0] != orders[1] && orders[1] != orders[2]);
+        R97_CHECK(orders[0] != orders[1] && orders[1] != orders[2]);
     }
 
     // Same seed gives the same batches; another seed does not.
@@ -201,16 +192,16 @@ void check_budget_coverage_and_resume() {
                 run[k][d][0].ids != run_other[k][d][0].ids) { differs = true; break; }
         if (differs) break;
     }
-    assert(differs);
+    R97_CHECK(differs);
     Batcher b3(seqs, cfg);
     auto run_again = whole_run(b3, 3);
-    assert(run_again.size() == run.size());
+    R97_CHECK(run_again.size() == run.size());
     for (size_t k = 0; k < run.size(); ++k) {
-        assert(run_again[k].size() == run[k].size());
+        R97_CHECK(run_again[k].size() == run[k].size());
         for (size_t d = 0; d < run[k].size(); ++d) {
-            assert(run_again[k][d].size() == run[k][d].size());
+            R97_CHECK(run_again[k][d].size() == run[k][d].size());
             for (size_t i = 0; i < run[k][d].size(); ++i)
-                assert(run_again[k][d][i].ids == run[k][d][i].ids);
+                R97_CHECK(run_again[k][d][i].ids == run[k][d][i].ids);
         }
     }
 
@@ -220,28 +211,28 @@ void check_budget_coverage_and_resume() {
     Batcher part(seqs, cfg);
     r97::Batcher::Position pos{1, 2};
     part.seek(pos);                       // epoch 1, from step 2 on
-    assert(part.position().epoch == 1 && part.position().step == 2);
+    R97_CHECK(part.position().epoch == 1 && part.position().step == 2);
     std::vector<std::vector<Batch>> resumed;
     std::vector<Batch> step;
     while (part.next(&step)) resumed.push_back(step);
     size_t offset = (size_t)keep.steps_in_epoch(0) + 2;
-    assert(resumed.size() == full.size() - (size_t)keep.steps_in_epoch(0) - 2);
+    R97_CHECK(resumed.size() == full.size() - (size_t)keep.steps_in_epoch(0) - 2);
     for (size_t k = 0; k < resumed.size(); ++k) {
-        assert(resumed[k].size() == full[offset + k].size());
+        R97_CHECK(resumed[k].size() == full[offset + k].size());
         for (size_t d = 0; d < resumed[k].size(); ++d)
             for (size_t i = 0; i < resumed[k][d].size(); ++i)
-                assert(resumed[k][d][i].ids == full[offset + k][d][i].ids);
+                R97_CHECK(resumed[k][d][i].ids == full[offset + k][d][i].ids);
     }
 
     // A step's sub-batches differ by less than one maximal sequence in tokens. Only a final odd
     // tail can hand out fewer than `devices`, and it has no pair to differ.
     for (const auto& stp : run) {
-        assert(!stp.empty());
-        assert((int)stp.size() <= devices);
+        R97_CHECK(!stp.empty());
+        R97_CHECK((int)stp.size() <= devices);
         std::vector<int64_t> loads(stp.size(), 0);
         int64_t max_seq = 0;
         for (size_t d = 0; d < stp.size(); ++d) {
-            assert(!stp[d].empty());
+            R97_CHECK(!stp[d].empty());
             for (const TokenSeq& s : stp[d]) {
                 loads[d] += tokens(s);
                 max_seq = std::max(max_seq, tokens(s));
@@ -250,7 +241,7 @@ void check_budget_coverage_and_resume() {
         if (stp.size() >= 2) {
             int64_t spread = *std::max_element(loads.begin(), loads.end()) -
                              *std::min_element(loads.begin(), loads.end());
-            assert(spread < max_seq);
+            R97_CHECK(spread < max_seq);
         }
     }
 }
@@ -258,7 +249,7 @@ void check_budget_coverage_and_resume() {
 // The budget is per sub-batch, not per step: four sequences, each too long to share a sub-batch
 // with any other under the budget, still fill both devices of every step. A per-step budget would
 // put one sequence in each step with the other device idle, the case a long-sequence run hits.
-void check_budget_is_per_batch() {
+R97_TEST(batcher_budget_is_per_batch) {
     const int64_t budget = 4096;
     const int devices = 2;
     const std::vector<int64_t> lens = {2800, 3000, 3500, 2200};
@@ -271,29 +262,29 @@ void check_budget_is_per_batch() {
     Batcher b(seqs, cfg);
 
     auto run = run_epoch(b);
-    assert(run.size() == 2);  // no two of these fit one sub-batch together
+    R97_CHECK(run.size() == 2);  // no two of these fit one sub-batch together
 
     std::set<size_t> seen;
     for (const auto& step : run) {
-        assert((int64_t)step.size() == devices);
+        R97_CHECK((int64_t)step.size() == devices);
         std::vector<int64_t> loads(devices, 0);
         int64_t max_seq = 0, step_total = 0;
         for (size_t d = 0; d < step.size(); ++d) {
-            assert(!step[d].empty());  // every device works on every step
+            R97_CHECK(!step[d].empty());  // every device works on every step
             for (const TokenSeq& s : step[d]) {
                 loads[d] += tokens(s);
                 max_seq = std::max(max_seq, tokens(s));
                 seen.insert((size_t)(s.ids[0] / 100003));
             }
-            assert(loads[d] <= budget);  // the budget belongs to each sub-batch
+            R97_CHECK(loads[d] <= budget);  // the budget belongs to each sub-batch
             step_total += loads[d];
         }
-        assert(step_total > budget);  // a step may spend more than one sub-batch's budget
+        R97_CHECK(step_total > budget);  // a step may spend more than one sub-batch's budget
         int64_t spread = *std::max_element(loads.begin(), loads.end()) -
                          *std::min_element(loads.begin(), loads.end());
-        assert(spread < max_seq);
+        R97_CHECK(spread < max_seq);
     }
-    assert(seen.size() == lens.size());  // every sequence appears once
+    R97_CHECK(seen.size() == lens.size());  // every sequence appears once
 }
 
 // The shuffle must reach the batches at a realistic budget, not only when the budget is small
@@ -302,7 +293,7 @@ void check_budget_is_per_batch() {
 // step partition follows from the bucket edges alone; the shuffled order the packing places the
 // sequences in is then the only thing the seed and the epoch can change, and they must change it.
 // Each case is a shape the fixed-sort batcher handed out identically for every seed and epoch.
-void check_shuffle_reaches_the_batches() {
+R97_TEST(batcher_shuffle_reaches_the_batches) {
     struct Case {
         const char* what;  // for a reader of this file; the checks below do not print it
         std::vector<int64_t> lens;
@@ -343,41 +334,41 @@ void check_shuffle_reaches_the_batches() {
             // with two sub-batches under the strict token spread.
             size_t seen = 0;
             for (const auto& step : one) {
-                assert(!step.empty());
-                assert((int)step.size() <= c.devices);
+                R97_CHECK(!step.empty());
+                R97_CHECK((int)step.size() <= c.devices);
                 std::vector<int64_t> loads(step.size(), 0);
                 int64_t max_seq = 0;
                 for (size_t d = 0; d < step.size(); ++d) {
-                    assert(!step[d].empty());
+                    R97_CHECK(!step[d].empty());
                     for (const TokenSeq& s : step[d]) {
                         loads[d] += tokens(s);
                         max_seq = std::max(max_seq, tokens(s));
                         ++seen;
                     }
-                    assert(loads[d] <= c.budget);
+                    R97_CHECK(loads[d] <= c.budget);
                 }
                 if (step.size() >= 2) {
                     int64_t spread = *std::max_element(loads.begin(), loads.end()) -
                                      *std::min_element(loads.begin(), loads.end());
-                    assert(spread < max_seq);
+                    R97_CHECK(spread < max_seq);
                 }
             }
-            assert(seen == c.lens.size());
+            R97_CHECK(seen == c.lens.size());
             epochs.push_back(shape(one));
         }
         // Each epoch is a new shuffle.
-        assert(epochs[0] != epochs[1] && epochs[1] != epochs[2]);
+        R97_CHECK(epochs[0] != epochs[1] && epochs[1] != epochs[2]);
 
         // The same seed replays the same batches.
         Batcher replay(seqs, cfg);
         replay.seek({0, 0});
-        assert(shape(run_epoch(replay)) == epochs[0]);
+        R97_CHECK(shape(run_epoch(replay)) == epochs[0]);
 
         // Another seed does not.
         cfg.seed = 2;
         Batcher other(seqs, cfg);
         other.seek({0, 0});
-        assert(shape(run_epoch(other)) != epochs[0]);
+        R97_CHECK(shape(run_epoch(other)) != epochs[0]);
     }
 }
 
@@ -387,7 +378,7 @@ void check_shuffle_reaches_the_batches() {
 // the same batches. The two shapes below are the ones a shuffle-inside-buckets batcher could not
 // change: two sequences in different length classes, and one sequence per class across eight
 // classes.
-void check_shuffle_reaches_single_sequence_buckets() {
+R97_TEST(batcher_shuffle_reaches_single_sequence_buckets) {
     struct Case {
         std::vector<int64_t> lens;
         int64_t budget;
@@ -410,10 +401,10 @@ void check_shuffle_reaches_single_sequence_buckets() {
         for (int64_t e = 0; e < 3; ++e) {
             b.seek({e, 0});
             auto one = run_epoch(b);
-            assert(coverage(one, c.lens).size() == c.lens.size());
+            R97_CHECK(coverage(one, c.lens).size() == c.lens.size());
             epochs.push_back(shape(one));
         }
-        assert(epochs[0] != epochs[1] || epochs[1] != epochs[2]);
+        R97_CHECK(epochs[0] != epochs[1] || epochs[1] != epochs[2]);
 
         // Another seed does not replay this shuffle. Three seeds rather than a pair: two buckets
         // have only two orders, so one pair may coincide by chance while the seed still reaches
@@ -424,12 +415,12 @@ void check_shuffle_reaches_single_sequence_buckets() {
             Batcher s(seqs, cfg);
             seeds.push_back(shape(run_epoch(s)));
         }
-        assert(seeds[0] != seeds[1] || seeds[1] != seeds[2]);
+        R97_CHECK(seeds[0] != seeds[1] || seeds[1] != seeds[2]);
 
         // Same seed, same batches.
         cfg.seed = 1;
         Batcher again(seqs, cfg);
-        assert(shape(run_epoch(again)) == epochs[0]);
+        R97_CHECK(shape(run_epoch(again)) == epochs[0]);
     }
 }
 
@@ -438,7 +429,7 @@ void check_shuffle_reaches_single_sequence_buckets() {
 // bucket's sequences are shuffled instead, under the seed and rotated by the epoch. This is the
 // case the earlier round covered for a dataset small next to the budget: every sequence the same
 // length, one bucket after grouping.
-void check_single_bucket_shuffle() {
+R97_TEST(batcher_single_bucket_shuffle) {
     // Two sequences is the smallest case: there are only two orders, so the three epochs cannot
     // all differ, but every consecutive pair must. Three sequences and a full bucket cover the
     // larger ones.
@@ -457,11 +448,11 @@ void check_single_bucket_shuffle() {
             b.seek({e, 0});
             epochs.push_back(shape(run_epoch(b)));
         }
-        assert(epochs[0] != epochs[1] && epochs[1] != epochs[2]);
+        R97_CHECK(epochs[0] != epochs[1] && epochs[1] != epochs[2]);
 
         cfg.seed = 2;
         Batcher other(seqs, cfg);
-        assert(shape(run_epoch(other)) != epochs[0]);
+        R97_CHECK(shape(run_epoch(other)) != epochs[0]);
     }
 }
 
@@ -473,7 +464,7 @@ void check_single_bucket_shuffle() {
 // cuts at the length class and the packing stops at the bucket edge. Both counts are checked, over
 // several epochs; the bucket order is the epoch's to choose, so no check here fixes which class
 // comes first.
-void check_similar_lengths_are_grouped() {
+R97_TEST(batcher_similar_lengths_are_grouped) {
     const int64_t kLong = 500;
     const int64_t kShort = 12;
     const size_t kShorts = 32;
@@ -496,8 +487,8 @@ void check_similar_lengths_are_grouped() {
             size_t steps = 0, seen = 0;
             std::vector<Batch> step;
             while (b.next(&step)) {
-                assert(step.size() == 1);
-                assert(!step[0].empty());
+                R97_CHECK(step.size() == 1);
+                R97_CHECK(!step[0].empty());
                 ++steps;
                 int64_t longest = 0, shortest = kLong;
                 for (const TokenSeq& s : step[0]) {
@@ -508,16 +499,16 @@ void check_similar_lengths_are_grouped() {
                 // No step mixes the two classes: a batch is never one long and a crowd of shorts.
                 // The shuffled bucket order decides which class comes first, so neither order is
                 // assumed.
-                assert(longest == shortest);
+                R97_CHECK(longest == shortest);
                 if (longest == kLong)
                     saw_long_step = true;
                 else
                     saw_short_step = true;
             }
-            assert(saw_long_step && saw_short_step);
-            assert(seen == kLongs + kShorts);
+            R97_CHECK(saw_long_step && saw_short_step);
+            R97_CHECK(seen == kLongs + kShorts);
             // Pairs of longs, the odd long alone when there is one, then one step of shorts.
-            assert(steps == (kLongs + 1) / 2 + 1);
+            R97_CHECK(steps == (kLongs + 1) / 2 + 1);
         }
     }
 }
@@ -525,7 +516,7 @@ void check_similar_lengths_are_grouped() {
 // A step whose whole set fits one step: it is one step, split across all devices, every device
 // gets a sub-batch, and the spread stays below the maximal sequence. All lengths share one length
 // class, so grouping puts them in one bucket and the whole set can indeed be one step.
-void check_single_step_split() {
+R97_TEST(batcher_single_step_split) {
     const std::vector<int64_t> lens = {4, 4, 5, 5, 6, 6, 7, 7};
     auto seqs = make_sequences(lens);
 
@@ -536,31 +527,31 @@ void check_single_step_split() {
     Batcher b(seqs, cfg);
 
     std::vector<Batch> step;
-    assert(b.next(&step));
-    assert(step.size() == 3);
+    R97_CHECK(b.next(&step));
+    R97_CHECK(step.size() == 3);
 
     std::vector<int64_t> loads(3, 0);
     size_t seen = 0;
     int64_t max_seq = 0;
     for (const Batch& sub : step) {
         size_t d = (size_t)(&sub - step.data());
-        assert(!sub.empty());
+        R97_CHECK(!sub.empty());
         for (const TokenSeq& s : sub) {
             loads[d] += tokens(s);
             max_seq = std::max(max_seq, tokens(s));
             ++seen;
         }
     }
-    assert(seen == lens.size());
+    R97_CHECK(seen == lens.size());
     int64_t spread = *std::max_element(loads.begin(), loads.end()) -
                      *std::min_element(loads.begin(), loads.end());
-    assert(spread < max_seq);
-    assert(!b.next(&step));  // one step holds the whole set
+    R97_CHECK(spread < max_seq);
+    R97_CHECK(!b.next(&step));  // one step holds the whole set
 }
 
 // reset() is the way back to the first epoch, and the constructor rejects a configuration that
 // could never plan an epoch: a budget of no tokens and a step with no devices.
-void check_reset_and_config_errors() {
+R97_TEST(batcher_reset_and_config_errors) {
     auto lens = lengths_for(60, 11);
     auto seqs = make_sequences(lens);
 
@@ -578,44 +569,44 @@ void check_reset_and_config_errors() {
         }
         return false;
     };
-    assert(!rejects(cfg));  // a workable configuration is accepted
+    R97_CHECK(!rejects(cfg));  // a workable configuration is accepted
     r97::BatcherConfig bad = cfg;
     bad.token_budget = 0;
-    assert(rejects(bad));
+    R97_CHECK(rejects(bad));
     bad.token_budget = -1;
-    assert(rejects(bad));
+    R97_CHECK(rejects(bad));
     bad = cfg;
     bad.devices = 0;
-    assert(rejects(bad));
+    R97_CHECK(rejects(bad));
     bad.devices = -1;
-    assert(rejects(bad));
+    R97_CHECK(rejects(bad));
 
     // One epoch from (0, 0), then the same epoch again after seeking elsewhere and resetting.
     Batcher b(seqs, cfg);
     auto first = run_epoch(b);
-    assert(!first.empty());
-    assert(b.position().epoch == 0 && b.position().step == (int64_t)first.size());
+    R97_CHECK(!first.empty());
+    R97_CHECK(b.position().epoch == 0 && b.position().step == (int64_t)first.size());
 
     b.seek({1, 0});
-    assert(!run_epoch(b).empty());  // a different epoch, from a different shuffle
+    R97_CHECK(!run_epoch(b).empty());  // a different epoch, from a different shuffle
     b.reset();
-    assert(b.position().epoch == 0 && b.position().step == 0);
+    R97_CHECK(b.position().epoch == 0 && b.position().step == 0);
     auto again = run_epoch(b);
-    assert(again.size() == first.size());
-    assert(id_order(again) == id_order(first));  // same seed, same batches
+    R97_CHECK(again.size() == first.size());
+    R97_CHECK(id_order(again) == id_order(first));  // same seed, same batches
 
     // reset() also revives a finished traversal: the epoch's end consumes nothing, so the
     // position still points there and the next epoch needs a seek; reset() is the way back.
     std::vector<Batch> step;
-    assert(!b.next(&step));
-    assert(b.position().epoch == 0 && b.position().step == (int64_t)again.size());
+    R97_CHECK(!b.next(&step));
+    R97_CHECK(b.position().epoch == 0 && b.position().step == (int64_t)again.size());
     b.reset();
-    assert(b.next(&step));
-    assert(b.position().epoch == 0 && b.position().step == 1);
-    assert(step.size() == again[0].size());
+    R97_CHECK(b.next(&step));
+    R97_CHECK(b.position().epoch == 0 && b.position().step == 1);
+    R97_CHECK(step.size() == again[0].size());
     for (size_t d = 0; d < step.size(); ++d)
         for (size_t i = 0; i < step[d].size(); ++i)
-            assert(step[d][i].ids == again[0][d][i].ids);
+            R97_CHECK(step[d][i].ids == again[0][d][i].ids);
 }
 
 // A short tail of a length bucket -- fewer sequences than devices -- must not be handed out as
@@ -627,7 +618,7 @@ void check_reset_and_config_errors() {
 // residue that greedy would hand to one device while leaving the other behind. The epoch's
 // shuffled bucket order may put the one-long tail last, where it has nothing to carry into, so
 // for that case a short step is allowed only as the final step.
-void check_short_tail_balance() {
+R97_TEST(batcher_short_tail_balance) {
     struct Case {
         const char* what;
         std::vector<int64_t> lens;
@@ -668,36 +659,36 @@ void check_short_tail_balance() {
         Batcher b(seqs, cfg);
 
         auto run = run_epoch(b);
-        assert(!run.empty());
+        R97_CHECK(!run.empty());
         size_t seen = 0;
         bool saw_short = false;
         for (const auto& step : run) {
-            assert(!step.empty());
-            assert((int)step.size() <= c.devices);
+            R97_CHECK(!step.empty());
+            R97_CHECK((int)step.size() <= c.devices);
             if ((int)step.size() < c.devices) saw_short = true;
             std::vector<int64_t> loads(step.size(), 0);
             int64_t max_seq = 0;
             for (size_t d = 0; d < step.size(); ++d) {
-                assert(!step[d].empty());  // never an empty sub-batch for a device
+                R97_CHECK(!step[d].empty());  // never an empty sub-batch for a device
                 for (const TokenSeq& s : step[d]) {
                     loads[d] += tokens(s);
                     max_seq = std::max(max_seq, tokens(s));
                     ++seen;
                 }
-                assert(loads[d] <= c.budget);
+                R97_CHECK(loads[d] <= c.budget);
             }
             if (step.size() >= 2) {
                 int64_t spread = *std::max_element(loads.begin(), loads.end()) -
                                  *std::min_element(loads.begin(), loads.end());
-                assert(spread < max_seq);
+                R97_CHECK(spread < max_seq);
             }
         }
-        assert(seen == c.lens.size());
+        R97_CHECK(seen == c.lens.size());
         if (c.carry_must_fill) {
             for (size_t i = 0; i < run.size(); ++i)
-                if ((int)run[i].size() < c.devices) assert(i + 1 == run.size());
+                if ((int)run[i].size() < c.devices) R97_CHECK(i + 1 == run.size());
         } else {
-            assert(saw_short);  // an epoch's final tail has nothing to fill with
+            R97_CHECK(saw_short);  // an epoch's final tail has nothing to fill with
         }
     }
 }
@@ -707,7 +698,7 @@ void check_short_tail_balance() {
 // seek() clamps it into the valid range, so a negative step resumes at the first step, a negative
 // epoch resumes at the first shuffle, and a step past the end leaves the traversal at the epoch's
 // end rather than reading a step that is not there.
-void check_position_is_range_checked() {
+R97_TEST(batcher_position_is_range_checked) {
     auto lens = lengths_for(80, 31);
     auto seqs = make_sequences(lens);
 
@@ -719,51 +710,32 @@ void check_position_is_range_checked() {
 
     b.seek({0, 0});
     auto first = run_epoch(b);
-    assert(!first.empty());
+    R97_CHECK(!first.empty());
 
     b.seek({0, -1});
-    assert(b.position().epoch == 0 && b.position().step == 0);
-    assert(id_order(run_epoch(b)) == id_order(first));  // the first step, not plan[-1]
+    R97_CHECK(b.position().epoch == 0 && b.position().step == 0);
+    R97_CHECK(id_order(run_epoch(b)) == id_order(first));  // the first step, not plan[-1]
 
     b.seek({0, -123456});
-    assert(b.position().step == 0);
-    assert(id_order(run_epoch(b)) == id_order(first));
+    R97_CHECK(b.position().step == 0);
+    R97_CHECK(id_order(run_epoch(b)) == id_order(first));
 
     b.seek({0, 2});
     auto from_two = run_epoch(b);
     b.seek({-7, 2});
-    assert(b.position().epoch == 0 && b.position().step == 2);
-    assert(id_order(run_epoch(b)) == id_order(from_two));
+    R97_CHECK(b.position().epoch == 0 && b.position().step == 2);
+    R97_CHECK(id_order(run_epoch(b)) == id_order(from_two));
 
     b.seek({-7, -7});
-    assert(b.position().epoch == 0 && b.position().step == 0);
-    assert(id_order(run_epoch(b)) == id_order(first));
+    R97_CHECK(b.position().epoch == 0 && b.position().step == 0);
+    R97_CHECK(id_order(run_epoch(b)) == id_order(first));
 
     const int64_t end = b.steps_in_epoch(0);
     b.seek({0, end + 1000});
-    assert(b.position().step == end);
+    R97_CHECK(b.position().step == end);
     std::vector<Batch> step;
-    assert(!b.next(&step));
-    assert(b.position().step == end);
+    R97_CHECK(!b.next(&step));
+    R97_CHECK(b.position().step == end);
 }
-
-void run_checks() {
-    check_budget_coverage_and_resume();
-    check_budget_is_per_batch();
-    check_shuffle_reaches_the_batches();
-    check_shuffle_reaches_single_sequence_buckets();
-    check_single_bucket_shuffle();
-    check_similar_lengths_are_grouped();
-    check_single_step_split();
-    check_short_tail_balance();
-    check_reset_and_config_errors();
-    check_position_is_range_checked();
-    std::puts("batcher ok");
-}
-
-// Armed at static-initialisation time; runs when the binary's `main` returns.
-struct ArmChecks {
-    ArmChecks() { std::atexit(&run_checks); }
-} arm_checks;
 
 }  // namespace
