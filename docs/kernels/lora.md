@@ -85,8 +85,11 @@ per block, and `atomicAdd` into an f32 staging buffer for the chunks that share 
 
     dB[n, j] = sum_{m valid} cot_y[m, n] * scale[s, n] * t[m, j]
 
-`to_bf16_kernel` rounds an f32 staging buffer of a gradient into the bf16 block that leaves the
-card, once per call.
+`shrink_da_kernel` and `expand_db_kernel` write into the *step's* accumulator rather than into a
+buffer of the call's: the shrink's `atomicAdd` and the expand's one-thread-per-entry add both
+accumulate into the f32 buffer `grad_stage.h` holds for that leaf, so a later call of the same step
+adds to the earlier call's total on the card instead of to a zeroed buffer, and nothing is rounded
+between them.
 
 ## The gradients
 
@@ -95,11 +98,25 @@ Those are the names and shapes the host rows use (`docs/adjoints/lora.md` §4), 
 contribution lands in its own pool row's block — for the model's pools, which have one slot, that
 is the whole leaf.
 
-The step's sum runs on the card: each kernel accumulates into an f32 buffer over every token of
-the call, and the bf16 block is produced from it once, on the way out, because a gradient on the
-card is bf16. The leaf the contract hands a row lives in the host's `ParamSet`, so a call ends by
-adding its block to the leaf, exactly as the host row's does: a step whose tokens arrive in two
-calls adds twice, and a test asserts that (`a second call adds to the same leaf`).
+The step's sum runs on the card, and the leaf stays off it. `dA` and `dB` are host memory by the
+contract (`include/r97/params.h`), so a row that copied a call's sum into the leaf when the call
+ended would sum the step in f32 only after rounding every call to bf16. Instead the row asks the
+step's stage for the leaf's accumulator (`src/adjoint/device/grad_stage.h`), which is one f32
+buffer per leaf for as long as the step lasts: the first ask of a step allocates and zeroes it,
+every later call — this site's next chunk of tokens, or another call that shares the leaf — adds
+into the same buffer, and no rounding happens in between.
+
+The walk ends the step with `grad_stage_flush(&grads)`: each accumulator is then rounded once, from
+its f32 total, to bf16 — the dtype a gradient has on the card — and added to the leaf of that name,
+which the flush creates from the name and shape the stage recorded. `grad_stage_discard` is the
+other way to end a step, for a walk whose gradients nobody wants. Both belong to the walk, not to
+the row: the stage's lifetime is the step's, so a walk that ends no step would have the next step's
+first call add to the old total.
+
+The staging costs the card `4 · R · K` and `4 · N · R` bytes — 320 KiB and 768 KiB for the model's
+`q_proj` at rank 16 — and that is the same for every call of the step. It is not the call's scratch:
+a call's scratch is freed when the call ends, while the stage lives until the step does, so it has
+its own count rather than a line in the scratch ledger.
 
 With `B = 0` — the adapter at its start (`docs/ADAPTER.md` §4) — nothing above the expand asks
 for its input's cotangent, so `dt` is zero, and the shrink, handed that zero, gives `dA = 0`. `dB`
@@ -112,9 +129,11 @@ is *not* zero there: it is what moves `B` off zero. The test asserts both halves
   tape records them in.
 - The cotangent of a *code* is an f32 number, not a code: it is `g · scale`, and rounding it to i8
   or to bf16 would be a quantisation the reference does not make. It leaves as f32.
-- The gradients are the opposite case: a real gradient is bf16 on the card, so the f32 sum rounds
-  once, at the end. `docs/kernels/README.md`'s "The harness" says why that is the room the
-  harness's tolerance gives a kernel that rounds to bf16 and accumulates in f32.
+- The gradients are the opposite case: a real gradient is bf16 on the card, so the step's f32
+  sum is rounded once, when the walk ends the step. A call of a step rounds nothing, which is the
+  whole point of the staging: `docs/kernels/README.md`'s "The harness" says why the room the
+  harness's tolerance gives a kernel is the room a kernel that rounds to bf16 and accumulates in
+  f32 has.
 - The sums are f32 throughout, including the atomics; the reference is f64, so a gradient entry
   carries both the bf16 rounding of its own value and the f32 noise of the terms that made it.
 
@@ -143,56 +162,73 @@ and 4 with 1024 and 4096 tokens, `down_proj` (K 17408, N 5120) with a batch of u
 per-sequence structure — and `ffn_gate_up` (N 34816, rank 32: two modules of 16 in one pool, with
 the zero regions `docs/ADAPTER.md` §2 describes).
 
-It also asserts the teeth: `dA` is named, shaped and filled in (not zero by accident); a second
-call adds to the same leaf; a `lora_shrink` record of the float trunk (`dtype` with no `a_scale`)
-has no device row; a deliberately wrong reference that drops the coded record's scale is
-rejected rather than accepted; and with `B = 0`, `dt` and `dA` are exactly zero while `dB` is
-filled.
+It also asserts the teeth: `dA` is named, shaped and filled in (not zero by accident); a step's
+tokens in two calls leave the `ParamSet` untouched until the walk ends it, put one accumulator on
+the card (the second call does not make a second one) and come out as twice the one-call step, to
+within that step's one rounding; a `lora_shrink` record of the float trunk
+(`dtype` with no `a_scale`) has no device row; a deliberately wrong reference that drops the coded
+record's scale is rejected rather than accepted; and with `B = 0`, `dt` and `dA` are exactly zero
+while `dB` is filled.
 
 ## Measurement
 
-`./build/r97_gpu_tests --bench` on one R9700 (gfx1201, 32 GB), 6 reps at 1024 tokens and 3 at
-4096, mean of the reps, in one run taken while this machine's other runs held the other card.
-That the card was mine shows in the rows agreeing with each other: rank does not move them and `N`
-scales them; a neighbour's run moves a row up by 2× and the rows stop agreeing.
+`./build/r97_gpu_tests --bench` on one R9700 (gfx1201, 32 GB), 6 reps at 1024 tokens and 3 at 4096,
+mean of the reps. This machine is shared — other work holds the other card and the CPU — and
+another job's run only adds to a row's time, so each number below is the fastest that column came
+out in the passes taken for this doc. The rows still agree with each other, which is what a pass
+is read for: rank does not move them, `N` scales them, four times the tokens cost 3.8 to 3.9 times
+the call. A pass a neighbour's run was on comes out a third to two thirds above these.
 
-"call" is the adjoint as the contract hands it (the number
-the harness's own bench prints); "with dA/dB" is the same call with a `ParamSet` handed to it, so
-it includes the f32 accumulation into the staging buffer, the one rounding to bf16 and the copy
-back into the leaf. "forward twin" is the op's forward in f64 on the host, from the same run
-(`src/adjoint/host/lora.cpp`), the reference the gradient is graded against.
+"call" is the adjoint as the contract hands it (the number the harness's own bench prints); "with
+dA/dB" is the same call with the gradient `ParamSet` handed to it, so the kernels accumulate `dA`
+and `dB` into the step's f32 buffers on the card and nothing is rounded or copied out; "step's
+flush" is `grad_stage_flush`, the end of a step — one copy of each accumulated block into a leaf,
+one rounding to bf16 per entry, one add — which a step pays once, not once per call; "forward
+twin" is the op's forward in f64 on the host (`src/adjoint/host/lora.cpp`), the reference the
+gradient is graded against.
 
-| shape                                | op     | call (ms) | with dA/dB (ms) | forward twin (ms) | scratch peak |
-|--------------------------------------|--------|-----------|-----------------|-------------------|--------------|
-| `q_proj` r16, 1024 tokens            | shrink |    47.4   |     48.4        |      393          |   40.7 MiB   |
-| `q_proj` r16, 1024 tokens            | expand |    58.6   |     59.7        |      234          |   48.9 MiB   |
-| `q_proj` r16, 4096 tokens            | shrink |   176.0   |    180.3        |     1573          |  161.8 MiB   |
-| `q_proj` r16, 4096 tokens            | expand |   221.4   |    223.4        |      924          |  193.3 MiB   |
-| `down_proj` r16, 448+320+256 tokens  | shrink |   150.4   |    152.7        |     1412          |  138.2 MiB   |
-| `down_proj` r16, 448+320+256 tokens  | expand |    12.7   |     13.6        |       95.2        |   20.5 MiB   |
-| `q_proj` r4, 1024 tokens             | shrink |    45.7   |     46.1        |       98.0        |   40.4 MiB   |
-| `q_proj` r4, 1024 tokens             | expand |    56.8   |     57.3        |      106          |   48.3 MiB   |
-| `ffn_gate_up` r32, 1024 tokens       | shrink |    46.8   |     48.1        |      785          |   41.1 MiB   |
-| `ffn_gate_up` r32, 1024 tokens       | expand |   165.6   |    173.6        |     1085          |  140.6 MiB   |
+| shape                                  | op     | call (ms) | with dA/dB (ms) | step's flush (ms) | forward twin (ms) | scratch peak |
+|----------------------------------------|--------|-----------|-----------------|------------------|-------------------|--------------|
+| `q_proj` r16, 1024 tokens              | shrink |      46.2 |            47.0 |             0.37 |               393 |     40.7 MiB |
+| `q_proj` r16, 1024 tokens              | expand |      57.7 |            58.7 |             0.45 |               230 |     48.9 MiB |
+| `q_proj` r16, 4096 tokens              | shrink |     178.0 |           176.7 |             0.37 |              1569 |    161.8 MiB |
+| `q_proj` r16, 4096 tokens              | expand |     222.7 |           310.2 |             0.88 |               952 |    193.3 MiB |
+| `down_proj` r16, 448+320+256 tokens    | shrink |     157.8 |           156.4 |             0.80 |              1414 |    138.2 MiB |
+| `down_proj` r16, 448+320+256 tokens    | expand |      13.8 |            14.0 |             0.24 |              96.4 |     20.5 MiB |
+| `q_proj` r4, 1024 tokens               | shrink |      46.0 |            47.4 |             0.17 |              97.9 |     40.4 MiB |
+| `q_proj` r4, 1024 tokens               | expand |      57.6 |            57.2 |             0.20 |               107 |     48.3 MiB |
+| `ffn_gate_up` r32, 1024 tokens         | shrink |      47.3 |            47.8 |             0.62 |               783 |     41.1 MiB |
+| `ffn_gate_up` r32, 1024 tokens         | expand |     169.5 |           173.0 |             2.21 |              1093 |    140.6 MiB |
 
 The reading: the call is bounded by moving the operands, not by the MACs. A 1024-token `q_proj`
-call hands over 42 MB of f32 operands and takes back 21 MB, and costs 47 ms; the adapter's
+call hands over 42 MB of f32 operands and takes back 21 MB, and costs 46 ms; the adapter's
 gradient arithmetic — `dA` is a 16 × 5120 block summed over 1024 rows, `dB` a 12288 × 16 block —
-adds 1 to 8 ms to it. Four times the tokens cost 3.7 to 3.8 times the call, which is what a
-copy-bound call does. The rank barely moves it: rank 4 and rank 32 are within a few percent of
-rank 16 at the same widths, and the expand follows `N` (`ffn_gate_up`'s 34816 against `q_proj`'s
-12288 is 2.8 times the money and 2.8 times the time). The forward twin is 2× to 17× the call
-because it is the same arithmetic in f64 on one host thread.
+is the call's own arithmetic into a buffer bought at the step's first ask, and it stays inside the
+passes' noise: −1.3 to +3.5 ms across the six shapes at 1024 tokens and the shrink at 4096. The
+one row the gradient does cost is the expand at 4096 tokens, 87 ms above its call: `dB`'s kernel
+gives one thread each (n, j) and each of them walks every token of `cot y` with a stride of `N`, so
+the walk touches the whole 201 MB of it, past the card's cache, where the 50 MB of the 1024-token
+row stays in it. What a step pays on top of its calls is the flush: 0.2 to 0.9 ms for one module's
+block — 320 KiB of `dA` or 768 KiB of `dB` at `q_proj` rank 16 — and 2.2 ms for `ffn_gate_up`'s
+two (640 KiB and 4.3 MiB).
+
+Four times the tokens cost 3.8 to 3.9 times the call, which is what a copy-bound call does. The
+rank barely moves it: rank 4 and rank 32 are within a few percent of rank 16 at the same widths,
+and the expand follows `N` (`ffn_gate_up`'s 34816 against `q_proj`'s 12288 is 2.8 times the money
+and 2.9 times the time). The forward twin is 2× to 17× the call because it is the same arithmetic
+in f64 on one host thread.
 
 The scratch is the price of that: a token-major operand and its cotangent as f32, which is
-`2 · 4 · M · K` bytes for the shrink and `2 · 4 · M · N` for the expand (161.8 MiB and 193.3 MiB
-at 4096 tokens), plus the pool's buffers — `A` and `dA`, `B` and `dB`, the bf16 block a gradient
-leaves in, the group scale and its cotangent, `t` and its cotangent, the slots. The codes are
-uploaded as f32, the value their recorded dtype denotes (for `i8` the integer, for `fp8` the
-decoded value), so one float path serves both coded forms; for the `i8` form the codes are the
-largest single piece of that scratch and the one place a later change would save 4×. `R` costs
-the shrink `2 · 4 · R · K` bytes only, which is why rank 16 and rank 4 come out within 0.3 MiB of
-each other.
+`2 · 4 · M · K` bytes for the shrink and `4 · M · N` for the expand (161.8 MiB and 193.3 MiB at
+4096 tokens), plus the pool's buffers — `A` and `dA`, `B` and `dB`, the group scale and its
+cotangent, `t` and its cotangent, the slots. The codes are uploaded as f32, the value their
+recorded dtype denotes (for `i8` the integer, for `fp8` the decoded value), so one float path
+serves both coded forms; for the `i8` form the codes are the largest single piece of that scratch
+and the one place a later change would save 4×. `R` costs the shrink's scratch nothing now that
+`dA` is the step's staging: rank 16 and rank 4 come out 0.3 MiB apart, the staging they hold. The
+staging is not in that ledger — `4 · R · K` bytes for `dA` and `4 · N · R` for `dB`, on the card
+for the step's length and counted by `grad_stage_bytes()` — because a call's scratch is freed when
+the call returns and this outlives it.
 
 No speed target is set. The measurement is the deliverable.
 
@@ -208,12 +244,15 @@ No speed target is set. The measurement is the deliverable.
   everywhere`, `docs/adjoints/lora.md` §3), so registering this row under that name would serve
   it too; it is left on the host because this issue names the two ops, and one line registers it
   when a trainer issues it.
-- **The step's accumulation across calls**: the leaf is host memory by the contract, so the card
-  hands a block over per call rather than holding the step's total. The host row does the same,
-  and the leaf adds in f32 either way.
+- **The walk that ends a step**: the backward core is issue 33 and is not written yet, so nothing
+  under `src/` calls `grad_stage_flush`; the gpu test calls it where the core will, and the core must
+  call it (or `grad_stage_discard`) at the end of every step, or the next step's gradients are added
+  to the step before it.
 
 ## Files
 
 - `src/adjoint/device/lora.hip` — the family's kernels and its two rows, in `libr97`.
+- `src/adjoint/device/grad_stage.h`, `src/adjoint/device/grad_stage.cpp` — the step's f32
+  accumulators and the copy into the gradient `ParamSet` that ends a step.
 - `tests/gpu/adjoint_lora.cpp` — the fixture and real-width cases, the gradients, the teeth.
 - `docs/kernels/lora.md` — this file.
