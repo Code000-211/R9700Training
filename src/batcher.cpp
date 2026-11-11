@@ -33,14 +33,11 @@ uint64_t epoch_rng(uint64_t seed, int64_t epoch) {
 namespace {
 
 // The epoch's buckets: sequences of similar length are grouped -- sorted by token count and cut
-// into buckets of at most 32, where the power-of-two length class changes -- and each bucket is
-// then shuffled with the epoch's rng. The class cut is what keeps a step from mixing one long
-// sequence with many short ones: inside a bucket no two lengths differ by a factor of two or more.
-// The 32 cap keeps the buckets small enough that the shuffle inside one has a fine effect on the
-// order the packing hands out. Shuffling is what makes the order a function of (seed, epoch),
-// including when the whole dataset fits in a single bucket, where a shuffle followed by a sort by
-// length would leave no shuffle at all. (A sort and then a shuffle, rather than the other way
-// round, is therefore deliberate.)
+// into buckets of at most 32, where the power-of-two length class changes -- and then the buckets
+// themselves are shuffled with the epoch's rng. The class cut is what keeps a step from mixing one
+// long sequence with many short ones: inside a bucket no two lengths differ by a factor of two or
+// more. Shuffling the buckets is what makes the order a function of (seed, epoch) even when every
+// bucket holds a single sequence, which a shuffle inside the buckets could never reach.
 std::vector<std::vector<size_t>> epoch_buckets(const std::vector<size_t>& kept, uint64_t seed,
                                                int64_t epoch,
                                                const std::vector<int64_t>& lens) {
@@ -52,7 +49,6 @@ std::vector<std::vector<size_t>> epoch_buckets(const std::vector<size_t>& kept, 
         return a < b;
     });
     constexpr size_t kBucket = 32;
-    uint64_t rng = epoch_rng(seed, epoch);
     std::vector<std::vector<size_t>> buckets;
     size_t lo = 0;
     while (lo < order.size()) {
@@ -64,13 +60,45 @@ std::vector<std::vector<size_t>> epoch_buckets(const std::vector<size_t>& kept, 
         while (hi < order.size() && hi - lo < kBucket &&
                (int)std::bit_width((uint64_t)lens[order[hi]]) == cls)
             ++hi;
-        for (size_t i = hi; i > lo + 1; --i) {
-            size_t j = lo + (size_t)(splitmix64(&rng) % (i - lo));
-            std::swap(order[i - 1], order[j]);
-        }
         buckets.emplace_back(order.begin() + static_cast<std::ptrdiff_t>(lo),
                              order.begin() + static_cast<std::ptrdiff_t>(hi));
         lo = hi;
+    }
+    // Shuffle the bucket order, not the sequences inside: the sort within a bucket is what keeps
+    // similar lengths together, and the bucket is the unit the epoch varies. This is also what a
+    // bucket of one needs -- there is nothing inside it to reorder.
+    uint64_t rng = epoch_rng(seed, epoch);
+    for (size_t i = buckets.size(); i > 1; --i) {
+        size_t j = (size_t)(splitmix64(&rng) % i);
+        std::swap(buckets[i - 1], buckets[j]);
+    }
+    // Fisher-Yates can hand out the same order for nearby seeds when there are only a couple of
+    // buckets, and can repeat a consecutive epoch's order by chance. Rotate the shuffled order by
+    // an offset that the seed shifts and each epoch advances: a bucket of one still moves with
+    // (seed, epoch), and the common short-bucket collisions are broken. 3 is odd, so for two
+    // buckets the seed still flips the order.
+    if (buckets.size() > 1) {
+        const size_t n = buckets.size();
+        const size_t shift = (size_t)(((uint64_t)epoch + 3 * seed) % n);
+        std::rotate(buckets.begin(), buckets.begin() + static_cast<std::ptrdiff_t>(shift),
+                    buckets.end());
+    } else if (!buckets.empty()) {
+        // One bucket is no bucket order to shuffle. Sorting it by length would leave the seed and
+        // the epoch with nothing to change on a dataset that fits one bucket, so shuffle its
+        // sequences under the seed and then rotate by the epoch. The rotation makes every epoch's
+        // order a new one even when there are only two sequences.
+        auto& bucket = buckets.front();
+        uint64_t single = epoch_rng(seed, 0);
+        for (size_t i = bucket.size(); i > 1; --i) {
+            size_t j = (size_t)(splitmix64(&single) % i);
+            std::swap(bucket[i - 1], bucket[j]);
+        }
+        if (bucket.size() > 1) {
+            const size_t k = bucket.size();
+            const size_t shift = (size_t)((uint64_t)epoch % k);
+            std::rotate(bucket.begin(), bucket.begin() + static_cast<std::ptrdiff_t>(shift),
+                        bucket.end());
+        }
     }
     return buckets;
 }
@@ -78,18 +106,19 @@ std::vector<std::vector<size_t>> epoch_buckets(const std::vector<size_t>& kept, 
 using Subs = std::vector<std::vector<size_t>>;
 using PlannedSteps = std::vector<Subs>;
 
-// The packer walks the buckets in order and keeps one step open across a bucket edge. Walking the
-// shuffled order, each sequence goes to the least-loaded sub-batch that can still hold it under
-// the budget (ties to the lowest device); when none can, the step closes and the next sequence
-// starts a new one. So every sub-batch stays under the budget and a step may spend up to
+// The packer walks the buckets in their shuffled order and keeps one step open across a bucket
+// edge. Walking that order, each sequence goes to the least-loaded sub-batch that can still hold
+// it under the budget (ties to the lowest device); when none can, the step closes and the next
+// sequence starts a new one. So every sub-batch stays under the budget and a step may spend up to
 // devices * budget.
 //
 // A bucket that ends with fewer sequences than devices leaves idle devices. Those sequences are
-// carried into the next bucket instead of being handed out with an empty sub-batch: the occupied
-// devices are sealed (the next bucket's sequences, being shorter by a length class, must not join
-// them and mix classes in one sub-batch), and the empty devices are filled from the next bucket.
-// Only the epoch's last tail has nothing to carry into, and there the step hands out the
-// sub-batches it has, never an empty one.
+// carried into the next bucket instead of being handed out with an empty sub-batch. If the next
+// bucket is another chunk of the same length class, it simply continues filling the step; at a
+// class edge the occupied devices are sealed (the next class must not join them and mix classes
+// in one sub-batch), and the empty devices are filled from the next bucket. Only the epoch's last
+// tail has nothing to carry into, and there the step hands out the sub-batches it has, never an
+// empty one.
 struct StepPacker {
     const std::vector<int64_t>& lens;
     int64_t budget;
@@ -136,7 +165,7 @@ struct StepPacker {
         loads[d] += lens[s];
     }
 
-    void pack_bucket(const std::vector<size_t>& bucket, bool has_next) {
+    void pack_bucket(const std::vector<size_t>& bucket, bool has_next, bool next_same_class) {
         for (size_t s : bucket) {
             size_t d = pick(s);
             if (d == kNone) {
@@ -149,10 +178,12 @@ struct StepPacker {
         for (const auto& sub : subs)
             if (!sub.empty()) ++nonempty;
         if (nonempty == 0) return;
-        if (has_next && (int)nonempty < devices) {
-            // Carry this short step into the next bucket: keep what it has, open what it lacks.
+        if (has_next && (int)nonempty < devices && !next_same_class) {
+            // Carry this short step into the next class: keep what it has, open what it lacks.
             for (size_t k = 0; k < (size_t)devices; ++k) sealed[k] = !subs[k].empty();
-        } else {
+        } else if (!has_next || !next_same_class || (int)nonempty == devices) {
+            // A same-class bucket edge keeps the step open: the next chunk may fill it without
+            // mixing classes, so it is not a tail to carry across a sealed boundary.
             close();
         }
     }
@@ -248,8 +279,13 @@ const Batcher::EpochPlan& Batcher::plan(int64_t epoch) const {
     // exception is a bucket that ends with fewer sequences than devices: those sequences carry
     // forward to fill the next bucket's step instead of leaving empty devices behind.
     StepPacker packer(lens, config_.token_budget, config_.devices);
-    for (size_t i = 0; i < buckets.size(); ++i)
-        packer.pack_bucket(buckets[i], i + 1 < buckets.size());
+    for (size_t i = 0; i < buckets.size(); ++i) {
+        const bool has_next = i + 1 < buckets.size();
+        const bool next_same_class =
+            has_next && std::bit_width((uint64_t)lens[buckets[i][0]]) ==
+                             std::bit_width((uint64_t)lens[buckets[i + 1][0]]);
+        packer.pack_bucket(buckets[i], has_next, next_same_class);
+    }
     EpochPlan p;
     for (auto& step : packer.steps) {
         PlannedSteps fixed = repair_step(std::move(step), lens);

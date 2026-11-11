@@ -13,30 +13,26 @@ An epoch is planned on demand from `(seed, epoch)` and cached (`Batcher::plan`):
    class always starts a new bucket. Any two lengths inside a bucket therefore differ by less
    than a factor of two, which is what keeps a batch from mixing one long sequence with many
    short ones.
-2. **Shuffle each bucket.** Every bucket is Fisher-Yates shuffled with a splitmix64 stream
-   derived from the config's seed and the epoch number. The same seed and epoch always give the
-   same order; a new epoch is a new shuffle. Grouping comes first and the shuffle second on
-   purpose: a shuffle followed by a sort by length would erase the shuffle entirely whenever the
-   whole dataset fits in one bucket (at most 32 sequences), leaving every seed and every epoch
-   with the same batches.
-3. **Pack each sub-batch under the budget.** Walking one bucket's shuffled order, each sequence
-   goes to the least-loaded of the `devices` sub-batches that still has room for it
+2. **Shuffle the buckets.** The bucket order is Fisher-Yates shuffled with a splitmix64 stream
+   derived from the config's seed and the epoch number, then rotated by `(epoch + 3 * seed)`
+   modulo the bucket count. The rotation matters when there are only a couple of buckets:
+   Fisher-Yates can hand the same order to nearby seeds, and the rotation makes the seed shift
+   the order and each epoch advance its starting bucket, which breaks the usual repeated order.
+   A sequence inside a bucket stays in length order. The one exception is a dataset that fits
+   one bucket: there is no bucket order to shuffle, so that bucket's sequences are shuffled
+   under the seed and rotated by the epoch, which keeps the seed and the epoch reaching the
+   batches even when the whole dataset is one length class.
+3. **Pack each sub-batch under the budget.** Walking the buckets in their shuffled order, each
+   sequence goes to the least-loaded of the `devices` sub-batches that still has room for it
    (`load + length <= token_budget`), ties to the lowest device. When no sub-batch can take the
-   next sequence the step closes. At a bucket's end the step normally closes too, so its
-   sub-batches hold one length class only. The exception is a bucket that ends with fewer
-   sequences than devices: those sequences carry into the next bucket to fill its idle devices
-   instead of being handed out with an empty sub-batch. The occupied devices are sealed for the
-   carry, so the next bucket's shorter sequences cannot join an occupied sub-batch and mix
-   classes inside one `Batch`; each sub-batch still holds sequences of one length class. Because
-   the sort runs longest first, the carry crosses from the short end of one class to the long end
-   of the next, so the two classes that meet at one carry are within a factor of two, and a carry
-   repeats only when a class is too small to fill the remaining devices. The budget
-   is per sub-batch, not per step: every `Batch` stays under `token_budget`, so a step may spend
-   up to `devices * token_budget` tokens. A sub-batch keeps its sequences in the order the
-   shuffle put them in; the packing does not re-sort them. A re-sort (longest first, say) would
-   erase the epoch's shuffle wherever the packing's outcome is fixed by the data — a bucket that
-   fits one step, sequences all of one length — leaving every seed and every epoch with
-   byte-identical batches.
+   next sequence the step closes. A bucket that ends with fewer sequences than devices carries
+   them into the next bucket to fill its idle devices instead of being handed out with an empty
+   sub-batch. If the next bucket is another chunk of the same length class, it just continues
+   filling the step. At a class edge the occupied devices are sealed for the carry, so the next
+   class cannot join an occupied sub-batch and mix classes inside one `Batch`; every sub-batch
+   still holds sequences of one length class. The budget is per sub-batch, not per step: every
+   `Batch` stays under `token_budget`, so a step may spend up to `devices * token_budget` tokens.
+   The packing keeps each sub-batch in the planned order; it does not re-sort it afterwards.
 4. **Balance devices.** Least-loaded-first assignment keeps the token spread between the fullest
    and emptiest sub-batch of a step under one maximal sequence of that step. If a closed step
    still reaches that bound — an odd residue of equal-length sequences, say — the fullest
@@ -66,13 +62,12 @@ plan out of bounds.
 ## Determinism
 
 Everything rests on splitmix64 and a Fisher-Yates over it — no `rand`, no locale, no
-unordered containers. Same seed, same batches, every run; another seed, and every new epoch,
-shuffles each length bucket differently. Which sequences a bucket holds is fixed by the data
-(the grouping); what the seed and the epoch choose is the order inside the buckets — the order
-the batches hand the sequences to a tape, and with it the step boundaries and so the batches. For
-a dataset whose sequences all share one length class and fit one bucket (at most 32), the order is
-a plain shuffle; for one small next to the budget, so that every step is one bucket wide, it is
-still the whole of what changes between seeds and epochs.
+unordered containers. Same seed, same batches, every run. Which sequences a bucket holds is
+fixed by the data (the grouping); what the seed and the epoch choose is the bucket order, so
+even a dataset whose buckets each hold one sequence changes its step order. For a dataset that
+fits one bucket, the seed chooses a shuffle of it and the epoch rotates that shuffle, so
+consecutive epochs differ even when there are only two sequences. The same seed and epoch replay
+the same plan, so a saved position resumes identically.
 
 ## Tests
 
@@ -86,23 +81,29 @@ to `(0, 0)` and replays the first epoch, even after a traversal has run out; a n
 and fewer than one device are rejected; on the varied data a step with two sub-batches keeps the
 strict spread, less than one maximal sequence; a short bucket tail — 33 sequences of 500 beside
 32 of 12 on two devices — fills the idle device from the next bucket, so no step has an empty
-sub-batch and the carried steps keep the strict bound; an epoch's last odd tail — 5 sequences of
-500 at budget 1200 on two devices — has no next bucket, so its last step has one sub-batch rather
-than an empty one, again keeping the strict bound on every step that has two; and the same holds
-for the smaller odd residues (3 sequences of 500, 3 unit sequences) that a greedy hand-out would
-leave unbalanced; a dataset that fits one step per bucket — 20 sequences of 17..74 tokens, 100
-sequences of one length, 1000 sequences of 50..80 tokens on two devices — still changes its whole
-shape (steps, sub-batches and the order inside them) with the seed and with the epoch, at the
-realistic budget of 4096 rather than a small one that forces the packing to end a step early; and
-a dataset of two length classes 40x apart, 32 long ones beside 32 shorts and then 33 long ones
-beside 32 shorts with one device, comes out in steps that hold one class only, the long ones
-first. The 32 case is exactly two buckets; the 33 case leaves a bucket that would hold one long
-and the shorts after it in the sorted order, so it is the case that mixes classes unless the
-bucket is cut at the length class and a step stops at the bucket edge — the grouping that a plain
-shuffle, or buckets of 32 without the class cut, would lose. A saved position with a negative step
-or epoch resumes at the epoch's first step or shuffle, and one past the epoch's end sits at its
-end and hands out nothing, so a stepped-back or corrupted position cannot read outside the plan.
-`tests/headers/hdr_batcher.cpp` is the standalone-compile check of the header.
+sub-batch and the carried steps keep the strict bound. For that case a short step is allowed only
+as the final one, because the shuffled bucket order may put the one-long remainder last where it
+has nothing to carry into. An epoch's last odd tail — 5 sequences of 500 at budget 1200 on two
+devices — has no next bucket, so its last step has one sub-batch rather than an empty one, again
+keeping the strict bound on every step that has two; and the same holds for the smaller odd
+residues (3 sequences of 500, 3 unit sequences) that a greedy hand-out would leave unbalanced. A
+dataset whose buckets each hold one sequence — two sequences in different length classes, and one
+per class across eight classes — does not come out identical across the seed runs or across three
+epochs; so does a dataset that fits one bucket (2, 3 and 20 sequences of one length), by shuffling
+and rotating that bucket. A dataset that fits one step per bucket — 20 sequences of 17..74 tokens,
+100 sequences of one length, 1000 sequences of 50..80 tokens on two devices — still changes its
+whole shape (steps, sub-batches and the order inside them) with the seed and with the epoch, at
+the realistic budget of 4096 rather than a small one that forces the packing to end a step early. A dataset of two length classes 40x
+apart, 32 long ones beside 32 shorts and then 33 long ones beside 32 shorts with one device, comes
+out in steps that hold one class only; the shuffled bucket order decides which class comes first,
+so no test fixes that order. The 32 case is exactly two buckets; the 33 case leaves a bucket that
+would hold one long and the shorts after it in the sorted order, so it is the case that mixes
+classes unless the bucket is cut at the length class and a step stops at the bucket edge — the
+grouping that a plain shuffle, or buckets of 32 without the class cut, would lose. A saved
+position with a negative step or epoch resumes at the epoch's first step or shuffle, and one past
+the epoch's end sits at its end and hands out nothing, so a stepped-back or corrupted position
+cannot read outside the plan. `tests/headers/hdr_batcher.cpp` is the standalone-compile check of
+the header.
 
 The host test binary has a single `main`, in `tests/host/vector_tape.cpp`; a second one cannot
 link. Rather than edit that test or settle the repository's host-test entry point from here, the

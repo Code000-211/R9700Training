@@ -381,12 +381,98 @@ void check_shuffle_reaches_the_batches() {
     }
 }
 
+// A dataset whose buckets each hold one sequence: the shuffle has to reorder the buckets
+// themselves. Shuffling only inside a bucket cannot touch a bucket of one, so with the grouping
+// fixed by length and the bucket order fixed by the sort, every seed and every epoch handed out
+// the same batches. The two shapes below are the ones a shuffle-inside-buckets batcher could not
+// change: two sequences in different length classes, and one sequence per class across eight
+// classes.
+void check_shuffle_reaches_single_sequence_buckets() {
+    struct Case {
+        std::vector<int64_t> lens;
+        int64_t budget;
+        int devices;
+    };
+    std::vector<Case> cases;
+    cases.push_back(Case{{3000, 700}, 4096, 2});
+    cases.push_back(Case{{100, 300, 700, 1500, 3000, 6000, 12000, 24000}, 30000, 1});
+
+    for (const Case& c : cases) {
+        auto seqs = make_sequences(c.lens);
+        r97::BatcherConfig cfg;
+        cfg.token_budget = c.budget;
+        cfg.devices = c.devices;
+        cfg.seed = 1;
+
+        // Each epoch is a new shuffle.
+        Batcher b(seqs, cfg);
+        std::vector<EpochShape> epochs;
+        for (int64_t e = 0; e < 3; ++e) {
+            b.seek({e, 0});
+            auto one = run_epoch(b);
+            assert(coverage(one, c.lens).size() == c.lens.size());
+            epochs.push_back(shape(one));
+        }
+        assert(epochs[0] != epochs[1] || epochs[1] != epochs[2]);
+
+        // Another seed does not replay this shuffle. Three seeds rather than a pair: two buckets
+        // have only two orders, so one pair may coincide by chance while the seed still reaches
+        // the batches.
+        std::vector<EpochShape> seeds;
+        for (uint64_t seed : {1, 2, 3}) {
+            cfg.seed = seed;
+            Batcher s(seqs, cfg);
+            seeds.push_back(shape(run_epoch(s)));
+        }
+        assert(seeds[0] != seeds[1] || seeds[1] != seeds[2]);
+
+        // Same seed, same batches.
+        cfg.seed = 1;
+        Batcher again(seqs, cfg);
+        assert(shape(run_epoch(again)) == epochs[0]);
+    }
+}
+
+// A dataset that fits one length bucket has no bucket order to shuffle. Sorting the bucket by
+// length alone would then leave the seed and the epoch with nothing to change, so the one
+// bucket's sequences are shuffled instead, under the seed and rotated by the epoch. This is the
+// case the earlier round covered for a dataset small next to the budget: every sequence the same
+// length, one bucket after grouping.
+void check_single_bucket_shuffle() {
+    // Two sequences is the smallest case: there are only two orders, so the three epochs cannot
+    // all differ, but every consecutive pair must. Three sequences and a full bucket cover the
+    // larger ones.
+    for (int64_t count : {2, 3, 20}) {
+        std::vector<int64_t> lens(static_cast<size_t>(count), 100);
+        auto seqs = make_sequences(lens);
+
+        r97::BatcherConfig cfg;
+        cfg.token_budget = 4096;
+        cfg.devices = 1;
+        cfg.seed = 1;
+        Batcher b(seqs, cfg);
+
+        std::vector<EpochShape> epochs;
+        for (int64_t e = 0; e < 3; ++e) {
+            b.seek({e, 0});
+            epochs.push_back(shape(run_epoch(b)));
+        }
+        assert(epochs[0] != epochs[1] && epochs[1] != epochs[2]);
+
+        cfg.seed = 2;
+        Batcher other(seqs, cfg);
+        assert(shape(run_epoch(other)) != epochs[0]);
+    }
+}
+
 // Grouping: a batch does not mix one long sequence with many short ones. Two length classes 40x
 // apart with a budget that would happily hold one long sequence beside dozens of shorts. The
 // counts matter: 32 longs are exactly one bucket by themselves, so they cannot expose a step that
-// crosses a bucket edge; 33 longs leave a bucket holding one long and the shorts that follow it in
-// the sorted order, which is the case that mixes classes unless the grouping cuts at the length
-// class and the packing stops at the bucket edge. Both counts are checked, over several epochs.
+// crosses a bucket edge; 33 longs leave a bucket holding one long, which carries into whichever
+// bucket the epoch's shuffle puts next, which is the case that mixes classes unless the grouping
+// cuts at the length class and the packing stops at the bucket edge. Both counts are checked, over
+// several epochs; the bucket order is the epoch's to choose, so no check here fixes which class
+// comes first.
 void check_similar_lengths_are_grouped() {
     const int64_t kLong = 500;
     const int64_t kShort = 12;
@@ -420,14 +506,13 @@ void check_similar_lengths_are_grouped() {
                     ++seen;
                 }
                 // No step mixes the two classes: a batch is never one long and a crowd of shorts.
+                // The shuffled bucket order decides which class comes first, so neither order is
+                // assumed.
                 assert(longest == shortest);
-                if (longest == kLong) {
-                    assert(!saw_short_step);  // grouped descending: every long step comes first
+                if (longest == kLong)
                     saw_long_step = true;
-                } else {
-                    assert(longest == kShort);
+                else
                     saw_short_step = true;
-                }
             }
             assert(saw_long_step && saw_short_step);
             assert(seen == kLongs + kShorts);
@@ -539,14 +624,16 @@ void check_reset_and_config_errors() {
 // one. Every step that still has two or more sub-batches keeps the strict balance: the token
 // spread is less than the step's longest sequence. The cases below are the ones a per-bucket
 // greedy gets wrong: a long bucket tail beside a short bucket, a final odd sequence, and an odd
-// residue that greedy would hand to one device while leaving the other behind.
+// residue that greedy would hand to one device while leaving the other behind. The epoch's
+// shuffled bucket order may put the one-long tail last, where it has nothing to carry into, so
+// for that case a short step is allowed only as the final step.
 void check_short_tail_balance() {
     struct Case {
         const char* what;
         std::vector<int64_t> lens;
         int64_t budget;
         int devices;
-        bool every_step_full;  // the carry must fill every step of this one
+        bool carry_must_fill;  // every short step here would be a carry that failed
     };
     std::vector<Case> cases;
     {
@@ -606,8 +693,12 @@ void check_short_tail_balance() {
             }
         }
         assert(seen == c.lens.size());
-        if (c.every_step_full) assert(!saw_short);
-        else assert(saw_short);  // an epoch's final tail has nothing to fill with
+        if (c.carry_must_fill) {
+            for (size_t i = 0; i < run.size(); ++i)
+                if ((int)run[i].size() < c.devices) assert(i + 1 == run.size());
+        } else {
+            assert(saw_short);  // an epoch's final tail has nothing to fill with
+        }
     }
 }
 
@@ -660,6 +751,8 @@ void run_checks() {
     check_budget_coverage_and_resume();
     check_budget_is_per_batch();
     check_shuffle_reaches_the_batches();
+    check_shuffle_reaches_single_sequence_buckets();
+    check_single_bucket_shuffle();
     check_similar_lengths_are_grouped();
     check_single_step_split();
     check_short_tail_balance();
