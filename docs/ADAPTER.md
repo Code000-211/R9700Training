@@ -86,7 +86,11 @@ exchanged" — the middle two dwords of each sixteen-byte step are exchanged, ho
 column order. `lora_shrink` reads codes by column, so an adapter over a step-order site would be
 wrong — which is why radiance refuses it (see §3). The first patch lifts this refusal *by
 unexchanging the middle dwords when it builds `x`* for the step-order dtypes, and the
-`i8a8h` sites of this contract need only the column-order path above.
+`i8a8h` sites of this contract need only the column-order path above. What says which order a
+shrink's codes are in is the encoding of the GEMM whose activation it reads, so the patch has the
+core declare `lora_shrink` with a `gemm_dtype` parameter holding that GEMM's own `dtype` string
+(`i8a8h`, `w8a8`, ...). `dtype` alone cannot: it is the activation's element dtype, `i8` at every
+coded site.
 
 ---
 

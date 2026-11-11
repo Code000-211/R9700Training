@@ -1,12 +1,19 @@
 // tests/host/lora_shrink_step_order.cpp -- the reference lora_shrink reads a step-order
 // activation.
 //
-// patches/serving/0210-lora-int8-trunk-host.patch gives libref's lora_shrink the step order that
-// quant_act_i8 writes at w4a8/w8a8/w2a8 (the middle dwords of every 16-byte step exchanged). The
-// int8 fixture's trunk is i8a8h, whose codes are already in column order, so the fixture test
-// cannot reach this path. This runs the reference kernel directly: the same codes, once in column
-// order and once in step order, must produce the same f32 accumulator, and that accumulator must
-// agree with an independent f64 dot in which every code is multiplied by its group's scale.
+// radiance declares lora_shrink with two dtype parameters: `dtype`, the activation's element dtype
+// (always "i8" for codes, whatever the site), and `gemm_dtype`, the encoding of the GEMM whose
+// activation it reads -- the same string that GEMM carries. It is `gemm_dtype` that says how the
+// codes are stored: quant_act_i8 writes them in the int8 WMMA's step order at w4a8/w8a8/w2a8 (the
+// middle dwords of every 16-byte step exchanged) and the rotated producers write column order.
+//
+// patches/serving/0210-lora-int8-trunk-host.patch makes libref's lora_shrink unexchange the step
+// order when `gemm_dtype` names one of those. The int8 fixture's trunk is i8a8h, whose codes are
+// already in column order, so the fixture test exercises only the column-order reading; this runs
+// the reference kernel directly, with the parameter set radiance declares at such a site: the
+// same codes, once in column order and once in step order, must produce the same f32 accumulator,
+// and that accumulator must agree with an independent f64 dot in which every code is multiplied
+// by its group's scale.
 
 #include <algorithm>
 #include <cmath>
@@ -32,10 +39,11 @@ struct Result {
     std::vector<float> t;
 };
 
-// Run libref's lora_shrink over `codes` (row-major [M,K], column order). With `step_order` the
-// codes are stored the way quant_act_i8 writes them.
+// Run libref's lora_shrink over `codes` (row-major [M,K], column order) as a site whose GEMM is
+// `gemm_dtype` reads it. With `step_order` the codes are stored the way quant_act_i8 writes them.
 Result shrink(const RadKernelInfo* k, const std::vector<int8_t>& codes,
-              const std::vector<float>& scale, const std::vector<float>& a, bool step_order) {
+              const std::vector<float>& scale, const std::vector<float>& a, const char* gemm_dtype,
+              bool step_order) {
     std::vector<int8_t> x((size_t)(kM * kK));
     for (int64_t m = 0; m < kM; ++m)
         for (int64_t c = 0; c < kK; ++c)
@@ -85,9 +93,14 @@ Result shrink(const RadKernelInfo* k, const std::vector<int8_t>& codes,
     tensors[4].stride[0] = kR;
     tensors[4].stride[1] = 1;
 
+    // `dtype` is the element dtype radiance declares (`rad_dtype_name` of the codes), and
+    // `gemm_dtype` the site GEMM's own name: the two are different strings at every coded site.
     RadParam params[] = {
-        RAD_INT("K", kK), RAD_INT("R", kR), RAD_INT("S", kS), RAD_INT("M", kM),
-        RAD_INT("group", kG), RAD_STR("dtype", step_order ? "w8a8" : "i8a8h"),
+        RAD_INT("K", kK),  RAD_INT("R", kR),
+        RAD_INT("S", kS),  RAD_INT("M", kM),
+        RAD_INT("group", kG),
+        RAD_STR("dtype", "i8"),
+        RAD_STR("gemm_dtype", gemm_dtype),
     };
     RadArgs args{};
     args.t = tensors;
@@ -120,12 +133,25 @@ R97_TEST(lora_shrink_reads_step_order_codes) {
     for (float& v : a)
         v = (float)r97::adjoint_check::urand(&seed) * 0.25f;
 
-    const Result column = shrink(k, codes, scale, a, false);
-    const Result step = shrink(k, codes, scale, a, true);
+    // The column-order readings: the rotated trunk's i8a8h, and the plain i8a8 codes of
+    // quant_act_i8g. Both must agree, bit for bit, with the same kernel run over the codes in
+    // each step-order encoding -- w4a8, w8a8 and w2a8 are what quant_act_i8 feeds and what
+    // radiance's model of an A in the fwht128 basis is served with.
+    const Result column = shrink(k, codes, scale, a, "i8a8h", false);
     R97_CHECK(column.rc == RAD_OK);
-    R97_CHECK(step.rc == RAD_OK);
-    R97_CHECK(column.t.size() == step.t.size());
-    R97_CHECK(std::memcmp(column.t.data(), step.t.data(), column.t.size() * sizeof(float)) == 0);
+    const struct {
+        const char* gemm_dtype;
+        bool        step_order;
+    } cases[] = {
+        { "i8a8", false }, { "i8a8h", false }, { "w4a8", true },
+        { "w8a8", true },  { "w2a8", true },
+    };
+    for (const auto& c : cases) {
+        const Result got = shrink(k, codes, scale, a, c.gemm_dtype, c.step_order);
+        R97_CHECK(got.rc == RAD_OK);
+        R97_CHECK(got.t.size() == column.t.size());
+        R97_CHECK(std::memcmp(column.t.data(), got.t.data(), column.t.size() * sizeof(float)) == 0);
+    }
 
     // The independent f64 dot: t[m,j] = sum_k (code[m,k] * scale[m,k]) * A[0,j,k].
     for (int64_t m = 0; m < kM; ++m) {
@@ -134,7 +160,7 @@ R97_TEST(lora_shrink_reads_step_order_codes) {
             for (int64_t c = 0; c < kK; ++c)
                 want += (double)codes[(size_t)(m * kK + c)] * (double)scale[(size_t)m] *
                         (double)a[(size_t)(j * kK + c)];
-            const double got = (double)step.t[(size_t)(m * kR + j)];
+            const double got = (double)column.t[(size_t)(m * kR + j)];
             R97_CHECK(std::fabs(got - want) <= 1e-5 * std::max(std::fabs(got), std::fabs(want)) + 1e-6);
         }
     }
