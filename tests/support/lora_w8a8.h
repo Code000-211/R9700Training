@@ -4,11 +4,11 @@
 // rotation (tests/fixtures/w8a8_fwht128.recipe), so an adapter that rides it says which basis its
 // A factors are in: `"radiance_input_basis": "fwht128"` in adapter_config.json (docs/ADAPTER.md).
 // This header writes such an adapter -- random A and B over every module the fixture declares, on
-// every layer that declares it, one rank and one alpha -- and runs the engine's prefill with it in
-// slot 0, handing back the tape of that step with every operand's bytes copied. Copied, because a
-// block reuses the activation buffers the previous one filled: by the end of the step an address
-// holds the last writer's values, and a test that compares what each site computed needs the
-// values the site's own ops saw.
+// every layer that declares it, one rank and one alpha -- and runs the engine's prefill with it as
+// the prefill's adapter, handing back the tape of that step with every operand's bytes copied.
+// Copied, because a block reuses the activation buffers the previous one filled: by the end of the
+// step an address holds the last writer's values, and a test that compares what each site computed
+// needs the values the site's own ops saw.
 //
 // Header-only, like the rest of tests/support/: one includer, no object file to collect.
 #pragma once
@@ -28,8 +28,18 @@
 #include "fixture_w8a8.h"  // the int8 fixture, and through it fixture.h (run_prefill, tiny)
 #include "r97/tape.h"
 
+// The prefill is patches/training/'s: 0103-prefill-logits.patch adds run_prefill(),
+// 0104-prefill-lora.patch lets that prefill run a named adapter, and 0101-issue-observer.patch the
+// tape. A serving build applies none of the set, so the body compiles to nothing there
+// (docs/FIXTURES.md) and an includer needs no guard of its own.
+#if R97_FIXTURE_PREFILL && defined(RAD_ISSUE_OBSERVER)
+
 namespace r97 {
 namespace lora_w8a8 {
+
+// The name the adapter is loaded under and the name the prefill runs: radiance takes adapters as
+// NAME=PATH (--lora), and cfg.prefill_lora names one of those.
+inline constexpr const char* kAdapterName = "mine";
 
 // ============================================================================ the modules
 // A linear the fixture's trunk declares, as PEFT names it: the module's rows and columns in the
@@ -145,7 +155,7 @@ inline std::string write_adapter(const std::string& dir, const Spec& spec = Spec
 }
 
 // ============================================================================ the engine
-// The config a prefill of the fixture needs, with `adapter` (empty for none) in slot 0.
+// The config a prefill of the fixture needs, with `adapter` (empty for none) loaded and run.
 inline rad::Config config(const Fixture& f, const std::vector<std::vector<int32_t>>& prompts,
                           const std::string& adapter, int64_t rank) {
     rad::Config cfg;
@@ -158,8 +168,8 @@ inline rad::Config config(const Fixture& f, const std::vector<std::vector<int32_
     cfg.max_ctx          = 512;
     cfg.prefill_prompts  = prompts;
     if (!adapter.empty()) {
-        cfg.prefill_lora = 0;
-        cfg.lora.adapters.push_back({ "mine", adapter });
+        cfg.prefill_lora = kAdapterName;
+        cfg.lora.adapters.push_back({ kAdapterName, adapter });
         cfg.lora.max_rank = rank;
     }
     return cfg;
@@ -355,3 +365,5 @@ inline std::vector<Site> sites(const Tape& t) {
 
 }  // namespace lora_w8a8
 }  // namespace r97
+
+#endif  // R97_FIXTURE_PREFILL && RAD_ISSUE_OBSERVER

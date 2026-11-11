@@ -22,8 +22,10 @@
 //                   two that stay: the vocabulary weight is not a site, and a weight the recipe
 //                   left unrotated cannot be ridden in the rotated basis
 //
-// The observer and the tape are patches/training/'s; a serving build applies none of that set, so
-// this file registers no test there.
+// The prefill, the observer and the tape are patches/training/'s; a serving build applies none of
+// that set, so this file registers no test there. The include sits above the guard, the way
+// tests/host/fixture_w8a8.cpp includes the fixture: it is what defines R97_FIXTURE_PREFILL (through
+// tests/support/fixture.h), and the header's own body compiles to nothing when the set is absent.
 #include "support/lora_w8a8.h"
 
 #if R97_FIXTURE_PREFILL && defined(RAD_ISSUE_OBSERVER)
