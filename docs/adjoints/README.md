@@ -14,7 +14,11 @@ Registration is a static object per op, in the op's own file, keyed by op name:
 example the `dtype` parameter): `R97_REGISTER_TWIN_IF`, `R97_REGISTER_ADJOINT_IF`,
 `R97_REGISTER_ADJOINT_F` (which marks operand positions frozen -- a weight, a
 scale: the walk does not ask for their cotangent), `R97_REGISTER_ADJOINT_IF_F`.
-A new op needs no edit to any shared file.
+A new op needs no edit to any shared file. A row with a predicate is the more
+specific one, so it wins over a catch-all whatever order the files were linked
+in: a separate file can add a variant for one walk under the same op name
+without touching the family's file. `docs/adjoints/reference.md` is that pattern
+for the reference step.
 
 `r97train ops --registered` lists every op with a twin, a host adjoint or a
 device adjoint. The checks every adjoint test runs live in
