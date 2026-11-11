@@ -635,6 +635,11 @@ R97_TEST(iqr_decode) {
     if (inz) time_case(plugin, f, *inz, 0, "ssm_inz");
     const RadFileEntry* out = f.find("blk.0.ssm_out.weight");
     if (out) time_case(plugin, f, *out, 0, "ssm_out");
+    for (const char* name : { "blk.3.attn_qg.weight", "blk.3.attn_k.weight", "blk.3.attn_v.weight",
+                              "blk.3.attn_output.weight" }) {
+        const RadFileEntry* e = f.find(name);
+        if (e) time_case(plugin, f, *e, 0, name + 6);  // "attn_..." without "blk.3."
+    }
     const RadFileEntry* head = f.find("output.k3.weight");
     if (head) time_case(plugin, f, *head, 256, "output.k3 head chunk");
     const RadFileEntry* emb = f.find("token_embd.weight");

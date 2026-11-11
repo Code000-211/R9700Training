@@ -87,18 +87,24 @@ prints them.
 
 | weight | shape `[out, in]` | out | scales | decode |
 |---|---|---:|---:|---:|
-| `blk.0.ffn_gate_up.weight` (largest) | 5120 × 34816 | 170.0 MiB | 2.66 MiB | 1.43 ms (116.1 GiB/s) |
-| `blk.0.ffn_down.weight` | 5120 × 17408 | 85.0 MiB | 1.33 MiB | 0.95 ms (87.4 GiB/s) |
-| `blk.0.ssm_inz.weight` | 5120 × 16384 | 80.0 MiB | 1.25 MiB | 0.95 ms (82.3 GiB/s) |
-| `blk.0.ssm_out.weight` | 5120 × 6144 | 30.0 MiB | 0.47 MiB | 0.36 ms (80.5 GiB/s) |
-| `output.k3.weight`, 256-row head chunk | 256 × 5120 | 1.2 MiB | 0.02 MiB | 0.119 ms (10.3 GiB/s) |
-| `token_embd.weight`, 256-row head chunk | 256 × 5120 | 1.2 MiB | 0.02 MiB | 0.187 ms (6.5 GiB/s) |
+| `blk.0.ffn_gate_up.weight` (largest) | 5120 × 34816 | 170.0 MiB | 2.66 MiB | 1.41 ms (117.5 GiB/s) |
+| `blk.0.ffn_down.weight` | 5120 × 17408 | 85.0 MiB | 1.33 MiB | 0.94 ms (88.7 GiB/s) |
+| `blk.0.ssm_inz.weight` | 5120 × 16384 | 80.0 MiB | 1.25 MiB | 0.93 ms (84.0 GiB/s) |
+| `blk.0.ssm_out.weight` | 5120 × 6144 | 30.0 MiB | 0.47 MiB | 0.36 ms (82.0 GiB/s) |
+| `blk.3.attn_qg.weight` | 5120 × 12288 | 60.0 MiB | 0.94 MiB | 0.59 ms (98.8 GiB/s) |
+| `blk.3.attn_k.weight` | 5120 × 1024 | 5.0 MiB | 0.08 MiB | 0.120 ms (40.8 GiB/s) |
+| `blk.3.attn_v.weight` | 5120 × 1024 | 5.0 MiB | 0.08 MiB | 0.120 ms (40.8 GiB/s) |
+| `blk.3.attn_output.weight` | 5120 × 6144 | 30.0 MiB | 0.47 MiB | 0.36 ms (81.2 GiB/s) |
+| `output.k3.weight`, 256-row head chunk | 256 × 5120 | 1.2 MiB | 0.02 MiB | 0.116 ms (10.5 GiB/s) |
+| `token_embd.weight`, 256-row head chunk | 256 × 5120 | 1.2 MiB | 0.02 MiB | 0.181 ms (6.7 GiB/s) |
 
-A layer of the trunk is one `ffn_gate_up`, one `ffn_down`, one `ssm_inz` and one `ssm_out`, so its
-weights decode in about 3.7 ms and need at most 173 MiB of scratch if they are decoded one at a
-time (the largest is 170.0 + 2.66 MiB). The whole vocabulary projection would need 1.184 GiB +
-18.96 MiB; a 256-row head chunk needs 1.25 MiB + 20 KiB, which is why it is decoded in chunks.
-The small chunks are launch-bound, not bandwidth-bound.
+A Mamba layer (blocks 0-2) decodes `ssm_inz`, `ssm_out`, `ffn_gate_up` and `ffn_down` in about
+3.6 ms; an attention layer (block 3 onward) decodes `attn_qg`, `attn_k`, `attn_v`,
+`attn_output`, `ffn_gate_up` and `ffn_down` in about 3.5 ms. Decoded one weight at a time, which
+is what the backward does, the largest needs 173 MiB of scratch (170.0 + 2.66 MiB). The whole
+vocabulary projection would need 1.184 GiB + 18.96 MiB; a 256-row head chunk needs 1.25 MiB +
+20 KiB, which is why it is decoded in chunks. The small chunks are launch-bound, not
+bandwidth-bound.
 
 ## The tests
 
