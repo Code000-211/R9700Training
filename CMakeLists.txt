@@ -123,14 +123,19 @@ else()
 endif()
 set(RAD_GPU_TARGETS "gfx1201" CACHE STRING "AMDGPU architectures radiance's HIP kernels target")
 
-# The int8 GEMM row the IQR decode test compares with is `libr4d`'s; it is a HIP module, so only
-# ask radiance for it when the build is building the card side at all.
+# The int8 GEMM row the IQR decode test compares with is `libr4d`'s. radiance produces that module
+# only for a HIP build whose targets hold RDNA4 (libr4d/CMakeLists.txt), so ask for it on those same
+# terms: a host-only build, a machine without hipcc, or a build for another card must name neither a
+# target radiance does not make nor a byproduct that never appears.
 set(R97_LIBR4D_TARGET "")
 set(R97_LIBR4D_BYPRODUCT "")
-if(RAD_WITH_HIP)
-  set(R97_LIBR4D_TARGET libr4d)
-  set(R97_LIBR4D_BYPRODUCT
-      ${CMAKE_BINARY_DIR}/radiance-build/radiance_home/kernels/libr4d.so)
+if(NOT R97_WITH_HIP STREQUAL "OFF")
+  find_program(R97_HIPCC NAMES hipcc HINTS /opt/rocm/bin ENV ROCM_PATH PATH_SUFFIXES bin)
+  if(R97_HIPCC AND RAD_GPU_TARGETS MATCHES "(^|;)gfx12")
+    set(R97_LIBR4D_TARGET libr4d)
+    set(R97_LIBR4D_BYPRODUCT
+        ${CMAKE_BINARY_DIR}/radiance-build/radiance_home/kernels/libr4d.so)
+  endif()
 endif()
 
 ExternalProject_Add(radiance_core
@@ -335,8 +340,13 @@ if(R97_BUILD_TESTS)
     if(TARGET libr97)
       add_dependencies(r97_gpu_tests libr97)
       target_compile_definitions(r97_gpu_tests PRIVATE
-        "R97_DEVICE_PLUGIN=\"$<TARGET_FILE:libr97>\""
-        "R97_LIBR4D=\"${CMAKE_BINARY_DIR}/radiance-build/radiance_home/kernels/libr4d.so\"")
+        "R97_DEVICE_PLUGIN=\"$<TARGET_FILE:libr97>\"")
+      # Where the IQR GEMM comparison finds radiance's int8 rows, when this build makes them; the
+      # test looks beside the device plugin otherwise (both land in the radiance home's kernels/).
+      if(R97_LIBR4D_TARGET)
+        target_compile_definitions(r97_gpu_tests PRIVATE
+          "R97_LIBR4D=\"${CMAKE_BINARY_DIR}/radiance-build/radiance_home/kernels/libr4d.so\"")
+      endif()
     endif()
   endif()
 

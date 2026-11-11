@@ -357,14 +357,24 @@ std::string sibling(const std::string& so, const char* name) {
 }
 
 void load_l4d(L4d& l, const std::string& plugin) {
+    // Where libr4d is: the environment's override, the build's own radiance home when this build
+    // makes the module, or beside the device plugin -- radiance's home kernels/ directory, which is
+    // where both plugins land. A path that is not there falls through to the next.
+    std::vector<std::string> paths;
     const char* env = std::getenv("R97_LIBR4D");
+    if (env && *env) paths.push_back(env);
 #ifdef R97_LIBR4D
-    const std::string path = env && *env ? env : R97_LIBR4D;
-#else
-    const std::string path = env && *env ? env : sibling(plugin, "libr4d.so");
+    paths.push_back(R97_LIBR4D);
 #endif
-    l.h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!l.h) throw std::runtime_error("the IQR GEMM comparison needs " + path + ": " + dlerror());
+    paths.push_back(sibling(plugin, "libr4d.so"));
+
+    std::string why;
+    for (const std::string& path : paths) {
+        l.h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (l.h) break;
+        why += "\n  " + path + ": " + dlerror();
+    }
+    if (!l.h) throw std::runtime_error("the IQR GEMM comparison needs libr4d.so:" + why);
 #define GET(f, n)                                                                                \
     do {                                                                                         \
         void* p = dlsym(l.h, n);                                                                 \

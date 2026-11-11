@@ -122,6 +122,9 @@ decoded grid with the same activation, and requires the outputs to agree within 
 (worst relative error 0.000977 on the reference card); both rows use `i8a8h`, because the stored
 grid is in the rotated basis.
 
-The GEMM check needs `libr4d.so`, so the build's radiance `BUILD_COMMAND` includes `libr4d` and
-the gpu test gets its path as `R97_LIBR4D`. The gpu test runs without a model container by
-skipping the container cases with a note; the synthetic host tier still runs.
+The GEMM check needs `libr4d.so`. radiance makes that module only for a HIP build whose targets
+hold RDNA4 (`libr4d/CMakeLists.txt`), so the build asks for it on those same terms: when it does,
+`libr4d` joins radiance's `BUILD_COMMAND` and the gpu test gets its path as `R97_LIBR4D`; when it
+does not, `R97_LIBR4D` is left unset and the test looks beside the device plugin, where the radiance
+home puts both modules. The gpu test runs without a model container by skipping the container cases
+with a note; the synthetic host tier still runs.
