@@ -136,36 +136,43 @@ int loss_main(int argc, char** argv) {
 
     // The forward config carries no adapter -- the driver is the base model's -- so the run names
     // it to radiance, which loads it with everything --lora loads and keeps it for the prefill
-    // steps every engine of this process runs.
-    if (!args.lora.empty()) rad::lora::preload_adapter("forward", args.lora);
-
-    std::string err;
-    std::unique_ptr<r97::ForwardDriver> driver = r97::ForwardDriver::open(cfg, &err);
-    if (!driver) {
-        std::cerr << "r97train loss: " << err << "\n";
-        return 3;
-    }
-
-    r97::Model model;
-    model.objective = r97::CeObjective;
-    const r97::StepFn step = driver->step(model);
-
+    // steps every engine of this process runs. A step reports a failed engine start by throwing,
+    // after radiance has logged the reason (an adapter directory its loader refuses, say), so the
+    // measurement runs under a catch and the run ends there rather than at the top of the process.
     double loss = 0.0;
     int64_t scored = 0;
-    r97::Batch chunk;
-    int64_t chunk_tokens = 0;
-    for (const r97::TokenSeq& s : batch) {
-        const int64_t tokens = int64_t(s.ids.size());
-        if (!chunk.empty() &&
-            (chunk.size() >= size_t(cfg.max_seqs) || chunk_tokens + tokens > token_budget)) {
-            add_chunk(step, chunk, &loss, &scored);
-            chunk.clear();
-            chunk_tokens = 0;
+    try {
+        if (!args.lora.empty()) rad::lora::preload_adapter("forward", args.lora);
+
+        std::string err;
+        std::unique_ptr<r97::ForwardDriver> driver = r97::ForwardDriver::open(cfg, &err);
+        if (!driver) {
+            std::cerr << "r97train loss: " << err << "\n";
+            return 3;
         }
-        chunk.push_back(s);
-        chunk_tokens += tokens;
+
+        r97::Model model;
+        model.objective = r97::CeObjective;
+        const r97::StepFn step = driver->step(model);
+
+        r97::Batch chunk;
+        int64_t chunk_tokens = 0;
+        for (const r97::TokenSeq& s : batch) {
+            const int64_t tokens = int64_t(s.ids.size());
+            if (!chunk.empty() &&
+                (chunk.size() >= size_t(cfg.max_seqs) || chunk_tokens + tokens > token_budget)) {
+                add_chunk(step, chunk, &loss, &scored);
+                chunk.clear();
+                chunk_tokens = 0;
+            }
+            chunk.push_back(s);
+            chunk_tokens += tokens;
+        }
+        if (!chunk.empty()) add_chunk(step, chunk, &loss, &scored);
+    } catch (const std::exception& e) {
+        std::cerr << "r97train loss: " << e.what() << "\n";
+        return 3;
     }
-    if (!chunk.empty()) add_chunk(step, chunk, &loss, &scored);
 
     if (scored == 0) {
         std::cerr << "r97train loss: the file has no scored tokens\n";

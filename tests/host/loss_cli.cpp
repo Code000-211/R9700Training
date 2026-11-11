@@ -4,12 +4,17 @@
 // rows the trainer scores. The second case runs the same comparison through an adapter directory
 // the fixture ships, so `--lora` is checked against radiance loading the same directory itself.
 #include "../support/fixture.h"
+
+// radiance's tests/rad_test.h, which the fixture header brings in, defines CHECK for its own
+// TEST() registry; this file checks through R97_CHECK, so drop the alias before test.h.
+#undef CHECK
 #include "../support/test.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -45,11 +50,6 @@ Run run(const std::string& command) {
 
 std::string quote(const std::string& s) { return r97::detail::shell_quote(s); }
 
-std::string script_path() {
-    const fs::path here = fs::absolute(fs::path(__FILE__));
-    return (here.parent_path().parent_path().parent_path() / "tools" / "kld_loss.py").string();
-}
-
 std::string chat_path() {
     const fs::path here = fs::absolute(fs::path(__FILE__));
     return (here.parent_path().parent_path() / "fixtures" / "chat_small.jsonl").string();
@@ -74,6 +74,53 @@ void check_close(double got, double want, const std::string& what) {
     if (rel > 1e-4)
         throw std::runtime_error(what + ": " + std::to_string(got) + " vs " + std::to_string(want) +
                                  " (relative " + std::to_string(rel) + ")");
+}
+
+// The record's own NLL column, read the way tools/kld_loss.py reads it: kld.json names the format
+// and the row count, and rows.f32 holds `rows` rows of little-endian f32, column 0 each row's
+// next-token NLL. The host tier never runs Python, so the check reads the record itself.
+struct RecordLoss {
+    double loss = 0.0;  // the mean over the record's rows
+    int64_t rows = 0;
+};
+
+RecordLoss record_loss(const fs::path& dir) {
+    std::ifstream manifest(dir / "kld.json");
+    if (!manifest) throw std::runtime_error("cannot read " + (dir / "kld.json").string());
+    nlohmann::json m;
+    manifest >> m;
+    const std::string format = m.at("format").get<std::string>();
+    const int64_t width = format == "radiance-kld-1"     ? 2
+                          : format == "radiance-kld-top-1" ? 3
+                                                          : 0;
+    if (!width) throw std::runtime_error("the KL record's format is '" + format + "'");
+    const int64_t rows = m.at("rows").get<int64_t>();
+    if (rows <= 0) throw std::runtime_error("the KL record has no rows");
+
+    std::ifstream in(dir / "rows.f32", std::ios::binary);
+    if (!in) throw std::runtime_error("cannot read " + (dir / "rows.f32").string());
+    in.seekg(0, std::ios::end);
+    const std::streamoff bytes = in.tellg();
+    in.seekg(0, std::ios::beg);
+    if (bytes != rows * width * 4)
+        throw std::runtime_error("rows.f32 holds " + std::to_string(bytes) + " bytes, not " +
+                                 std::to_string(rows * width * 4));
+    std::vector<char> raw(static_cast<size_t>(bytes));
+    if (!in.read(raw.data(), bytes))
+        throw std::runtime_error("cannot read all of " + (dir / "rows.f32").string());
+
+    double sum = 0.0;
+    for (int64_t r = 0; r < rows; ++r) {
+        const auto* b = reinterpret_cast<const unsigned char*>(raw.data() + r * width * 4);
+        const uint32_t bits = uint32_t(b[0]) | uint32_t(b[1]) << 8 | uint32_t(b[2]) << 16 |
+                              uint32_t(b[3]) << 24;
+        float nll = 0.0f;
+        std::memcpy(&nll, &bits, sizeof nll);
+        if (!std::isfinite(nll))
+            throw std::runtime_error("row " + std::to_string(r) + "'s NLL is not finite");
+        sum += nll;
+    }
+    return {sum / double(rows), rows};
 }
 
 std::vector<int32_t> read_tokens(const fs::path& path) {
@@ -146,11 +193,48 @@ Corpus write_corpus(const r97::Fixture& f, const std::string& name) {
     return c;
 }
 
+// The fixture and the corpus, built before main.
+//
+// The host runner calls an R97_TEST from an exit handler, after the binary's namespace-scope
+// objects are destroyed, and by then radiance's own chat-template machinery is gone: ChatData
+// cannot open a container any more. So the corpus is built here, at static-initialiser time,
+// where ChatData does work (the chat-data checks use it there). The engine at the other end is
+// the reverse -- it allocates through radiance's device ledger, whose constructor runs later in
+// the binary's static initialisation -- so an engine starts only from the exit-time test. One
+// test, two moments; nothing about the comparison changes.
+//
+// The prepared state is leaked on purpose: it has to outlive the exit-time test, and a static of
+// its own would be destroyed before the runner runs.
+struct Prepared {
+    bool ok = false;
+    std::string error;
+    r97::Fixture fixture;
+    Corpus corpus;
+};
+
+Prepared& prepared() {
+    static Prepared* const p = [] {
+        Prepared* q = new Prepared();
+        try {
+            q->fixture = r97::detail::make();
+            q->corpus = write_corpus(q->fixture, "loss_cli");
+            q->ok = true;
+        } catch (const std::exception& e) {
+            q->error = e.what();
+        }
+        return q;
+    }();
+    return *p;
+}
+
+[[maybe_unused]] const bool prepared_before_main = (prepared(), true);
+
 // Record the corpus's loss with radiance itself -- through `lora`, when one is named -- run
 // `r97train loss` over the same chat file, and check they agree.
-void check_against_record(const r97::Fixture& f, const std::string& name, const std::string& lora) {
-    const Corpus c = write_corpus(f, name);
-    const fs::path record = c.dir / "kld";
+void check_against_record(const Prepared& p, const std::string& name, const std::string& lora) {
+    const r97::Fixture& f = p.fixture;
+    const Corpus&       c = p.corpus;
+    const fs::path record = c.dir / ("kld_" + name);
 
     rad::Config cfg;
     cfg.model            = f.container;
@@ -183,10 +267,7 @@ void check_against_record(const r97::Fixture& f, const std::string& name, const 
     if (got_tokens != c.tokens)
         throw std::runtime_error("the KL record tokenised the corpus differently from chat-data");
 
-    const std::string python = std::getenv("PYTHON") ? std::getenv("PYTHON") : "python3";
-    const Run kld = run(quote(python) + " " + quote(script_path()) + " " + quote(record.string()));
-    if (kld.status != 0)
-        throw std::runtime_error("tools/kld_loss.py failed:\n" + kld.output);
+    const RecordLoss kld = record_loss(record);
 
     const std::string cli_path = (fs::path(r97::detail::build_dir()) / "r97train").string();
     if (!fs::exists(cli_path))
@@ -196,25 +277,56 @@ void check_against_record(const r97::Fixture& f, const std::string& name, const 
                         quote(chat_path()) + lora_flag);
     if (cli.status != 0) throw std::runtime_error("r97train loss failed:\n" + cli.output);
 
-    const double kld_loss = field(kld.output, "loss");
     const double cli_loss = field(cli.output, "loss");
-    if (int64_t(field(kld.output, "scored")) != c.rows)
-        throw std::runtime_error("kld_loss.py scored " + std::to_string(field(kld.output, "scored")) +
-                                 " rows, the chat file has " + std::to_string(c.rows));
+    if (kld.rows != c.rows)
+        throw std::runtime_error("the KL record holds " + std::to_string(kld.rows) +
+                                 " rows, the chat file has " + std::to_string(c.rows) +
+                                 " scored tokens");
     if (int64_t(field(cli.output, "scored")) != c.rows)
         throw std::runtime_error("r97train loss scored " + std::to_string(field(cli.output, "scored")) +
                                  " tokens, the chat file has " + std::to_string(c.rows));
-    check_close(cli_loss, kld_loss, "r97train loss against the KL record" +
+    check_close(cli_loss, kld.loss, "r97train loss against the KL record" +
                                         (lora.empty() ? std::string() : " through --lora"));
 }
 
-}  // namespace
-
 // Two cases: the base model, and the fixture's adapter through --lora.
-R97_TEST(loss_cli_matches_radiance_kld) { check_against_record(r97::fixture(), "loss_cli", ""); }
+R97_TEST(loss_cli_matches_radiance_kld) {
+    const Prepared& p = prepared();
+    if (!p.ok) throw std::runtime_error(p.error);
+    check_against_record(p, "base", "");
+}
 
 R97_TEST(loss_cli_lora_matches_radiance_kld) {
-    check_against_record(r97::fixture(), "loss_cli_lora", adapter_path());
+    const Prepared& p = prepared();
+    if (!p.ok) throw std::runtime_error(p.error);
+    check_against_record(p, "lora", adapter_path());
 }
+
+// A directory radiance cannot load must end the run with a message and a non-zero status, not take
+// the process down: the driver reports a failed engine start by throwing, and loss_main must catch
+// it. Radiance logs the reason the loader refused the directory.
+R97_TEST(loss_cli_reports_an_unloadable_lora) {
+    const Prepared& p = prepared();
+    if (!p.ok) throw std::runtime_error(p.error);
+    const r97::Fixture& f = p.fixture;
+    const std::string cli_path = (fs::path(r97::detail::build_dir()) / "r97train").string();
+    if (!fs::exists(cli_path))
+        throw std::runtime_error("r97train is not beside the test binary at " + cli_path);
+
+    const fs::path empty = p.corpus.dir / "no_adapter";
+    std::error_code ec;
+    fs::remove_all(empty, ec);
+    fs::create_directories(empty, ec);
+
+    const Run cli = run(quote(cli_path) + " loss --model " + quote(f.container) + " --data " +
+                        quote(chat_path()) + " --lora " + quote(empty.string()));
+    if (cli.status != 3)
+        throw std::runtime_error("an unloadable adapter directory exited " +
+                                 std::to_string(cli.status) + ", not 3:\n" + cli.output);
+    if (cli.output.find("adapter_config.json") == std::string::npos)
+        throw std::runtime_error("the run did not report radiance's loader error:\n" + cli.output);
+}
+
+}  // namespace
 
 #endif  // R97_FORWARD

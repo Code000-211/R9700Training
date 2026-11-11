@@ -28,8 +28,9 @@ architecture on the host kernels, a bf16 key-value pool, speculation off.
 The forward config has no adapter field -- the driver is the base model's -- so the run names the
 directory to radiance before the driver's first engine starts
 (`patches/training/0106-preload-adapter.patch`): every engine after that loads it the way
-`--lora` does and runs its prefill steps through it. A directory radiance cannot load fails the
-run with radiance's own error, not a trainer one.
+`--lora` does and runs its prefill steps through it. A directory radiance cannot load ends the
+run non-zero rather than aborting: radiance logs its own error (`lora: adapter 'forward': cannot
+read .../adapter_config.json`) and the trainer reports that the step could not start.
 `--limit N` scores only the first N conversations of the file, for a quick look.
 
 The plugin home is `$RADIANCE_HOME`; beside the build it defaults to
@@ -52,8 +53,8 @@ python3 tools/kld_loss.py /tmp/chat_small.kld
 The corpus is one JSONL document per contiguous scored run of a conversation: `{"prompt":
 "<the conversation prefix through that run>", "score_from": <the row predicting the run's first
 token>}`. Its rows are then exactly the rows the trainer scores. `tests/host/loss_cli.cpp` builds
-that corpus from `ChatData` for `tests/fixtures/chat_small.jsonl` and checks the two losses agree
-to 1e-4 relative.
+that corpus from `ChatData` for `tests/fixtures/chat_small.jsonl`, reads the record's NLL column
+itself (the host tier runs no Python), and checks the two losses agree to 1e-4 relative.
 
 `tools/kld_loss.py` reads the NLL column of `rows.f32` and prints it in the same format as
 `r97train loss`; it accepts full and `--kld-top` records.
