@@ -112,13 +112,22 @@ using PlannedSteps = std::vector<Subs>;
 // sequence starts a new one. So every sub-batch stays under the budget and a step may spend up to
 // devices * budget.
 //
+// A sub-batch is only ever added to when the step it is in still hands out sub-batches within one
+// maximal sequence of each other in tokens: the spread is part of what a device is asked for, so
+// an add that would break it is no candidate at all. A step then closes with its devices full --
+// every device is either carrying a sub-batch or was sealed by an earlier class -- and a sub-batch
+// that no longer has room is what closes one early. The sequences a step could not take are the
+// first of the next step, not a step of their own: nothing is split off after the fact, which
+// would hand out a step of one sub-batch in the middle of an epoch.
+//
 // A bucket that ends with fewer sequences than devices leaves idle devices. Those sequences are
 // carried into the next bucket instead of being handed out with an empty sub-batch. If the next
 // bucket is another chunk of the same length class, it simply continues filling the step; at a
 // class edge the occupied devices are sealed (the next class must not join them and mix classes
-// in one sub-batch), and the empty devices are filled from the next bucket. Only the epoch's last
-// tail has nothing to carry into, and there the step hands out the sub-batches it has, never an
-// empty one.
+// in one sub-batch), and the empty devices are filled from the next bucket. So a step can hold two
+// classes in different sub-batches, which is how a short tail fills a device a long sequence left
+// idle. Only the epoch's last tail has nothing to carry into, and there the step hands out the
+// sub-batches it has, never an empty one.
 struct StepPacker {
     const std::vector<int64_t>& lens;
     int64_t budget;
@@ -126,6 +135,7 @@ struct StepPacker {
     Subs subs;
     std::vector<int64_t> loads;
     std::vector<char> sealed;  // occupied by an earlier bucket; the current bucket may not add
+    int64_t step_max = 0;      // the longest sequence the open step holds
     PlannedSteps steps;
     static constexpr size_t kNone = (size_t)-1;
 
@@ -137,17 +147,34 @@ struct StepPacker {
         for (auto& sub : subs) sub.clear();
         std::fill(loads.begin(), loads.end(), int64_t{0});
         std::fill(sealed.begin(), sealed.end(), char{0});
+        step_max = 0;
     }
 
     void close() {
-        bool empty = true;
-        for (const auto& sub : subs)
-            if (!sub.empty()) {
-                empty = false;
-                break;
-            }
-        if (!empty) steps.push_back(subs);
+        Subs step;
+        for (auto& sub : subs)
+            if (!sub.empty()) step.push_back(std::move(sub));
+        if (!step.empty()) steps.push_back(std::move(step));
         reset();
+    }
+
+    // Whether adding `s` to device `d` keeps the step's sub-batches within one maximal sequence of
+    // each other in tokens. The spread is over the sub-batches the step hands out, so a step that
+    // would hand out only one of them has nothing to bound, and a step whose sequences are all of
+    // no tokens has no sequence to bound it by.
+    bool keeps_spread(size_t s, size_t d) const {
+        const int64_t grown = loads[d] + lens[s];
+        int64_t hi = grown, lo = grown;
+        size_t nonempty = 1;
+        for (size_t k = 0; k < (size_t)devices; ++k) {
+            if (k == d || subs[k].empty()) continue;
+            hi = std::max(hi, loads[k]);
+            lo = std::min(lo, loads[k]);
+            ++nonempty;
+        }
+        if (nonempty < 2) return true;
+        const int64_t max_seq = std::max(step_max, lens[s]);
+        return max_seq == 0 || hi - lo < max_seq;
     }
 
     size_t pick(size_t s) const {
@@ -155,6 +182,7 @@ struct StepPacker {
         for (size_t k = 0; k < (size_t)devices; ++k) {
             if (sealed[k]) continue;
             if (loads[k] + lens[s] > budget) continue;
+            if (!keeps_spread(s, k)) continue;
             if (best == kNone || loads[k] < loads[best]) best = k;
         }
         return best;
@@ -163,6 +191,7 @@ struct StepPacker {
     void add(size_t s, size_t d) {
         subs[d].push_back(s);
         loads[d] += lens[s];
+        step_max = std::max(step_max, lens[s]);
     }
 
     void pack_bucket(const std::vector<size_t>& bucket, bool has_next, bool next_same_class) {
@@ -188,76 +217,6 @@ struct StepPacker {
         }
     }
 };
-
-// One closed step -> the steps it becomes. Empty sub-batches are dropped, and a step whose
-// sub-batches differ by at least its longest sequence is split: the fullest sub-batch gives up
-// its last sequences to a step of its own until the remainder is balanced. What comes off is one
-// sub-batch's worth, which is under the budget, so the spill is a valid sub-batch. The result is
-// the strict bound the packing wants -- less than one maximal sequence between sub-batches -- and
-// a step of fewer than two sub-batches (an epoch's final tail) has no spread to bound.
-PlannedSteps repair_step(Subs subs, const std::vector<int64_t>& lens) {
-    subs.erase(std::remove_if(subs.begin(), subs.end(),
-                              [](const std::vector<size_t>& sub) { return sub.empty(); }),
-               subs.end());
-    PlannedSteps spills;
-    while (subs.size() >= 2) {
-        std::vector<int64_t> loads(subs.size(), 0);
-        int64_t max_seq = 0;
-        for (size_t d = 0; d < subs.size(); ++d) {
-            for (size_t s : subs[d]) {
-                loads[d] += lens[s];
-                max_seq = std::max(max_seq, lens[s]);
-            }
-        }
-        int64_t lo = loads[0], hi = loads[0];
-        size_t full = 0;
-        for (size_t d = 1; d < subs.size(); ++d) {
-            lo = std::min(lo, loads[d]);
-            if (loads[d] > hi) {
-                hi = loads[d];
-                full = d;
-            }
-        }
-        if (max_seq == 0 || hi - lo < max_seq) break;
-
-        std::vector<size_t> spill;
-        while (!subs[full].empty()) {
-            spill.push_back(subs[full].back());
-            subs[full].pop_back();
-            // Recompute over the sub-batches that still hold something.
-            std::vector<int64_t> rest_loads;
-            int64_t rest_max = 0;
-            for (const auto& sub : subs) {
-                if (sub.empty()) continue;
-                int64_t load = 0;
-                for (size_t s : sub) {
-                    load += lens[s];
-                    rest_max = std::max(rest_max, lens[s]);
-                }
-                rest_loads.push_back(load);
-            }
-            if (rest_loads.size() < 2) break;
-            int64_t rest_lo = rest_loads[0], rest_hi = rest_loads[0];
-            for (int64_t load : rest_loads) {
-                rest_lo = std::min(rest_lo, load);
-                rest_hi = std::max(rest_hi, load);
-            }
-            if (rest_max == 0 || rest_hi - rest_lo < rest_max) break;
-        }
-        subs.erase(std::remove_if(subs.begin(), subs.end(),
-                                  [](const std::vector<size_t>& sub) { return sub.empty(); }),
-                   subs.end());
-        if (!spill.empty()) {
-            std::reverse(spill.begin(), spill.end());  // back into the shuffle's order
-            spills.push_back(Subs{std::move(spill)});
-        }
-    }
-
-    PlannedSteps out;
-    if (!subs.empty()) out.push_back(std::move(subs));
-    for (auto& spill : spills) out.push_back(std::move(spill));
-    return out;
-}
 
 }  // namespace
 
@@ -287,10 +246,7 @@ const Batcher::EpochPlan& Batcher::plan(int64_t epoch) const {
         packer.pack_bucket(buckets[i], has_next, next_same_class);
     }
     EpochPlan p;
-    for (auto& step : packer.steps) {
-        PlannedSteps fixed = repair_step(std::move(step), lens);
-        for (auto& one : fixed) p.steps.push_back(std::move(one));
-    }
+    p.steps = std::move(packer.steps);
     cached_plan_ = std::move(p);
     planned_epoch_ = epoch;
     return cached_plan_;

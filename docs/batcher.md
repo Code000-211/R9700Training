@@ -23,26 +23,33 @@ An epoch is planned on demand from `(seed, epoch)` and cached (`Batcher::plan`):
    under the seed and rotated by the epoch, which keeps the seed and the epoch reaching the
    batches even when the whole dataset is one length class.
 3. **Pack each sub-batch under the budget.** Walking the buckets in their shuffled order, each
-   sequence goes to the least-loaded of the `devices` sub-batches that still has room for it
-   (`load + length <= token_budget`), ties to the lowest device. When no sub-batch can take the
-   next sequence the step closes. A bucket that ends with fewer sequences than devices carries
-   them into the next bucket to fill its idle devices instead of being handed out with an empty
-   sub-batch. If the next bucket is another chunk of the same length class, it just continues
-   filling the step. At a class edge the occupied devices are sealed for the carry, so the next
-   class cannot join an occupied sub-batch and mix classes inside one `Batch`; every sub-batch
-   still holds sequences of one length class. The budget is per sub-batch, not per step: every
-   `Batch` stays under `token_budget`, so a step may spend up to `devices * token_budget` tokens.
-   The packing keeps each sub-batch in the planned order; it does not re-sort it afterwards.
-4. **Balance devices.** Least-loaded-first assignment keeps the token spread between the fullest
-   and emptiest sub-batch of a step under one maximal sequence of that step. If a closed step
-   still reaches that bound — an odd residue of equal-length sequences, say — the fullest
-   sub-batch's last sequences spill into a step of their own until the remainder is strictly
-   under the bound. What spills is one sub-batch's worth, so it is still under the budget, and a
-   spill step has a single sub-batch and no spread to bound. So a step hands out fewer than
-   `devices` sub-batches in two cases: it is a spill split off to keep another step's strict
-   spread, or it is the epoch's last tail, which has no next bucket to carry into. Neither is
-   handed out with an empty sub-batch: a single final sequence has no step to balance against, so
-   its step has one sub-batch rather than an empty second one.
+   sequence goes to the least-loaded of the `devices` sub-batches that can still take it: it has
+   room under the budget (`load + length <= token_budget`) and adding it keeps the step's spread
+   inside its bound (point 4). Ties go to the lowest device. When no sub-batch can take the next
+   sequence the step closes and the next sequence starts a new one. A bucket that ends with
+   fewer sequences than devices carries them into the next bucket to fill its idle devices
+   instead of being handed out with an empty sub-batch. If the next bucket is another chunk of
+   the same length class, it just continues filling the step. At a class edge the occupied
+   devices are sealed for the carry, so the next class cannot join an occupied sub-batch and mix
+   classes inside one `Batch`; every sub-batch still holds sequences of one length class, while a
+   step may hold two classes in different sub-batches. The budget is per sub-batch, not per step:
+   every `Batch` stays under `token_budget`, so a step may spend up to `devices * token_budget`
+   tokens. The packing keeps each sub-batch in the planned order; it does not re-sort it
+   afterwards.
+4. **Balance devices.** The spread is part of what a device is asked for, not a repair after the
+   packing: a sub-batch is only a candidate for a sequence while the step it is in still hands
+   out sub-batches within one maximal sequence of each other in tokens, and the bound is read
+   against the longest sequence in the step, which is what `keeps_spread` in the packer checks.
+   An add that would break it is no candidate, so a step closes with every device carrying a
+   sub-batch — the sequences it could not take are the first of the next step, and nothing is
+   split off after the fact to keep the bound. Every step but an epoch's last tail therefore
+   hands out `devices` sub-batches, and the tail hands out the one to `devices` it has. Neither
+   is handed out with an empty sub-batch: a single final sequence has no step to balance against,
+   so its step has one sub-batch rather than an empty second one. A sequence of no tokens is the
+   case neither rule covers and the packing does not special-case: it is its own length class, so
+   it cannot join a sub-batch that already holds one, and a step of one sub-batch has no bound
+   that admits a second, so a zero-token sequence can leave a step short in the middle of an
+   epoch. A tokenised sequence is never empty, and such a sequence has nothing to train on.
 
 ## Skip, position, resume
 
@@ -73,40 +80,44 @@ the same plan, so a saved position resumes identically.
 
 `tests/host/batcher.cpp` holds the host tier's checks: the budget holds for every sub-batch (each
 `Batch`), not for a step over all of them, and on the varied data a step spends more than one
-budget; a run of four long sequences, none of which can share a sub-batch with another, still
-fills both devices of every step; every step's lengths are within a factor of two; every kept
-sequence appears exactly once an epoch and the skipped one in no batch; the same seed replays and
-another seed does not; a seek to a saved `(epoch, step)` continues identically; `reset()` returns
-to `(0, 0)` and replays the first epoch, even after a traversal has run out; a non-positive budget
-and fewer than one device are rejected; on the varied data a step with two sub-batches keeps the
-strict spread, less than one maximal sequence; a short bucket tail — 33 sequences of 500 beside
-32 of 12 on two devices — fills the idle device from the next bucket, so no step has an empty
-sub-batch and the carried steps keep the strict bound. For that case a short step is allowed only
-as the final one, because the shuffled bucket order may put the one-long remainder last where it
-has nothing to carry into. An epoch's last odd tail — 5 sequences of 500 at budget 1200 on two
-devices — has no next bucket, so its last step has one sub-batch rather than an empty one, again
-keeping the strict bound on every step that has two; and the same holds for the smaller odd
-residues (3 sequences of 500, 3 unit sequences) that a greedy hand-out would leave unbalanced. A
-dataset whose buckets each hold one sequence — two sequences in different length classes, and one
-per class across eight classes — does not come out identical across the seed runs or across three
-epochs; so does a dataset that fits one bucket (2, 3 and 20 sequences of one length), by shuffling
-and rotating that bucket. A dataset that fits one step per bucket — 20 sequences of 17..74 tokens,
-100 sequences of one length, 1000 sequences of 50..80 tokens on two devices — still changes its
-whole shape (steps, sub-batches and the order inside them) with the seed and with the epoch, at
-the realistic budget of 4096 rather than a small one that forces the packing to end a step early. A dataset of two length classes 40x
-apart, 32 long ones beside 32 shorts and then 33 long ones beside 32 shorts with one device, comes
-out in steps that hold one class only; the shuffled bucket order decides which class comes first,
-so no test fixes that order. The 32 case is exactly two buckets; the 33 case leaves a bucket that
-would hold one long and the shorts after it in the sorted order, so it is the case that mixes
-classes unless the bucket is cut at the length class and a step stops at the bucket edge — the
-grouping that a plain shuffle, or buckets of 32 without the class cut, would lose. A saved
-position with a negative step or epoch resumes at the epoch's first step or shuffle, and one past
-the epoch's end sits at its end and hands out nothing, so a stepped-back or corrupted position
-cannot read outside the plan. `tests/headers/hdr_batcher.cpp` is the standalone-compile check of
-the header.
+budget; a run of four long sequences, none of which can share a sub-batch with another, still fills
+both devices of every step; every sub-batch's lengths are within a factor of two (a step may hold
+two classes, one per sub-batch, where a short tail fills an idle device); every kept sequence
+appears exactly once an epoch and the skipped one in no batch; the same seed replays and another
+seed does not; a seek to a saved `(epoch, step)` continues identically; `reset()` returns to `(0,
+0)` and replays the first epoch, even after a traversal has run out; a non-positive budget and fewer
+than one device are rejected; on the varied data a step with two sub-batches keeps the strict
+spread, less than one maximal sequence; a short bucket tail — 33 sequences of 500 beside 32 of 12 on
+two devices — fills the idle device from the next bucket, so no step has an empty sub-batch and the
+carried steps keep the strict bound. For that case a short step is allowed only as the final one,
+because the shuffled bucket order may put the one-long remainder last where it has nothing to carry
+into. An epoch's last odd tail — 5 sequences of 500 at budget 1200 on two devices — has no next
+bucket, so its last step has one sub-batch rather than an empty one, again keeping the strict bound
+on every step that has two; and the same holds for the smaller odd residues (3 sequences of 500, 3
+unit sequences) that a greedy hand-out would leave unbalanced. Every step but the epoch's last fills
+all of its devices — on three longs beside three shorts on two devices, the case where one long is
+left for the next step and the three shorts then fill the device it left idle, and on 800 varied
+lengths at two, three and four devices, over three seeds and three epochs each, and on 101 sequences
+of one length at three devices; before the spread became part of the pick, each of those handed out
+a step of one sub-batch in the middle of the epoch. A dataset whose buckets each hold one sequence —
+two sequences in different length classes, and one per class across eight classes — does not come
+out identical across the seed runs or across three epochs; so does a dataset that fits one bucket
+(2, 3 and 20 sequences of one length), by shuffling and rotating that bucket. A dataset that fits
+one step per bucket — 20 sequences of 17..74 tokens, 100 sequences of one length, 1000 sequences of
+50..80 tokens on two devices — still changes its whole shape (steps, sub-batches and the order
+inside them) with the seed and with the epoch, at the realistic budget of 4096 rather than a small
+one that forces the packing to end a step early. A dataset of two length classes 40x apart, 32 long
+ones beside 32 shorts and then 33 long ones beside 32 shorts with one device, comes out in steps
+that hold one class only; the shuffled bucket order decides which class comes first, so no test
+fixes that order. The 32 case is exactly two buckets; the 33 case leaves a bucket that would hold
+one long and the shorts after it in the sorted order, so it is the case that mixes classes unless
+the bucket is cut at the length class and a step stops at the bucket edge — the grouping that a
+plain shuffle, or buckets of 32 without the class cut, would lose. A saved position with a negative
+step or epoch resumes at the epoch's first step or shuffle, and one past the epoch's end sits at its
+end and hands out nothing, so a stepped-back or corrupted position cannot read outside the plan.
+`tests/headers/hdr_batcher.cpp` is the standalone-compile check of the header.
 
-The host test binary has a single `main`, in `tests/host/vector_tape.cpp`; a second one cannot
-link. Rather than edit that test or settle the repository's host-test entry point from here, the
-batcher's test file carries its own runner and arms it with `std::atexit`, so it runs when the
-binary's `main` returns and a failed assertion still fails `ctest`. It is the only part of the
-file that has to change once one entry point is agreed.
+The host test binary has a single `main`, in `tests/host/vector_tape.cpp`; a second one cannot link.
+The batcher's checks therefore register themselves with `R97_TEST` and fail through `R97_CHECK` from
+`tests/support/test.h`, which runs them once that `main` returns, so a failed check still fails
+`ctest`.

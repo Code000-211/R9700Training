@@ -103,6 +103,31 @@ EpochShape shape(const std::vector<std::vector<Batch>>& epoch) {
     return out;
 }
 
+// One step's contract: at most `devices` sub-batches, none of them empty, each under the budget,
+// and -- when the step hands out two or more -- a token spread under one maximal sequence of the
+// step.
+void check_step(const std::vector<Batch>& step, int64_t budget, int devices) {
+    R97_CHECK(!step.empty());
+    R97_CHECK((int)step.size() <= devices);
+    std::vector<int64_t> loads;
+    int64_t max_seq = 0;
+    for (const Batch& sub : step) {
+        R97_CHECK(!sub.empty());
+        int64_t total = 0;
+        for (const TokenSeq& s : sub) {
+            total += tokens(s);
+            max_seq = std::max(max_seq, tokens(s));
+        }
+        R97_CHECK(total <= budget);
+        loads.push_back(total);
+    }
+    if (loads.size() >= 2) {
+        const int64_t spread = *std::max_element(loads.begin(), loads.end()) -
+                               *std::min_element(loads.begin(), loads.end());
+        R97_CHECK(spread < max_seq);
+    }
+}
+
 std::vector<std::vector<Batch>> whole_run(Batcher& b, int64_t epochs) {
     std::vector<std::vector<Batch>> all;
     for (int64_t e = 0; e < epochs; ++e) {
@@ -139,25 +164,27 @@ R97_TEST(batcher_budget_coverage_and_resume) {
 
     // The budget holds for every Batch, not for a step over all of its sub-batches: a step can
     // spend up to devices * budget tokens, and on this data the largest step does exceed a whole
-    // budget, so a batcher that bounded the step instead would fail here. A step's sequences are
-    // of similar length: all of them come from one length bucket, whose lengths are within a
-    // factor of two.
+    // budget, so a batcher that bounded the step instead would fail here. A sub-batch's sequences
+    // are of similar length -- they all come from one length bucket, whose lengths are within a
+    // factor of two. A step may hold more than one class: a short tail carried into the next
+    // bucket fills an idle device without joining the sub-batch that was already there. A step's
+    // sub-batches differ by less than one maximal sequence in tokens; a step of one sub-batch has
+    // no pair to differ. Which steps hand out fewer than `devices` is the next test's business.
     int64_t largest_step_total = 0;
     for (const auto& step : run) {
-        R97_CHECK((int64_t)step.size() == devices);
-        int64_t longest = 0, shortest = INT64_MAX, step_total = 0;
+        check_step(step, budget, devices);
+        int64_t step_total = 0;
         for (const Batch& sub : step) {
-            int64_t total = 0;
+            int64_t total = 0, longest = 0, shortest = INT64_MAX;
             for (const TokenSeq& s : sub) {
                 total += tokens(s);
                 longest = std::max(longest, tokens(s));
                 shortest = std::min(shortest, tokens(s));
             }
-            R97_CHECK(total <= budget);
+            R97_CHECK(shortest > 0 && longest < 2 * shortest);
             step_total += total;
         }
         largest_step_total = std::max(largest_step_total, step_total);
-        R97_CHECK(shortest > 0 && longest < 2 * shortest);
     }
     R97_CHECK(largest_step_total > budget);
 
@@ -223,25 +250,52 @@ R97_TEST(batcher_budget_coverage_and_resume) {
             for (size_t i = 0; i < resumed[k][d].size(); ++i)
                 R97_CHECK(resumed[k][d][i].ids == full[offset + k][d][i].ids);
     }
+}
 
-    // A step's sub-batches differ by less than one maximal sequence in tokens. Only a final odd
-    // tail can hand out fewer than `devices`, and it has no pair to differ.
-    for (const auto& stp : run) {
-        R97_CHECK(!stp.empty());
-        R97_CHECK((int)stp.size() <= devices);
-        std::vector<int64_t> loads(stp.size(), 0);
-        int64_t max_seq = 0;
-        for (size_t d = 0; d < stp.size(); ++d) {
-            R97_CHECK(!stp[d].empty());
-            for (const TokenSeq& s : stp[d]) {
-                loads[d] += tokens(s);
-                max_seq = std::max(max_seq, tokens(s));
+// Every step hands out `devices` sub-batches wherever the epoch still has sequences to fill one:
+// only the last tail, with fewer sequences left than devices, may be short. A mid-epoch short
+// step leaves a device idle while there is data still to hand out, which is what packing one
+// bucket at a time does at an odd residue -- three longs beside three shorts on two devices, or
+// varied lengths on three, where a bucket ends one or two sequences short of a full step.
+R97_TEST(batcher_fills_every_device_mid_epoch) {
+    struct Case {
+        std::vector<int64_t> lens;
+        int64_t budget;
+        int devices;
+    };
+    const std::vector<int64_t> varied = lengths_for(800, 7);
+    const std::vector<Case> cases = {
+        // Three longs beside three shorts: the third long has no room in the step that pairs the
+        // first two and no bound admits it beside a short, so it opens the next step, and the
+        // shorts then fill the device it left idle.
+        {{500, 500, 500, 12, 12, 12}, 1000, 2},
+        {varied, 4096, 2},
+        {varied, 4096, 3},
+        {varied, 4096, 4},
+        // One length class whose count is not a multiple of the devices per step.
+        {std::vector<int64_t>(101, 500), 2000, 3},
+    };
+    for (const Case& c : cases) {
+        auto seqs = make_sequences(c.lens);
+        for (uint64_t seed : {1ull, 2ull, 99ull}) {
+            for (int64_t epoch = 0; epoch < 3; ++epoch) {
+                r97::BatcherConfig cfg;
+                cfg.token_budget = c.budget;
+                cfg.devices = c.devices;
+                cfg.seed = seed;
+                Batcher b(seqs, cfg);
+                b.seek({epoch, 0});
+                auto run = run_epoch(b);
+                R97_CHECK((int64_t)run.size() == b.steps_in_epoch(epoch));
+                R97_CHECK(!run.empty());
+                auto seen = coverage(run, c.lens);
+                R97_CHECK(seen.size() == c.lens.size());
+                for (const auto& stp : run) check_step(stp, c.budget, c.devices);
+                // Everything but the epoch's last tail has a step after it to carry into, so it
+                // has no excuse for an idle device.
+                for (size_t i = 0; i + 1 < run.size(); ++i)
+                    R97_CHECK((int)run[i].size() == c.devices);
             }
-        }
-        if (stp.size() >= 2) {
-            int64_t spread = *std::max_element(loads.begin(), loads.end()) -
-                             *std::min_element(loads.begin(), loads.end());
-            R97_CHECK(spread < max_seq);
         }
     }
 }
