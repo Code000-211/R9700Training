@@ -370,6 +370,9 @@ ModelMeta read_model_meta(const std::string& container) {
         const RadFileEntry* input = fused ? fused : split;
         if (out && input) {
             const int64_t vdim = cols(*out);
+            if (z && rows(*z) != vdim)
+                fail("'" + container + "' layer " + std::to_string(l) + " keeps in_proj_z at " +
+                     std::to_string(rows(*z)) + " rows but ssm_out's input is " + std::to_string(vdim));
             int64_t conv_dim = 0;
             if (conv) {
                 conv_dim = rows(*conv);

@@ -10,7 +10,6 @@
 // (`model.layers.3.self_attn.q_proj`), by the name inside a block (`self_attn.q_proj`, the way
 // docs/ADAPTER.md's table lists them) or by its leaf (`q_proj`, the way PEFT writes
 // target_modules); anything else is an error that lists the names the container does have.
-#include "r97/adapter_io.h"
 #include "r97/delta.h"
 #include "r97/delta_registry.h"
 #include "r97/params.h"
