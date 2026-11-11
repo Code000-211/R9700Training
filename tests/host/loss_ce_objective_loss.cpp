@@ -1,9 +1,9 @@
 // tests/host/loss_ce_objective_loss.cpp -- CeObjective's loss is the loss it wraps: the summed
 // cross-entropy over the window's scored tokens, in f64, and the count that goes with it. Not the
 // mean, not zero, and not scaled by the gradient's 1/total_scored. Label: host.
-#include "support/self_check.h"
+#include "../support/self_check.h"
 
-#include "support/vector_tape.h"
+#include "../support/vector_tape.h"
 
 #include "r97/loss.h"
 
@@ -14,11 +14,13 @@
 using r97::Batch;
 using r97::TokenSeq;
 
-// One sequence of six tokens, scored tokens 2, 3 and 5: three scored rows, one unscored row
-// between the second and the third (rows 1, 2 and 4 of the five logits rows).
+// One sequence of six tokens, scored tokens 2, 3 and 3: three scored rows, one unscored row
+// between the second and the third (rows 1, 2 and 4 of the five logits rows). Every scored token
+// is inside the four-token vocab the tests below pass: a target at or past the vocab reads past
+// its logits row, and with NDEBUG the assert in ce_position does not catch it.
 static Batch scored_sequence() {
     Batch b;
-    b.push_back(TokenSeq{{0, 1, 2, 3, 4, 5}, {0, 0, 1, 1, 0, 1}});
+    b.push_back(TokenSeq{{0, 1, 2, 3, 4, 3}, {0, 0, 1, 1, 0, 1}});
     return b;
 }
 
