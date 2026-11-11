@@ -9,11 +9,11 @@ for a range of output rows.
 - Device: `src/adjoint/device/iqr_decode.hip`, entry point `r97_iqr_decode` in `libr97.so`.
 - Host reference: `r97_iqr_decode_host` in `src/iqr_decode.h`, the same arithmetic as the kernel
   inline, for tests and the host tier.
-- Tests: `tests/host/iqr_decode.cpp` (synthetic forms against libquant's `grid_decode` /
-  `grid_tcq_decode`) and `tests/gpu/iqr_decode.cpp` (the real container, every form, and the GEMM
-  check).
-- Reference for the arithmetic: libquant `libquant/lq_grid.h`, `grid_decode` and
-  `grid_tcq_decode`.
+- Tests: `tests/host/iqr_decode.cpp` (synthetic forms of both kinds against libquant's
+  `grid_decode` / `grid_tcq_decode`) and `tests/gpu/iqr_decode.cpp` (the real container, every IQR
+  form, and the GEMM check).
+- Reference for the arithmetic: libquant `libquant/lq_grid.h`: `grid_tcq_decode` for the trellis
+  forms and `grid_decode` for the affine one.
 
 ## What it reads and writes
 
@@ -30,15 +30,33 @@ the scale planes, and writes
 
 `R97IqrDecodeDesc` carries the plane pointers, their formats and blocks, the run length (`T`, the
 trellis's block rows), `rb`, the code width and the trellis state width, and the row range
-`[row0, row0 + rows)`. `codes` and `scale` **start at `row0`**, so a chunked caller offsets those
-two pointers by `row0 × row_bytes`; `lut`, `trellis.mad` and `scale.1` stay at the plane's base.
+`[row0, row0 + rows)`. `codes`, `scale` and (in the affine form) `zero` **start at `row0`**, so a
+chunked caller offsets those pointers by `row0 × row_bytes`; `lut`, `trellis.mad` and `scale.1`
+stay at the plane's base, and the affine form has none of the three.
 `row0` must be a multiple of `T`, and `rows` must be a multiple of `T` unless the range ends at the
 weight's last row, so every workgroup decodes whole trellis runs and the tail-biting seam is inside
-its own run.
+its own run. The affine form's `T` is 1, so any range is a whole number of runs.
 
 The vocabulary projection is `248320 × 5120`; the head is decoded in chunks (the test uses 256
 rows). A chunk is independent: the seam is taken from the last `ceil(state_bits / bits)` codes of
 the run, which are in the chunk's codes.
+
+## The two forms
+
+radiance stores two kinds of IQR grid in the first container, and one descriptor decodes both:
+
+- **Trellis** (the trunk, `transform=fwht128`): `codes` (u3..u6) with `scale` and an optional
+  `scale.1`, and a `trellis` table or a `trellis.mad` pair to compute the table from. A column is a
+  tail-biting trellis of `state_bits` bits down its run of `T` rows: each row's code is looked up
+  from the state and the row's code, and the state carries across the run. libquant's
+  `grid_tcq_decode`.
+- **Affine** (`dflash.draft_head.weight`, the container's one affine tensor): u2 `codes` and a u8
+  `zero` on the same 128-column block as an f16 `scale`, and nothing above a row. An element is
+  `(code - zero) * scale` — libquant's `grid_decode` for an asymmetric grid with no table — and the
+  difference is already on the int8 grid, so the scale is all that is left. A row is a complete
+  run: the descriptor sets `affine`, `zero`, `zero_bits` and `zero_row_bytes`, `run_rows` and `rb`
+  are 1, and `state_bits`, `lut`, `mad` and `scale2` stay clear, so the kernel's launch needs no
+  second shape.
 
 ## What it does not do
 
@@ -50,6 +68,11 @@ the run, which are in the chunk's codes.
   to the magic-number form libquant uses whenever a column factor or a trellis mad is present.
 - **No `scale.1` folding into the code.** The second-level scale is applied to the row/128-block
   scale and rounded to bf16 before the code multiplies it, as libquant does.
+- **The affine form has no `gemm_iqr_*` to compare against.** `R4D_IQR_FORMS` in
+  `libr4d/r4d_iqr.h` carries a `zero` plane only for its 6-bit form, so radiance's forward GEMM
+  never runs a 2-bit affine weight and there is no forward decode of the drafter's head to compare
+  with. The affine form is therefore checked device against the host (libquant's `grid_decode`),
+  not against a forward GEMM over the same codes; the GEMM check below is the trellis path's.
 
 For `rb > 1`, a block of `rb` rows shares the largest row scale in the block (libquant's
 `rb_round`); the kernel carries that maximum across the block.
@@ -62,6 +85,8 @@ R97IqrDecodeDesc d{};
 //      scale_dtype, scale_block_rows/cols, scale_row_bytes, scale2_*,
 //      codes, codes_row_bytes, scale, scale2, lut, mad/mad_a/mad_b,
 //      out_codes, out_scale
+// the affine form instead sets affine = 1, zero, zero_bits and zero_row_bytes,
+// leaves state_bits, lut, mad and scale2 clear, and has run_rows = rb = 1
 r97_iqr_decode(&d, stream);   // asynchronous on `stream`; 0, or 1 outside the rules
 rad_stream_sync(stream);      // the caller's wait, on the stream it handed in
 ```
@@ -82,48 +107,63 @@ and its downloads.
 
 One thread per column, one workgroup per trellis run: `grid = (ceil(cols/256), ceil(rows/T))`,
 block 256. Threads of a workgroup cover consecutive columns, so at each row they read consecutive
-packed codes of the same row; a column walks its run sequentially, seeded from the run's tail.
+packed codes of the same row; a column walks its run sequentially, seeded from the run's tail. An
+affine weight is the same launch with `T = 1`: a workgroup is one row and a thread its columns.
 There is no shared memory and no scratch beyond the two output buffers: the caller's scratch is
 exactly `rows × cols` int8 plus `rows × cols/128` bf16.
 
 ## Measured
 
-AMD Radeon AI PRO R9700 (gfx1201, 32 GB), `R97_DEVICE=0`, one queue; the numbers are the launch
+AMD Radeon AI PRO R9700 (gfx1201, 32 GB), one card and one queue; the numbers are the launch
 and the caller's `rad_stream_sync` on that queue, best of five, with the planes uploaded once.
 `tests/gpu/iqr_decode.cpp` prints them.
 
 | weight | shape `[out, in]` | out | scales | decode |
 |---|---|---:|---:|---:|
-| `blk.0.ffn_gate_up.weight` (largest) | 5120 × 34816 | 170.0 MiB | 2.66 MiB | 1.41 ms (117.5 GiB/s) |
-| `blk.0.ffn_down.weight` | 5120 × 17408 | 85.0 MiB | 1.33 MiB | 0.94 ms (88.7 GiB/s) |
-| `blk.0.ssm_inz.weight` | 5120 × 16384 | 80.0 MiB | 1.25 MiB | 0.93 ms (84.0 GiB/s) |
-| `blk.0.ssm_out.weight` | 5120 × 6144 | 30.0 MiB | 0.47 MiB | 0.36 ms (82.0 GiB/s) |
-| `blk.3.attn_qg.weight` | 5120 × 12288 | 60.0 MiB | 0.94 MiB | 0.59 ms (98.8 GiB/s) |
-| `blk.3.attn_k.weight` | 5120 × 1024 | 5.0 MiB | 0.08 MiB | 0.120 ms (40.8 GiB/s) |
-| `blk.3.attn_v.weight` | 5120 × 1024 | 5.0 MiB | 0.08 MiB | 0.120 ms (40.8 GiB/s) |
-| `blk.3.attn_output.weight` | 5120 × 6144 | 30.0 MiB | 0.47 MiB | 0.36 ms (81.2 GiB/s) |
-| `output.k3.weight`, 256-row head chunk | 256 × 5120 | 1.2 MiB | 0.02 MiB | 0.116 ms (10.5 GiB/s) |
-| `token_embd.weight`, 256-row head chunk | 256 × 5120 | 1.2 MiB | 0.02 MiB | 0.181 ms (6.7 GiB/s) |
+| `blk.0.ffn_gate_up.weight` (largest) | 5120 × 34816 | 170.0 MiB | 2.66 MiB | 1.47 ms (113 GiB/s) |
+| `blk.0.ffn_down.weight` | 5120 × 17408 | 85.0 MiB | 1.33 MiB | 0.97 ms (86 GiB/s) |
+| `blk.0.ssm_inz.weight` | 5120 × 16384 | 80.0 MiB | 1.25 MiB | 0.97 ms (81 GiB/s) |
+| `blk.0.ssm_out.weight` | 5120 × 6144 | 30.0 MiB | 0.47 MiB | 0.39 ms (75 GiB/s) |
+| `blk.3.attn_qg.weight` | 5120 × 12288 | 60.0 MiB | 0.94 MiB | 0.63 ms (92 GiB/s) |
+| `blk.3.attn_k.weight` | 5120 × 1024 | 5.0 MiB | 0.08 MiB | 0.138 ms (35 GiB/s) |
+| `blk.3.attn_v.weight` | 5120 × 1024 | 5.0 MiB | 0.08 MiB | 0.138 ms (35 GiB/s) |
+| `blk.3.attn_output.weight` | 5120 × 6144 | 30.0 MiB | 0.47 MiB | 0.38 ms (78 GiB/s) |
+| `output.k3.weight`, 256-row head chunk | 256 × 5120 | 1.2 MiB | 0.02 MiB | 0.137 ms (8.9 GiB/s) |
+| `token_embd.weight`, 256-row head chunk | 256 × 5120 | 1.2 MiB | 0.02 MiB | 0.201 ms (6.1 GiB/s) |
+| `dflash.draft_head.weight`, 8192-row chunk (affine) | 8192 × 5120 | 40.0 MiB | 0.62 MiB | 0.85 ms (46 GiB/s) |
 
 A Mamba layer (blocks 0-2) decodes `ssm_inz`, `ssm_out`, `ffn_gate_up` and `ffn_down` in about
-3.6 ms; an attention layer (block 3 onward) decodes `attn_qg`, `attn_k`, `attn_v`,
-`attn_output`, `ffn_gate_up` and `ffn_down` in about 3.5 ms. Decoded one weight at a time, which
+3.8 ms; an attention layer (block 3 onward) decodes `attn_qg`, `attn_k`, `attn_v`,
+`attn_output`, `ffn_gate_up` and `ffn_down` in about 3.7 ms. Decoded one weight at a time, which
 is what the backward does, the largest needs 173 MiB of scratch (170.0 + 2.66 MiB). The whole
 vocabulary projection would need 1.184 GiB + 18.96 MiB; a 256-row head chunk needs 1.25 MiB +
 20 KiB, which is why it is decoded in chunks. The small chunks are launch-bound, not
 bandwidth-bound.
+
+The drafter's head is the same `248320 × 5120` shape in the affine form, so its whole width needs
+the same 1.184 GiB + 18.96 MiB and it is chunked the same way: the 8192-row chunk above is 40.0
+MiB + 0.62 MiB and runs at about half the trellis rate, because a 2-bit affine row is a short run
+(a row, decoded by one workgroup) whose codes are two bits an element, so the int8 write dominates
+and there is no trellis walk to spread a thread's work over. The last 512 rows are the short tail
+of the range, checked as its own chunk.
 
 ## The tests
 
 `tests/host/iqr_decode.cpp` covers the forms synthetically: code widths 3-6, trellis table and
 computed (`mad`) values, f32/bf16/e4m3 scales, a second-level scale, `rb` 8 and 16, L=12 and
 16, a shorter last run, a partial workgroup, and a chunk against the whole decode; every case is
-also checked against libquant's host decode when `R97_LIBQUANT` points at `libquant.so`.
+also checked against libquant's host decode when `R97_LIBQUANT` points at `libquant.so`. The
+affine form has its own cases: u2 codes under a u8 zero with an f16 scale (the container's
+shape), a u4 zero to exercise a packed zero plane, and bf16, a 100-row chunk at `row0 = 128`, and
+refusal of a descriptor without its zero. Each affine case is compared value by value with
+libquant's `grid_decode` over a constructed `Grid{asym}` and `BlockScale{s, zero}`.
 
 `tests/gpu/iqr_decode.cpp` reads the real container (label `model`, `R97_MODEL_DIR`, default
-`/srv/models/qwen3.8-27b-iqr-v4`) and, for one tensor of each of the container's ten IQR encodings
+`/srv/models/qwen3.8-27b-iqr-v4`) and, for a tensor of each of the container's trellis encodings
 and each linear kind, decodes a chunk starting inside the tensor and the short last chunk, and
-requires the device bytes to equal the host bytes exactly. It then runs radiance's
+requires the device bytes to equal the host bytes exactly. The container's one affine tensor,
+`dflash.draft_head.weight` (u2 codes, u8 zero, f16 scale), gets the same treatment for an 8192-row
+chunk and its last 512 rows, and a timed pass over the chunk. It then runs radiance's
 `gemm_iqr_nt_m64` over `blk.0.ssm_out.weight`'s original planes and `gemm_i8a8_m16` over the
 decoded grid with the same activation, and requires the outputs to agree within bf16 tolerance
 (worst relative error 0.000977 on the reference card); both rows use `i8a8h`, because the stored
