@@ -15,6 +15,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <stdexcept>
 #include <vector>
@@ -35,9 +36,30 @@ struct Reg {
     Reg(const char* name, void (*fn)());
 };
 
+// R97_TEST_ONLY names registered tests, comma separated, for a caller that needs a process where the
+// runner runs none of the other tests: a check that asserts what this process has loaded reads
+// nothing if another test in the same binary loaded it first. The static self-checks still run, and
+// load no kernel library. Unset (the ctest runs), every test runs.
+inline bool test_selected(const char* name) {
+    const char* only = std::getenv("R97_TEST_ONLY");
+    if (!only || !*only) return true;
+    const std::size_t n = std::strlen(name);
+    for (const char* at = only; *at;) {
+        const char* comma = std::strchr(at, ',');
+        const std::size_t len = comma ? std::size_t(comma - at) : std::strlen(at);
+        if (len == n && std::strncmp(at, name, n) == 0) return true;
+        if (!comma) break;
+        at = comma + 1;
+    }
+    return false;
+}
+
 inline int run_all() {
     int failed = 0;
+    size_t ran = 0;
     for (const Test& t : tests()) {
+        if (!test_selected(t.name)) continue;
+        ++ran;
         try {
             t.fn();
         } catch (const std::exception& e) {
@@ -48,7 +70,7 @@ inline int run_all() {
             ++failed;
         }
     }
-    std::printf("%zu tests, %d failed\n", tests().size(), failed);
+    std::printf("%zu tests, %d failed\n", ran, failed);
     return failed ? 1 : 0;
 }
 

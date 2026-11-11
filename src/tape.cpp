@@ -95,13 +95,20 @@ void Tape::record(const RadIssueOp& issue) {
     rec.position = static_cast<int64_t>(ops_.size());
 
     // OpRecord carries an int or a string per parameter. A resolved geometry is made of those; a
-    // range or a double has no slot and is left out rather than flattened into a lie.
+    // range has no slot and is left out rather than flattened into a lie, and a double travels as
+    // its decimal spelling so a twin can parse it back exactly.
     for (int i = 0; i < issue.n_params; ++i) {
         const RadParam& p = issue.params[i];
         if (p.kind == RAD_P_INT) {
             rec.params.emplace_back(p.key, (int64_t)p.ival);
         } else if (p.kind == RAD_P_STR) {
             rec.params.emplace_back(p.key, std::string(p.sval ? p.sval : ""));
+        } else if (p.kind == RAD_P_F64) {
+            /* A real has no slot of its own; its decimal spelling round-trips through the twin's
+             * strtod, and the JSON program keeps the same string, so live and recorded agree. */
+            char text[40];
+            std::snprintf(text, sizeof text, "%.17g", p.dval);
+            rec.params.emplace_back(p.key, std::string(text));
         }
     }
 

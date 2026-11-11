@@ -1,0 +1,4108 @@
+{
+  "batch": [
+    [
+      75,
+      287,
+      99,
+      285,
+      290,
+      266,
+      7,
+      265,
+      203,
+      319,
+      303,
+      55,
+      150,
+      107,
+      233,
+      103,
+      293,
+      87,
+      232,
+      238,
+      111,
+      43,
+      126,
+      271,
+      103,
+      156,
+      268,
+      60,
+      259,
+      58,
+      298,
+      35,
+      88,
+      46,
+      173,
+      253,
+      91,
+      276,
+      171,
+      86,
+      260,
+      201,
+      60,
+      187,
+      192,
+      301,
+      254,
+      120,
+      166,
+      168,
+      4,
+      163,
+      60,
+      313,
+      225,
+      176,
+      40,
+      169,
+      303,
+      220,
+      285,
+      293,
+      26,
+      55,
+      235,
+      34,
+      125,
+      294,
+      117,
+      207,
+      204,
+      17,
+      311,
+      182,
+      230,
+      317,
+      103,
+      99,
+      258,
+      229,
+      205,
+      203,
+      252,
+      263,
+      105,
+      311,
+      29,
+      252,
+      119,
+      131,
+      151,
+      116,
+      208,
+      65,
+      71,
+      40,
+      284,
+      135,
+      246,
+      185,
+      136,
+      146,
+      277,
+      47,
+      112,
+      120,
+      109,
+      155,
+      201,
+      50,
+      255,
+      251,
+      181,
+      177,
+      150,
+      38,
+      192,
+      178,
+      112,
+      130,
+      299,
+      195,
+      258,
+      15,
+      114,
+      49,
+      84,
+      307,
+      137,
+      52,
+      175,
+      50,
+      253,
+      312,
+      33,
+      69,
+      222,
+      242,
+      235,
+      318
+    ],
+    [
+      105,
+      281,
+      41,
+      280,
+      192,
+      294,
+      263,
+      215,
+      234,
+      198,
+      270,
+      252,
+      200,
+      65,
+      181,
+      178,
+      27,
+      158,
+      301,
+      172,
+      259,
+      279,
+      86,
+      190,
+      252,
+      125,
+      206,
+      261,
+      170,
+      141,
+      316,
+      115,
+      155,
+      173,
+      123,
+      52,
+      254,
+      272,
+      111,
+      292,
+      14,
+      286,
+      257,
+      164,
+      108,
+      194,
+      299,
+      178,
+      176,
+      298,
+      25,
+      71,
+      99,
+      59,
+      95,
+      74,
+      144,
+      30,
+      247,
+      229,
+      306,
+      287,
+      18,
+      220,
+      303,
+      296,
+      181,
+      156,
+      285,
+      122,
+      288,
+      220,
+      86
+    ],
+    [
+      318,
+      26,
+      108,
+      198,
+      66,
+      258,
+      219,
+      314,
+      82,
+      100,
+      19,
+      86,
+      253,
+      242,
+      166,
+      270,
+      136,
+      248,
+      305,
+      172,
+      10,
+      193,
+      19,
+      108,
+      55,
+      240,
+      156,
+      298,
+      81,
+      51,
+      156
+    ]
+  ],
+  "format": "r97-program",
+  "ops": [
+    {
+      "block": -1,
+      "n": 244,
+      "op": "embed_lookup",
+      "operands": [
+        {
+          "buffer": "raw:0",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            244
+          ],
+          "written": false
+        },
+        {
+          "buffer": "token_embd.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            320,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "n_embd": 128,
+        "n_vocab": 320,
+        "vocab_offset": 0
+      },
+      "position": 0
+    },
+    {
+      "block": 0,
+      "n": 244,
+      "op": "rmsnorm",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.0.attn_norm.weight",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "eps": "9.9999999747524271e-07",
+        "n": 128,
+        "wadd": "1"
+      },
+      "position": 1
+    },
+    {
+      "block": 0,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.0.ssm_in.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            136,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_in",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            136
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 128,
+        "M": 512,
+        "N": 136,
+        "dtype": "bf16"
+      },
+      "position": 2
+    },
+    {
+      "block": 0,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.0.ssm_z.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            64,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_z",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            64
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 128,
+        "M": 512,
+        "N": 64,
+        "dtype": "bf16"
+      },
+      "position": 3
+    },
+    {
+      "block": 0,
+      "n": 244,
+      "op": "gdn_conv_prep",
+      "operands": [
+        {
+          "buffer": "gdn_in",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            136
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.0.ssm_conv1d.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128,
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "none:2",
+          "dtype": "invalid",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [],
+          "written": false
+        },
+        {
+          "buffer": "blk.0.ssm_a_log",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.0.ssm_dt.bias",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "kv:3",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            8,
+            128,
+            3
+          ],
+          "written": true
+        },
+        {
+          "buffer": "raw:6",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 4,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_in",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            136
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_in",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            136
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:9",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 3,
+          "shape": [
+            3
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:10",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 3,
+          "shape": [
+            3
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_q",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            2,
+            16
+          ],
+          "written": true
+        },
+        {
+          "buffer": "gdn_k",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            2,
+            16
+          ],
+          "written": true
+        },
+        {
+          "buffer": "gdn_v",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": true
+        },
+        {
+          "buffer": "gdn_g",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": true
+        },
+        {
+          "buffer": "gdn_beta",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "chunk": 64,
+        "conv_width": 4,
+        "head_k": 16,
+        "head_v": 16
+      },
+      "position": 4
+    },
+    {
+      "block": 0,
+      "n": 244,
+      "op": "gdn_kkt_solve",
+      "operands": [
+        {
+          "buffer": "gdn_k",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            2,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_beta",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_g",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:3",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 4,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_kkt",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            64
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "head_k": 16
+      },
+      "position": 5
+    },
+    {
+      "block": 0,
+      "n": 244,
+      "op": "gdn_chunk_scan",
+      "operands": [
+        {
+          "buffer": "gdn_q",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            2,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_k",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            2,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_v",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_kkt",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            64
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_g",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_beta",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "kv:2",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            8,
+            4,
+            16,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:7",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 4,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_o",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": true
+        },
+        {
+          "buffer": "kv:2",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            8,
+            4,
+            16,
+            16
+          ],
+          "written": true
+        },
+        {
+          "buffer": "raw:10",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 3,
+          "shape": [
+            3,
+            1
+          ],
+          "written": false
+        }
+      ],
+      "params": {
+        "M": 512,
+        "head_k": 16,
+        "head_v": 16,
+        "scale": "0.25"
+      },
+      "position": 6
+    },
+    {
+      "block": 0,
+      "n": 244,
+      "op": "gdn_gated_rmsnorm",
+      "operands": [
+        {
+          "buffer": "gdn_o",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_z",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            64
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.0.ssm_norm.weight",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_o",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "act": "silu",
+        "channels": 16,
+        "eps": "9.9999999747524271e-07"
+      },
+      "position": 7
+    },
+    {
+      "block": 0,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "gdn_o",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.0.ssm_out.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128,
+            64
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 64,
+        "M": 512,
+        "N": 128,
+        "dtype": "bf16"
+      },
+      "position": 8
+    },
+    {
+      "block": 0,
+      "n": 244,
+      "op": "add",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "n": 128
+      },
+      "position": 9
+    },
+    {
+      "block": 0,
+      "n": 244,
+      "op": "rmsnorm",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.0.ffn_norm.weight",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "eps": "9.9999999747524271e-07",
+        "n": 128,
+        "wadd": "1"
+      },
+      "position": 10
+    },
+    {
+      "block": 0,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.0.ffn_gate_up.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gate_up",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            512
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 128,
+        "M": 512,
+        "N": 512,
+        "dtype": "bf16"
+      },
+      "position": 11
+    },
+    {
+      "block": 0,
+      "n": 244,
+      "op": "silu_mul",
+      "operands": [
+        {
+          "buffer": "gate_up",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            512
+          ],
+          "written": false
+        },
+        {
+          "buffer": "ffn",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            256
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "n": 256
+      },
+      "position": 12
+    },
+    {
+      "block": 0,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "ffn",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            256
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.0.ffn_down.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128,
+            256
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 256,
+        "M": 512,
+        "N": 128,
+        "dtype": "bf16"
+      },
+      "position": 13
+    },
+    {
+      "block": 0,
+      "n": 244,
+      "op": "add",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "n": 128
+      },
+      "position": 14
+    },
+    {
+      "block": 1,
+      "n": 244,
+      "op": "rmsnorm",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.1.attn_norm.weight",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "eps": "9.9999999747524271e-07",
+        "n": 128,
+        "wadd": "1"
+      },
+      "position": 15
+    },
+    {
+      "block": 1,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.1.ssm_in.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            136,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_in",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            136
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 128,
+        "M": 512,
+        "N": 136,
+        "dtype": "bf16"
+      },
+      "position": 16
+    },
+    {
+      "block": 1,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.1.ssm_z.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            64,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_z",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            64
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 128,
+        "M": 512,
+        "N": 64,
+        "dtype": "bf16"
+      },
+      "position": 17
+    },
+    {
+      "block": 1,
+      "n": 244,
+      "op": "gdn_conv_prep",
+      "operands": [
+        {
+          "buffer": "gdn_in",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            136
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.1.ssm_conv1d.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128,
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "none:2",
+          "dtype": "invalid",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [],
+          "written": false
+        },
+        {
+          "buffer": "blk.1.ssm_a_log",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.1.ssm_dt.bias",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "kv:3",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            8,
+            128,
+            3
+          ],
+          "written": true
+        },
+        {
+          "buffer": "raw:6",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 4,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_in",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            136
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_in",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            136
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:9",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 3,
+          "shape": [
+            3
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:10",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 3,
+          "shape": [
+            3
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_q",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            2,
+            16
+          ],
+          "written": true
+        },
+        {
+          "buffer": "gdn_k",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            2,
+            16
+          ],
+          "written": true
+        },
+        {
+          "buffer": "gdn_v",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": true
+        },
+        {
+          "buffer": "gdn_g",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": true
+        },
+        {
+          "buffer": "gdn_beta",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "chunk": 64,
+        "conv_width": 4,
+        "head_k": 16,
+        "head_v": 16
+      },
+      "position": 18
+    },
+    {
+      "block": 1,
+      "n": 244,
+      "op": "gdn_kkt_solve",
+      "operands": [
+        {
+          "buffer": "gdn_k",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            2,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_beta",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_g",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:3",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 4,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_kkt",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            64
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "head_k": 16
+      },
+      "position": 19
+    },
+    {
+      "block": 1,
+      "n": 244,
+      "op": "gdn_chunk_scan",
+      "operands": [
+        {
+          "buffer": "gdn_q",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            2,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_k",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            2,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_v",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_kkt",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            64
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_g",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_beta",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "kv:2",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            8,
+            4,
+            16,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:7",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 4,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_o",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": true
+        },
+        {
+          "buffer": "kv:2",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            8,
+            4,
+            16,
+            16
+          ],
+          "written": true
+        },
+        {
+          "buffer": "raw:10",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 3,
+          "shape": [
+            3,
+            1
+          ],
+          "written": false
+        }
+      ],
+      "params": {
+        "M": 512,
+        "head_k": 16,
+        "head_v": 16,
+        "scale": "0.25"
+      },
+      "position": 20
+    },
+    {
+      "block": 1,
+      "n": 244,
+      "op": "gdn_gated_rmsnorm",
+      "operands": [
+        {
+          "buffer": "gdn_o",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_z",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            64
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.1.ssm_norm.weight",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_o",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "act": "silu",
+        "channels": 16,
+        "eps": "9.9999999747524271e-07"
+      },
+      "position": 21
+    },
+    {
+      "block": 1,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "gdn_o",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.1.ssm_out.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128,
+            64
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 64,
+        "M": 512,
+        "N": 128,
+        "dtype": "bf16"
+      },
+      "position": 22
+    },
+    {
+      "block": 1,
+      "n": 244,
+      "op": "add",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "n": 128
+      },
+      "position": 23
+    },
+    {
+      "block": 1,
+      "n": 244,
+      "op": "rmsnorm",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.1.ffn_norm.weight",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "eps": "9.9999999747524271e-07",
+        "n": 128,
+        "wadd": "1"
+      },
+      "position": 24
+    },
+    {
+      "block": 1,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.1.ffn_gate_up.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gate_up",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            512
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 128,
+        "M": 512,
+        "N": 512,
+        "dtype": "bf16"
+      },
+      "position": 25
+    },
+    {
+      "block": 1,
+      "n": 244,
+      "op": "silu_mul",
+      "operands": [
+        {
+          "buffer": "gate_up",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            512
+          ],
+          "written": false
+        },
+        {
+          "buffer": "ffn",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            256
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "n": 256
+      },
+      "position": 26
+    },
+    {
+      "block": 1,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "ffn",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            256
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.1.ffn_down.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128,
+            256
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 256,
+        "M": 512,
+        "N": 128,
+        "dtype": "bf16"
+      },
+      "position": 27
+    },
+    {
+      "block": 1,
+      "n": 244,
+      "op": "add",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "n": 128
+      },
+      "position": 28
+    },
+    {
+      "block": 2,
+      "n": 244,
+      "op": "rmsnorm",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.2.attn_norm.weight",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "eps": "9.9999999747524271e-07",
+        "n": 128,
+        "wadd": "1"
+      },
+      "position": 29
+    },
+    {
+      "block": 2,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.2.ssm_in.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            136,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_in",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            136
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 128,
+        "M": 512,
+        "N": 136,
+        "dtype": "bf16"
+      },
+      "position": 30
+    },
+    {
+      "block": 2,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.2.ssm_z.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            64,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_z",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            64
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 128,
+        "M": 512,
+        "N": 64,
+        "dtype": "bf16"
+      },
+      "position": 31
+    },
+    {
+      "block": 2,
+      "n": 244,
+      "op": "gdn_conv_prep",
+      "operands": [
+        {
+          "buffer": "gdn_in",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            136
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.2.ssm_conv1d.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128,
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "none:2",
+          "dtype": "invalid",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [],
+          "written": false
+        },
+        {
+          "buffer": "blk.2.ssm_a_log",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.2.ssm_dt.bias",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "kv:3",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            8,
+            128,
+            3
+          ],
+          "written": true
+        },
+        {
+          "buffer": "raw:6",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 4,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_in",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            136
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_in",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            136
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:9",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 3,
+          "shape": [
+            3
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:10",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 3,
+          "shape": [
+            3
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_q",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            2,
+            16
+          ],
+          "written": true
+        },
+        {
+          "buffer": "gdn_k",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            2,
+            16
+          ],
+          "written": true
+        },
+        {
+          "buffer": "gdn_v",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": true
+        },
+        {
+          "buffer": "gdn_g",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": true
+        },
+        {
+          "buffer": "gdn_beta",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "chunk": 64,
+        "conv_width": 4,
+        "head_k": 16,
+        "head_v": 16
+      },
+      "position": 32
+    },
+    {
+      "block": 2,
+      "n": 244,
+      "op": "gdn_kkt_solve",
+      "operands": [
+        {
+          "buffer": "gdn_k",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            2,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_beta",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_g",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:3",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 4,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_kkt",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            64
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "head_k": 16
+      },
+      "position": 33
+    },
+    {
+      "block": 2,
+      "n": 244,
+      "op": "gdn_chunk_scan",
+      "operands": [
+        {
+          "buffer": "gdn_q",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            2,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_k",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            2,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_v",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_kkt",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            64
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_g",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_beta",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "kv:2",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            8,
+            4,
+            16,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:7",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 4,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_o",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": true
+        },
+        {
+          "buffer": "kv:2",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            8,
+            4,
+            16,
+            16
+          ],
+          "written": true
+        },
+        {
+          "buffer": "raw:10",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 3,
+          "shape": [
+            3,
+            1
+          ],
+          "written": false
+        }
+      ],
+      "params": {
+        "M": 512,
+        "head_k": 16,
+        "head_v": 16,
+        "scale": "0.25"
+      },
+      "position": 34
+    },
+    {
+      "block": 2,
+      "n": 244,
+      "op": "gdn_gated_rmsnorm",
+      "operands": [
+        {
+          "buffer": "gdn_o",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_z",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            64
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.2.ssm_norm.weight",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gdn_o",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "act": "silu",
+        "channels": 16,
+        "eps": "9.9999999747524271e-07"
+      },
+      "position": 35
+    },
+    {
+      "block": 2,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "gdn_o",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            16
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.2.ssm_out.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128,
+            64
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 64,
+        "M": 512,
+        "N": 128,
+        "dtype": "bf16"
+      },
+      "position": 36
+    },
+    {
+      "block": 2,
+      "n": 244,
+      "op": "add",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "n": 128
+      },
+      "position": 37
+    },
+    {
+      "block": 2,
+      "n": 244,
+      "op": "rmsnorm",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.2.ffn_norm.weight",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "eps": "9.9999999747524271e-07",
+        "n": 128,
+        "wadd": "1"
+      },
+      "position": 38
+    },
+    {
+      "block": 2,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.2.ffn_gate_up.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gate_up",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            512
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 128,
+        "M": 512,
+        "N": 512,
+        "dtype": "bf16"
+      },
+      "position": 39
+    },
+    {
+      "block": 2,
+      "n": 244,
+      "op": "silu_mul",
+      "operands": [
+        {
+          "buffer": "gate_up",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            512
+          ],
+          "written": false
+        },
+        {
+          "buffer": "ffn",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            256
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "n": 256
+      },
+      "position": 40
+    },
+    {
+      "block": 2,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "ffn",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            256
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.2.ffn_down.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128,
+            256
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 256,
+        "M": 512,
+        "N": 128,
+        "dtype": "bf16"
+      },
+      "position": 41
+    },
+    {
+      "block": 2,
+      "n": 244,
+      "op": "add",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "n": 128
+      },
+      "position": 42
+    },
+    {
+      "block": 3,
+      "n": 244,
+      "op": "rmsnorm",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.3.attn_norm.weight",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "eps": "9.9999999747524271e-07",
+        "n": 128,
+        "wadd": "1"
+      },
+      "position": 43
+    },
+    {
+      "block": 3,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.3.attn_qg.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            256,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "attn_qg",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            64
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 128,
+        "M": 512,
+        "N": 256,
+        "dtype": "bf16"
+      },
+      "position": 44
+    },
+    {
+      "block": 3,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.3.attn_k.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            64,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "attn_k",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            64
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 128,
+        "M": 512,
+        "N": 64,
+        "dtype": "bf16"
+      },
+      "position": 45
+    },
+    {
+      "block": 3,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.3.attn_v.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            64,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "attn_v",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            64
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 128,
+        "M": 512,
+        "N": 64,
+        "dtype": "bf16"
+      },
+      "position": 46
+    },
+    {
+      "block": 3,
+      "n": 976,
+      "op": "rmsnorm",
+      "operands": [
+        {
+          "buffer": "attn_qg",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            64
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.3.attn_q_norm.weight",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            32
+          ],
+          "written": false
+        },
+        {
+          "buffer": "attn_q",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 2048,
+        "dtype": "bf16",
+        "eps": "9.9999999747524271e-07",
+        "n": 32,
+        "wadd": "1"
+      },
+      "position": 47
+    },
+    {
+      "block": 3,
+      "n": 488,
+      "op": "rmsnorm",
+      "operands": [
+        {
+          "buffer": "attn_k",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            64
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.3.attn_k_norm.weight",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            32
+          ],
+          "written": false
+        },
+        {
+          "buffer": "attn_k",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            64
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 1024,
+        "dtype": "bf16",
+        "eps": "9.9999999747524271e-07",
+        "n": 32,
+        "wadd": "1"
+      },
+      "position": 48
+    },
+    {
+      "block": 3,
+      "n": 244,
+      "op": "rope",
+      "operands": [
+        {
+          "buffer": "attn_q",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        },
+        {
+          "buffer": "raw:1",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            244
+          ],
+          "written": false
+        }
+      ],
+      "params": {
+        "M": 512,
+        "head_dim": 32,
+        "mode": "mrope",
+        "n_head": 4,
+        "n_head_kv": 0,
+        "rotary_dim": 16,
+        "scale": "1",
+        "theta": "10000"
+      },
+      "position": 49
+    },
+    {
+      "block": 3,
+      "n": 244,
+      "op": "rope",
+      "operands": [
+        {
+          "buffer": "attn_k",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            64
+          ],
+          "written": true
+        },
+        {
+          "buffer": "raw:1",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            244
+          ],
+          "written": false
+        }
+      ],
+      "params": {
+        "M": 512,
+        "head_dim": 32,
+        "mode": "mrope",
+        "n_head": 2,
+        "n_head_kv": 0,
+        "rotary_dim": 16,
+        "scale": "1",
+        "theta": "10000"
+      },
+      "position": 50
+    },
+    {
+      "block": 3,
+      "n": 244,
+      "op": "kv_store",
+      "operands": [
+        {
+          "buffer": "attn_k",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            64
+          ],
+          "written": false
+        },
+        {
+          "buffer": "attn_v",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            64
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:2",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            244
+          ],
+          "written": false
+        },
+        {
+          "buffer": "kv:1",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            482,
+            2,
+            16,
+            64
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "block_size": 16,
+        "head_dim": 32,
+        "kv_dtype": "bf16",
+        "n_head_kv": 2
+      },
+      "position": 51
+    },
+    {
+      "block": 3,
+      "n": 140,
+      "op": "attn_paged",
+      "operands": [
+        {
+          "buffer": "attn_q",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "kv:1",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            482,
+            2,
+            16,
+            64
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:2",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 3,
+          "shape": [
+            3,
+            33
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:3",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 3,
+          "shape": [
+            3
+          ],
+          "written": false
+        },
+        {
+          "buffer": "none:4",
+          "dtype": "invalid",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [],
+          "written": false
+        },
+        {
+          "buffer": "none:5",
+          "dtype": "invalid",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [],
+          "written": false
+        },
+        {
+          "buffer": "raw:6",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 4,
+          "shape": [
+            4
+          ],
+          "written": false
+        },
+        {
+          "buffer": "attn_out",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "block_size": 16,
+        "causal": 1,
+        "gqa": 2,
+        "head_dim": 32,
+        "kv_dtype": "bf16",
+        "max_ctx": 512,
+        "max_seqs": 8,
+        "n_head": 4,
+        "q_dtype": "bf16",
+        "q_len": 512,
+        "window": 0
+      },
+      "position": 52
+    },
+    {
+      "block": 3,
+      "n": 976,
+      "op": "sigmoid",
+      "operands": [
+        {
+          "buffer": "attn_qg",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            4,
+            64
+          ],
+          "written": false
+        },
+        {
+          "buffer": "attn_gate",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 2048,
+        "dtype": "bf16",
+        "n": 32
+      },
+      "position": 53
+    },
+    {
+      "block": 3,
+      "n": 244,
+      "op": "mul",
+      "operands": [
+        {
+          "buffer": "attn_out",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "attn_gate",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "attn_out",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "n": 128
+      },
+      "position": 54
+    },
+    {
+      "block": 3,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "attn_out",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.3.attn_output.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 128,
+        "M": 512,
+        "N": 128,
+        "dtype": "bf16"
+      },
+      "position": 55
+    },
+    {
+      "block": 3,
+      "n": 244,
+      "op": "add",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "n": 128
+      },
+      "position": 56
+    },
+    {
+      "block": 3,
+      "n": 244,
+      "op": "rmsnorm",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.3.ffn_norm.weight",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "eps": "9.9999999747524271e-07",
+        "n": 128,
+        "wadd": "1"
+      },
+      "position": 57
+    },
+    {
+      "block": 3,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.3.ffn_gate_up.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "gate_up",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            512
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 128,
+        "M": 512,
+        "N": 512,
+        "dtype": "bf16"
+      },
+      "position": 58
+    },
+    {
+      "block": 3,
+      "n": 244,
+      "op": "silu_mul",
+      "operands": [
+        {
+          "buffer": "gate_up",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            512
+          ],
+          "written": false
+        },
+        {
+          "buffer": "ffn",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            256
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "n": 256
+      },
+      "position": 59
+    },
+    {
+      "block": 3,
+      "n": 244,
+      "op": "gemm_nt",
+      "operands": [
+        {
+          "buffer": "ffn",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            256
+          ],
+          "written": false
+        },
+        {
+          "buffer": "blk.3.ffn_down.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128,
+            256
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "K": 256,
+        "M": 512,
+        "N": 128,
+        "dtype": "bf16"
+      },
+      "position": 60
+    },
+    {
+      "block": 3,
+      "n": 244,
+      "op": "add",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "n": 128
+      },
+      "position": 61
+    },
+    {
+      "block": -1,
+      "n": 244,
+      "op": "rmsnorm",
+      "operands": [
+        {
+          "buffer": "x",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "output_norm.weight",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 512,
+        "dtype": "bf16",
+        "eps": "9.9999999747524271e-07",
+        "n": 128,
+        "wadd": "1"
+      },
+      "position": 62
+    },
+    {
+      "block": -1,
+      "n": 247,
+      "op": "gather_rows",
+      "operands": [
+        {
+          "buffer": "h",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 244,
+          "shape": [
+            512,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "raw:1",
+          "dtype": "i32",
+          "row_lo": 0,
+          "rows": 247,
+          "shape": [
+            247
+          ],
+          "written": false
+        },
+        {
+          "buffer": "h_out",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 247,
+          "shape": [
+            520,
+            128
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 520,
+        "dtype": "bf16",
+        "n": 128
+      },
+      "position": 63
+    },
+    {
+      "block": -1,
+      "n": 247,
+      "op": "logits_gemm",
+      "operands": [
+        {
+          "buffer": "h_out",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 247,
+          "shape": [
+            520,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "output.weight",
+          "dtype": "bf16",
+          "row_lo": 0,
+          "rows": 0,
+          "shape": [
+            320,
+            128
+          ],
+          "written": false
+        },
+        {
+          "buffer": "logits",
+          "dtype": "f32",
+          "row_lo": 0,
+          "rows": 247,
+          "shape": [
+            520,
+            320
+          ],
+          "written": true
+        }
+      ],
+      "params": {
+        "M": 520,
+        "dtype": "bf16",
+        "n_embd": 128,
+        "n_vocab": 320
+      },
+      "position": 64
+    }
+  ],
+  "version": 1
+}

@@ -166,10 +166,18 @@ inline std::vector<RadParam> rec_params(const OpRecord& rec) {
     return out;
 }
 
-// The read and the written operand counts of a record.
-inline void operand_counts(const OpRecord& rec, size_t* reads, size_t* writes) {
+// The read and the written operand counts of a record. An in-place operand (a schema index in
+// `in_place`) is written but also read: the tape snaps it before the write, so the checker needs
+// a value for it on the read side as well.
+inline void operand_counts(const OpRecord& rec, size_t* reads, size_t* writes,
+                           const std::vector<size_t>& in_place = {}) {
     size_t r = 0, w = 0;
-    for (const Operand& o : rec.operands) (o.written ? w : r)++;
+    for (size_t i = 0; i < rec.operands.size(); ++i) {
+        const bool inout = rec.operands[i].written &&
+                           std::find(in_place.begin(), in_place.end(), i) != in_place.end();
+        if (rec.operands[i].written) ++w;
+        if (!rec.operands[i].written || inout) ++r;
+    }
     if (reads) *reads = r;
     if (writes) *writes = w;
 }
@@ -187,10 +195,11 @@ struct KernelReport {
 };
 
 inline KernelReport check_kernel(const OpRecord& rec, const std::vector<AdValue>& in,
-                                 const std::vector<AdValue>& out_spec, double tol) {
+                                 const std::vector<AdValue>& out_spec, double tol,
+                                 const std::vector<size_t>& in_place = {}) {
     KernelReport rep;
     size_t n_reads = 0, n_writes = 0;
-    operand_counts(rec, &n_reads, &n_writes);
+    operand_counts(rec, &n_reads, &n_writes, in_place);
     if (n_reads != in.size() || n_writes != out_spec.size()) {
         rep.note = "record reads " + std::to_string(n_reads) + " and writes " +
                    std::to_string(n_writes) + "; the check was given " +
@@ -232,7 +241,9 @@ inline KernelReport check_kernel(const OpRecord& rec, const std::vector<AdValue>
     std::vector<RadTensor> t(rec.operands.size());
     size_t r = 0, w = 0;
     for (size_t i = 0; i < rec.operands.size(); ++i) {
-        const AdValue& a = rec.operands[i].written ? out_spec[w++] : in[r++];
+        const bool inout = rec.operands[i].written &&
+                           std::find(in_place.begin(), in_place.end(), i) != in_place.end();
+        const AdValue& a = (rec.operands[i].written && !inout) ? out_spec[w++] : in[r++];
         RadTensor x{};
         x.dtype = rad_dtype_parse(a.dtype.c_str());
         x.rank = (uint32_t)a.shape.size();
@@ -245,7 +256,7 @@ inline KernelReport check_kernel(const OpRecord& rec, const std::vector<AdValue>
         // Packed dtypes place several elements in a byte; bytes round up.
         const int64_t bits = (int64_t)rad_dtype_bits(x.dtype) * n;
         x.data = std::calloc((size_t)((bits + 7) / 8 > 0 ? (bits + 7) / 8 : 1), 1);
-        if (!rec.operands[i].written)  // a write starts zeroed
+        if (!rec.operands[i].written || inout)  // a plain write starts zeroed
             for (int64_t e = 0; e < n; ++e)
                 rad_store_f32(x.data, x.dtype, e, (float)a.value[(size_t)e]);
         t[i] = x;
@@ -322,16 +333,20 @@ struct FdReport {
 // run repeats from it.
 inline FdReport check_adjoint(const OpRecord& rec, const std::vector<AdValue>& in,
                               const std::vector<AdValue>& out_spec, double rel_tol,
-                              uint64_t seed = 0xfeedface1234ull) {
+                              uint64_t seed = 0xfeedface1234ull,
+                              const std::vector<size_t>& in_place = {}) {
     FdReport rep;
     size_t n_reads = 0, n_writes = 0;
-    operand_counts(rec, &n_reads, &n_writes);
+    operand_counts(rec, &n_reads, &n_writes, in_place);
     if (n_reads != in.size() || n_writes != out_spec.size()) {
         rep.note = "record reads " + std::to_string(n_reads) + " and writes " +
                    std::to_string(n_writes) + "; the check was given " +
                    std::to_string(in.size()) + " and " + std::to_string(out_spec.size());
         return rep;
     }
+    auto inout_at = [&in_place](size_t i) {
+        return std::find(in_place.begin(), in_place.end(), i) != in_place.end();
+    };
     std::string err;
     TwinFn twin = twin_find(rec.op, rec.params, &err);
     if (!twin) {
@@ -360,8 +375,12 @@ inline FdReport check_adjoint(const OpRecord& rec, const std::vector<AdValue>& i
     std::vector<AdValue> fwd(rec.operands.size());
     {
         size_t r = 0, w = 0;
-        for (size_t i = 0; i < rec.operands.size(); ++i)
-            fwd[i] = rec.operands[i].written ? out_vals[w++] : in[r++];
+        for (size_t i = 0; i < rec.operands.size(); ++i) {
+            if (rec.operands[i].written && !inout_at(i))
+                fwd[i] = out_vals[w++];
+            else
+                fwd[i] = in[r++];
+        }
     }
 
     // Random cotangent for every written operand.
@@ -377,12 +396,13 @@ inline FdReport check_adjoint(const OpRecord& rec, const std::vector<AdValue>& i
         cot.push_back(std::move(c));
     }
 
-    // The adjoint's answer. `fwd` and `dc` span the full schema; the writes'
-    // slots of `dc` stay zero.
+    // The adjoint's answer. `fwd` and `dc` span the full schema; the plain writes'
+    // slots of `dc` stay zero. An in-place operand is a read for the adjoint, so its
+    // slot carries a zero cotangent to fill in.
     std::vector<AdValue> dc(rec.operands.size());
     size_t r = 0;
     for (size_t i = 0; i < rec.operands.size(); ++i) {
-        if (rec.operands[i].written) continue;
+        if (rec.operands[i].written && !inout_at(i)) continue;
         dc[i] = in[r++];
         dc[i].value.assign(dc[i].value.size(), 0.0);
     }
@@ -394,7 +414,7 @@ inline FdReport check_adjoint(const OpRecord& rec, const std::vector<AdValue>& i
     double analytic = 0.0;
     std::vector<std::vector<double>> dir(rec.operands.size());
     for (size_t i = 0; i < rec.operands.size(); ++i) {
-        if (rec.operands[i].written || is_frozen((int)i)) continue;
+        if ((rec.operands[i].written && !inout_at(i)) || is_frozen((int)i)) continue;
         dir[i].resize(fwd[i].value.size());
         for (double& v : dir[i]) v = urand(&s);
         for (size_t e = 0; e < dir[i].size(); ++e) analytic += dc[i].value[e] * dir[i][e];
@@ -406,7 +426,7 @@ inline FdReport check_adjoint(const OpRecord& rec, const std::vector<AdValue>& i
         std::vector<AdValue> x = in;
         size_t at = 0;
         for (size_t i = 0; i < rec.operands.size(); ++i) {
-            if (rec.operands[i].written) continue;
+            if (rec.operands[i].written && !inout_at(i)) continue;
             if (!dir[i].empty())
                 for (size_t e = 0; e < dir[i].size(); ++e) x[at].value[e] += eps * dir[i][e];
             ++at;

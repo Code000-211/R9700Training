@@ -77,6 +77,18 @@ struct Segment {
     int64_t row_hi = 0;
 };
 
+// A written operand that is also the op's input, though no separate read names it: rope's
+// in-place write and the recurrent/conv state buffers. The prior version is the read.
+bool in_place_read(const OpRecord& rec, size_t j) {
+    const Operand& o = rec.operands[j];
+    if (!o.written) return false;
+    if (rec.op == "rope" && j == 0) return true;
+    if (o.buffer.rfind("kv:", 0) != 0) return false;
+    for (size_t k = 0; k < rec.operands.size(); ++k)
+        if (k != j && !rec.operands[k].written && rec.operands[k].buffer == o.buffer) return false;
+    return true;
+}
+
 struct Plan {
     std::vector<Buffer> buffers;
     std::map<std::string, int64_t> by_name;
@@ -135,8 +147,11 @@ Plan make_plan(const std::vector<OpRecord>& records) {
         plan.write_version[i].assign(rec.operands.size(), -1);
         plan.read_segments[i].resize(rec.operands.size());
         // Reads first: an op that writes the buffer it reads sees the version before its own.
+        // rope is recorded with only its in-place write, so operand 0 is also its read: name that
+        // prior version here and hand its adjoint's cotangent back to it below.
         for (size_t j = 0; j < rec.operands.size(); ++j) {
-            if (rec.operands[j].written) continue;
+            const bool in_place = in_place_read(rec, j);
+            if (rec.operands[j].written && !in_place) continue;
             const int64_t bi = buffer_index(rec.operands[j], &plan);
             Buffer& b = plan.buffers[static_cast<size_t>(bi)];
             int64_t lo = 0, hi = 0;
@@ -395,7 +410,8 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                 std::max(result.report.peak_cotangent_bytes, held);
         }
 
-        const AdjointCall call{rec, fwd, cot, &dc, options.grads, options.prefix};
+
+        const AdjointCall call{rec, fwd, cot, &dc, options.grads, options.prefix, options.slot_prefix};
         fn(call);
 
         // The writers' adjoint has run: their cotangent storage is done.
@@ -407,7 +423,8 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         const std::vector<int> frozen = adjoint_frozen(rec.op, options.side, rec.params);
         const std::set<size_t> frozen_at(frozen.begin(), frozen.end());
         for (size_t j = 0; j < rec.operands.size(); ++j) {
-            if (rec.operands[j].written) continue;
+            const bool in_place = in_place_read(rec, j);
+            if (rec.operands[j].written && !in_place) continue;
             if (frozen_at.count(j)) continue;
             const int64_t bi = plan.by_name.at(rec.operands[j].buffer);
             Buffer& b = plan.buffers[static_cast<size_t>(bi)];

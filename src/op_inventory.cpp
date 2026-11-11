@@ -219,24 +219,25 @@ const char* block_kind_name(BlockKind kind) {
     return "?";
 }
 
-bool record_prefill_step(const std::string& container, const std::string& radiance_home,
-                         const std::vector<std::string>& kernels,
-                         const std::vector<int32_t>& token_ids, Tape& tape, std::string* error) {
+static bool run_prefill(const std::string& container, const std::string& radiance_home,
+                        const std::vector<std::string>& kernels,
+                        const std::vector<std::vector<int32_t>>& prompts, Tape& tape,
+                        std::string* error) {
     try {
         rad::Config cfg;
         cfg.model            = container;
         cfg.radiance_home    = radiance_home;
         cfg.kernel_hierarchy = kernels;
         // The training forward: text only, speculation off (prefill mode also refuses n_spec > 0),
-        // one prompt of at most one context, so the tape holds exactly one step.
+        // so the tape holds exactly one step.
         cfg.n_spec          = 0;
         // Text only: a tower the container carries stays off the card (mm_max_patches 0), so no
         // vision op can be issued whatever the container holds.
         cfg.mm_max_patches  = 0;
         cfg.max_tok         = 512;
-        cfg.max_seqs        = 8;
+        cfg.max_seqs        = prompts.size() > 8 ? (int)prompts.size() : 8;
         cfg.max_ctx         = 512;
-        cfg.prefill_prompts = {token_ids};
+        cfg.prefill_prompts = prompts;
 
         rad::Engine engine(std::move(cfg));
         int s = engine.start();
@@ -268,6 +269,19 @@ bool record_prefill_step(const std::string& container, const std::string& radian
         if (error) *error = e.what();
         return false;
     }
+}
+
+bool record_prefill_step(const std::string& container, const std::string& radiance_home,
+                         const std::vector<std::string>& kernels,
+                         const std::vector<int32_t>& token_ids, Tape& tape, std::string* error) {
+    return run_prefill(container, radiance_home, kernels, {token_ids}, tape, error);
+}
+
+bool record_prefill_batch(const std::string& container, const std::string& radiance_home,
+                          const std::vector<std::string>& kernels,
+                          const std::vector<std::vector<int32_t>>& prompts, Tape& tape,
+                          std::string* error) {
+    return run_prefill(container, radiance_home, kernels, prompts, tape, error);
 }
 
 OpInventory build_op_inventory(const Tape& tape, const std::string& container,

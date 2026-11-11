@@ -1,7 +1,7 @@
 // tools/ops.cpp -- the `ops` subcommand: what one prefill step issues, and what the op registry
 // already holds for it.
 //
-//   r97train ops <file.rad> [--home DIR] [--kernels libavx,libref]
+//   r97train ops <file.rad> [--home DIR] [--kernels libavx,libref] [--record FILE] [--batch FILE]
 //   r97train ops --registered
 //
 // The first form runs one text-only prefill step of the container with speculation off (the
@@ -15,9 +15,13 @@
 
 #include "../include/r97/adjoint.h"
 
+#include <cstring>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "../src/op_inventory.h"
 
@@ -69,16 +73,104 @@ static std::vector<std::string> split_list(const std::string& list) {
     return out;
 }
 
+static nlohmann::json program_json(const r97::Tape& tape,
+                                   const std::vector<std::vector<int32_t>>& prompts) {
+    nlohmann::json doc;
+    doc["format"] = "r97-program";
+    doc["version"] = 1;
+    doc["batch"] = nlohmann::json::array();
+    for (const std::vector<int32_t>& p : prompts) doc["batch"].push_back(p);
+    doc["ops"] = nlohmann::json::array();
+    for (const r97::OpRecord& rec : tape.ops()) {
+        nlohmann::json op;
+        op["op"] = rec.op;
+        op["block"] = rec.block;
+        op["position"] = rec.position;
+        op["n"] = rec.n;
+        nlohmann::json params = nlohmann::json::object();
+        for (const auto& [name, value] : rec.params) {
+            if (const auto* i = std::get_if<int64_t>(&value)) params[name] = *i;
+            else params[name] = std::get<std::string>(value);
+        }
+        op["params"] = params;
+        op["operands"] = nlohmann::json::array();
+        for (const r97::Operand& o : rec.operands) {
+            op["operands"].push_back({{"buffer", o.buffer}, {"dtype", o.dtype},
+                                      {"shape", o.shape}, {"row_lo", o.row_lo},
+                                      {"rows", o.rows}, {"written", o.written}});
+        }
+        doc["ops"].push_back(op);
+    }
+    return doc;
+}
+
+static bool read_batch(const std::string& path, std::vector<std::vector<int32_t>>* prompts,
+                       std::string* error) {
+    try {
+        std::ifstream in(path);
+        if (!in) {
+            *error = "cannot read " + path;
+            return false;
+        }
+        nlohmann::json doc;
+        in >> doc;
+        if (doc.is_object() && doc.contains("batch")) doc = doc["batch"];
+        if (!doc.is_array()) {
+            *error = path + ": expected a JSON array of token-id arrays";
+            return false;
+        }
+        for (const nlohmann::json& seq : doc) {
+            if (!seq.is_array()) {
+                *error = path + ": every sequence must be an array of token ids";
+                return false;
+            }
+            std::vector<int32_t> ids;
+            for (const nlohmann::json& id : seq) {
+                if (!id.is_number_integer()) {
+                    *error = path + ": every token id must be an integer";
+                    return false;
+                }
+                ids.push_back(id.get<int32_t>());
+            }
+            prompts->push_back(std::move(ids));
+        }
+        if (prompts->empty()) {
+            *error = path + ": the batch is empty";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        *error = path + ": " + e.what();
+        return false;
+    }
+}
+
 static int inventory_main(const std::string& container, const std::string& home,
-                          const std::vector<std::string>& kernels) {
+                          const std::vector<std::string>& kernels, const std::string& record,
+                          const std::string& batch_path) {
 #if defined(RAD_ISSUE_OBSERVER)
     // Byte ids: every container's vocabulary holds 1..8 (the tiny one's is 320).
-    const std::vector<int32_t> tokens = {1, 2, 3, 4, 5, 6, 7, 8};
-    r97::Tape tape;
+    std::vector<std::vector<int32_t>> prompts = {{1, 2, 3, 4, 5, 6, 7, 8}};
     std::string error;
-    if (!r97::record_prefill_step(container, home, kernels, tokens, tape, &error)) {
+    if (!batch_path.empty()) {
+        prompts.clear();
+    }
+    if (!batch_path.empty() && !read_batch(batch_path, &prompts, &error)) {
         std::cerr << "r97train ops: " << error << "\n";
         return 1;
+    }
+    r97::Tape tape;
+    if (!r97::record_prefill_batch(container, home, kernels, prompts, tape, &error)) {
+        std::cerr << "r97train ops: " << error << "\n";
+        return 1;
+    }
+    if (!record.empty()) {
+        std::ofstream out(record);
+        if (!out) {
+            std::cerr << "r97train ops: cannot write " << record << "\n";
+            return 1;
+        }
+        out << program_json(tape, prompts).dump(2) << "\n";
     }
     const r97::OpInventory inventory =
         r97::build_op_inventory(tape, container, {"logits", "ce", "gate_logits"});
@@ -98,7 +190,7 @@ static int inventory_main(const std::string& container, const std::string& home,
 
 static int ops_main(int argc, char** argv) {
     bool registered = false;
-    std::string container, home;
+    std::string container, home, record, batch_path;
     std::vector<std::string> kernels;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -108,10 +200,15 @@ static int ops_main(int argc, char** argv) {
             home = argv[++i];
         } else if (arg == "--kernels" && i + 1 < argc) {
             kernels = split_list(argv[++i]);
+        } else if (arg == "--record" && i + 1 < argc) {
+            record = argv[++i];
+        } else if (arg == "--batch" && i + 1 < argc) {
+            batch_path = argv[++i];
         } else if (arg.rfind("--", 0) != 0 && container.empty()) {
             container = arg;
         } else {
             std::cerr << "usage: r97train ops <file.rad> [--home DIR] [--kernels LIST]\n"
+                         "       [--record FILE] [--batch FILE]\n"
                          "       r97train ops --registered\n";
             return 2;
         }
@@ -128,7 +225,7 @@ static int ops_main(int argc, char** argv) {
                      "       r97train ops --registered\n";
         return 2;
     }
-    return inventory_main(container, home, kernels);
+    return inventory_main(container, home, kernels, record, batch_path);
 }
 
 R97_REGISTER_COMMAND("ops", "<file.rad>|--registered", ops_main);
