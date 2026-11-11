@@ -1,0 +1,977 @@
+{
+  "generator": "tools/oracle/make_reference.py",
+  "packages": {
+    "torch": "2.15.0+cpu",
+    "transformers": "5.22.2",
+    "safetensors": "0.8.0",
+    "numpy": "2.5.4"
+  },
+  "seed": 20261111,
+  "torch_threads": 1,
+  "fixture": {
+    "file": "model.safetensors",
+    "sha256": "8712e34c8f93b8c9b5dfbb809cbffacda6971f11828eb64c6fc290e7a810a1f7",
+    "config_sha256": "cd76e9dcb69bc21bfa3d5478ae4d44c845cb0c3d22c203ac4fd8983ea465190d"
+  },
+  "dtype_overrides": {
+    "rms_norm": 0.0,
+    "rms_norm_gated": 0.0,
+    "rotary": 0.0,
+    "eager_attention": 0.0,
+    "gdn_forward": 0.0,
+    "delta_chunk": 0.0,
+    "delta_recurrent": 0.0
+  },
+  "delta_rule_relative_difference": 4.343558202335743e-12,
+  "lora": {
+    "rank": 4,
+    "alpha": 8.0,
+    "targets": [
+      "self_attn.q_proj",
+      "self_attn.k_proj",
+      "self_attn.v_proj",
+      "self_attn.o_proj",
+      "linear_attn.in_proj_qkv",
+      "linear_attn.in_proj_z",
+      "linear_attn.out_proj",
+      "mlp.gate_proj",
+      "mlp.up_proj",
+      "mlp.down_proj"
+    ]
+  },
+  "cases": {
+    "sequences": {
+      "lengths": [
+        140,
+        73,
+        31
+      ],
+      "longest_chunks": [
+        3,
+        2,
+        1
+      ],
+      "names": [
+        "seq0",
+        "seq1",
+        "seq2"
+      ]
+    },
+    "blocks": [
+      "gdn_mixer",
+      "attention_sublayer",
+      "mlp_sublayer"
+    ]
+  },
+  "tensors": {
+    "seq0/input_ids": {
+      "shape": [
+        140
+      ],
+      "dtype": "i64"
+    },
+    "seq0/score": {
+      "shape": [
+        140
+      ],
+      "dtype": "i64"
+    },
+    "seq0/logits_without_adapter": {
+      "shape": [
+        140,
+        320
+      ],
+      "dtype": "f64"
+    },
+    "seq0/loss_with_adapter": {
+      "shape": [],
+      "dtype": "f64"
+    },
+    "seq1/input_ids": {
+      "shape": [
+        73
+      ],
+      "dtype": "i64"
+    },
+    "seq1/score": {
+      "shape": [
+        73
+      ],
+      "dtype": "i64"
+    },
+    "seq1/logits_without_adapter": {
+      "shape": [
+        73,
+        320
+      ],
+      "dtype": "f64"
+    },
+    "seq1/loss_with_adapter": {
+      "shape": [],
+      "dtype": "f64"
+    },
+    "seq2/input_ids": {
+      "shape": [
+        31
+      ],
+      "dtype": "i64"
+    },
+    "seq2/score": {
+      "shape": [
+        31
+      ],
+      "dtype": "i64"
+    },
+    "seq2/logits_without_adapter": {
+      "shape": [
+        31,
+        320
+      ],
+      "dtype": "f64"
+    },
+    "seq2/loss_with_adapter": {
+      "shape": [],
+      "dtype": "f64"
+    },
+    "with_adapter/loss": {
+      "shape": [],
+      "dtype": "f64"
+    },
+    "with_adapter/lengths": {
+      "shape": [
+        3
+      ],
+      "dtype": "i64"
+    },
+    "seq0/residual.0": {
+      "shape": [
+        140,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq0/residual_grad.0": {
+      "shape": [
+        140,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq0/residual.1": {
+      "shape": [
+        140,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq0/residual_grad.1": {
+      "shape": [
+        140,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq0/residual.2": {
+      "shape": [
+        140,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq0/residual_grad.2": {
+      "shape": [
+        140,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq0/residual.3": {
+      "shape": [
+        140,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq0/residual_grad.3": {
+      "shape": [
+        140,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq0/residual.4": {
+      "shape": [
+        140,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq0/residual_grad.4": {
+      "shape": [
+        140,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq1/residual.0": {
+      "shape": [
+        73,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq1/residual_grad.0": {
+      "shape": [
+        73,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq1/residual.1": {
+      "shape": [
+        73,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq1/residual_grad.1": {
+      "shape": [
+        73,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq1/residual.2": {
+      "shape": [
+        73,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq1/residual_grad.2": {
+      "shape": [
+        73,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq1/residual.3": {
+      "shape": [
+        73,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq1/residual_grad.3": {
+      "shape": [
+        73,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq1/residual.4": {
+      "shape": [
+        73,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq1/residual_grad.4": {
+      "shape": [
+        73,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq2/residual.0": {
+      "shape": [
+        31,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq2/residual_grad.0": {
+      "shape": [
+        31,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq2/residual.1": {
+      "shape": [
+        31,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq2/residual_grad.1": {
+      "shape": [
+        31,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq2/residual.2": {
+      "shape": [
+        31,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq2/residual_grad.2": {
+      "shape": [
+        31,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq2/residual.3": {
+      "shape": [
+        31,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq2/residual_grad.3": {
+      "shape": [
+        31,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq2/residual.4": {
+      "shape": [
+        31,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "seq2/residual_grad.4": {
+      "shape": [
+        31,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.0.linear_attn.in_proj_qkv.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.0.linear_attn.in_proj_qkv.lora_B": {
+      "shape": [
+        128,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.0.linear_attn.in_proj_z.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.0.linear_attn.in_proj_z.lora_B": {
+      "shape": [
+        64,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.0.linear_attn.out_proj.lora_A": {
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.0.linear_attn.out_proj.lora_B": {
+      "shape": [
+        128,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.0.mlp.gate_proj.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.0.mlp.gate_proj.lora_B": {
+      "shape": [
+        256,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.0.mlp.up_proj.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.0.mlp.up_proj.lora_B": {
+      "shape": [
+        256,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.0.mlp.down_proj.lora_A": {
+      "shape": [
+        4,
+        256
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.0.mlp.down_proj.lora_B": {
+      "shape": [
+        128,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.1.linear_attn.in_proj_qkv.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.1.linear_attn.in_proj_qkv.lora_B": {
+      "shape": [
+        128,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.1.linear_attn.in_proj_z.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.1.linear_attn.in_proj_z.lora_B": {
+      "shape": [
+        64,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.1.linear_attn.out_proj.lora_A": {
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.1.linear_attn.out_proj.lora_B": {
+      "shape": [
+        128,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.1.mlp.gate_proj.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.1.mlp.gate_proj.lora_B": {
+      "shape": [
+        256,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.1.mlp.up_proj.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.1.mlp.up_proj.lora_B": {
+      "shape": [
+        256,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.1.mlp.down_proj.lora_A": {
+      "shape": [
+        4,
+        256
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.1.mlp.down_proj.lora_B": {
+      "shape": [
+        128,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.2.linear_attn.in_proj_qkv.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.2.linear_attn.in_proj_qkv.lora_B": {
+      "shape": [
+        128,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.2.linear_attn.in_proj_z.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.2.linear_attn.in_proj_z.lora_B": {
+      "shape": [
+        64,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.2.linear_attn.out_proj.lora_A": {
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.2.linear_attn.out_proj.lora_B": {
+      "shape": [
+        128,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.2.mlp.gate_proj.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.2.mlp.gate_proj.lora_B": {
+      "shape": [
+        256,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.2.mlp.up_proj.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.2.mlp.up_proj.lora_B": {
+      "shape": [
+        256,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.2.mlp.down_proj.lora_A": {
+      "shape": [
+        4,
+        256
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.2.mlp.down_proj.lora_B": {
+      "shape": [
+        128,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.3.self_attn.q_proj.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.3.self_attn.q_proj.lora_B": {
+      "shape": [
+        256,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.3.self_attn.k_proj.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.3.self_attn.k_proj.lora_B": {
+      "shape": [
+        64,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.3.self_attn.v_proj.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.3.self_attn.v_proj.lora_B": {
+      "shape": [
+        64,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.3.self_attn.o_proj.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.3.self_attn.o_proj.lora_B": {
+      "shape": [
+        128,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.3.mlp.gate_proj.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.3.mlp.gate_proj.lora_B": {
+      "shape": [
+        256,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.3.mlp.up_proj.lora_A": {
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.3.mlp.up_proj.lora_B": {
+      "shape": [
+        256,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.3.mlp.down_proj.lora_A": {
+      "shape": [
+        4,
+        256
+      ],
+      "dtype": "f64"
+    },
+    "lora_grad/model.layers.3.mlp.down_proj.lora_B": {
+      "shape": [
+        128,
+        4
+      ],
+      "dtype": "f64"
+    },
+    "gdn_mixer.single.input": {
+      "shape": [
+        1,
+        23,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "gdn_mixer.single.output": {
+      "shape": [
+        1,
+        23,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "gdn_mixer.single.cotangent": {
+      "shape": [
+        1,
+        23,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "gdn_mixer.single.input_cotangent": {
+      "shape": [
+        1,
+        23,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "gdn_mixer.single.lengths": {
+      "shape": [
+        1
+      ],
+      "dtype": "i64"
+    },
+    "gdn_mixer.single.mask": {
+      "shape": [
+        1,
+        23
+      ],
+      "dtype": "i64"
+    },
+    "attention_sublayer.single.input": {
+      "shape": [
+        1,
+        23,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "attention_sublayer.single.output": {
+      "shape": [
+        1,
+        23,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "attention_sublayer.single.cotangent": {
+      "shape": [
+        1,
+        23,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "attention_sublayer.single.input_cotangent": {
+      "shape": [
+        1,
+        23,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "attention_sublayer.single.lengths": {
+      "shape": [
+        1
+      ],
+      "dtype": "i64"
+    },
+    "attention_sublayer.single.mask": {
+      "shape": [
+        1,
+        23
+      ],
+      "dtype": "i64"
+    },
+    "mlp_sublayer.single.input": {
+      "shape": [
+        1,
+        23,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "mlp_sublayer.single.output": {
+      "shape": [
+        1,
+        23,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "mlp_sublayer.single.cotangent": {
+      "shape": [
+        1,
+        23,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "mlp_sublayer.single.input_cotangent": {
+      "shape": [
+        1,
+        23,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "mlp_sublayer.single.lengths": {
+      "shape": [
+        1
+      ],
+      "dtype": "i64"
+    },
+    "mlp_sublayer.single.mask": {
+      "shape": [
+        1,
+        23
+      ],
+      "dtype": "i64"
+    },
+    "gdn_mixer.batch.input": {
+      "shape": [
+        3,
+        17,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "gdn_mixer.batch.output": {
+      "shape": [
+        3,
+        17,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "gdn_mixer.batch.cotangent": {
+      "shape": [
+        3,
+        17,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "gdn_mixer.batch.input_cotangent": {
+      "shape": [
+        3,
+        17,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "gdn_mixer.batch.lengths": {
+      "shape": [
+        3
+      ],
+      "dtype": "i64"
+    },
+    "gdn_mixer.batch.mask": {
+      "shape": [
+        3,
+        17
+      ],
+      "dtype": "i64"
+    },
+    "attention_sublayer.batch.input": {
+      "shape": [
+        3,
+        17,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "attention_sublayer.batch.output": {
+      "shape": [
+        3,
+        17,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "attention_sublayer.batch.cotangent": {
+      "shape": [
+        3,
+        17,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "attention_sublayer.batch.input_cotangent": {
+      "shape": [
+        3,
+        17,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "attention_sublayer.batch.lengths": {
+      "shape": [
+        3
+      ],
+      "dtype": "i64"
+    },
+    "attention_sublayer.batch.mask": {
+      "shape": [
+        3,
+        17
+      ],
+      "dtype": "i64"
+    },
+    "mlp_sublayer.batch.input": {
+      "shape": [
+        3,
+        17,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "mlp_sublayer.batch.output": {
+      "shape": [
+        3,
+        17,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "mlp_sublayer.batch.cotangent": {
+      "shape": [
+        3,
+        17,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "mlp_sublayer.batch.input_cotangent": {
+      "shape": [
+        3,
+        17,
+        128
+      ],
+      "dtype": "f64"
+    },
+    "mlp_sublayer.batch.lengths": {
+      "shape": [
+        3
+      ],
+      "dtype": "i64"
+    },
+    "mlp_sublayer.batch.mask": {
+      "shape": [
+        3,
+        17
+      ],
+      "dtype": "i64"
+    }
+  }
+}
