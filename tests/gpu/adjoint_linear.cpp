@@ -579,6 +579,12 @@ r97test::GuardOptions guard_options() { return device_check::guard_options(int64
 R97_TEST(adjoint_linear_device_rows) {
     // What the family registers: the two ops on Side::device, the same frozen positions as their
     // host rows, and the int8 predicate that keeps the kernel to the 128-wide scale grid it serves.
+    // Loading the plugin registers the code objects it carries with HIP, which opens the card, so
+    // this test takes the guard like every other gpu test: the lock and `R97_DEVICE` come first,
+    // before anything touches a card. The rows it reads allocate nothing, so it declares no VRAM.
+    const r97test::GuardOptions o = device_check::guard_options(0);
+    const r97test::DeviceGuard guard(o);
+    device_check::require_device(o.device);
     (void)device_check::load_plugin();
     for (const OpRecord& rec : {gemm_nt_q_rec(4, 256, 128), gemm_nt_rec(4, 256, 128)}) {
         const std::vector<int> dev = adjoint_frozen(rec.op, Side::device, rec.params);
