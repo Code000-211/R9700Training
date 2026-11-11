@@ -1,7 +1,7 @@
 Concern: an optional issue observer and layer block brackets on the runtime context
 Upstream: not-submitted
 diff --git a/abi/rad_runtime.h b/abi/rad_runtime.h
-index c6f5d7b..54b7c09 100644
+index c6f5d7b..3afcced 100644
 --- a/abi/rad_runtime.h
 +++ b/abi/rad_runtime.h
 @@ -916,6 +916,60 @@ int rad_lane_join(RadCtx* c, int from, int to);
@@ -18,7 +18,6 @@ index c6f5d7b..54b7c09 100644
 +typedef struct RadIssueOperand {
 +    uint8_t  kind;         /* RAD_OPK_* */
 +    uint32_t handle;       /* rad_buf, rad_weight or rad_kvgroup; 0 for RAW and NONE */
-+    void*    raw;          /* RAD_OPK_RAW: the pointer as issued */
 +    void*    data;         /* the pointer the kernel receives; for WTAB the pointer table */
 +    int64_t  bytes;        /* bytes at data for this issue; 0 when they are not one span */
 +    const char* name;      /* the declared name of a buffer or weight; null otherwise */
@@ -40,10 +39,11 @@ index c6f5d7b..54b7c09 100644
 +    int64_t         n;          /* the ranged count this issue resolved to */
 +} RadIssueOp;
 +
-+/* `block` is called with begin=1 before an architecture block (a layer) issues its ops and with
-+ * begin=0 after its last one. `block` is the index the architecture names it by; the core does not
-+ * interpret it. An observer must not call rad_issue: the issue path's per-issue storage does not
-+ * nest. */
++/* `op` is called once per issue, after the op ran, so a consumer that reads operand bytes sees
++ * what it wrote. `block` is called with begin=1 before an architecture block (a layer) issues its
++ * ops and with begin=0 after its last one. `block` is the index the architecture names it by; the
++ * core does not interpret it. An observer must not call rad_issue: the issue path's per-issue
++ * storage does not nest. */
 +typedef struct RadIssueObserver {
 +    void* user;
 +    void (*op)(void* user, RadCtx* c, const RadIssueOp* o);
@@ -142,20 +142,21 @@ index 2ec9f8e..d76be9b 100644
      /* Prebuilt tensor templates by handle: a buffer's carries its arena pointer, dtype, shape and
       * packed strides; a weight's carries WeightInfo::ptr. An issue copies one and patches at most
 diff --git a/core/runtime/issue.cpp b/core/runtime/issue.cpp
-index 8d18803..3495e1a 100644
+index 8d18803..f8b0ac3 100644
 --- a/core/runtime/issue.cpp
 +++ b/core/runtime/issue.cpp
-@@ -929,6 +929,9 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
-     p.issued    = true;
-     ++n_issues_;
- 
-+    /* The whole cost when no observer is set: one branch. */
-+    if (issue_observer_.op) observe_issue(h, p, ip.args.p, ip.args.n_p, opd, t, n_opd, n);
+@@ -1158,6 +1158,10 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
+         host_touch_pending_[l] = true;
+     }
+     if (horacle) oracle_after(h, *horacle, ip, ip.args.n_t);
 +
-     /* All-reduce link accounting: `n` is the collective's numel (its ranged parameter) and operand
-      * 0's dtype is the wire element type. The op's `dtype` key ("w4a8") is not an element
-      * width. */
-@@ -1321,6 +1324,65 @@ void* Ctx::buf_ptr(rad_buf b) {
++    /* The observer is the last thing an issue does, so a consumer that reads operand bytes sees
++     * what the op wrote. The whole cost when none is set: one branch. */
++    if (issue_observer_.op) observe_issue(h, p, ip.args.p, ip.args.n_p, opd, t, n_opd, n);
+     return RAD_OK;
+ }
+ 
+@@ -1321,6 +1325,64 @@ void* Ctx::buf_ptr(rad_buf b) {
      return buf_tmpl_[b].data;
  }
  
@@ -170,7 +171,6 @@ index 8d18803..3495e1a 100644
 +        e = RadIssueOperand{};
 +        e.kind   = o.kind;
 +        e.handle = o.handle;
-+        e.raw    = o.raw;
 +        e.data   = t[i].data;
 +        e.dtype  = t[i].dtype;
 +        e.rank   = (uint8_t)t[i].rank;

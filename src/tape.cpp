@@ -61,6 +61,7 @@ void Tape::detach() {
 void Tape::clear() {
     ops_.clear();
     contents_.clear();
+    copies_.clear();
     blocks_.clear();
     block_ = -1;
 }
@@ -70,6 +71,10 @@ const std::vector<OperandContent>& Tape::contents(size_t op) const {
 }
 
 OperandContent Tape::content(size_t op, size_t operand) const { return contents_.at(op).at(operand); }
+
+void Tape::set_bracket_hook(BracketHook hook) { bracket_hook_ = std::move(hook); }
+
+void Tape::set_issue_hook(IssueHook hook) { issue_hook_ = std::move(hook); }
 
 void Tape::observe_op(void* user, RadCtx* /*ctx*/, const RadIssueOp* issue) {
     if (user && issue) static_cast<Tape*>(user)->record(*issue);
@@ -109,26 +114,49 @@ void Tape::record(const RadIssueOp& issue) {
         op.buffer = identity(o, i);
         op.dtype = rad_dtype_name(o.dtype);
         op.shape.clear();
-        if (o.rank > 0 && o.shape) op.shape.assign(o.shape, o.shape + o.rank);
+        if (o.rank > 0) op.shape.assign(o.shape, o.shape + o.rank);
         op.row_lo = first_row(o);
         op.rows = o.rows;
         op.written = o.written != 0;
         rec.operands.push_back(std::move(op));
-        content.push_back(OperandContent{o.data, static_cast<size_t>(o.bytes)});
+        if (keep_ && o.data != nullptr) {
+            // bytes is 0 where the ABI says the operand is not one span: an op that views its
+            // buffer with a shape whose dim 0 it narrows. The declared shape still sizes the rows
+            // the issue uses, so a copy of them is the slice the op addressed as long as the
+            // view is dense, which is what a copy has to assume. A reader that asked for copies is
+            // the one that can tell: its comparison is against these bytes.
+            int64_t bytes = o.bytes;
+            if (bytes <= 0 && o.rank >= 2 && o.rows > 0) {
+                int64_t n = 1;
+                for (uint8_t d = 1; d < o.rank; ++d) n *= o.shape[d];
+                bytes = rad_dtype_bytes(o.dtype, o.rows * n);
+            }
+            if (bytes > 0) {
+                const auto* from = static_cast<const uint8_t*>(o.data);
+                copies_.emplace_back(from, from + bytes);
+                content.push_back(OperandContent{copies_.back().data(),
+                                                 static_cast<size_t>(bytes), o.name != nullptr});
+                continue;
+            }
+        }
+        content.push_back(OperandContent{o.data, static_cast<size_t>(o.bytes), o.name != nullptr});
     }
 
     ops_.push_back(std::move(rec));
     contents_.push_back(std::move(content));
+    if (issue_hook_) issue_hook_(*this, ops_.back(), contents_.back());
 }
 
 void Tape::open_block(int64_t block) {
     block_ = block;
     blocks_.push_back(Block{block, ops_.size(), ops_.size()});
+    if (bracket_hook_) bracket_hook_(*this, block, true);
 }
 
 void Tape::close_block(int64_t block) {
     if (!blocks_.empty() && blocks_.back().index == block) blocks_.back().end = ops_.size();
     if (block_ == block) block_ = -1;
+    if (bracket_hook_) bracket_hook_(*this, block, false);
 }
 
 }  // namespace r97

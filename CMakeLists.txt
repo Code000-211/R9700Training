@@ -26,6 +26,10 @@ endif()
 set(R97_PATCH_SET "all" CACHE STRING "all | serving -- which patch sets apply to radiance")
 set_property(CACHE R97_PATCH_SET PROPERTY STRINGS all serving)
 
+# Leave out one patch, by its number (e.g. 0102), to build and test a tree that does without it.
+# Empty applies them all. The tests that need the patch skip by name; see docs/UPSTREAM.md.
+set(R97_PATCH_SKIP "" CACHE STRING "patch number to leave out (e.g. 0102); empty applies all")
+
 # A string, not option(): AUTO lets radiance's own detection decide; OFF gives a host-only build.
 set(R97_WITH_HIP "AUTO" CACHE STRING "ON | OFF | AUTO -- build radiance's HIP device kernels")
 set_property(CACHE R97_WITH_HIP PROPERTY STRINGS ON OFF AUTO)
@@ -43,10 +47,10 @@ set(R97_RADIANCE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/radiance)
 set(R97_RADIANCE_COPY ${CMAKE_BINARY_DIR}/radiance)
 set(R97_PATCHES ${CMAKE_CURRENT_SOURCE_DIR}/patches)
 
-r97_selected_patches("${R97_PATCHES}" "${R97_PATCH_SET}" R97_PATCH_FILES)
+r97_selected_patches("${R97_PATCHES}" "${R97_PATCH_SET}" R97_PATCH_FILES "${R97_PATCH_SKIP}")
 
-# The fingerprint of what the copy must contain: the submodule's commit, the selection and the
-# patch list. Unchanged (a repeated configure) means the copy is kept as is, so configuring is
+# The fingerprint of what the copy must contain: the submodule's commit, the selection, the skip
+# and each patch's content. Unchanged (a repeated configure) means the copy is kept as is, so configuring is
 # idempotent and cheap; anything else means a fresh copy and a fresh application.
 find_package(Git QUIET)
 if(NOT GIT_FOUND)
@@ -61,11 +65,17 @@ if(NOT _rc EQUAL 0)
   message(FATAL_ERROR "r97: third_party/radiance is not initialised. "
                       "Run: git submodule update --init")
 endif()
-set(R97_PATCH_STAMP "${R97_RADIANCE_COMMIT}|${R97_PATCH_SET}")
+set(R97_PATCH_STAMP "${R97_RADIANCE_COMMIT}|${R97_PATCH_SET}|${R97_PATCH_SKIP}")
 foreach(p ${R97_PATCH_FILES})
   get_filename_component(n "${p}" NAME)
-  string(APPEND R97_PATCH_STAMP "|${n}")
+  # The content too, not only the name: a patch that grew must land on the copy, not be kept
+  # because its file name did not change.
+  file(SHA1 "${p}" digest)
+  string(APPEND R97_PATCH_STAMP "|${n}:${digest}")
 endforeach()
+if(R97_PATCH_SKIP)
+  message(STATUS "r97: R97_PATCH_SKIP=${R97_PATCH_SKIP}: leaving that patch out")
+endif()
 set(R97_STAMP_FILE "${R97_RADIANCE_COPY}/.r97-patch-stamp")
 
 if(EXISTS "${R97_STAMP_FILE}")
@@ -79,7 +89,7 @@ if(NOT stamp STREQUAL R97_PATCH_STAMP)
   # The copied .git file is the submodule's pointer into the superproject's module store; the
   # copy stands on its own and must not look like the submodule's worktree.
   file(REMOVE "${R97_RADIANCE_COPY}/.git")
-  r97_apply_patches("${R97_RADIANCE_COPY}" "${R97_PATCHES}" "${R97_PATCH_SET}")
+  r97_apply_patches("${R97_RADIANCE_COPY}" "${R97_PATCHES}" "${R97_PATCH_SET}" "${R97_PATCH_SKIP}")
   file(WRITE "${R97_STAMP_FILE}" "${R97_PATCH_STAMP}")
 endif()
 message(STATUS "r97: radiance at ${R97_RADIANCE_COPY}, commit ${R97_RADIANCE_COMMIT}, "
@@ -123,6 +133,21 @@ else()
 endif()
 set(RAD_GPU_TARGETS "gfx1201" CACHE STRING "AMDGPU architectures radiance's HIP kernels target")
 
+# The int8 GEMM row the IQR decode test compares with is `libr4d`'s. radiance produces that module
+# only for a HIP build whose targets hold RDNA4 (libr4d/CMakeLists.txt), so ask for it on those same
+# terms: a host-only build, a machine without hipcc, or a build for another card must name neither a
+# target radiance does not make nor a byproduct that never appears.
+set(R97_LIBR4D_TARGET "")
+set(R97_LIBR4D_BYPRODUCT "")
+if(NOT R97_WITH_HIP STREQUAL "OFF")
+  find_program(R97_HIPCC NAMES hipcc HINTS /opt/rocm/bin ENV ROCM_PATH PATH_SUFFIXES bin)
+  if(R97_HIPCC AND RAD_GPU_TARGETS MATCHES "(^|;)gfx12")
+    set(R97_LIBR4D_TARGET libr4d)
+    set(R97_LIBR4D_BYPRODUCT
+        ${CMAKE_BINARY_DIR}/radiance-build/radiance_home/kernels/libr4d.so)
+  endif()
+endif()
+
 ExternalProject_Add(radiance_core
   PREFIX  ${CMAKE_BINARY_DIR}/radiance-ext
   SOURCE_DIR ${R97_RADIANCE_COPY}
@@ -137,13 +162,15 @@ ExternalProject_Add(radiance_core
     -DRAD_WITH_HIP=${RAD_WITH_HIP}
     -DRAD_GPU_TARGETS=${RAD_GPU_TARGETS}
     -DR97_PATCH_STAMP=${R97_PATCH_STAMP}
-  BUILD_COMMAND ${CMAKE_COMMAND} --build . --target rad_core libref libavx libquant rad-convert qwen35_bf16 qwen35_w8a8
+  BUILD_COMMAND ${CMAKE_COMMAND} --build . --target rad_core libref libavx libquant
+                ${R97_LIBR4D_TARGET} rad-convert qwen35_bf16 qwen35_w8a8
   INSTALL_COMMAND ""
   BUILD_ALWAYS FALSE
   USES_TERMINAL_BUILD TRUE
   BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/radiance-build/core/librad_core.a
                    ${CMAKE_BINARY_DIR}/radiance-build/vendor/librad_vendor_llama.a
-                   ${CMAKE_BINARY_DIR}/radiance-build/vendor/librad_vendor_httplib.a)
+                   ${CMAKE_BINARY_DIR}/radiance-build/vendor/librad_vendor_httplib.a
+                   ${R97_LIBR4D_BYPRODUCT})
 
 set(R97_RADIANCE_LIB ${CMAKE_BINARY_DIR}/radiance-build/core/librad_core.a)
 # rad_core links the vendored llama (the tokeniser, the chat templates) and cpp-httplib, so a
@@ -319,6 +346,7 @@ if(R97_BUILD_TESTS)
     target_include_directories(r97_gpu_tests PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/tests
       ${CMAKE_CURRENT_SOURCE_DIR}/src)   # the device harness reads the scratch ledger
+    target_compile_definitions(r97_gpu_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
     if(TARGET libr97)
       add_dependencies(r97_gpu_tests libr97)
       target_compile_definitions(r97_gpu_tests PRIVATE
@@ -359,9 +387,31 @@ if(R97_BUILD_TESTS)
                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/patch_sets_test.cmake)
   set_tests_properties(patch_sets PROPERTIES LABELS host)
 
+  # The patch audit: every patch's budget and upstream status in docs/UPSTREAM.md, its two header
+  # lines, and the serving set's isolation from the training set. The test drives the failures on
+  # copies, so the audit's pass on this tree is checked together with its reasons to fail.
+  add_test(NAME patch_audit
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/patch_audit_test.sh
+                   ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(patch_audit PROPERTIES LABELS host)
+
   if(TARGET r97_gpu_tests)
+    # The gpu binary holds two kinds of test, and the labels promise different things: a `gpu` test
+    # never skips, while a `model` test resolves the container first thing and skips with 77 when it
+    # is absent. One process cannot be both, so ctest starts the binary twice and each run is one
+    # kind. The card's own tests:
     add_test(NAME gpu_tests COMMAND r97_gpu_tests)
     set_tests_properties(gpu_tests PROPERTIES LABELS gpu RUN_SERIAL TRUE)
+    # ... and the tests that also need the real container (`R97_MODEL_TEST`, tests/support/
+    # model_case.h). They run in a second start of the same binary; R97_MODEL_CASES is the whole
+    # difference between the two runs. This entry carries `model` and not `gpu`: it skips when the
+    # container is absent, which is what `model` promises and what a `gpu` test may never do.
+    add_test(NAME gpu_model_tests COMMAND r97_gpu_tests)
+    set_tests_properties(gpu_model_tests PROPERTIES
+      LABELS model
+      RUN_SERIAL TRUE
+      ENVIRONMENT "R97_MODEL_CASES=1"
+      SKIP_RETURN_CODE 77)   # the model cases skip when the container is absent, like model_tests
   endif()
 
   if(TARGET r97_model_tests)

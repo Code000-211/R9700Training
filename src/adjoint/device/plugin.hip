@@ -15,7 +15,9 @@
 #include "rad_abi_layout.h"
 
 #include "r97/adjoint.h"
+#include "r97/head.h"
 
+#include "grad_stage.h"
 #include "scratch.h"
 
 // The build passes the architecture list it is building for; a standalone compile of this file
@@ -49,15 +51,24 @@ extern "C" const RadKernelInfo* rad_kernel_at(int) { return nullptr; }
 // tests build with ENABLE_EXPORTS -- and the dynamic loader prefers the executable's definition to
 // a library's, so an r97 process gets the real registry and allocator. Where the fallbacks are in
 // force there is no registry to register into and no device adjoint runs, which is right: the
-// plugin serves no rows to a process that is not r97. Add no twin fallback until a kernel uses one.
+// plugin serves no rows to a process that is not r97. Add no fallback until a kernel uses one.
 namespace r97 {
 
 void adjoint_register(const char*, Side, AdjointFn, const std::vector<int>&, ParamPred) {}
+
+// The head's chunk kernel is not an op's adjoint: the loss registers it (include/r97/head.h) so the
+// walk in src/head.cpp can run a chunk on the card.
+void head_ce_register(HeadCeKernel) {}
+
+// The fused producers' adjoint (quant.hip) rebuilds the value the quantiser rotated through the
+// parts' twin. A process with no registry has no twin, and no device adjoint runs there either.
+TwinFn twin_find(const std::string&, const std::vector<OpParam>&, std::string*) { return nullptr; }
 
 namespace device {
 
 void* scratch_alloc(int64_t) { return nullptr; }
 void scratch_free(void*) {}
+float* grad_stage_slot(const std::string&, const std::vector<int64_t>&) { return nullptr; }
 
 }  // namespace device
 }  // namespace r97

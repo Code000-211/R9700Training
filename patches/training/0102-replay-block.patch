@@ -1,0 +1,234 @@
+Concern: re-running one block of a step from a restored residual, after its ops have run
+Upstream: not-submitted
+
+The replay needs one thing from radiance that the issue observer (0101) does not give: a way to run
+one block of the step alone, after its caller restored the residual at every boundary. It sets the
+block on the engine, the architecture reads rad_replay_block() at the top of step() and issues only
+that block between its brackets, and the observer, which runs after each op, hands the caller that
+op's bytes before the planner reuses the buffer. The patch adds no observer of its own: 0101 has the
+one call.
+diff --git a/abi/rad_runtime.h b/abi/rad_runtime.h
+index 3afcced..82191ef 100644
+--- a/abi/rad_runtime.h
++++ b/abi/rad_runtime.h
+@@ -970,6 +970,17 @@ void rad_block_end(RadCtx* c, int64_t block);
+  * macro rather than the radiance version, because the hook may reach it as a downstream patch. */
+ #define RAD_ISSUE_OBSERVER 1
+ 
++/* Layer replay: the block the next step runs alone, or -1 (the default) for the whole model. An
++ * engine sets it to re-run one recorded block of the last step from the residual its caller
++ * restored; an architecture reads it at the top of step() and, when set, issues only that block.
++ * The observer above sees the block's ops, after each has run, and its bracket, so the caller can
++ * hand each op's bytes on before the next op reuses the buffer. */
++int64_t rad_replay_block(const RadCtx* c);
++
++/* Defined by a runtime that carries layer replay: a build tests this macro rather than the
++ * radiance version, because the hook may reach it as a downstream patch. */
++#define RAD_REPLAY_BLOCK 1
++
+ /* Fail the step with a reason. An architecture block's step() returns void, so this is how it
+  * refuses a batch shape it does not serve; the engine stops with `what` in the message. Returns
+  * the status it set, so a helper can `return rad_step_fail(...)`. */
+diff --git a/arch/qwen35_bf16/qwen35_bf16.cpp b/arch/qwen35_bf16/qwen35_bf16.cpp
+index a7f9b9b..5564356 100644
+--- a/arch/qwen35_bf16/qwen35_bf16.cpp
++++ b/arch/qwen35_bf16/qwen35_bf16.cpp
+@@ -478,6 +478,28 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+     return RAD_OK;
+ }
+ 
++/* One layer's ops: exactly what a block's brackets cover, so a replay re-issues the block and
++ * nothing else. Calibration taps stay inside, because they are part of the ops the tape sees. */
++static void run_layer(RadCtx* c, const RadBatch* batch, Model& m, const Layer& l, int64_t T) {
++    /* Under calibration a block's input norm is issued once ahead of the block, so its output
++     * is read before the block overwrites `h`; the block computes it again, the same op on
++     * the same bytes. */
++    if (l.cs_in >= 0) {
++        if (l.full) RAD_ISSUE(c, l.attn.op_norm, brows(m.b_x, T), RAD_W(l.attn.w_norm), brows(m.b_h, T));
++        else        RAD_ISSUE(c, l.gdn.op_norm,  brows(m.b_x, T), RAD_W(l.gdn.w_norm),  brows(m.b_h, T));
++        m.calib.tap(c, (size_t)l.cs_in, T);
++    }
++    if (l.full) l.attn.step(c, batch);
++    else        l.gdn.step(c, batch);
++    if (l.cs_o >= 0) m.calib.tap(c, (size_t)l.cs_o, T);
++    if (l.cs_mlp >= 0) {
++        RAD_ISSUE(c, l.mlp.op_norm, brows(m.b_x, T), RAD_W(l.mlp.w_norm), brows(m.b_h, T));
++        m.calib.tap(c, (size_t)l.cs_mlp, T);
++    }
++    l.mlp.step(c, batch);
++    if (l.cs_down >= 0) m.calib.tap(c, (size_t)l.cs_down, T);
++}
++
+ static void step(RadCtx* c, const RadBatch* batch) {
+     Model& m = g_model[rad_rank(c)];
+ 
+@@ -487,6 +509,21 @@ static void step(RadCtx* c, const RadBatch* batch) {
+         return;
+     }
+ 
++    /* A layer replay (patches/training/0102): the caller put the block's input residual back and
++     * the engine cleared its recurrent state, so issue only that block, bracketed as the forward
++     * bracketed it, and none of the embeddings, other layers or the head. */
++    const int64_t replay = rad_replay_block(c);
++    if (replay >= 0) {
++        if (replay >= (int64_t)m.layers.size()) {
++            rad_step_fail(c, "replay block is past the trunk's layers");
++            return;
++        }
++        rad_block_begin(c, replay);
++        run_layer(c, batch, m, m.layers[(size_t)replay], batch->n_tok);
++        rad_block_end(c, replay);
++        return;
++    }
++
+     RAD_ISSUE(c, m.op_embed,
+               praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.w_tok),
+               brows(m.b_x, batch->n_tok));
+@@ -497,24 +534,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
+                     brows(m.b_x, batch->n_tok), RAD_NONE);
+ 
+     const int64_t T = batch->n_tok;
+-    for (const Layer& l : m.layers) {
+-        /* Under calibration a block's input norm is issued once ahead of the block, so its output
+-         * is read before the block overwrites `h`; the block computes it again, the same op on
+-         * the same bytes. */
+-        if (l.cs_in >= 0) {
+-            if (l.full) RAD_ISSUE(c, l.attn.op_norm, brows(m.b_x, T), RAD_W(l.attn.w_norm), brows(m.b_h, T));
+-            else        RAD_ISSUE(c, l.gdn.op_norm,  brows(m.b_x, T), RAD_W(l.gdn.w_norm),  brows(m.b_h, T));
+-            m.calib.tap(c, (size_t)l.cs_in, T);
+-        }
+-        if (l.full) l.attn.step(c, batch);
+-        else        l.gdn.step(c, batch);
+-        if (l.cs_o >= 0) m.calib.tap(c, (size_t)l.cs_o, T);
+-        if (l.cs_mlp >= 0) {
+-            RAD_ISSUE(c, l.mlp.op_norm, brows(m.b_x, T), RAD_W(l.mlp.w_norm), brows(m.b_h, T));
+-            m.calib.tap(c, (size_t)l.cs_mlp, T);
+-        }
+-        l.mlp.step(c, batch);
+-        if (l.cs_down >= 0) m.calib.tap(c, (size_t)l.cs_down, T);
++    for (size_t i = 0; i < m.layers.size(); ++i) {
++        rad_block_begin(c, (int64_t)i);
++        run_layer(c, batch, m, m.layers[i], T);
++        rad_block_end(c, (int64_t)i);
+     }
+ 
+     RAD_ISSUE(c, m.op_final_norm,
+diff --git a/core/engine.cpp b/core/engine.cpp
+index 3170856..41c03a2 100644
+--- a/core/engine.cpp
++++ b/core/engine.cpp
+@@ -3674,4 +3674,47 @@ int Engine::run_server() {
+     return rc;
+ }
+ 
++int Engine::replay_block(int64_t block) {
++    if (ranks_.empty()) return RAD_E_STATE;
++    for (auto& rk : ranks_) {
++        const RadBatch* b = rk->ctx.batch();
++        if (!b) return RAD_E_STATE;
++        /* The step's recurrent state is what the forward left behind that this block would read
++         * again: gdn_chunk_scan reads h0 unconditionally, so its layer is zeroed for every
++         * sequence, from the slots the batch's own state_index names (the card's copy, read back
++         * because a replay is a host path). The paged KV needs nothing: the batch's used counts and
++         * slot map are the step's start, and the block's stores overwrite every slot it reads. */
++        std::vector<int32_t> sidx;
++        for (int32_t g = 0; g < b->n_kv_groups; ++g) {
++            const KVGroupPlan* p = rk->kv.plan(g);
++            if (!p || !p->stateful() || block < 0 || block >= (int64_t)p->n_layers) continue;
++            const int64_t pitch = b->kv[g].state_index_pitch;
++            if (pitch <= 0) continue;
++            sidx.resize((size_t)(b->n_seq * pitch));
++            if (rad_memcpy_async(sidx.data(), b->kv[g].state_index,
++                                 (int64_t)sidx.size() * (int64_t)sizeof(int32_t),
++                                 rk->ctx.stream()) < 0)
++                return RAD_E_DEVICE;
++            if (rad_stream_sync(rk->ctx.stream()) < 0) return RAD_E_DEVICE;
++            for (int32_t s = 0; s < b->n_seq; ++s) {
++                for (int64_t j = 0; j < pitch; ++j) {
++                    const int32_t slot = sidx[(size_t)s * (size_t)pitch + (size_t)j];
++                    if (slot < 0) continue;
++                    void* q = rk->kv.state_ptr(g, (int32_t)block, slot);
++                    if (!q) continue;
++                    if (rad_memset_async(q, 0, p->layer_bytes_per_state(), rk->ctx.stream()) < 0)
++                        return RAD_E_DEVICE;
++                }
++            }
++        }
++        if (rad_stream_sync(rk->ctx.stream()) < 0) return RAD_E_DEVICE;
++        rk->ctx.set_replay_block(block);
++        const int rc = rk->ctx.run_step(b);
++        rk->ctx.set_replay_block(-1);
++        if (rc < 0) return rc;
++        if (rad_stream_sync(rk->ctx.stream()) < 0) return RAD_E_DEVICE;
++    }
++    return RAD_OK;
++}
++
+ }  /* namespace rad */
+diff --git a/core/engine.h b/core/engine.h
+index c913d1c..ca74e9b 100644
+--- a/core/engine.h
++++ b/core/engine.h
+@@ -81,6 +81,15 @@ public:
+      * first-class mode rather than a verbose-flag side effect, so what runs is always visible. */
+     int dump();
+ 
++    /* Layer replay (patches/training/0102): re-run one block of the last step. Clears the block's
++     * recurrent state for the step's sequences, then sets the replay block on every rank's context
++     * and runs the step again, so each rank issues only `block`; the architecture reads the block
++     * at the top of its step(). The caller restores the block's input residual before the call.
++     * The last step must have been a live prefill (the pass is not replayed from a tape), and the
++     * observers see the ops as they issue, so the result is the host's. Returns RAD_OK or the
++     * step's status. */
++    int replay_block(int64_t block);
++
+     const Program& program() const;
+     const Config&  config()  const { return cfg_; }
+ 
+diff --git a/core/runtime/ctx.h b/core/runtime/ctx.h
+index d76be9b..e973646 100644
+--- a/core/runtime/ctx.h
++++ b/core/runtime/ctx.h
+@@ -270,6 +270,9 @@ public:
+     void block_event(int64_t block, int begin) {
+         if (issue_observer_.block) issue_observer_.block(issue_observer_.user, this, block, begin);
+     }
++    /* The block the next step runs alone, or -1 for the whole model (rad_runtime.h). */
++    void    set_replay_block(int64_t block) { replay_block_ = block; }
++    int64_t replay_block() const { return replay_block_; }
+ 
+     /* The lane subsequent issues launch on, and its stream. Lane 0 is `stream_`. See lane1_ for
+      * the constraints on a second lane. */
+@@ -628,7 +631,7 @@ public:
+ private:
+     [[noreturn]] void fatal_issue(rad_op h, int64_t n, const char* why) const;
+ 
+-    /* Report this issue to the observer, when one is set. */
++    /* Report this issue to the observer, when one is set, after the op has run. */
+     void observe_issue(rad_op h, const OpPlan& p, const RadParam* params, int n_params,
+                        const RadOperand* opd, const RadTensor* t, int n_opd, int64_t n);
+ 
+@@ -763,6 +766,8 @@ private:
+     RadTensor tbuf_[MAX_OPERANDS];
+     /* The optional observer; zeroed when none is set, so the issue path pays one branch. */
+     RadIssueObserver issue_observer_{};
++    /* The block the next step runs alone, -1 for the whole model. */
++    int64_t replay_block_ = -1;
+ 
+     /* Prebuilt tensor templates by handle: a buffer's carries its arena pointer, dtype, shape and
+      * packed strides; a weight's carries WeightInfo::ptr. An issue copies one and patches at most
+diff --git a/core/runtime/issue.cpp b/core/runtime/issue.cpp
+index f8b0ac3..7023b5f 100644
+--- a/core/runtime/issue.cpp
++++ b/core/runtime/issue.cpp
+@@ -1399,6 +1399,10 @@ void rad_set_issue_observer(RadCtx* c, const RadIssueObserver* observer) {
+     if (c) static_cast<rad::Ctx*>(c)->set_issue_observer(observer);
+ }
+ 
++int64_t rad_replay_block(const RadCtx* c) {
++    return c ? static_cast<const rad::Ctx*>(c)->replay_block() : -1;
++}
++
+ void rad_block_begin(RadCtx* c, int64_t block) {
+     if (c) static_cast<rad::Ctx*>(c)->block_event(block, 1);
+ }
