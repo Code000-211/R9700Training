@@ -13,14 +13,14 @@ whoever regenerates the files needs the environment. No card is used.
 From a clean checkout, with `build/` configured (`cmake -B build -G Ninja -DR97_WITH_HIP=OFF`):
 
 ```sh
-python3 -m venv .venv-oracle
-.venv-oracle/bin/python -m pip install --upgrade pip
-.venv-oracle/bin/pip install -r tools/oracle/requirements.txt
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/pip install -r tools/oracle/requirements.txt
 
 cmake --build build --target r97_write_fixture
 build/r97_write_fixture /tmp/tiny_qwen35_bf16
 
-.venv-oracle/bin/python tools/oracle/make_reference.py --checkpoint /tmp/tiny_qwen35_bf16
+.venv/bin/python tools/oracle/make_reference.py --checkpoint /tmp/tiny_qwen35_bf16
 ```
 
 The virtual environment lives under the checkout and is ignored by git. Nothing is installed
@@ -30,9 +30,9 @@ says where the CPU wheel comes from. The writer is the fixture's own helper
 (`tests/support/fixture.h`), so the script and the tests see the same checkpoint bytes.
 
 On this machine, with the environment and the writer already built, the generator takes about 15
-seconds: 14.4 s in the last run, 33 s of CPU time. The shared machine's load can stretch the wall
-time to a minute or more (65 s in one run). A fresh virtual environment takes about a minute for
-the CPU torch wheel, and building `r97_write_fixture` took about two minutes on the shared machine.
+seconds: 14.0 s in the last run, 33 s of CPU time. The shared machine's load can stretch the wall
+time to a minute or more (34 s in another run). A fresh virtual environment takes about two
+minutes for the CPU torch wheel, and building `r97_write_fixture` took about three minutes.
 Two runs from the same environment produce byte-identical files (checked with `sha256sum`).
 
 `--check-only` runs every check and writes nothing. `--out DIR` writes elsewhere.
@@ -106,7 +106,11 @@ tensor with its shape and dtype.
 - `lora_grad/<module>.lora_A`, `lora_grad/<module>.lora_B` — the gradient of every LoRA `A` and
   `B`, for the ten target modules `docs/ADAPTER.md` lists, in every layer where the module exists.
 - `gdn_mixer.{single,batch}.{input,output,cotangent,input_cotangent,lengths,mask}` — the module
-  `linear_attn` from its normed input to its output, before the residual add.
+  `linear_attn` from the normed hidden state to its output, before the residual add. `input` is
+  `input_layernorm`'s output for a random residual of the same shape, computed and then detached:
+  the norm is not part of this case, so `input_cotangent` is the mixer's own cotangent rather than
+  the composite's through the norm. The other two cases do include their norm, because the issue
+  defines them from residual to residual.
 - `attention_sublayer.…` — residual in, residual after the add; input norm, attention and add are
   inside.
 - `mlp_sublayer.…` — residual in, residual after the add; post-attention norm, MLP and add are
@@ -199,3 +203,7 @@ project's own definition. That stays with the descent check of the int8 backward
 - Residuals are stored per sequence without padding, so "per sequence" is literal and the file does
   not pay for padding.
 - The block cases use layer 0 (`linear_attn`, `mlp`) and the only full-attention layer (layer 3).
+- `gdn_mixer` starts at the normed hidden state, as the issue defines it, and the other two blocks
+  start at the residual, as it defines them. The first version of the script started `gdn_mixer` at
+  the residual too, which made its `input_cotangent` the composite's through `input_layernorm` and
+  made the three `.input` tensors byte-identical; the case was wrong, not the model.

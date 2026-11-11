@@ -602,12 +602,14 @@ def block_cases(model, modeling, config, gen):
             cases[f"{name}.{tag}.lengths"] = torch.tensor(lengths, dtype=torch.long)
             cases[f"{name}.{tag}.mask"] = mask2d.clone()
 
-        # gdn_mixer: input_layernorm's output -> linear_attn's output, before the residual add.
-        inp = x.clone().requires_grad_(True)
-        attn = model.model.layers[layer_gdn].linear_attn
-        normed = model.model.layers[layer_gdn].input_layernorm(inp)
-        mixer_out = attn(normed, cache_params=None, attention_mask=mask2d)
-        finish("gdn_mixer", inp, mixer_out)
+        # gdn_mixer: the normed hidden state -> linear_attn's output, before the residual add.
+        # The norm is applied first and its result is the leaf, so the case's input really is
+        # input_layernorm's output: its cotangent is the mixer's own, not the composite's through
+        # the norm, which is what the residual being the leaf would give.
+        layer = model.model.layers[layer_gdn]
+        normed = layer.input_layernorm(x).detach().requires_grad_(True)
+        mixer_out = layer.linear_attn(normed, cache_params=None, attention_mask=mask2d)
+        finish("gdn_mixer", normed, mixer_out)
 
         # attention_sublayer: residual -> residual + self_attn(input_layernorm(residual)).
         inp = x.clone().requires_grad_(True)
@@ -641,9 +643,9 @@ def check_gradcheck(model, modeling, config, gen) -> None:
     x = torch.randn(1, length, hidden, generator=gen, dtype=torch.float64)
 
     def gdn(inp):
+        # The block case starts at the normed hidden state, so this is the mixer on its own.
         attn = model.model.layers[layer_gdn].linear_attn
-        normed = model.model.layers[layer_gdn].input_layernorm(inp)
-        return attn(normed, cache_params=None, attention_mask=None)
+        return attn(inp, cache_params=None, attention_mask=None)
 
     layer = model.model.layers[layer_attn]
     positions = torch.arange(length)[None]
