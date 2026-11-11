@@ -92,7 +92,9 @@ R97IqrDecodeDesc describe(const rad::RadFile& f, const RadFileEntry& e, bool wit
     const int ic = plane_of(enc, "codes");
     const int is = plane_of(enc, "scale");
     const int it = plane_of(enc, "trellis");
-    expect(ic >= 0 && is >= 0 && it >= 0, std::string(f.str(e.name)) + ": the IQR planes");
+    const int iz = plane_of(enc, "zero");
+    const std::string nm = f.str(e.name);
+    expect(ic >= 0 && is >= 0 && (it >= 0 || iz >= 0), nm + ": the IQR planes");
 
     R97IqrDecodeDesc d{};
     d.rows_all = e.shape[0];
@@ -102,27 +104,55 @@ R97IqrDecodeDesc describe(const rad::RadFile& f, const RadFileEntry& e, bool wit
 
     int sg = 0;
     const int packed = rad_dtype_packed_int(enc.plane[ic].dtype, &sg);
-    expect(packed > 0 && !sg, std::string(f.str(e.name)) + ": packed unsigned codes");
+    expect(packed > 0 && !sg, nm + ": packed unsigned codes");
     d.bits = rad_dtype_bits(enc.plane[ic].dtype);
-    d.state_bits = log2_exact(enc.plane[it].extent[0]);
-    expect(d.state_bits > 0, std::string(f.str(e.name)) + ": a power-of-two trellis");
-    d.run_rows = (int32_t)enc.plane[it].block[0];
-    expect(d.run_rows > 0, std::string(f.str(e.name)) + ": a trellis run");
-    d.rb = enc.plane[it].block[1] > 0 ? (int32_t)enc.plane[it].block[1] : 1;
+    if (iz >= 0) {
+        // The affine grid (the drafter head): a zero a block beside the scale and no trellis above
+        // it, so a row is a run of its own.
+        expect(it < 0, nm + ": one form, not a trellis and a zero");
+        // The zero is a whole byte a block (RAD_U8) or a packed unsigned field whose width is its
+        // own, as radiance writes both.
+        int zsg = 0;
+        const int zpacked = rad_dtype_packed_int(enc.plane[iz].dtype, &zsg);
+        expect(!zsg && (zpacked > 0 || enc.plane[iz].dtype == RAD_U8), nm + ": unsigned zeros");
+        d.zero_bits = rad_dtype_bits(enc.plane[iz].dtype);
+        expect(d.zero_bits >= 1 && d.zero_bits <= 8, nm + ": a zero of 8 bits at most");
+        expect(enc.plane[iz].block[0] == enc.plane[is].block[0] &&
+                   enc.plane[iz].block[1] == enc.plane[is].block[1],
+               nm + ": the zero is tiled like the scale");
+        d.affine = 1;
+        d.run_rows = 1;
+        d.rb = 1;
+    } else {
+        d.state_bits = log2_exact(enc.plane[it].extent[0]);
+        expect(d.state_bits > 0, nm + ": a power-of-two trellis");
+        d.run_rows = (int32_t)enc.plane[it].block[0];
+        expect(d.run_rows > 0, nm + ": a trellis run");
+        d.rb = enc.plane[it].block[1] > 0 ? (int32_t)enc.plane[it].block[1] : 1;
+    }
 
     d.scale_dtype = scale_type(enc.plane[is].dtype);
-    expect(d.scale_dtype >= 0, std::string(f.str(e.name)) + ": a scale format");
+    expect(d.scale_dtype >= 0, nm + ": a scale format");
     d.scale_block_cols = enc.plane[is].block[1];
     const int64_t nkb = d.cols / 128;
     const int64_t srow = rad_enc_row_bytes(enc.plane[is].dtype,
                                            d.scale_block_cols > 0 ? nkb : 1);
     d.scale_row_bytes = srow;
     d.codes_row_bytes = rad_enc_row_bytes(enc.plane[ic].dtype, d.cols);
+    if (iz >= 0) {
+        d.zero_row_bytes = rad_enc_row_bytes(enc.plane[iz].dtype,
+                                             d.scale_block_cols > 0 ? nkb : 1);
+        // The zero is a plane in the scale's order, one entry a row and block: a decode that walks
+        // rows depends on that, so say so rather than read past the plane.
+        expect((int64_t)f.plane(e, iz).bytes >= d.rows_all * d.zero_row_bytes,
+               nm + ": a zero a row of blocks");
+    }
 
     const int is2 = plane_of(enc, "scale.1");
     if (is2 >= 0) {
+        expect(iz < 0, nm + ": the affine grid has no second level");
         d.scale2_dtype = scale_type(enc.plane[is2].dtype);
-        expect(d.scale2_dtype >= 0, std::string(f.str(e.name)) + ": a scale.1 format");
+        expect(d.scale2_dtype >= 0, nm + ": a scale.1 format");
         d.scale2_block_rows = enc.plane[is2].block[0];
         d.scale2_block_cols = enc.plane[is2].block[1];
         d.scale2_row_bytes = rad_enc_row_bytes(enc.plane[is2].dtype,
@@ -133,7 +163,7 @@ R97IqrDecodeDesc describe(const rad::RadFile& f, const RadFileEntry& e, bool wit
     const int icf = plane_of(enc, "scale.col");
     d.mad = im >= 0;
     d.round_mad = d.mad || icf >= 0;
-    d.lut = (const int8_t*)f.data(f.plane(e, it));
+    if (it >= 0) d.lut = (const int8_t*)f.data(f.plane(e, it));
     if (im >= 0) {
         const uint32_t* ab = (const uint32_t*)f.data(f.plane(e, im));
         d.mad_a = ab[0];
@@ -141,6 +171,7 @@ R97IqrDecodeDesc describe(const rad::RadFile& f, const RadFileEntry& e, bool wit
     }
     d.codes = (const uint8_t*)f.data(f.plane(e, ic));
     d.scale = (const uint8_t*)f.data(f.plane(e, is));
+    if (iz >= 0) d.zero = (const uint8_t*)f.data(f.plane(e, iz));
     if (is2 >= 0) d.scale2 = (const uint8_t*)f.data(f.plane(e, is2));
 
     if (with_out) {
@@ -157,11 +188,13 @@ R97IqrDecodeDesc slice(R97IqrDecodeDesc d, int64_t row0, int64_t rows) {
     d.rows = rows;
     d.codes += row0 * d.codes_row_bytes;
     d.scale += row0 * d.scale_row_bytes;
+    if (d.zero) d.zero += row0 * d.zero_row_bytes;
     return d;
 }
 
 int64_t code_bytes(const R97IqrDecodeDesc& d) { return d.rows * d.codes_row_bytes; }
 int64_t scale_bytes(const R97IqrDecodeDesc& d) { return d.rows * d.scale_row_bytes; }
+int64_t zero_bytes(const R97IqrDecodeDesc& d) { return d.zero ? d.rows * d.zero_row_bytes : 0; }
 int64_t out_code_bytes(const R97IqrDecodeDesc& d) { return d.rows * d.cols; }
 int64_t out_scale_bytes(const R97IqrDecodeDesc& d) {
     return d.rows * (d.cols / 128) * (int64_t)sizeof(uint16_t);
@@ -199,7 +232,8 @@ void decode_case(const std::string& so, rad::RadFile& f, const RadFileEntry& e, 
 
     void* dcodes = device_alloc(code_bytes(hd));
     void* dscale = device_alloc(scale_bytes(hd));
-    void* dlut = device_alloc(int64_t(1) << hd.state_bits);
+    void* dzero = hd.zero ? device_alloc(zero_bytes(hd)) : nullptr;
+    void* dlut = hd.lut ? device_alloc(int64_t(1) << hd.state_bits) : nullptr;
     void* dmad = hd.mad ? device_alloc(8) : nullptr;
     const int is2 = plane_of(f.encoding(e), "scale.1");
     const int64_t s2bytes = is2 >= 0 ? (int64_t)f.plane(e, is2).bytes : 0;
@@ -209,7 +243,8 @@ void decode_case(const std::string& so, rad::RadFile& f, const RadFileEntry& e, 
 
     upload(dcodes, hd.codes, code_bytes(hd), dev.stream);
     upload(dscale, hd.scale, scale_bytes(hd), dev.stream);
-    upload(dlut, hd.lut, int64_t(1) << hd.state_bits, dev.stream);
+    if (hd.zero) upload(dzero, hd.zero, zero_bytes(hd), dev.stream);
+    if (hd.lut) upload(dlut, hd.lut, int64_t(1) << hd.state_bits, dev.stream);
     if (hd.mad) {
         uint32_t ab[2] = { hd.mad_a, hd.mad_b };
         upload(dmad, ab, 8, dev.stream);
@@ -221,6 +256,7 @@ void decode_case(const std::string& so, rad::RadFile& f, const RadFileEntry& e, 
     R97IqrDecodeDesc dd = hd;
     dd.codes = (const uint8_t*)dcodes;
     dd.scale = (const uint8_t*)dscale;
+    dd.zero = (const uint8_t*)dzero;
     dd.lut = (const int8_t*)dlut;
     dd.scale2 = (const uint8_t*)ds2;
     if (hd.mad) {
@@ -257,6 +293,7 @@ void decode_case(const std::string& so, rad::RadFile& f, const RadFileEntry& e, 
 
     device_free(dcodes);
     device_free(dscale);
+    device_free(dzero);
     device_free(dlut);
     device_free(dmad);
     device_free(ds2);
@@ -278,7 +315,8 @@ void time_case(const std::string& so, rad::RadFile& f, const RadFileEntry& e, in
         throw std::runtime_error(std::string("rad_stream_create: ") + rad_dev_last_error());
     void* dcodes = device_alloc(code_bytes(hd));
     void* dscale = device_alloc(scale_bytes(hd));
-    void* dlut = device_alloc(int64_t(1) << hd.state_bits);
+    void* dzero = hd.zero ? device_alloc(zero_bytes(hd)) : nullptr;
+    void* dlut = hd.lut ? device_alloc(int64_t(1) << hd.state_bits) : nullptr;
     void* dmad = hd.mad ? device_alloc(8) : nullptr;
     const int is2 = plane_of(f.encoding(e), "scale.1");
     const int64_t s2bytes = is2 >= 0 ? (int64_t)f.plane(e, is2).bytes : 0;
@@ -287,7 +325,8 @@ void time_case(const std::string& so, rad::RadFile& f, const RadFileEntry& e, in
     void* dsc = device_alloc(out_scale_bytes(hd));
     upload(dcodes, hd.codes, code_bytes(hd), dev.stream);
     upload(dscale, hd.scale, scale_bytes(hd), dev.stream);
-    upload(dlut, hd.lut, int64_t(1) << hd.state_bits, dev.stream);
+    if (hd.zero) upload(dzero, hd.zero, zero_bytes(hd), dev.stream);
+    if (hd.lut) upload(dlut, hd.lut, int64_t(1) << hd.state_bits, dev.stream);
     if (hd.mad) {
         uint32_t ab[2] = { hd.mad_a, hd.mad_b };
         upload(dmad, ab, 8, dev.stream);
@@ -296,6 +335,7 @@ void time_case(const std::string& so, rad::RadFile& f, const RadFileEntry& e, in
     R97IqrDecodeDesc dd = hd;
     dd.codes = (const uint8_t*)dcodes;
     dd.scale = (const uint8_t*)dscale;
+    dd.zero = (const uint8_t*)dzero;
     dd.lut = (const int8_t*)dlut;
     dd.scale2 = (const uint8_t*)ds2;
     if (hd.mad) dd.mad_a = hd.mad_a, dd.mad_b = hd.mad_b;
@@ -328,7 +368,8 @@ void time_case(const std::string& so, rad::RadFile& f, const RadFileEntry& e, in
                 gib / (best / 1000.0), (double)out_code_bytes(hd) / (1024.0 * 1024.0),
                 (double)out_scale_bytes(hd) / (1024.0 * 1024.0));
     dlclose(h);
-    device_free(dcodes); device_free(dscale); device_free(dlut); device_free(dmad);
+    device_free(dcodes); device_free(dscale); device_free(dzero); device_free(dlut);
+    device_free(dmad);
     device_free(ds2); device_free(dout); device_free(dsc);
 }
 
@@ -634,6 +675,15 @@ R97_MODEL_TEST(iqr_decode) {
         decode_case(plugin, f, *e, e->shape[0] - 256, 256);
     }
 
+    // The one affine form in the container: the drafter's head, u2 codes under a u8 zero and an f16
+    // scale the 128 columns, 248320 rows of them. It decodes in chunks like the vocabulary
+    // projection, so a chunk and the short last chunk are both checked.
+    const RadFileEntry* draft = f.find("dflash.draft_head.weight");
+    if (draft) {
+        decode_case(plugin, f, *draft, 0, 8192);
+        decode_case(plugin, f, *draft, draft->shape[0] - 512, 512);
+    }
+
     const RadFileEntry* big = f.find("blk.0.ffn_gate_up.weight");
     if (big) time_case(plugin, f, *big, 0, "ffn_gate_up");
     const RadFileEntry* down = f.find("blk.0.ffn_down.weight");
@@ -651,6 +701,7 @@ R97_MODEL_TEST(iqr_decode) {
     if (head) time_case(plugin, f, *head, 256, "output.k3 head chunk");
     const RadFileEntry* emb = f.find("token_embd.weight");
     if (emb) time_case(plugin, f, *emb, 256, "token_embd head chunk");
+    if (draft) time_case(plugin, f, *draft, 8192, "draft head chunk");
 
     dlclose(h);
 
