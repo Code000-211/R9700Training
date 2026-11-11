@@ -187,6 +187,12 @@ target_include_directories(r97
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(r97 PUBLIC rad_core)
 
+# An op's twin and adjoint register themselves from a static object in the op's own file, so no
+# file lists the ops (r97/adjoint.h). An archive link drops the members nothing references, so
+# the binaries that ask the registry -- r97train and the host and gpu test tiers -- link r97
+# whole; the model tier never looks an op up.
+set(R97_LINK_WHOLE "$<LINK_LIBRARY:WHOLE_ARCHIVE,r97>")
+
 if(NOT R97_PATCH_SET STREQUAL "all")
   message(STATUS "r97: R97_PATCH_SET=${R97_PATCH_SET}: serving build, no r97train")
 else()
@@ -198,11 +204,12 @@ else()
   target_compile_features(r97train PRIVATE cxx_std_20)
   target_include_directories(r97train PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools
                                               ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_link_libraries(r97train PRIVATE r97)
+  target_link_libraries(r97train PRIVATE ${R97_LINK_WHOLE})
 
   # The oracle's checkpoint writer: the tests' own tiny fixture, written to a directory the
   # Python generator loads. It sits in its own subdirectory so it is not one of r97train's
   # sources, and it is separate from the tests because only regenerating the reference needs it.
+  # It reads the fixture's header only, so it never looks an op up and links r97 as it comes.
   add_executable(r97_write_fixture tools/oracle/write_fixture.cpp)
   target_compile_features(r97_write_fixture PRIVATE cxx_std_20)
   target_include_directories(r97_write_fixture PRIVATE
@@ -234,7 +241,7 @@ if(R97_BUILD_TESTS)
     # The plugins are dlopen()ed and call back into rad_core, so its symbols must be in the
     # binary's dynamic table (the fixture loads the qwen35_bf16 plugin).
     set_target_properties(r97_host_tests PROPERTIES ENABLE_EXPORTS TRUE)
-    target_link_libraries(r97_host_tests PRIVATE r97)
+    target_link_libraries(r97_host_tests PRIVATE ${R97_LINK_WHOLE})
     target_include_directories(r97_host_tests PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/tests
       ${R97_RADIANCE_COPY}/tests)   # radiance's write_qwen35, the fixture's checkpoint writer
@@ -247,7 +254,7 @@ if(R97_BUILD_TESTS)
        ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/*.cpp)
   if(NOT R97_GPU_TEST_SOURCES STREQUAL "")
     add_executable(r97_gpu_tests ${R97_GPU_TEST_SOURCES})
-    target_link_libraries(r97_gpu_tests PRIVATE r97)
+    target_link_libraries(r97_gpu_tests PRIVATE ${R97_LINK_WHOLE})
     target_include_directories(r97_gpu_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   endif()
 
