@@ -9,9 +9,9 @@ Python and never need PyTorch.
 From the repository root (no `sudo`, nothing system-wide, nothing in `/opt/hf`):
 
 ```sh
-python3 -m venv .venv-oracle
-.venv-oracle/bin/python -m pip install --upgrade pip
-.venv-oracle/bin/pip install -r tools/oracle/requirements.txt
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/pip install -r tools/oracle/requirements.txt
 ```
 
 `requirements.txt` pins `torch==2.15.0+cpu` (the CPU wheel), `transformers==5.22.2`,
@@ -35,7 +35,7 @@ and `tokenizer_config.json` (with the chat template), like any checkpoint.
 ## Generate
 
 ```sh
-.venv-oracle/bin/python tools/oracle/make_reference.py --checkpoint /tmp/tiny_qwen35_bf16
+.venv/bin/python tools/oracle/make_reference.py --checkpoint /tmp/tiny_qwen35_bf16
 ```
 
 It writes `reference.safetensors`, `manifest.json` and `adapter/` under `tests/fixtures/oracle/`.
@@ -49,9 +49,10 @@ The script checks, in this order:
 3. that the chunked and recurrent delta rules agree to 1e-10 relative;
 4. that `torch.autograd.gradcheck` passes in f64 on the three block cases.
 
-Then it writes the reference. On this machine the generator takes about 15 seconds; the fresh
-venv's `pip install` takes about a minute and building the writer about two minutes. Two runs from
-the same environment produce byte-identical files.
+Then it writes the reference. On this machine the generator takes about 15 seconds (14.0 s in the
+last run, 34 s under load); the fresh venv's `pip install` takes about two minutes and building the
+writer about three. Two runs from the same environment produce byte-identical files. The
+environment lives at `.venv` under the checkout, which `.gitignore` already covers.
 
 ## What not to do
 
