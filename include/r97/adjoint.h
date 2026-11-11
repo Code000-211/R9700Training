@@ -62,7 +62,7 @@ struct AdjointCall {
     const std::vector<AdValue>& cot; // the cotangent of every operand the op wrote, writes' order
     std::vector<AdValue>* dc;        // every operand, in schema order, added to, never overwritten
     ParamSet* grads;                 // the trainable leaves, or null when the walk runs without
-    const char* prefix;              // the name prefix grads entries carry (Delta::grad_prefix)
+    const char* prefix;              // the grads' name prefix; empty leaves it to the record
 };
 
 // A twin: the forward in f64. `operands` are the op's read operands in schema order; `out` receives

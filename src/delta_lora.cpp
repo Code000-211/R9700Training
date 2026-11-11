@@ -143,8 +143,10 @@ public:
         return params;
     }
 
-    // The parameters are already named `<module>.lora_A`, so the adjoint adds no prefix of its
-    // own; the walk takes each call's prefix from the site's module (docs/adjoints/lora.md).
+    // The parameters are already named `<module>.lora_A`, so the delta adds no prefix of its own.
+    // The adjoint names each pool's gradient after the record's weight (`lora.<weight>.a`/`.b`),
+    // so a trainer can split a fused weight's pool by the site's slot before the optimiser sees it;
+    // an empty prefix here therefore does not merge a block's pools into one leaf.
     const char* grad_prefix() const override { return ""; }
 
     // One site per targeted linear, with the factor pair the ParamSet holds for it and the scale

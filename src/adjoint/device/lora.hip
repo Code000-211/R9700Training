@@ -106,9 +106,26 @@ int64_t group_width(int64_t k, int64_t groups) {
     return (k + b - 1) / b == groups ? b : lo;
 }
 
-std::string grad_name(const char* prefix, const char* leaf) {
-    if (!prefix || !*prefix) return leaf;
-    return std::string(prefix) + "." + leaf;
+// The declared weight a record's adapter pool belongs to, from the buffer radiance names it:
+// "lora.<weight>.a" for the shrink's `lora_a`, "lora.<weight>.b" for the expand's. Empty for a
+// record whose operand is not a radiance pool (a unit test's bare "lora_a").
+std::string pool_weight(const Operand& o) {
+    const std::string head = "lora.";
+    const std::string& b = o.buffer;
+    if (b.size() <= head.size() + 2 || b.compare(0, head.size(), head) != 0) return {};
+    if (b.compare(b.size() - 2, 2, ".a") != 0 && b.compare(b.size() - 2, 2, ".b") != 0) return {};
+    return b.substr(head.size(), b.size() - head.size() - 2);
+}
+
+// A cotangent of a trainable leaf. A prefix names it outright. An empty prefix does not mean a bare
+// leaf: the lora kind names each parameter after its module, so it leaves the name to the record's
+// own pool weight -- otherwise every block's pools would merge into one `lora_A`, and the second
+// pool's shape would disagree with the first's. A trainer can split a fused weight's pool by
+// `WireBuffers::Site` (weight_name and slot) before the optimiser sees it.
+std::string grad_name(const AdjointCall& call, const char* leaf, size_t operand) {
+    if (call.prefix && *call.prefix) return std::string(call.prefix) + "." + leaf;
+    const std::string weight = pool_weight(call.rec.operands[operand]);
+    return weight.empty() ? std::string(leaf) : weight + "." + leaf;
 }
 
 // One stream for every device adjoint call in this process: upload, launch and download are one
@@ -382,7 +399,7 @@ void lora_shrink_device_adjoint(const AdjointCall& call) {
     // accumulator the step is holding on the card, and the walk copies the step's total out when
     // the step ends (grad_stage.h). Nothing of the leaf is touched here.
     float* d_da = nullptr;
-    if (call.grads) d_da = device::grad_stage_slot(grad_name(call.prefix, "lora_A"), {sh.R, sh.K});
+    if (call.grads) d_da = device::grad_stage_slot(grad_name(call, "lora_A", 3), {sh.R, sh.K});
 
     device::ScratchBlock d_a(f32_bytes(sh.M * sh.K));
     device::ScratchBlock d_as(f32_bytes(sh.M * sh.groups));
@@ -441,7 +458,7 @@ void lora_expand_device_adjoint(const AdjointCall& call) {
     if (!stream) return;
 
     float* d_db = nullptr;
-    if (call.grads) d_db = device::grad_stage_slot(grad_name(call.prefix, "lora_B"), {ex.N, ex.R});
+    if (call.grads) d_db = device::grad_stage_slot(grad_name(call, "lora_B", 2), {ex.N, ex.R});
 
     device::ScratchBlock d_cy(f32_bytes(ex.M * ex.N));
     device::ScratchBlock d_t(f32_bytes(ex.M * ex.R));

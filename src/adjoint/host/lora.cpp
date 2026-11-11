@@ -109,9 +109,26 @@ Param& grad_entry(ParamSet* grads, const std::string& name, const std::vector<in
     return grads->back();
 }
 
-std::string grad_name(const char* prefix, const char* leaf) {
-    if (!prefix || !*prefix) return leaf;
-    return std::string(prefix) + "." + leaf;
+/* The declared weight a record's adapter pool belongs to, from the buffer radiance names it:
+ * "lora.<weight>.a" for the shrink's `lora_a`, "lora.<weight>.b" for the expand's. Empty for a
+ * record whose operand is not a radiance pool (a unit test's bare "lora_a"). */
+std::string pool_weight(const Operand& o) {
+    const std::string head = "lora.";
+    const std::string& b = o.buffer;
+    if (b.size() <= head.size() + 2 || b.compare(0, head.size(), head) != 0) return {};
+    if (b.compare(b.size() - 2, 2, ".a") != 0 && b.compare(b.size() - 2, 2, ".b") != 0) return {};
+    return b.substr(head.size(), b.size() - head.size() - 2);
+}
+
+/* A cotangent of a trainable leaf. A prefix names it outright. An empty prefix does not mean a bare
+ * leaf: the lora kind names each parameter after its module, so it leaves the name to the record's
+ * own pool weight -- otherwise every block's pools would merge into one `lora_A`, and the second
+ * pool's shape would disagree with the first's. A trainer can split a fused weight's pool by
+ * `WireBuffers::Site` (weight_name and slot) before the optimiser sees it. */
+std::string grad_name(const AdjointCall& call, const char* leaf, size_t operand) {
+    if (call.prefix && *call.prefix) return std::string(call.prefix) + "." + leaf;
+    const std::string weight = pool_weight(call.rec.operands[operand]);
+    return weight.empty() ? std::string(leaf) : weight + "." + leaf;
 }
 
 /* bf16 rounding, which lora_expand_mm's twin needs and r97's own arithmetic never does. Ties go to
@@ -255,7 +272,7 @@ void lora_shrink_host_adjoint(const AdjointCall& call) {
     }
 
     Param* da = nullptr;
-    if (call.grads) da = &grad_entry(call.grads, grad_name(call.prefix, "lora_A"), {sh.R, sh.K});
+    if (call.grads) da = &grad_entry(call.grads, grad_name(call, "lora_A", 3), {sh.R, sh.K});
 
     std::vector<double> g((size_t)sh.K, 0.0);
     for (int64_t m = 0; m < sh.M; ++m) {
@@ -380,7 +397,7 @@ void lora_expand_host_adjoint(const AdjointCall& call) {
     if ((int64_t)t_cot.value.size() != ex.M * ex.R) return;
 
     Param* db = nullptr;
-    if (call.grads) db = &grad_entry(call.grads, grad_name(call.prefix, "lora_B"), {ex.N, ex.R});
+    if (call.grads) db = &grad_entry(call.grads, grad_name(call, "lora_B", 2), {ex.N, ex.R});
 
     for (int64_t m = 0; m < ex.M; ++m) {
         const int64_t s = row_slot(ex, m);

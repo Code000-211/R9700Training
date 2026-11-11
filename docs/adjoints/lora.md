@@ -122,9 +122,15 @@ twice in one step sums both contributions:
 | `lora_shrink` | `<prefix>.lora_A` | `[r, K]` | the adapter's down factor, summed over the pool rows the record's slots name |
 | `lora_expand` | `<prefix>.lora_B` | `[N, r]` | the adapter's up factor, likewise |
 
-`<prefix>` is `call.prefix`, which the walk takes from the `Delta` the site belongs to
-(`include/r97/delta.h`: `grad_prefix()`); `A` is stored `[r, K]` and `B` `[N, r]`, i.e. the layout
-the adapter file holds them in, so the optimiser's update is a flat `ParamSet` update.
+`<prefix>` is `call.prefix` when the walk has one, taken from the `Delta` the site belongs to
+(`include/r97/delta.h`: `grad_prefix()`). A `Delta` whose parameters carry their own module (the
+lora kind) leaves it empty; the name then comes from the record's own weight operand, which
+radiance declares as `lora.<weight>.a` for the shrink and `lora.<weight>.b` for the expand, so the
+leaf is `<weight>.lora_A`/`<weight>.lora_B`. A declared weight that carries more than one module
+keeps one pool per weight: `to_wire`'s `weight_name` and `slot` say which module each row run
+belongs to, and a trainer can split the pool's leaf along that slot before the optimiser sees it.
+`A` is stored `[r, K]` and `B` `[N, r]`, i.e. the layout the adapter file holds them in, so the
+optimiser's update is a flat `ParamSet` update.
 
 ### 3.2 Frozen positions
 

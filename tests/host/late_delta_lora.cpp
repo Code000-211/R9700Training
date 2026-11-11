@@ -13,6 +13,8 @@
 //     that lists the valid names;
 //   * to_wire is one site per targeted linear, carrying that linear's factors, its address (the
 //     declared weight it lands in and its slot there) and the document's scale alpha/r;
+//   * an empty gradient prefix names each lora pool after its record's weight, so a block's pools
+//     keep separate leaves and the trainer can split a fused weight by slot;
 //   * the registry's list has the kind, and building it by name gives the same Delta.
 //
 // Label: host (the fixture container needs rad-convert, no card).
@@ -20,6 +22,7 @@
 #include "support/test.h"
 
 #include "r97/adapter_io.h"
+#include "r97/adjoint.h"
 #include "r97/config.h"
 #include "r97/delta.h"
 #include "r97/model.h"
@@ -306,6 +309,102 @@ R97_TEST(delta_lora_to_wire_addresses_every_module) {
         R97_CHECK(site->weight_name == s.weight);
         R97_CHECK(site->slot == s.slot);
     }
+}
+
+// An empty prefix does not mean one bare `lora_A` for the whole block: the lora adjoint names each
+// pool after the weight the record belongs to (radiance declares the pool `lora.<weight>.a`/`.b`),
+// so two weights of the same shape keep two leaves and the second one does not hit the first one's
+// shape. `to_wire` carries the weight_name and slot the trainer splits a fused pool by.
+R97_TEST(delta_lora_grads_are_named_by_their_pool) {
+    const ModelMeta& meta = fixture_meta();
+    auto delta = lora();
+    const DeltaConfig cfg = config(4, 8.0, {"q_proj"});
+    const ParamSet params = delta->init(meta, cfg, 2);
+    WireBuffers wire;
+    delta->to_wire(params, &wire);
+    R97_CHECK(wire.sites.size() == 1);
+    const WireBuffers::Site& site = wire.sites[0];
+
+    const ModelMeta::Linear* lin = nullptr;
+    for (const ModelMeta::Linear& candidate : meta.targetable)
+        if (candidate.module == site.module) lin = &candidate;
+    R97_CHECK(lin != nullptr);
+
+    auto zeros = [](std::vector<int64_t> shape) {
+        int64_t n = 1;
+        for (int64_t d : shape) n *= d;
+        AdValue v;
+        v.shape = std::move(shape);
+        v.value.assign(size_t(n), 0.0);
+        return v;
+    };
+    const int64_t M = 1, R = cfg.rank, K = lin->in, N = lin->out;
+
+    // lora_shrink: a, a_scale (absent), slot, lora_a, t.
+    OpRecord shrink;
+    shrink.op = "lora_shrink";
+    shrink.params = {{"M", M},
+                     {"K", K},
+                     {"R", R},
+                     {"S", int64_t(1)},
+                     {"dtype", std::string("bf16")}};
+    const std::string pool_a = "lora." + site.weight_name + ".a";
+    shrink.operands = {{"a", "bf16", {M, K}, 0, M, false},
+                       {"a_scale", "invalid", {}, 0, 0, false},
+                       {"slot", "i32", {M}, 0, M, false},
+                       {pool_a, "bf16", {1, R, K}, 0, 1, false},
+                       {"t", "f32", {M, R}, 0, M, true}};
+    std::vector<AdValue> s_fwd = {zeros({M, K}), zeros({}), zeros({M}), zeros({1, R, K}),
+                                  zeros({M, R})};
+    s_fwd[1].dtype = "invalid";
+    std::vector<AdValue> s_cot = {zeros({M, R})};
+    std::vector<AdValue> s_dc = {zeros({M, K}), zeros({}), zeros({M}), zeros({1, R, K}),
+                                 zeros({M, R})};
+    ParamSet s_grads;
+    AdjointFn shrink_adj = adjoint_find(shrink.op, Side::host, shrink.params, nullptr);
+    R97_CHECK(shrink_adj != nullptr);
+    shrink_adj(AdjointCall{shrink, s_fwd, s_cot, &s_dc, &s_grads, ""});
+    R97_CHECK(s_grads.size() == 1);
+    R97_CHECK(s_grads[0].name == site.weight_name + ".lora_A");
+    R97_CHECK(s_grads[0].shape == std::vector<int64_t>({R, K}));
+
+    // A second pool of the same shape keeps its own leaf: the empty prefix did not name both
+    // `lora_A` and let the second pool's shape hit the first's.
+    OpRecord other = shrink;
+    other.operands[3].buffer = "lora.blk.99.ssm_in.a";
+    std::vector<AdValue> other_dc = {zeros({M, K}), zeros({}), zeros({M}), zeros({1, R, K}),
+                                     zeros({M, R})};
+    shrink_adj(AdjointCall{other, s_fwd, s_cot, &other_dc, &s_grads, ""});
+    R97_CHECK(s_grads.size() == 2);
+    R97_CHECK(s_grads[1].name == "blk.99.ssm_in.lora_A");
+    R97_CHECK(s_grads[1].shape == std::vector<int64_t>({R, K}));
+
+    // lora_expand: t, slot, lora_b, scale, y.
+    OpRecord expand;
+    expand.op = "lora_expand";
+    expand.params = {{"M", M},
+                     {"N", N},
+                     {"R", R},
+                     {"S", int64_t(1)},
+                     {"dtype", std::string("bf16")}};
+    const std::string pool_b = "lora." + site.weight_name + ".b";
+    expand.operands = {{"t", "bf16", {M, R}, 0, M, false},
+                       {"slot", "i32", {M}, 0, M, false},
+                       {pool_b, "bf16", {1, N, R}, 0, 1, false},
+                       {"scale", "f32", {1, N}, 0, 1, false},
+                       {"y", "bf16", {M, N}, 0, M, true}};
+    std::vector<AdValue> e_fwd = {zeros({M, R}), zeros({M}), zeros({1, N, R}), zeros({1, N}),
+                                  zeros({M, N})};
+    std::vector<AdValue> e_cot = {zeros({M, N})};
+    std::vector<AdValue> e_dc = {zeros({M, R}), zeros({M}), zeros({1, N, R}), zeros({1, N}),
+                                 zeros({M, N})};
+    ParamSet e_grads;
+    AdjointFn expand_adj = adjoint_find(expand.op, Side::host, expand.params, nullptr);
+    R97_CHECK(expand_adj != nullptr);
+    expand_adj(AdjointCall{expand, e_fwd, e_cot, &e_dc, &e_grads, ""});
+    R97_CHECK(e_grads.size() == 1);
+    R97_CHECK(e_grads[0].name == site.weight_name + ".lora_B");
+    R97_CHECK(e_grads[0].shape == std::vector<int64_t>({N, R}));
 }
 
 // The registration: the registry's list has the kind, and building it by name gives a Delta whose
