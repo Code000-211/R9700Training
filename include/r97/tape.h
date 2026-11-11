@@ -7,10 +7,16 @@
 //
 // Block ranges are recorded from the begin/end calls the architecture makes around a layer. Ops
 // outside any block have block -1 and appear in ops() but in no range.
+//
+// The observer is a training patch on radiance (patches/training/0101-issue-observer.patch), and a
+// serving build applies none of the training set. A runtime without the observer has no graph to
+// read, so there is no tape there at all rather than one that records nothing.
 #pragma once
 
 #include "r97/op.h"
 #include "rad_runtime.h"
+
+#if defined(RAD_ISSUE_OBSERVER)
 
 #include <cstddef>
 #include <cstdint>
@@ -74,3 +80,5 @@ private:
 };
 
 }  // namespace r97
+
+#endif  // RAD_ISSUE_OBSERVER

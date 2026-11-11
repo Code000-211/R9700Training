@@ -1,10 +1,10 @@
 Concern: an optional issue observer and layer block brackets on the runtime context
 Upstream: not-submitted
 diff --git a/abi/rad_runtime.h b/abi/rad_runtime.h
-index c6f5d7b..b33f313 100644
+index c6f5d7b..54b7c09 100644
 --- a/abi/rad_runtime.h
 +++ b/abi/rad_runtime.h
-@@ -916,6 +916,56 @@ int rad_lane_join(RadCtx* c, int from, int to);
+@@ -916,6 +916,60 @@ int rad_lane_join(RadCtx* c, int from, int to);
  #define RAD_ISSUE(c, op, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), RAD_N_BATCH)
  #define RAD_ISSUE_N(c, op, n, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), (n))
  
@@ -57,6 +57,10 @@ index c6f5d7b..b33f313 100644
 + * branch. */
 +void rad_block_begin(RadCtx* c, int64_t block);
 +void rad_block_end(RadCtx* c, int64_t block);
++
++/* Defined by a runtime that carries the observer above: a tool that records the graph tests this
++ * macro rather than the radiance version, because the hook may reach it as a downstream patch. */
++#define RAD_ISSUE_OBSERVER 1
 +
  /* Fail the step with a reason. An architecture block's step() returns void, so this is how it
   * refuses a batch shape it does not serve; the engine stops with `what` in the message. Returns

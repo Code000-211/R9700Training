@@ -1,5 +1,11 @@
 // r97/tape.cpp -- the issue-observer callbacks and the records they build.
+//
+// The observer comes from a training patch (patches/training/0101-issue-observer.patch); a serving
+// build applies none of the training set, so a tape would have nothing to attach to and this file
+// compiles to nothing.
 #include "r97/tape.h"
+
+#if defined(RAD_ISSUE_OBSERVER)
 
 #include <cstddef>
 #include <string>
@@ -102,7 +108,8 @@ void Tape::record(const RadIssueOp& issue) {
         Operand op;
         op.buffer = identity(o, i);
         op.dtype = rad_dtype_name(o.dtype);
-        op.shape.assign(o.shape, o.shape + o.rank);
+        op.shape.clear();
+        if (o.rank > 0 && o.shape) op.shape.assign(o.shape, o.shape + o.rank);
         op.row_lo = first_row(o);
         op.rows = o.rows;
         op.written = o.written != 0;
@@ -125,3 +132,5 @@ void Tape::close_block(int64_t block) {
 }
 
 }  // namespace r97
+
+#endif  // RAD_ISSUE_OBSERVER
