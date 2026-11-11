@@ -83,8 +83,9 @@ For `rb > 1`, a block of `rb` rows shares the largest row scale in the block (li
 ```cpp
 R97IqrDecodeDesc d{};
 // fill rows_all, cols, row0, rows, bits, state_bits, run_rows, rb,
-//      scale_dtype, scale_block_rows/cols, scale_row_bytes, scale2_*,
+//      scale_dtype, scale_block_cols, scale_row_bytes, scale2_*,
 //      codes, codes_row_bytes, scale, scale2, lut, mad/mad_a/mad_b,
+//      round_mad (for rb > 1: set it when mad or a scale.col plane is present),
 //      out_codes, out_scale
 // the affine form instead sets affine = 1, zero, zero_bits and zero_row_bytes,
 // leaves state_bits, lut, mad and scale2 clear, and has run_rows = rb = 1
