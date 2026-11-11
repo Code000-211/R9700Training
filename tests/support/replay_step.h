@@ -138,7 +138,7 @@ struct ReplayStep {
         RadCtx* ctx = engine->issue_ctx();
         if (!ctx) throw std::runtime_error("replay step: the engine has no issue context");
         tape.attach(ctx);
-        recorder.reset(new BoundaryRecorder(ctx, tokens, hidden));
+        recorder.reset(new BoundaryRecorder(tape, tokens, hidden));
 
         s = engine->serve(std::make_unique<rad::StallWatch>("replay step", 60000));
         if (s < 0)

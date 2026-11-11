@@ -1,55 +1,28 @@
 Concern: re-running one block of a step from a restored residual, after its ops have run
 Upstream: not-submitted
 
-The replay of a layer needs two things from radiance that the issue observer (0101) does not give.
-First, an op's operands after it ran: the planner reuses transient buffers inside a layer and
-across layers, so a snapshot taken at issue time is gone by the time the caller reads it. Second,
-an entry point that runs exactly one block of a step: the caller restores the block's input
-residual, and the engine clears the block's recurrent state (gdn_chunk_scan reads h0
-unconditionally, so a replay that kept the forward's state would start from the wrong h0) and asks
-an architecture to issue only that block.
-
-The patch adds a second observer, RadReplayObserver, whose `issued` callback runs after the op has
-launched and whose `block` callback sees the same brackets as the issue observer; the two share
-the context so a tape and a replay can watch the same step. It adds rad_replay_block /
-rad_set_replay_block to the context and Engine::replay_block, which zeros the stateful groups'
-slots for the step's sequences (from the batch's own state_index, the same slots the step used) and
-runs the step with the block set. The paged KV needs no reset: the batch's used counts and slot map
-are the step's start, and the block's own kv_store overwrites every slot it reads.
-
-The qwen35_bf16 step is split so a block's ops, calibration taps included, are one function, the
-forward brackets each call, and a replay calls it alone after the embeddings and head are skipped.
-clef_bf16 includes the same source, so it gets the same hook.
-
+The replay needs one thing from radiance that the issue observer (0101) does not give: a way to run
+one block of the step alone, after its caller restored the residual at every boundary. It sets the
+block on the engine, the architecture reads rad_replay_block() at the top of step() and issues only
+that block between its brackets, and the observer, which runs after each op, hands the caller that
+op's bytes before the planner reuses the buffer. The patch adds no observer of its own: 0101 has the
+one call.
 diff --git a/abi/rad_runtime.h b/abi/rad_runtime.h
+index 3afcced..82191ef 100644
 --- a/abi/rad_runtime.h
 +++ b/abi/rad_runtime.h
-@@ -970,6 +970,31 @@
+@@ -970,6 +970,17 @@ void rad_block_end(RadCtx* c, int64_t block);
   * macro rather than the radiance version, because the hook may reach it as a downstream patch. */
  #define RAD_ISSUE_OBSERVER 1
  
-+/* A second observer, for a caller that must read an op's operands after it ran: `issued` is called
-+ * once the op has launched (on the host backend, once it has run), where the issue observer above
-+ * sees them before. `block` is the same bracket the issue observer sees, so a reader can snapshot
-+ * a block's output at its end. A layer replay installs one to hand each op's bytes to its caller
-+ * before the next op reuses the buffer. An observer must not call rad_issue. */
-+typedef struct RadReplayObserver {
-+    void* user;
-+    void (*issued)(void* user, RadCtx* c, const RadIssueOp* o);
-+    void (*block)(void* user, RadCtx* c, int64_t block, int begin);
-+} RadReplayObserver;
-+
-+/* Install `observer` (copied) and clear it with null. Not thread safe; set it between steps. */
-+void rad_set_replay_observer(RadCtx* c, const RadReplayObserver* observer);
-+
 +/* Layer replay: the block the next step runs alone, or -1 (the default) for the whole model. An
 + * engine sets it to re-run one recorded block of the last step from the residual its caller
 + * restored; an architecture reads it at the top of step() and, when set, issues only that block.
-+ * `rad_set_replay_block` refuses a block the architecture did not bracket. */
++ * The observer above sees the block's ops, after each has run, and its bracket, so the caller can
++ * hand each op's bytes on before the next op reuses the buffer. */
 +int64_t rad_replay_block(const RadCtx* c);
-+void    rad_set_replay_block(RadCtx* c, int64_t block);
 +
-+/* Defined by a runtime that carries the replay hook: a build tests this macro rather than the
++/* Defined by a runtime that carries layer replay: a build tests this macro rather than the
 + * radiance version, because the hook may reach it as a downstream patch. */
 +#define RAD_REPLAY_BLOCK 1
 +
@@ -57,9 +30,10 @@ diff --git a/abi/rad_runtime.h b/abi/rad_runtime.h
   * refuses a batch shape it does not serve; the engine stops with `what` in the message. Returns
   * the status it set, so a helper can `return rad_step_fail(...)`. */
 diff --git a/arch/qwen35_bf16/qwen35_bf16.cpp b/arch/qwen35_bf16/qwen35_bf16.cpp
+index a7f9b9b..5564356 100644
 --- a/arch/qwen35_bf16/qwen35_bf16.cpp
 +++ b/arch/qwen35_bf16/qwen35_bf16.cpp
-@@ -478,6 +478,28 @@
+@@ -478,6 +478,28 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      return RAD_OK;
  }
  
@@ -88,7 +62,7 @@ diff --git a/arch/qwen35_bf16/qwen35_bf16.cpp b/arch/qwen35_bf16/qwen35_bf16.cpp
  static void step(RadCtx* c, const RadBatch* batch) {
      Model& m = g_model[rad_rank(c)];
  
-@@ -487,6 +509,21 @@
+@@ -487,6 +509,21 @@ static void step(RadCtx* c, const RadBatch* batch) {
          return;
      }
  
@@ -110,7 +84,7 @@ diff --git a/arch/qwen35_bf16/qwen35_bf16.cpp b/arch/qwen35_bf16/qwen35_bf16.cpp
      RAD_ISSUE(c, m.op_embed,
                praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.w_tok),
                brows(m.b_x, batch->n_tok));
-@@ -497,24 +534,10 @@
+@@ -497,24 +534,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
                      brows(m.b_x, batch->n_tok), RAD_NONE);
  
      const int64_t T = batch->n_tok;
@@ -140,9 +114,10 @@ diff --git a/arch/qwen35_bf16/qwen35_bf16.cpp b/arch/qwen35_bf16/qwen35_bf16.cpp
  
      RAD_ISSUE(c, m.op_final_norm,
 diff --git a/core/engine.cpp b/core/engine.cpp
+index 3170856..41c03a2 100644
 --- a/core/engine.cpp
 +++ b/core/engine.cpp
-@@ -3685,4 +3685,47 @@
+@@ -3674,4 +3674,47 @@ int Engine::run_server() {
      return rc;
  }
  
@@ -191,9 +166,10 @@ diff --git a/core/engine.cpp b/core/engine.cpp
 +
  }  /* namespace rad */
 diff --git a/core/engine.h b/core/engine.h
+index c913d1c..ca74e9b 100644
 --- a/core/engine.h
 +++ b/core/engine.h
-@@ -81,6 +81,15 @@
+@@ -81,6 +81,15 @@ public:
       * first-class mode rather than a verbose-flag side effect, so what runs is always visible. */
      int dump();
  
@@ -210,20 +186,12 @@ diff --git a/core/engine.h b/core/engine.h
      const Config&  config()  const { return cfg_; }
  
 diff --git a/core/runtime/ctx.h b/core/runtime/ctx.h
+index d76be9b..e973646 100644
 --- a/core/runtime/ctx.h
 +++ b/core/runtime/ctx.h
-@@ -266,10 +266,18 @@
-     void set_issue_observer(const RadIssueObserver* observer) {
-         issue_observer_ = observer ? *observer : RadIssueObserver{};
-     }
-+    /* The optional post-issue observer; null clears it. */
-+    void set_replay_observer(const RadReplayObserver* observer) {
-+        replay_observer_ = observer ? *observer : RadReplayObserver{};
-+    }
-     /* The block brackets a plugin calls: one branch when no observer is set. */
+@@ -270,6 +270,9 @@ public:
      void block_event(int64_t block, int begin) {
          if (issue_observer_.block) issue_observer_.block(issue_observer_.user, this, block, begin);
-+        if (replay_observer_.block) replay_observer_.block(replay_observer_.user, this, block, begin);
      }
 +    /* The block the next step runs alone, or -1 for the whole model (rad_runtime.h). */
 +    void    set_replay_block(int64_t block) { replay_block_ = block; }
@@ -231,93 +199,34 @@ diff --git a/core/runtime/ctx.h b/core/runtime/ctx.h
  
      /* The lane subsequent issues launch on, and its stream. Lane 0 is `stream_`. See lane1_ for
       * the constraints on a second lane. */
-@@ -628,9 +636,11 @@
+@@ -628,7 +631,7 @@ public:
  private:
      [[noreturn]] void fatal_issue(rad_op h, int64_t n, const char* why) const;
  
 -    /* Report this issue to the observer, when one is set. */
-+    /* Report this issue to the observers, when one is set: `issued` selects the post-issue
-+     * observer (the replay observer's `issued`), which sees the operands after the launch. */
++    /* Report this issue to the observer, when one is set, after the op has run. */
      void observe_issue(rad_op h, const OpPlan& p, const RadParam* params, int n_params,
--                       const RadOperand* opd, const RadTensor* t, int n_opd, int64_t n);
-+                       const RadOperand* opd, const RadTensor* t, int n_opd, int64_t n,
-+                       bool issued);
+                        const RadOperand* opd, const RadTensor* t, int n_opd, int64_t n);
  
-     /* ---- the op oracle (runtime/oracle.cpp), inert unless RADIANCE_OP_ORACLE names an op. Runs
-      * the host kernel for the same (op, band) on a host copy of the device kernel's operands and
-@@ -761,8 +771,11 @@
-     /* Per-issue tensor storage, bound into every IssuePlan::args.t at prepare. One array, because
-      * issues do not nest. */
+@@ -763,6 +766,8 @@ private:
      RadTensor tbuf_[MAX_OPERANDS];
--    /* The optional observer; zeroed when none is set, so the issue path pays one branch. */
--    RadIssueObserver issue_observer_{};
-+    /* The optional observers; zeroed when none is set, so the issue path pays one branch. */
-+    RadIssueObserver  issue_observer_{};
-+    RadReplayObserver replay_observer_{};
+     /* The optional observer; zeroed when none is set, so the issue path pays one branch. */
+     RadIssueObserver issue_observer_{};
 +    /* The block the next step runs alone, -1 for the whole model. */
 +    int64_t replay_block_ = -1;
  
      /* Prebuilt tensor templates by handle: a buffer's carries its arena pointer, dtype, shape and
       * packed strides; a weight's carries WeightInfo::ptr. An issue copies one and patches at most
 diff --git a/core/runtime/issue.cpp b/core/runtime/issue.cpp
+index f8b0ac3..7023b5f 100644
 --- a/core/runtime/issue.cpp
 +++ b/core/runtime/issue.cpp
-@@ -929,8 +929,8 @@
-     p.issued    = true;
-     ++n_issues_;
- 
--    /* The whole cost when no observer is set: one branch. */
--    if (issue_observer_.op) observe_issue(h, p, ip.args.p, ip.args.n_p, opd, t, n_opd, n);
-+    /* The whole cost when neither observer is set: one branch. */
-+    if (issue_observer_.op) observe_issue(h, p, ip.args.p, ip.args.n_p, opd, t, n_opd, n, false);
- 
-     /* All-reduce link accounting: `n` is the collective's numel (its ranged parameter) and operand
-      * 0's dtype is the wire element type. The op's `dtype` key ("w4a8") is not an element
-@@ -1160,6 +1160,8 @@
-         if (er < 0) return abort_step(h, b, dom, ip, n, er);
-         host_touch_pending_[l] = true;
-     }
-+    if (replay_observer_.issued)
-+        observe_issue(h, p, ip.args.p, ip.args.n_p, opd, t, n_opd, n, true);
-     if (horacle) oracle_after(h, *horacle, ip, ip.args.n_t);
-     return RAD_OK;
- }
-@@ -1325,8 +1327,9 @@
- }
- 
- void Ctx::observe_issue(rad_op h, const OpPlan& p, const RadParam* params, int n_params,
--                        const RadOperand* opd, const RadTensor* t, int n_opd, int64_t n) {
--    if (!issue_observer_.op) return;
-+                        const RadOperand* opd, const RadTensor* t, int n_opd, int64_t n,
-+                        bool issued) {
-+    if (issued ? !replay_observer_.issued : !issue_observer_.op) return;
-     RadIssueOperand os[MAX_OPERANDS];
-     const int no = std::min(n_opd, (int)MAX_OPERANDS);
-     for (int i = 0; i < no; ++i) {
-@@ -1380,7 +1383,8 @@
-     ev.operands   = os;
-     ev.n_operands = no;
-     ev.n          = n;
--    issue_observer_.op(issue_observer_.user, this, &ev);
-+    if (issued) replay_observer_.issued(replay_observer_.user, this, &ev);
-+    else        issue_observer_.op(issue_observer_.user, this, &ev);
- }
- 
- }  /* namespace rad */
-@@ -1399,6 +1403,18 @@
+@@ -1399,6 +1399,10 @@ void rad_set_issue_observer(RadCtx* c, const RadIssueObserver* observer) {
      if (c) static_cast<rad::Ctx*>(c)->set_issue_observer(observer);
  }
  
-+void rad_set_replay_observer(RadCtx* c, const RadReplayObserver* observer) {
-+    if (c) static_cast<rad::Ctx*>(c)->set_replay_observer(observer);
-+}
-+
 +int64_t rad_replay_block(const RadCtx* c) {
 +    return c ? static_cast<const rad::Ctx*>(c)->replay_block() : -1;
-+}
-+
-+void rad_set_replay_block(RadCtx* c, int64_t block) {
-+    if (c) static_cast<rad::Ctx*>(c)->set_replay_block(block);
 +}
 +
  void rad_block_begin(RadCtx* c, int64_t block) {

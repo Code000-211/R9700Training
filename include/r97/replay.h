@@ -6,10 +6,11 @@
 // state the first forward started from, and re-issues exactly that block's ops, so the backward
 // can take one layer at a time without holding every activation.
 //
-// The replay is a training path: it reads the block brackets and the post-issue observer that
-// patches/training/0101 and 0102 add to radiance, and an architecture must honour the replay block
-// (qwen35_bf16 does). A serving build applies neither patch, so there is no replay there rather
-// than one that would issue the whole model.
+// The replay is a training path: it reads the block brackets and the issue observer that
+// patches/training/0101 adds to radiance, and the replay block that 0102 adds; an architecture
+// must honour that block (qwen35_bf16 does). A serving build applies neither patch, so there is no
+// replay there rather than one that would issue the whole model. A build that leaves 0102 out has
+// the observer and the brackets but no replay, so the tests that need it skip by name.
 #pragma once
 
 #include <cstdint>
@@ -67,12 +68,13 @@ private:
 using ReplaySnapshot =
     std::function<void(const OpRecord& op, const std::vector<OperandContent>& operands)>;
 
-// Records the residual at each block boundary of a step as it runs. Install one before the step,
-// read store() after it, and destroy it before replaying a layer (the replay installs its own
-// observer). The architecture must bracket its blocks (rad_block_begin/end).
+// Records the residual at each block boundary of a step as it runs, through the hooks of the tape
+// that is recording the step: install it after the tape is attached, read store() after the step,
+// and detach it before replaying a layer (the replay replaces those hooks). The architecture must
+// bracket its blocks (rad_block_begin/end).
 class BoundaryRecorder {
 public:
-    BoundaryRecorder(RadCtx* ctx, int64_t tokens, int64_t hidden);
+    BoundaryRecorder(Tape& tape, int64_t tokens, int64_t hidden);
     ~BoundaryRecorder();
 
     BoundaryRecorder(const BoundaryRecorder&) = delete;
@@ -89,9 +91,9 @@ private:
 };
 
 // Re-runs one block of a recorded step from the stored residual of its input boundary. The tape's
-// op records and block ranges are copied at construction and the tape is detached, because the
-// replay installs an observer of its own; the engine must outlive the replay and the step must be
-// its last live prefill.
+// op records and block ranges are copied at construction and the tape is detached; replay()
+// attaches that same tape again for the block, with this replay's hooks. The engine must outlive
+// the replay and the step must be its last live prefill.
 class LayerReplay {
 public:
     LayerReplay(rad::Engine& engine, Tape& tape, ResidualStore store);

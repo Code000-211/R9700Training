@@ -24,6 +24,13 @@ namespace r97test {
     std::abort();
 }
 
+// Announce a test this build leaves out, by name, the way run() announces one it runs. A tier
+// built without a patch then says which tests it skipped instead of passing silently or failing.
+inline void skip(const char* name, const char* why) {
+    std::printf("[host] %s ... skipped (%s)\n", name, why);
+    std::fflush(stdout);
+}
+
 // Run one test. A test that throws is a failure too, reported by name, not a terminate() in
 // another file's main.
 inline void run(const char* name, void (*fn)()) {
