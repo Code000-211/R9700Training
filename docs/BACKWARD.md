@@ -1,10 +1,13 @@
 # The backward core
 
 `include/r97/backward.h`, `src/backward.cpp`. One recorded block, walked in reverse from a
-list of seeds, with the cotangents kept per buffer version. It knows nothing about the model:
-the caller gives it the block's `OpRecord`s, a snapshot provider, the `Seed`s of the objective
-and the cotangent the block above handed down, and gets back the cotangent of the block's
-inputs and the additions to a gradient `ParamSet`.
+list of seeds, with the cotangents kept per buffer version. It knows the model's ops only by the
+two record shapes in [Versions](#versions): an operand the op rewrites in place (rope's operand 0)
+and a write into a `kv:` state buffer, which is the recurrent and conv state's update. It branches
+on no loss and no trainable kind — those register themselves — and the caller gives it the block's
+`OpRecord`s, a snapshot provider, the `Seed`s of the objective and the cotangent the block above
+handed down, and gets back the cotangent of the block's inputs and the additions to a gradient
+`ParamSet`.
 
 ## What it is given
 
@@ -38,7 +41,16 @@ and a cotangent belongs to `(buffer, rows, version)`:
 
 The first pass, in append order, records per row which version is live at each read. Reads are
 taken before writes within one record, so an op that writes the buffer it reads still reads the
-version that was live before it. The reverse pass then never hands a cotangent to a version
+version that was live before it.
+
+Two kinds of write are also a read even though no separate operand names the input, because the
+record has only the write: rope's operand 0 (it rewrites q or k in place, and its adjoint's
+cotangent for that operand is the read's), and a write into a `kv:` buffer (the cache and the
+recurrent/conv state are updated in place, and the pool the adjoint sees is the state before the
+write) unless a separate read operand names that same `kv:` buffer. Every other write is taken as
+new content, so an ordinary op's written buffer is never mistaken for its input.
+
+The reverse pass then never hands a cotangent to a version
 that is already gone: every reader of a version sits after its writer.
 
 ## Stops

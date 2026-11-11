@@ -87,6 +87,6 @@ void kv_store_adjoint(const AdjointCall& call) {
 }  // namespace
 
 R97_REGISTER_TWIN("kv_store", kv_store_twin)
-R97_REGISTER_ADJOINT("kv_store", host, kv_store_adjoint)
+R97_REGISTER_ADJOINT_F("kv_store", host, kv_store_adjoint, 2)  // slots is discrete
 
 }  // namespace r97

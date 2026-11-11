@@ -122,8 +122,10 @@ twice in one step sums both contributions:
 | `lora_shrink` | `<prefix>.lora_A` | `[r, K]` | the adapter's down factor, summed over the pool rows the record's slots name |
 | `lora_expand` | `<prefix>.lora_B` | `[N, r]` | the adapter's up factor, likewise |
 
-`<prefix>` is `call.prefix`, which the walk takes from the `Delta` the site belongs to
-(`include/r97/delta.h`: `grad_prefix()`); `A` is stored `[r, K]` and `B` `[N, r]`, i.e. the layout
+`<prefix>` is the module's own prefix when one fused record names several modules
+(`call.slot_prefix(slot)`, the slot's module), and `call.prefix` otherwise, which the walk takes
+from the `Delta` the site belongs to (`include/r97/delta.h`: `grad_prefix()`); `A` is stored
+`[r, K]` and `B` `[N, r]`, i.e. the layout
 the adapter file holds them in, so the optimiser's update is a flat `ParamSet` update.
 
 ### 3.2 Frozen positions

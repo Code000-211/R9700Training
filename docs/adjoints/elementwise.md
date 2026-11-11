@@ -89,8 +89,11 @@ y = σ(x) = 1 / (1 + exp(-x))
 dx = dy · y · (1 - y)
 ```
 
-The adjoint reads the op's own output from the forward (`fwd[1]`), which is what the kernel
-rounded and the tape keeps, so it never recomputes the exponential.
+The adjoint recomputes `σ(x)` from the forward's input (`fwd[0]`), not from the op's output: the
+tape snaps a written operand before the write, so `fwd[1]` is not the value the write left. When
+the gate is the second column slice of a fused `[tokens, heads, 2·head_dim]` operand, the twin and
+the adjoint both read that slice — `column_view` takes `n` from the output's width and the stride
+from the input-to-output element ratio — and write the `n` columns out.
 
 ## 5. `silu`
 
@@ -195,6 +198,12 @@ The derivation: differentiating `y_i = mult · s · x_i · u_i` gives
 `dx_j = Σ_i dy_i ∂y_i/∂x_j = mult·s·(u_j·dy_j - (s²·x_j/n)·t)`. The second term is the row's
 shared rms: every element of the row moves it, so every `dy_i` weights `x_j`. The gain is frozen
 (`R97_REGISTER_ADJOINT_F("rmsnorm", host, …, 1)`), so the adjoint returns `dx` only.
+
+The operand may be a column slice of a fused buffer rather than a `[rows, n]` tensor: the tiny
+fixture's attention writes q and gate into `[tokens, heads, 2·head_dim]` and normalizes the first
+slice. `column_view` takes `n` from the written operand's width and infers the group stride from
+the input-to-output element ratio (the first slice has offset 0); the twin reads and the adjoint
+writes that slice, leaving the other columns alone.
 
 ## 10. What the test covers
 

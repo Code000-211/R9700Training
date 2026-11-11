@@ -97,6 +97,6 @@ void rope_adjoint(const AdjointCall& call) {
 }  // namespace
 
 R97_REGISTER_TWIN("rope", rope_twin)
-R97_REGISTER_ADJOINT("rope", host, rope_adjoint)
+R97_REGISTER_ADJOINT_F("rope", host, rope_adjoint, 1)  // positions is discrete
 
 }  // namespace r97

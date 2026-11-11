@@ -4,6 +4,7 @@
 // lora_grad to the floor an f32 parameter puts under it, stated where it is checked. The live
 // trace and the recorded program must agree bit for bit: the program mode touches no radiance
 // kernel, so it also proves the twins run the graph.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 #include <nlohmann/json.hpp>
 
 #include <filesystem>
+#include <limits>
 #include <unistd.h>
 #include <string>
 #include <vector>
@@ -47,6 +49,17 @@ r97::Batch batch_of(const r97::oracle::detail::File& ref) {
         seq.score.assign(seq.ids.size(), 1);
         seq.score[0] = 0;
         batch.push_back(std::move(seq));
+    }
+    return batch;
+}
+
+// The same prompts with an assistant-only mask: only the second half of every sequence is
+// scored. The batch's row space then differs from the scored subset's, which is what the
+// forward/objective boundary has to keep straight.
+r97::Batch mixed_mask(r97::Batch batch) {
+    for (r97::TokenSeq& seq : batch) {
+        const size_t n = seq.ids.size();
+        for (size_t i = 0; i < n; ++i) seq.score[i] = i >= n / 2 ? 1 : 0;
     }
     return batch;
 }
@@ -154,6 +167,55 @@ R97_TEST(reference_step_loss_and_gradients_match_the_oracle) {
         throw std::runtime_error("reference step: " + worst_name + " leaves the f32 floor at " +
                                  std::to_string(worst));
     R97_CHECK(sum_abs(grads) > 0.0);
+#endif
+}
+
+// One step, no adapter (the up-projection is zeroed, so the graph is the trunk alone), against
+// the bf16 fixture's own prefill: the loss must be what the bf16 logits give, and it must be
+// taken on the batch's row space even where an assistant-only mask leaves gaps. bf16's logits
+// differ from the f64 twins' by up to a few 1e-2, so the loss tolerance stated here is 2e-2;
+// the row-space fault this pins was a whole loss off (0 against 42), not a rounding away.
+R97_TEST(reference_step_matches_the_bf16_prefill_on_a_mixed_mask) {
+#if !R97_FIXTURE_PREFILL
+    return;
+#else
+    Setup s = setup(true);
+    s.batch = mixed_mask(std::move(s.batch));
+    for (auto& p : s.params)
+        if (p.name.size() > 7 && p.name.compare(p.name.size() - 7, 7, ".lora_B") == 0)
+            std::fill(p.value.begin(), p.value.end(), 0.0f);
+
+    r97::StepResult r = r97::make_reference_step(s.model, s.opts)(s.batch, s.params, nullptr);
+
+    std::vector<std::vector<int32_t>> prompts;
+    for (const r97::TokenSeq& seq : s.batch)
+        prompts.emplace_back(seq.ids.begin(), seq.ids.end());
+    const std::vector<r97::Prefill> pre = r97::run_prefill(r97::fixture(), prompts);
+
+    double sum = 0.0;
+    int64_t scored = 0;
+    for (size_t b = 0; b < s.batch.size(); ++b) {
+        const r97::TokenSeq& seq = s.batch[b];
+        for (size_t i = 1; i < seq.ids.size(); ++i) {
+            if (seq.score[i] != 1) continue;
+            const float* row = pre[b].at((int32_t)i - 1);
+            double m = -std::numeric_limits<double>::infinity();
+            for (int32_t c = 0; c < pre[b].n_vocab; ++c) m = std::max(m, double(row[c]));
+            double z = 0.0;
+            for (int32_t c = 0; c < pre[b].n_vocab; ++c) z += std::exp(double(row[c]) - m);
+            sum += (m + std::log(z)) - double(row[seq.ids[i]]);
+            ++scored;
+        }
+    }
+    R97_CHECK(scored > 0);
+    R97_CHECK(r.scored == scored);
+    const double got = r.loss / double(r.scored);
+    const double want = sum / double(scored);
+    if (std::abs(got - want) >= 2e-2)
+        throw std::runtime_error("reference step: mixed-mask loss " + std::to_string(got) +
+                                 " against the bf16 prefill's " + std::to_string(want));
+    std::printf("  reference step: mixed-mask loss %.6f against the bf16 prefill's %.6f (2e-2) ok\n",
+                got, want);
 #endif
 }
 

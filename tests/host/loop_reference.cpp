@@ -56,8 +56,10 @@ r97::Batch oracle_batch() {
         const auto& t = ref.tensor("seq" + std::to_string(s) + "/input_ids");
         r97::TokenSeq seq;
         for (double v : t.data) seq.ids.push_back(int32_t(v));
-        seq.score.assign(seq.ids.size(), 1);
-        seq.score[0] = 0;
+        // An assistant-only shape: the first half of every sequence is context, the second half
+        // is scored. The step has to keep the batch's row space and the scored subset apart.
+        seq.score.assign(seq.ids.size(), 0);
+        for (size_t i = seq.ids.size() / 2; i < seq.ids.size(); ++i) seq.score[i] = 1;
         b.push_back(std::move(seq));
     }
     return b;

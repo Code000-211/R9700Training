@@ -183,3 +183,11 @@ For each op, `tests/host/adjoint_qk.cpp`:
 
 The host kernel is loaded from the build's `libref` plugin, so the comparison is against the
 same host path the engine uses rather than a second copy of the formula.
+
+`tests/host/adjoint_qk_registry.cpp` drives the two registered rows themselves through
+`check_kernel` and `check_adjoint`, not by calling the family's f64 functions directly: `rope` at
+the fixture's `T = 5`, `n_q = 2`, `D = 8` with `theta = 500000` (so a twin that reads a
+different key falls back to the kernel's 10000 default and cannot match), and `kv_store` at 5
+tokens, one kv head and a `[3, 1, 4, 2*D]` pool. It also pins the two rows' rejection paths: a rope
+record with no head width and a kv_store record with no pool write. The positions and slots are
+registered as frozen, so the checker never perturbs a discrete operand.

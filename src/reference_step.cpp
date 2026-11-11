@@ -2,9 +2,10 @@
 //
 // The value path is deliberately plain: every buffer is a std::vector<double> in an environment,
 // every op is a registered twin, and the backward is the registered host adjoints walked by the
-// same core the trainer uses. Only the op list and the weights touch radiance: the list comes from
-// a recorded program or from one live host-kernel trace, and the weights come from the container
-// through rad_core's reader. No kernel output is ever read into the value path.
+// same core the trainer uses, started from the objective's own seeds. Only the op list and the
+// weights touch radiance: the list comes from a recorded program or from one live host-kernel
+// trace, and the weights come from the container through rad_core's reader. No kernel output is
+// ever read into the value path.
 
 #include "r97/reference_step.h"
 
@@ -14,7 +15,6 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
-#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -524,40 +524,6 @@ private:
     int64_t rows_ = 0;
 };
 
-// The loss's f64 cotangent on the graph logits. The objective's own gradient is f32 (the
-// contract's Seed); the backward wants the value in f64, so it is written once here from the
-// same softmax the objective computes.
-AdValue ce_dlogits(const Batch& batch, const AdValue& logits, int64_t vocab) {
-    const int64_t rows = logits.shape.empty() ? 0 : logits.shape[0];
-    std::vector<double> g((size_t)(rows * vocab), 0.0);
-    int64_t scored = 0;
-    for (const TokenSeq& s : batch)
-        for (size_t i = 1; i < s.ids.size(); ++i) scored += s.score[i] == 1 ? 1 : 0;
-    if (scored == 0) return make_value("f64", {rows, vocab}, std::move(g));
-    const double scale = 1.0 / double(scored);
-    int64_t row = 0;
-    for (const TokenSeq& seq : batch) {
-        for (size_t i = 1; i < seq.ids.size(); ++i) {
-            if (seq.score[i] != 1) continue;
-            if (row >= rows) throw std::runtime_error("reference step: seed rows overflow");
-            const double* r = &logits.value[(size_t)(row * vocab)];
-            double m = -std::numeric_limits<double>::infinity();
-            for (int64_t c = 0; c < vocab; ++c) m = std::max(m, r[c]);
-            double z = 0.0;
-            for (int64_t c = 0; c < vocab; ++c) z += std::exp(r[c] - m);
-            const double lz = std::log(z);
-            const int32_t target = seq.ids[i];
-            for (int64_t c = 0; c < vocab; ++c) {
-                double d = std::exp(r[c] - m - lz) * scale;
-                if (c == target) d -= scale;
-                g[(size_t)(row * vocab + c)] += d;
-            }
-            ++row;
-        }
-    }
-    return make_value("f64", {rows, vocab}, std::move(g));
-}
-
 // ------------------------------------------------------------------ the step
 
 // A private op: add a narrow increment into a column range of a wider buffer. The LoRA expand of a
@@ -597,8 +563,8 @@ void ref_add_cols_adjoint(const AdjointCall& call) {
 }
 
 // A private op: select rows of the full logits into the boundary's buffer. The forward writes one
-// logits row per token (the BOS row included); the objective's tape has one row per scored token,
-// so this is where the two row spaces meet.
+// logits row per token (the BOS row included); the boundary has the batch's row space, one row per
+// non-BOS token, so this is where the two row spaces meet.
 void ref_select_rows_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
                           std::vector<AdValue>* out) {
     const AdValue& x = operands[0];
@@ -680,7 +646,7 @@ public:
         result.scored = obj.scored;
         if (!grads) return result;
 
-        if (!wire.sites.empty()) backward(batch, layout, run, params, grads);
+        if (!wire.sites.empty()) backward(tape, run, obj.seeds, grads);
         return result;
     }
 
@@ -700,7 +666,7 @@ private:
         std::vector<std::vector<size_t>> write_index;  // per op, schema index of each write
         AdValue logits;
         int64_t graph_rows = 0;
-        int64_t scored_rows = 0;
+        int64_t rows = 0;
         int64_t vocab = 0;
         std::map<std::string, AdValue> constants;
     };
@@ -961,12 +927,13 @@ private:
         out.vocab = layout.vocab;
         out.graph_rows = layout.graph_rows;
         batch_nseq_ = layout.n_seq;
+        // The boundary is in the batch's own row space, not the scored subset's: every
+        // non-BOS row is present, in batch order, and the objective picks the scored ones.
         std::vector<int64_t> select_rows;
         for (size_t s = 0; s < batch.size(); ++s)
             for (size_t i = 1; i < batch[s].ids.size(); ++i)
-                if (batch[s].score[i] == 1)
-                    select_rows.push_back(layout.out_start[s] + 1 + (int64_t)(i - 1));
-        out.scored_rows = (int64_t)select_rows.size();
+                select_rows.push_back(layout.out_start[s] + 1 + (int64_t)(i - 1));
+        out.rows = (int64_t)select_rows.size();
         out.ops = build_graph(ops_in, wire, layout, select_rows, &out);
         out.reads.resize(out.ops.size());
         out.writes.resize(out.ops.size());
@@ -1014,7 +981,7 @@ private:
                 out.writes[oi].push_back(writes[wi]);
                 apply_write(n, i, writes[wi], &env);
                 if (o.buffer == "logits" && o.shape.size() == 2 &&
-                    int64_t(writes[wi].value.size()) == out.scored_rows * layout.vocab)
+                    int64_t(writes[wi].value.size()) == out.rows * layout.vocab)
                     out.logits = writes[wi];
                 ++wi;
             }
@@ -1123,20 +1090,14 @@ private:
             }
     }
 
-    void backward(const Batch& batch, const Layout& layout, const Values& run,
-                  const ParamSet& params, ParamSet* grads) {
+    void backward(const ForwardTape& tape, const Values& run, const std::vector<Seed>& seeds,
+                  ParamSet* grads) {
         StoredSnapshots snaps;
         for (size_t oi = 0; oi < run.ops.size(); ++oi)
             for (size_t j = 0; j < run.reads[oi].size(); ++j) {
                 snaps.set(run.ops[oi].rec.position, j, run.reads[oi][j]);
             }
 
-        AdValue dlogits = ce_dlogits(batch, run.logits, run.vocab);
-        std::vector<IncomingCotangent> incoming;
-        incoming.push_back(
-            IncomingCotangent{"logits", 0, run.scored_rows, dlogits.value});
-
-        RefTape tape(batch, run.logits, run.vocab);
         BackwardOptions bo;
         bo.grads = grads;
         bo.prefix = "";
@@ -1150,8 +1111,7 @@ private:
         std::vector<OpRecord> records;
         records.reserve(run.ops.size());
         for (const NormOp& n : run.ops) records.push_back(twin_record(n.rec));
-        backward_block(records, snaps, BoundaryNames::from(tape), {}, incoming, bo);
-        (void)params;
+        backward_block(records, snaps, BoundaryNames::from(tape), seeds, {}, bo);
     }
 
     Model model_;
