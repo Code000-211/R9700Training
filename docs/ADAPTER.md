@@ -337,3 +337,16 @@ layers — 218 MB (207.5 MiB) of bf16 per copy; held twice at training time (bas
 two targeted modules (`ssm_inz`, `ffn_gate_up`) is `2 * 16 = 32`, so the device adjoint sees
 `A` `[32, 5120]`-shaped slices and `B` `[N_r, 32]`-shaped slices with one module's block live per
 slot, exactly as `PackedSite` packs them (`core/lora/lora.h`).
+
+## 7. ops
+
+A step with a live adapter still runs the base GEMMs; the adapter is two ops around each targeted
+GEMM, issued by radiance's `core/lora/declare.cpp`:
+
+- `lora_shrink` reads the GEMM's own activation operand(s) and multiplies by the slot's A factors.
+  A fused weight may need one per row part (for example `in_proj_qkv`'s three parts).
+- `lora_expand` multiplies by the slot's B factors and adds the result to the GEMM's output `y`.
+
+Both are present at every targeted site. `tests/host/live_adapter.cpp` checks the program of a
+bf16-fixture engine with a live slot and finds one `lora_shrink` and one `lora_expand` per entry
+in `Program::lora_sites`; the int8 trunk follows with patch `0210` and the same two ops.
