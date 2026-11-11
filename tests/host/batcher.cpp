@@ -478,6 +478,149 @@ R97_TEST(batcher_shuffle_reaches_single_sequence_buckets) {
     }
 }
 
+// The two shapes the last round's review reproduced. Both are ordinary data -- every sequence
+// under the budget, lengths in a handful of classes -- and on both the plan repeated: the first
+// handed out the same steps and batches for two consecutive epochs at one seed, the second gave
+// the same three steps for two different seeds. A handful of classes leaves few buckets, so a
+// plan has few shapes to take, and at that size a shuffle left to chance -- or an offset that can
+// cancel it -- lands on another epoch's order often enough to see.
+R97_TEST(batcher_repeats_the_review_found) {
+    struct Case {
+        std::vector<int64_t> lens;
+        int64_t budget;
+        int devices;
+        std::vector<uint64_t> seeds;
+    };
+    const std::vector<Case> cases = {
+        {{37, 395, 417, 103, 36, 137, 327, 402, 223, 69, 116, 365}, 427, 3, {82}},
+        {{273, 320, 541, 137, 146, 484, 327, 470}, 559, 3, {214, 215}},
+    };
+
+    for (const Case& c : cases) {
+        auto seqs = make_sequences(c.lens);
+        std::vector<EpochShape> per_seed;
+        for (uint64_t seed : c.seeds) {
+            r97::BatcherConfig cfg;
+            cfg.token_budget = c.budget;
+            cfg.devices = c.devices;
+            cfg.seed = seed;
+            Batcher b(seqs, cfg);
+
+            std::vector<EpochShape> epochs;
+            for (int64_t e = 0; e < 3; ++e) {
+                b.seek({e, 0});
+                auto one = run_epoch(b);
+                R97_CHECK(coverage(one, c.lens).size() == c.lens.size());
+                epochs.push_back(shape(one));
+            }
+            // Each epoch is a new shuffle, not only the epochs three apart.
+            R97_CHECK(epochs[0] != epochs[1]);
+            R97_CHECK(epochs[1] != epochs[2]);
+            per_seed.push_back(std::move(epochs[0]));
+        }
+        // Another seed does not hand out this one's batches.
+        if (per_seed.size() > 1) R97_CHECK(per_seed[0] != per_seed[1]);
+    }
+}
+
+// "Each epoch is a new shuffle" is a promise over ordinary data, not over the shapes a test
+// happens to pick: every sequence under the budget, a budget between one and three maximal
+// sequences, two to four devices, and lengths in a handful of classes, which is where a plan has
+// few orders to choose from and a draw per epoch can easily land on the last epoch's. A few
+// hundred generated datasets, each with four epochs compared to the one before: no epoch may hand
+// out the previous epoch's steps and batches. The steps still keep to their contract on the way --
+// reordering inside a bucket changes the order, not what a step may spend or how it fills the
+// devices.
+R97_TEST(batcher_each_epoch_is_a_new_shuffle) {
+    uint64_t state = 0x9e3779b97f4a7c15ull;
+    auto next = [&state] {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return state;
+    };
+
+    for (int dataset = 0; dataset < 200; ++dataset) {
+        const size_t count = 20 + (size_t)(next() % 30);  // 20..49 sequences
+        const int64_t floor_len = 16 + (int64_t)(next() % 400);
+        std::vector<int64_t> lens;
+        lens.reserve(count);
+        int64_t longest = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const int64_t len = floor_len + (int64_t)(next() % (uint64_t)(3 * floor_len));
+            lens.push_back(len);
+            longest = std::max(longest, len);
+        }
+        auto seqs = make_sequences(lens);
+
+        r97::BatcherConfig cfg;
+        cfg.token_budget = longest + (int64_t)(next() % (uint64_t)(2 * longest));
+        cfg.devices = 2 + (int)(next() % 3);
+        cfg.seed = next() % 1000;
+        Batcher b(seqs, cfg);
+
+        std::vector<EpochShape> epochs;
+        for (int64_t e = 0; e < 4; ++e) {
+            b.seek({e, 0});
+            auto one = run_epoch(b);
+            R97_CHECK(coverage(one, lens).size() == lens.size());
+            for (size_t st = 0; st < one.size(); ++st) {
+                check_step(one[st], cfg.token_budget, cfg.devices);
+                // Every step but the epoch's last tail fills the devices.
+                if (st + 1 < one.size()) R97_CHECK((int)one[st].size() == cfg.devices);
+            }
+            epochs.push_back(shape(one));
+        }
+        for (size_t e = 1; e < epochs.size(); ++e) R97_CHECK(epochs[e - 1] != epochs[e]);
+    }
+}
+
+// Another seed does not hand out the first seed's plan, wherever the plan space has room for it.
+// A plan is an order of the sequences: the buckets' order and each bucket's own. A dataset whose
+// buckets hold one sequence each has n! orders and no more, so a pair of seeds must agree on some
+// such datasets -- two buckets leave two orders. Most buckets hold more than one sequence, and
+// then the orders inside them count too. The datasets below spread their lengths across a dozen
+// classes or so, where the plans outnumber the seeds compared here by far, and there the plan must
+// change with the seed.
+R97_TEST(batcher_another_seed_does_not_replay) {
+    uint64_t state = 0x243f6a8885a308d3ull;
+    auto next = [&state] {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return state;
+    };
+
+    for (int dataset = 0; dataset < 60; ++dataset) {
+        const size_t count = 10 + (size_t)(next() % 20);  // 10..29 sequences
+        std::vector<int64_t> lens;
+        lens.reserve(count);
+        int64_t longest = 0;
+        for (size_t i = 0; i < count; ++i) {
+            // Spread over many power-of-two classes, so the grouping leaves many buckets: their
+            // order alone is already a wide space, before each bucket's own orders count.
+            const int64_t len = 8 + (int64_t)(next() % 60000);
+            lens.push_back(len);
+            longest = std::max(longest, len);
+        }
+        auto seqs = make_sequences(lens);
+
+        r97::BatcherConfig cfg;
+        cfg.token_budget = longest + (int64_t)(next() % (uint64_t)(2 * longest));
+        cfg.devices = 2 + (int)(next() % 2);
+
+        std::vector<EpochShape> plans;
+        for (uint64_t seed : {1ull, 2ull, 3ull}) {
+            cfg.seed = seed;
+            Batcher b(seqs, cfg);
+            plans.push_back(shape(run_epoch(b)));
+        }
+        R97_CHECK(plans[0] != plans[1]);
+        R97_CHECK(plans[1] != plans[2]);
+        R97_CHECK(plans[0] != plans[2]);
+    }
+}
+
 // A dataset that fits one length bucket has no bucket order to shuffle. Sorting the bucket by
 // length alone would then leave the seed and the epoch with nothing to change, so the one
 // bucket's sequences are shuffled instead, under the seed and rotated by the epoch. This is the
