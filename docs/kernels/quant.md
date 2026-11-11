@@ -122,30 +122,74 @@ mask and the inverse rotation.
 
 ## Timing and scratch
 
-**Not measured: this change had no card.** The run that wrote it found `/dev/kfd` unreachable (the
-GPU guard reports that HIP does not see the card and that no bus id resolves), so the `gpu` tier
-could not run and no line of the bench format exists to quote. The measurement is still the
-deliverable, and it is one command on a machine with an R9700:
+Measured with `./build/r97_gpu_tests --bench` on one R9700 (`gfx1201`, 32 GB), card 1, under
+the `gpu` guard, 20 repetitions per case. The adjoint's time is the whole call -- upload,
+launch, download -- and the forward is the op's f64 host twin, because these ops have no device
+forward. The correctness comparison ran in the same process and passed every case.
 
 ```sh
 cmake -B build -G Ninja && cmake --build build
 ctest --test-dir build -L gpu             # the checks
-./build/r97_gpu_tests --bench             # the same, plus one line per case:
-# quant 4096 x 5120 g128  <adjoint> ms adjoint  <forward> ms forward twin  <ratio>x forward  scratch peak <K> KiB
+R97_DEVICE=1 sg render -c './build/r97_gpu_tests --bench'   # the same, plus one line per case:
+# <op> <shape>  <adjoint> ms adjoint  <forward> ms forward twin  <ratio>x forward  scratch peak <K> KiB
 ```
+
+`had_quant_act_i8g`:
+
+| case | adjoint | forward twin | ratio | scratch |
+|---|---|---|---|---|
+| `4 x 128`, group 128 | 0.699 ms | 0.006 ms | 111.71x | 8 KiB |
+| `4 x 128`, group 64 | 0.684 ms | 0.006 ms | 117.61x | 8 KiB |
+| `1024 x 5120` | 124.106 ms | 174.564 ms | 0.71x | 87 360 KiB |
+| `2024 x 5120` | 271.044 ms | 333.682 ms | 0.81x | 172 672 KiB |
+| `4096 x 5120` | 591.478 ms | 576.584 ms | 1.03x | 349 440 KiB |
+
+`rmsnorm_had_quant_i8g`:
+
+| case | adjoint | forward twin | ratio | scratch |
+|---|---|---|---|---|
+| `4 x 128`, group 128 | 0.790 ms | 0.010 ms | 77.85x | 8 KiB |
+| `4 x 128`, group 64 | 0.828 ms | 0.010 ms | 82.35x | 8 KiB |
+| `1024 x 5120` | 144.886 ms | 222.116 ms | 0.65x | 87 360 KiB |
+| `2024 x 5120` | 347.345 ms | 520.241 ms | 0.67x | 172 672 KiB |
+| `4096 x 5120` | 1100.972 ms | 1440.513 ms | 0.76x | 349 440 KiB |
+
+`gated_had_quant_i8g`:
+
+| case | adjoint | forward twin | ratio | scratch |
+|---|---|---|---|---|
+| `4 x 128`, group 128 | 1.042 ms | 0.016 ms | 63.19x | 8 KiB |
+| `4 x 128`, group 64 | 1.249 ms | 0.016 ms | 77.54x | 8 KiB |
+| `1024 x 5120` | 500.946 ms | 590.103 ms | 0.85x | 87 360 KiB |
+| `2024 x 5120` | 584.051 ms | 668.512 ms | 0.87x | 172 672 KiB |
+| `4096 x 5120` | 1696.857 ms | 2401.680 ms | 0.71x | 349 440 KiB |
+
+`gate_had_quant_i8g`:
+
+| case | adjoint | forward twin | ratio | scratch |
+|---|---|---|---|---|
+| `4 x 128`, group 128 | 1.299 ms | 0.016 ms | 83.25x | 8 KiB |
+| `4 x 128`, group 64 | 1.308 ms | 0.014 ms | 95.56x | 8 KiB |
+| `1024 x 5120` | 404.743 ms | 711.269 ms | 0.57x | 87 360 KiB |
+| `2024 x 5120` | 929.031 ms | 847.672 ms | 1.10x | 172 672 KiB |
+| `4096 x 5120` | 937.293 ms | 850.661 ms | 1.10x | 349 440 KiB |
+
+The tiny cases are dominated by the call overhead (a launch is ~0.7 ms on this card), so their
+ratio says nothing about throughput. The real shapes are the interesting ones.
 
 The scratch the call takes is fixed by the code and can be read off it. With `T = M · n` elements of
 codes, the mask pass holds `8T` (the f64 rotated value), `T` (the codes), `4T` (the f32 cotangent)
 and `4T` (the output) plus `8·M·n/group` for the scales; the backprop adds the elementwise part's
 operands, `4T` for `quant`/`rmsnorm` (plus `4n` for the gain) and `8T` for `gated`/`gate`, and
-`2T`/`4T` of bf16 out. The pass is the high-water mark, near `17T`:
+`2T`/`4T` of bf16 out. The pass is the high-water mark, near `17T`; the peaks the run reported at
+those cases were:
 
-| case | `T` | scratch, by that arithmetic |
+| case | `T` | measured scratch |
 |---|---|---|
-| `4 x 128` | 512 | 8.5 KiB |
-| `1024 x 5120` | 5.24 M | 85 MiB |
-| `2024 x 5120` | 10.4 M | 168 MiB |
-| `4096 x 5120` | 21.0 M | 340 MiB |
+| `4 x 128` | 512 | 8 KiB |
+| `1024 x 5120` | 5.24 M | 87 360 KiB (85 MiB) |
+| `2024 x 5120` | 10.4 M | 172 672 KiB (169 MiB) |
+| `4096 x 5120` | 21.0 M | 349 440 KiB (341 MiB) |
 
 The f64 upload of `v` is what makes the largest case cost that much; it buys the mask the
 reference's exact decision. The call also copies that much through the host, since the contract

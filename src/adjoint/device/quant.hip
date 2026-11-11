@@ -419,7 +419,11 @@ void quant_adjoint(const AdjointCall& call, Part part) {
     if (arg_count > 0 && !d_arg) return;
     if (arg_count > 0) {
         std::vector<float> h_arg((size_t)arg_count);
-        for (int64_t i = 0; i < total; ++i) h_arg[(size_t)i] = (float)call.fwd[0].value[(size_t)i];
+        // The gated producer's first operand is gate_up, both halves of it; the others' is one
+        // row of the elementwise op's input.
+        const int64_t first = part == Part::gated ? 2 * total : total;
+        for (int64_t i = 0; i < first; ++i)
+            h_arg[(size_t)i] = (float)call.fwd[0].value[(size_t)i];
         if (part == Part::rmsnorm || part == Part::gate) {
             const AdValue& second = call.fwd[1];
             const int64_t count = part == Part::rmsnorm ? n : total;
