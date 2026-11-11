@@ -295,10 +295,22 @@ void gdn_kkt_host_adjoint(const AdjointCall& call) {
             for (int64_t c0 = 0; c0 < slen; c0 += c.chunk) {
                 const int64_t L = load_chunk(c, s, h, c0, &w);
                 if (L <= 0) continue;
-                /* The forward's A, and the row base of each token's row, read back as written. */
-                for (int64_t p = 0; p < L; ++p)
-                    for (int64_t j = 0; j <= p; ++j)
-                        w.A[(size_t)(p * c.chunk + j)] = c.A_at(bos + c0 + p, h, j);
+                /* Recompute the forward's A from k, beta and g. The snapshot the walk hands an
+                 * adjoint for a written operand is the value the buffer held before the write,
+                 * so `c.A` cannot be read as the output here; the twin's substitution is
+                 * deterministic and this is the same arithmetic. */
+                for (int64_t i = 0; i < L; ++i) {
+                    const double* row = &w.M[(size_t)(i * c.chunk)];
+                    for (int64_t j = 0; j <= i; ++j) w.s[(size_t)j] = (i == j) ? 1.0 : 0.0;
+                    for (int64_t l = 0; l < i; ++l) {
+                        const double rl = row[l];
+                        if (rl == 0.0) continue;
+                        const double* al = &w.A[(size_t)(l * c.chunk)];
+                        for (int64_t j = 0; j <= l; ++j) w.s[(size_t)j] -= rl * al[j];
+                    }
+                    double* ai = &w.A[(size_t)(i * c.chunk)];
+                    for (int64_t j = 0; j <= i; ++j) ai[j] = w.s[(size_t)j];
+                }
 
                 /* Y[p][l] = sum_{j<=l} Ac[p][j] A[l][j]: the cotangent's rows against the
                  * forward's A. */

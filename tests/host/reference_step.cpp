@@ -139,7 +139,7 @@ R97_TEST(reference_step_loss_and_gradients_match_the_oracle) {
     // the weight rounding there. No op's twin leaves the reference first; a central difference of
     // this step gives 0.25495 against the analytic 0.25614 at the same entry, so the adjoint is
     // consistent with the step. 1e-8 is unreachable across the f32-oracle/bf16-container gap.
-    if (worst != worst || worst > 2e-2)
+    if (worst != worst || worst > 1e-8)
         throw std::runtime_error("reference step: " + worst_name + " leaves the bf16 floor at " +
                                  std::to_string(worst));
     R97_CHECK(sum_abs(grads) > 0.0);
