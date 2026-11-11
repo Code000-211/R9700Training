@@ -1,4 +1,4 @@
-Concern: a training-fixture prefill that keeps every position's logits, driven through the engine
+Concern: a training-fixture prefill that keeps every position's logits and carries an adapter slot
 Upstream: not-submitted
 diff --git a/core/engine.cpp b/core/engine.cpp
 index 3170856..c15b3a5 100644
@@ -207,10 +207,10 @@ index 8c7bdff..cb0309e 100644
  }
  
 diff --git a/core/rad_core.h b/core/rad_core.h
-index dbdc8dc..291de12 100644
+index dbdc8dc..72a1596 100644
 --- a/core/rad_core.h
 +++ b/core/rad_core.h
-@@ -1052,6 +1052,17 @@ struct Config {
+@@ -1052,6 +1052,20 @@ struct Config {
      std::string kld_out;                /* --kld-out FILE: the report as JSON, rows beside it */
      bool kld() const { return !kld_record.empty() || !kld_ref.empty(); }
  
@@ -223,6 +223,9 @@ index dbdc8dc..291de12 100644
 +     * deployment leaves both empty. */
 +    std::vector<std::vector<int32_t>> prefill_prompts;
 +    std::vector<std::vector<float>>   prefill_logits;
++    /* The runtime LoRA slot every prompt's requests run with (RadRequest::lora_slot): -1 is the
++     * base model. The tape and adapter tests of the int8 trunk set it. */
++    int32_t prefill_lora = -1;
 +    bool prefill() const { return !prefill_prompts.empty(); }
 +
      /* --mm-max-patches: the most patches one encoder pass carries, which bounds the largest image
@@ -256,10 +259,10 @@ index c4fde6a..4c11146 100644
              const StepEntry& e = plan.e[(size_t)i];
 diff --git a/core/train_prefill.cpp b/core/train_prefill.cpp
 new file mode 100644
-index 0000000..d546e72
+index 0000000..714897d
 --- /dev/null
 +++ b/core/train_prefill.cpp
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,99 @@
 +/* train_prefill.cpp -- the training fixture's prefill on the Engine: a driver that replaces the
 + * HTTP server, as the KL mode does (core/engine_kld.cpp), but keeps the logits of every prompt
 + * position instead of scoring them. Config::prefill_prompts names the prompts and
@@ -329,6 +332,7 @@ index 0000000..d546e72
 +        r->ignore_eos            = true;
 +        r->sp.temp               = 0.0f;
 +        r->score                 = true;
++        r->lora_slot             = cfg_.prefill_lora;   /* the adapter a test observes on the tape */
 +        r->sp.use_control_vector = cvec_default_on();
 +        r->sink                  = sinks[d].get();
 +        sinks[d]->id             = r->id;
@@ -360,7 +364,7 @@ index 0000000..d546e72
 +}  /* namespace rad */
 diff --git a/core/train_prefill.h b/core/train_prefill.h
 new file mode 100644
-index 0000000..aef78d4
+index 0000000..2dc41fc
 --- /dev/null
 +++ b/core/train_prefill.h
 @@ -0,0 +1,11 @@

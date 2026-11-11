@@ -135,7 +135,7 @@ index ad04866..3fee53a 100644
          RAD_ERR("lora: %s", err.c_str());
          return s;
 diff --git a/core/lora/lora.cpp b/core/lora/lora.cpp
-index 708784a..9bd1044 100644
+index 708784a..e1e8033 100644
 --- a/core/lora/lora.cpp
 +++ b/core/lora/lora.cpp
 @@ -566,6 +566,27 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
@@ -176,7 +176,23 @@ index 708784a..9bd1044 100644
      auto no = [&](const std::string& m) { if (why) *why = m; return false; };
      if (b_out) *b_out = 0;
      const bool g = op.op == "gemm_nt", gb = op.op == "gemm_nt_bias", gq = op.op == "gemm_nt_q",
-@@ -616,14 +638,31 @@ bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::s
+@@ -602,10 +624,12 @@ bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::s
+     }
+     if (gq || gqb) {
+         /* At w4a8, w8a8 and w2a8 `a` is quant_act_i8's codes in the int8 WMMA's step order (the
+-         * middle dwords of every 16-byte step exchanged, docs/OPS.md), which lora_shrink would
+-         * read as the activation's columns. */
++         * middle dwords of every 16-byte step exchanged, docs/OPS.md). An A in the fwht128 basis
++         * is read by the host lora_shrink form, which unexchanges the steps; the natural basis
++         * has no such adapter, so it keeps the refusal. */
+         const char* dt = op.base.get_s("dtype");
+-        if (dt && (!std::strcmp(dt, "w4a8") || !std::strcmp(dt, "w8a8") || !std::strcmp(dt, "w2a8")))
++        if (dt && (!std::strcmp(dt, "w4a8") || !std::strcmp(dt, "w8a8") || !std::strcmp(dt, "w2a8"))
++            && basis != kInputFwht128)
+             return no(fmt("%s at %s reads quant_act_i8's codes in the int8 WMMA's step order, not "
+                           "in the activation's column order", op.op.c_str(), dt));
+     }
+@@ -616,14 +640,31 @@ bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::s
              return no(fmt("%s reads K=%lld against a weight of %lld columns (a widened, rotated "
                            "input)", op.op.c_str(), k, (long long)w.decl.shape[1]));
      }
@@ -212,7 +228,7 @@ index 708784a..9bd1044 100644
      if (out) out->clear();
      if (targets.empty() || gen_scope(prog)) return 0;
      const MapIndex mi(prog);
-@@ -633,7 +672,7 @@ int find_unsupported_uses(const Program& prog, const TargetSet& targets,
+@@ -633,7 +674,7 @@ int find_unsupported_uses(const Program& prog, const TargetSet& targets,
          if (op.weights.empty() || !op_live(op)) continue;
          rad_weight b = 0;
          std::string why;
@@ -221,7 +237,7 @@ index 708784a..9bd1044 100644
          for (rad_weight h : op.weights) {
              if (!targeted_idx(prog, mi, h, targets)) continue;
              /* Every view of a targeted weight read by a site over the same logical weight is the
-@@ -662,7 +701,8 @@ int find_unsupported_uses(const Program& prog, const TargetSet& targets,
+@@ -662,7 +703,8 @@ int find_unsupported_uses(const Program& prog, const TargetSet& targets,
  }
  
  int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
@@ -231,7 +247,7 @@ index 708784a..9bd1044 100644
      if (!out) return fail(err, RAD_E_INVAL, "build_sites: null output");
      out->clear();
      if (pool_weights) pool_weights->clear();
-@@ -677,7 +717,7 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
+@@ -677,7 +719,7 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
              const OpInfo& op = prog.ops[i];
              if (op.weights.empty() || !op_live(op)) continue;
              rad_weight b = 0;
@@ -240,7 +256,7 @@ index 708784a..9bd1044 100644
              for (rad_weight h : op.weights)
                  if (h && h < prog.weights.size() &&
                      (!site || !b || prog.weights[b].source != prog.weights[h].source))
-@@ -687,7 +727,7 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
+@@ -687,7 +729,7 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
      std::vector<size_t> first_site;
      for (size_t i = 1; i < prog.ops.size(); ++i) {
          rad_weight b = 0;
@@ -249,7 +265,7 @@ index 708784a..9bd1044 100644
          if (!targeted_idx(prog, mi, b, targets)) continue;
          if (other_reader.count(prog.weights[b].source)) continue;
          if (gen_scope(prog)) {
-@@ -731,7 +771,8 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
+@@ -731,7 +773,8 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
      return RAD_OK;
  }
  
@@ -259,7 +275,7 @@ index 708784a..9bd1044 100644
      const std::string want[3] = {
          module,
          module.starts_with("model.") && !module.starts_with("model.language_model.")
-@@ -773,7 +814,7 @@ std::string explain_module(const Program& prog, const TargetSet& targets, const
+@@ -773,7 +816,7 @@ std::string explain_module(const Program& prog, const TargetSet& targets, const
                  if (!uses) continue;
                  rad_weight b = 0;
                  std::string no;
@@ -268,7 +284,7 @@ index 708784a..9bd1044 100644
                  reads += fmt("%sop %zu %s (%s)", reads.empty() ? "" : "; ", i, op.op.c_str(), no.c_str());
              }
              if (!reads.empty()) why = std::string("'") + m.declared + "' is read by " + reads;
-@@ -865,6 +906,14 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
+@@ -865,6 +908,14 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
                     cfg["use_rslora"].get<bool>();
      if (cfg.contains("base_model_name_or_path") && cfg["base_model_name_or_path"].is_string())
          info->base_model = cfg["base_model_name_or_path"].get<std::string>();
@@ -283,7 +299,7 @@ index 708784a..9bd1044 100644
      if (cfg.contains("target_modules")) {
          const ojson& t = cfg["target_modules"];
          if (t.is_string()) info->target_modules.push_back(t.get<std::string>());
-@@ -1234,13 +1283,15 @@ int pack_modules(const std::vector<Site>& sites, int max_rank,
+@@ -1234,13 +1285,15 @@ int pack_modules(const std::vector<Site>& sites, int max_rank,
  int check_placed(const std::vector<AdapterInfo>& per_rank, std::string* err, const Program* prog,
                   const TargetSet* targets) {
      if (per_rank.empty()) return RAD_OK;
@@ -367,3 +383,75 @@ index 11156ce..ed5929b 100644
  
  }  /* namespace lora */
  }  /* namespace rad */
+diff --git a/libavx/avx_lora.cpp b/libavx/avx_lora.cpp
+index fbf6c51..ccdcdb8 100644
+--- a/libavx/avx_lora.cpp
++++ b/libavx/avx_lora.cpp
+@@ -16,6 +16,8 @@
+ #include "avx_common.h"
+ #include "avx_vec.h"
+ 
++#include <vector>
++
+ using namespace avx;
+ 
+ namespace {
+@@ -116,6 +118,30 @@ AVX_KERNEL(lora_shrink) {
+     const int64_t gp = p_int(a, "group", 0);
+     if (gp > 0 && SA.p && (K + gp - 1) / gp != (K + SA.group - 1) / SA.group) return RAD_E_SHAPE;
+ 
++    /* quant_act_i8's codes arrive with the middle two dwords of every 16-byte step exchanged;
++     * exchange them back into a contiguous copy, as avx_gemm.cpp does, so the group scale below
++     * indexes the same columns as A. */
++    RadTensor Xc;
++    if (X->dtype == RAD_I8 && i8_steps_dtype(p_str(a, "dtype", nullptr))) {
++        if (K % 16) return RAD_E_SHAPE;
++        if (!dense_row(X)) return RAD_E_STRIDE;
++        static thread_local std::vector<int8_t> x_cols;
++        x_cols.resize((size_t)(M * K));
++        for (int64_t m = 0; m < M; ++m) {
++            const int8_t* row = (const int8_t*)X->data + rowoff(X, m, K);
++            int8_t* dst = x_cols.data() + m * K;
++            for (int64_t k = 0; k < K; k += 16) {
++                std::memcpy(dst + k,      row + k,      4);
++                std::memcpy(dst + k + 4,  row + k + 8,  4);
++                std::memcpy(dst + k + 8,  row + k + 4,  4);
++                std::memcpy(dst + k + 12, row + k + 12, 4);
++            }
++        }
++        Xc = *X;
++        Xc.data = x_cols.data();
++        Xc.rank = 2; Xc.shape[0] = M; Xc.shape[1] = K; Xc.stride[0] = K; Xc.stride[1] = 1;
++        X = &Xc;
++    }
+     const Mat mx = as_mat(X, K), mt = as_mat(T, R);
+     const Pool3 pa = pool3(LA, R, K);
+     float* const td = (float*)T->data;
+diff --git a/libref/ref_lora.cpp b/libref/ref_lora.cpp
+index 54ec504..78cfe67 100644
+--- a/libref/ref_lora.cpp
++++ b/libref/ref_lora.cpp
+@@ -79,6 +79,23 @@ int ref_lora_shrink(const RadArgs* a, RadStream) {
+     const int64_t gp = p_int(a, "group", 0);
+     if (gp > 0 && SA.p && (K + gp - 1) / gp != (K + SA.group - 1) / SA.group) return RAD_E_SHAPE;
+ 
++    /* quant_act_i8's codes arrive in the step order (ref_common.h); read them back into column
++     * order, as gemm_nt_q does, so the group scale below indexes the same columns as A. */
++    std::vector<int8_t> x_cols;
++    RadTensor Xc;
++    if (X->dtype == RAD_I8 && i8_steps_dtype(p_str(a, "dtype", nullptr))) {
++        if (K % 16) return RAD_E_SHAPE;
++        if (laststride(X) != 1) return RAD_E_STRIDE;
++        x_cols.resize((size_t)(M * K));
++        for (int64_t m = 0; m < M; ++m) {
++            const int8_t* row = (const int8_t*)X->data + rowoff(X, m, K);
++            for (int64_t c = 0; c < K; ++c) x_cols[(size_t)(m * K + c)] = row[i8_step_pos(c)];
++        }
++        Xc = *X;
++        Xc.data = x_cols.data();
++        Xc.rank = 2; Xc.shape[0] = M; Xc.shape[1] = K; Xc.stride[0] = K; Xc.stride[1] = 1;
++        X = &Xc;
++    }
+     const Mat mx = as_mat(X, K), mt = as_mat(T, R);
+     const Pool3 pa = pool3(LA, R, K);
+     const uint32_t dx = X->dtype;

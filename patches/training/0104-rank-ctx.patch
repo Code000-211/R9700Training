@@ -1,4 +1,4 @@
-Concern: the trainer's prefill driver: an adapter in the prefill slot, and a rank's context
+Concern: a rank's runtime context for a test that observes the step
 Upstream: not-submitted
 diff --git a/core/engine.cpp b/core/engine.cpp
 index c15b3a5..bae8bac 100644
@@ -32,29 +32,3 @@ index b2a0168..df16f56 100644
      /* The startup report (core/diag/diag.h): every option with its value and source, the
       * machine, and what on it costs speed or correctness. serve() prints it with RAD_OK before
       * listening; main prints it with the error start() or serve() failed with, so a server that
-diff --git a/core/rad_core.h b/core/rad_core.h
-index 291de12..72a1596 100644
---- a/core/rad_core.h
-+++ b/core/rad_core.h
-@@ -1061,6 +1061,9 @@ struct Config {
-      * deployment leaves both empty. */
-     std::vector<std::vector<int32_t>> prefill_prompts;
-     std::vector<std::vector<float>>   prefill_logits;
-+    /* The runtime LoRA slot every prompt's requests run with (RadRequest::lora_slot): -1 is the
-+     * base model. The tape and adapter tests of the int8 trunk set it. */
-+    int32_t prefill_lora = -1;
-     bool prefill() const { return !prefill_prompts.empty(); }
- 
-     /* --mm-max-patches: the most patches one encoder pass carries, which bounds the largest image
-diff --git a/core/train_prefill.cpp b/core/train_prefill.cpp
-index d546e72..714897d 100644
---- a/core/train_prefill.cpp
-+++ b/core/train_prefill.cpp
-@@ -67,6 +67,7 @@ int Engine::run_prefill() {
-         r->ignore_eos            = true;
-         r->sp.temp               = 0.0f;
-         r->score                 = true;
-+        r->lora_slot             = cfg_.prefill_lora;   /* the adapter a test observes on the tape */
-         r->sp.use_control_vector = cvec_default_on();
-         r->sink                  = sinks[d].get();
-         sinks[d]->id             = r->id;

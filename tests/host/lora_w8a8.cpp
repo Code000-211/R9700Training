@@ -1,15 +1,15 @@
 // tests/host/lora_w8a8.cpp -- a LoRA adapter on the rotated int8 trunk, through the host kernels.
 //
 // patches/serving/0210-lora-int8-trunk-host.patch lifts, for an adapter that declares
-// `"radiance_input_basis": "fwht128"` (the key docs/ADAPTER.md defines), the refusal that says a
-// weight is stored in the transform basis, so its GEMM is fed a transformed activation. The trunk
-// applies the 128-wide Hadamard before quantising, so the codes had_quant_act_i8g writes are in
-// the activation's column order, which is the order lora_shrink reads them in; the step-order
-// refusal the same function has (for a GEMM whose `dtype` is w4a8/w8a8/w2a8, quant_act_i8's
-// exchanged codes) is left standing, and no site of this trunk has one of those dtypes. What is
-// left to prove is the arithmetic: the trunk's int8 GEMM already multiplies the rotated
-// activation, so an adapter whose A factors are in that basis adds its delta to the same product,
-// and the sum has to be the model's output at that site.
+// `"radiance_input_basis": "fwht128"` (the key docs/ADAPTER.md defines), both refusals in
+// core/lora/lora.cpp: the weight "stored in the 'fwht128' transform basis" one and the step-order
+// dtype one (w4a8/w8a8/w2a8), because the host lora_shrink form now unexchanges quant_act_i8's
+// codes before it reads them. The trunk applies the 128-wide Hadamard before quantising, so the
+// codes had_quant_act_i8g writes are already in the activation's column order and need no
+// unexchange; no site of this trunk has a step-order dtype. What is left to prove is the
+// arithmetic: the trunk's int8 GEMM already multiplies the rotated activation, so an adapter
+// whose A factors are in that basis adds its delta to the same product, and the sum has to be the
+// model's output at that site.
 //
 // These tests run the engine's prefill on the int8 fixture with an adapter over every module it
 // can ride, and read the step's tape:
@@ -201,7 +201,8 @@ R97_TEST(lora_w8a8_refuses_an_adapter_without_the_key) {
     R97_CHECK(r.code < 0);
     R97_CHECK(r.mentions("is stored in the 'fwht128' transform basis"));
     R97_CHECK(r.mentions("is fed a transformed activation"));
-    R97_CHECK(!r.mentions("step order"));   // that refusal is about other dtypes: no site has one
+    // This fixture has no step-order site, so the missing key reaches the basis refusal first.
+    R97_CHECK(!r.mentions("step order"));
     std::printf("  lora_w8a8: an adapter with no key is refused with today's message ok\n");
 }
 
