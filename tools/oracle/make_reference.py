@@ -570,14 +570,81 @@ def run_model(model, modeling, config, ids, score, mask, positions, keep_grad):
     return loss, per_seq, logits, boundaries, grads
 
 
+BLOCK_NAMES = ("gdn_mixer", "attention_sublayer", "mlp_sublayer")
+
+
+def block_layers(config) -> dict[str, int]:
+    """The layer each block case is taken from; the manifest records these.
+
+    `gdn_mixer` and `mlp_sublayer` use layer 0, the first gated delta net layer, and
+    `attention_sublayer` the last full-attention layer, which on this fixture is the only one
+    (layer 3). One function rather than a literal in each place: a doc line and a script literal
+    had already drifted apart over which layer `mlp_sublayer` uses, and nothing recorded it.
+    """
+    full = [i for i, kind in enumerate(config.layer_types) if kind == "full_attention"]
+    if not full:
+        raise SystemExit("oracle: the fixture has no full-attention layer")
+    return {"gdn_mixer": 0, "attention_sublayer": max(full), "mlp_sublayer": 0}
+
+
+def assert_no_lora(model, where: str) -> None:
+    """Fail unless every LoRA target still holds a plain torch.nn.Linear.
+
+    The block cases are the plain trunk. The first version of this script computed them after
+    add_lora(), so each stored output and cotangent was `W x + (alpha / r) B A x` rather than the
+    block the issue defines, and a test differentiating the trunk's block could not use them. The
+    guard sits here so that cannot come back unnoticed.
+    """
+    for layer in model.model.layers:
+        for target in LORA_TARGETS:
+            module = layer
+            for part in target.split("."):
+                module = getattr(module, part, None)
+                if module is None:
+                    break
+            if isinstance(module, LoRALinear):
+                raise SystemExit(f"oracle: {where}: {target} is LoRA-wrapped")
+
+
+def block_output(name, model, modeling, config, x, mask2d, positions):
+    """One block case's output, on the trunk as it is.
+
+    `x` is the residual for the two sublayer cases and the already-normed hidden state for
+    `gdn_mixer`, which is where the issue starts that case. The norms the other two cases include
+    are inside them, as the issue defines them from residual to residual.
+    """
+    layers = block_layers(config)
+    if name == "gdn_mixer":
+        layer = model.model.layers[layers["gdn_mixer"]]
+        return layer.linear_attn(x, cache_params=None, attention_mask=mask2d)
+    if name == "attention_sublayer":
+        layer = model.model.layers[layers["attention_sublayer"]]
+        position_ids = positions[None].expand(4, -1, -1)
+        attn_mask = causal_mask(modeling, model, config, x, mask2d, positions)
+        cos, sin = model.model.rotary_emb(x, position_ids[1:])
+        attn_out, _ = layer.self_attn(
+            layer.input_layernorm(x),
+            position_embeddings=(cos, sin),
+            attention_mask=attn_mask,
+            position_ids=position_ids[0],
+        )
+        return x + attn_out
+    if name == "mlp_sublayer":
+        layer = model.model.layers[layers["mlp_sublayer"]]
+        return x + layer.mlp(layer.post_attention_layernorm(x))
+    raise SystemExit(f"oracle: unknown block case {name}")
+
+
 def block_cases(model, modeling, config, gen):
-    """The three block cases, each for one sequence and for a padded batch of unequal lengths."""
+    """The three block cases, each for one sequence and for a padded batch of unequal lengths.
+
+    Computed on the plain trunk, before add_lora() wraps anything: the issue defines `gdn_mixer` as
+    the module `linear_attn` from the normed hidden state to its output, and the other two from the
+    residual to the residual after the add. The layer each case comes from is in block_layers(),
+    and the manifest records it per case.
+    """
+    assert_no_lora(model, "block_cases")
     cases = {}
-    layer_gdn = 0
-    layer_attn = max(
-        i for i, t in enumerate(config.layer_types) if t == "full_attention"
-    )
-    layer_mlp = 1
     for tag, lengths in (("single", [23]), ("batch", [17, 11, 6])):
         max_len = max(lengths)
         hidden = config.hidden_size
@@ -606,69 +673,64 @@ def block_cases(model, modeling, config, gen):
         # The norm is applied first and its result is the leaf, so the case's input really is
         # input_layernorm's output: its cotangent is the mixer's own, not the composite's through
         # the norm, which is what the residual being the leaf would give.
-        layer = model.model.layers[layer_gdn]
-        normed = layer.input_layernorm(x).detach().requires_grad_(True)
-        mixer_out = layer.linear_attn(normed, cache_params=None, attention_mask=mask2d)
-        finish("gdn_mixer", normed, mixer_out)
+        gdn = model.model.layers[block_layers(config)["gdn_mixer"]]
+        normed = gdn.input_layernorm(x).detach().requires_grad_(True)
+        finish(
+            "gdn_mixer",
+            normed,
+            block_output("gdn_mixer", model, modeling, config, normed, mask2d, positions),
+        )
 
         # attention_sublayer: residual -> residual + self_attn(input_layernorm(residual)).
-        inp = x.clone().requires_grad_(True)
-        layer = model.model.layers[layer_attn]
-        position_ids = positions[None].expand(4, -1, -1)
-        text_positions, rope_positions = position_ids[0], position_ids[1:]
-        embeds = inp
-        attn_mask = causal_mask(modeling, model, config, embeds, mask2d, positions)
-        cos, sin = model.model.rotary_emb(embeds, rope_positions)
-        attn_out, _ = layer.self_attn(
-            layer.input_layernorm(inp),
-            position_embeddings=(cos, sin),
-            attention_mask=attn_mask,
-            position_ids=text_positions,
-        )
-        finish("attention_sublayer", inp, inp + attn_out)
-
         # mlp_sublayer: residual -> residual + mlp(post_attention_layernorm(residual)).
-        inp = x.clone().requires_grad_(True)
-        layer = model.model.layers[layer_mlp]
-        finish("mlp_sublayer", inp, inp + layer.mlp(layer.post_attention_layernorm(inp)))
+        for name in ("attention_sublayer", "mlp_sublayer"):
+            inp = x.clone().requires_grad_(True)
+            finish(name, inp, block_output(name, model, modeling, config, inp, mask2d, positions))
     return cases
+
+
+def check_blocks_exclude_adapter(model, modeling, config, cases) -> float:
+    """Recompute each stored block case on the adapter-wrapped model and require it to differ.
+
+    A positive control for block_cases() having run before add_lora(): if those numbers had been
+    taken from the adapter-wrapped trunk, this would find them unchanged. The returned number is
+    the smallest of the six max-abs differences and goes into the manifest, so a consumer can see
+    how far the adapter would move each case.
+    """
+    smallest = None
+    with torch.no_grad():
+        for name in BLOCK_NAMES:
+            for tag in ("single", "batch"):
+                inp = cases[f"{name}.{tag}.input"]
+                mask2d = cases[f"{name}.{tag}.mask"]
+                positions = torch.zeros_like(mask2d)
+                for row in range(mask2d.shape[0]):
+                    length = int(mask2d[row].sum())
+                    positions[row, :length] = torch.arange(length)
+                out = block_output(name, model, modeling, config, inp, mask2d, positions)
+                diff = float((out - cases[f"{name}.{tag}.output"]).abs().max())
+                if diff < 1e-6:
+                    raise SystemExit(
+                        f"oracle: {name}.{tag} is unchanged with the adapter wrapped in; the "
+                        "stored case is not the plain trunk"
+                    )
+                smallest = diff if smallest is None else min(smallest, diff)
+    return smallest
 
 
 def check_gradcheck(model, modeling, config, gen) -> None:
     """gradcheck in f64 on the three block cases, on the single-sequence shape each uses."""
-    layer_gdn, layer_mlp = 0, 1
-    layer_attn = max(i for i, t in enumerate(config.layer_types) if t == "full_attention")
+    assert_no_lora(model, "check_gradcheck")
     length = 7
     hidden = config.hidden_size
     x = torch.randn(1, length, hidden, generator=gen, dtype=torch.float64)
-
-    def gdn(inp):
-        # The block case starts at the normed hidden state, so this is the mixer on its own.
-        attn = model.model.layers[layer_gdn].linear_attn
-        return attn(inp, cache_params=None, attention_mask=None)
-
-    layer = model.model.layers[layer_attn]
     positions = torch.arange(length)[None]
-    position_ids = positions[None].expand(4, -1, -1)
-    text_positions, rope_positions = position_ids[0], position_ids[1:]
-    attn_mask = causal_mask(modeling, model, config, x, None, positions)
-    cos, sin = model.model.rotary_emb(x, rope_positions)
+    for name in BLOCK_NAMES:
+        def fn(inp, name=name):
+            # The block case starts at the normed hidden state for gdn_mixer, so this is the mixer
+            # on its own there and residual-to-residual for the other two.
+            return block_output(name, model, modeling, config, inp, None, positions)
 
-    def attention(inp):
-        out, _ = layer.self_attn(
-            layer.input_layernorm(inp),
-            position_embeddings=(cos, sin),
-            attention_mask=attn_mask,
-            position_ids=text_positions,
-        )
-        return inp + out
-
-    mlp_layer = model.model.layers[layer_mlp]
-
-    def mlp(inp):
-        return inp + mlp_layer.mlp(mlp_layer.post_attention_layernorm(inp))
-
-    for name, fn in (("gdn_mixer", gdn), ("attention_sublayer", attention), ("mlp_sublayer", mlp)):
         ok = torch.autograd.gradcheck(fn, (x.clone().requires_grad_(True),), eps=1e-6, atol=1e-6, rtol=1e-5)
         if not ok:
             raise SystemExit(f"oracle: gradcheck failed for {name}")
@@ -830,6 +892,9 @@ def main() -> int:
     delta_calls = capture_delta_rule_inputs(model, modeling, config, ids, mask, positions)
     delta_rule = check_delta_agreement(modeling, delta_calls)
     check_gradcheck(model, modeling, config, gen)
+    # Before add_lora(): the block cases are the plain trunk (block_cases asserts it), and the
+    # draws they take from the generator therefore come before the adapter's A and B.
+    block = block_cases(model, modeling, config, gen)
     print(
         "oracle: dtype overrides match stock in f32; the chunked and the recurrent delta rule "
         f"agree to {delta_rule['relative_difference']:.3g} relative over {delta_rule['chunks']} chunks"
@@ -839,6 +904,7 @@ def main() -> int:
             model, modeling, config, ids, score, mask, positions, keep_grad=False
         )
     modules = add_lora(model, args.lora_rank, args.lora_alpha, gen)
+    adapter_control = check_blocks_exclude_adapter(model, modeling, config, block)
     loss, per_seq, logits_after, boundaries, grads = run_model(
         model, modeling, config, ids, score, mask, positions, keep_grad=True
     )
@@ -866,7 +932,7 @@ def main() -> int:
         adapter_grads[f"lora_grad/{name}.lora_B"] = module.lora_B.grad.detach()
     tensors.update(adapter_grads)
 
-    tensors.update(block_cases(model, modeling, config, gen))
+    tensors.update(block)
 
     # A batch of unequal lengths has padding; check it costs nothing: the scored loss is the
     # token-count-weighted mean of the per-sequence losses, so no padded tail leaks in.
@@ -894,7 +960,20 @@ def main() -> int:
                 "longest_chunks": [length // DEFAULT_CHUNK + (length % DEFAULT_CHUNK != 0) for length in lengths],
                 "names": ["seq0", "seq1", "seq2"],
             },
-            "blocks": ["gdn_mixer", "attention_sublayer", "mlp_sublayer"],
+            # The layer each case comes from, and that no adapter is inside it: the first version
+            # of this reference stored adapter-wrapped blocks and said neither.
+            "blocks": [
+                {"name": name, "layer": block_layers(config)[name], "with_adapter": False}
+                for name in BLOCK_NAMES
+            ],
+        },
+        "block_adapter_control": {
+            "smallest_output_change": adapter_control,
+            "what": (
+                "each stored block case recomputed on the adapter-wrapped model: the smallest "
+                "max-abs difference from the stored output, which would be zero if the cases "
+                "had been taken with the adapter in"
+            ),
         },
         "tensors": tensor_case_names(tensors),
     }

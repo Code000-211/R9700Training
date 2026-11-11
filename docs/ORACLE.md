@@ -29,12 +29,12 @@ system-wide and nothing goes into `/opt/hf`. The pinned versions are `torch==2.1
 says where the CPU wheel comes from. The writer is the fixture's own helper
 (`tests/support/fixture.h`), so the script and the tests see the same checkpoint bytes.
 
-On this machine, with the environment and the writer already built, the generator takes about 20
-seconds: 16.9 s, 21.7 s and 39.5 s in the last three runs. The shared machine's load can stretch
-the wall time to a minute or more (34 s under load in another run). A fresh virtual environment
-takes about three minutes for the CPU torch wheel (3 m 18 s here), and building
-`r97_write_fixture` took six minutes once the radiance submodule had been fetched. Two runs from
-the same environment produce byte-identical files (checked with `sha256sum`).
+On this machine, with the environment and the writer already built, the generator takes about 15
+seconds of its own (16.9 s, 21.7 s, 39.5 s, 14.8 s and 14.7 s across the runs that produced the
+reference), 17 s wall including the interpreter start. Creating the virtual environment and
+installing the pins took 4 m 10 s from a warm pip cache, and building `r97_write_fixture` took
+the better part of ten minutes once the radiance submodule had been fetched on a loaded machine.
+Two runs from the same environment produce byte-identical files (checked with `sha256sum`).
 
 `--check-only` runs every check and writes nothing. `--out DIR` writes elsewhere.
 
@@ -130,6 +130,12 @@ tensor with its shape and dtype.
 - `mlp_sublayer.…` — residual in, residual after the add; post-attention norm, MLP and add are
   inside.
 
+All three are computed on the trunk as the checkpoint holds it, before the LoRA adapter is wrapped
+in: no `A` and no `B` is inside a stored case, so a test differentiates the bf16 trunk's block
+backwards with the stored cotangents as they are. The layer each case comes from is in the
+manifest's `cases.blocks` — `gdn_mixer` and `mlp_sublayer` use layer 0, `attention_sublayer` the
+only full-attention layer, 3 — together with `with_adapter: false`.
+
 The single cases are one sequence of length 23; the batch cases are three sequences of lengths
 17, 11 and 6, padded to 17 with an attention mask. Each case has a fixed random output cotangent and
 the input cotangent autograd returns for it, so a test can differentiate a block on its own, without
@@ -208,6 +214,33 @@ position, so a regression that changes one place is visible in the log even when
 elementwise disagreement, including the argmax that can flip at a spike, is the finding about
 radiance's bf16 GDN; changing it would be a change to radiance, outside this issue.
 
+## What the block cases are computed on
+
+The first version computed the three block cases after `add_lora()`, so every stored output and
+cotangent was the adapter-wrapped `W x + (alpha / r) B A x` throughout, not the block the issue
+defines and not what this file said. A test differentiating the trunk's block backwards could not
+use them without applying the rank-4 adapter itself. Measured on the first checked-in file:
+`mlp_sublayer.single.output` differed from the plain layer 0 block
+(`inp + layers[0].mlp(post_attention_layernorm(inp))`) by 40.8, and matched the adapter-wrapped
+layer 1 block to 5.8e-6.
+
+`block_cases()` now runs before the adapter is wrapped in, and three things keep it that way:
+
+- `assert_no_lora()` stops the script if any LoRA target is wrapped when a block case is computed.
+- `check_blocks_exclude_adapter()` recomputes all six stored cases on the adapter-wrapped model and
+  requires each output to differ; the smallest of those differences is in the manifest under
+  `block_adapter_control`. It is a positive control: numbers taken with the adapter in would come
+  back unchanged and the script would stop instead of checking them in under the block's name.
+- The manifest's `cases.blocks` names the layer each case comes from and says `with_adapter: false`.
+  This file used to claim layer 0 for `mlp_sublayer` while the script used layer 1, and neither the
+  manifest nor the tensors recorded it. `block_layers()` is now the one place the script, the
+  manifest and this file take the layers from.
+
+Because the cases' random inputs now come from the seeded generator before the adapter's `A` and
+`B`, the regenerated files hold a different adapter, loss, residual cotangents and adapter
+gradients than the first version did. The token ids and the logits without the adapter are
+unchanged, so the table above still applies.
+
 ## What this reference does not cover
 
 The int8 trunk. transformers has no `w8a8_fwht128` model, and the straight-through gradient is this
@@ -222,7 +255,9 @@ project's own definition. That stays with the descent check of the int8 backward
   and the total keeps the file under 5 MB.
 - Residuals are stored per sequence without padding, so "per sequence" is literal and the file does
   not pay for padding.
-- The block cases use layer 0 (`linear_attn`, `mlp`) and the only full-attention layer (layer 3).
+- The block cases use layer 0 for `gdn_mixer` and `mlp_sublayer`, and the only full-attention
+  layer (layer 3) for `attention_sublayer`. `block_layers()` computes them once and the manifest
+  records them, so this file and the script cannot drift apart again.
 - `gdn_mixer` starts at the normed hidden state, as the issue defines it, and the other two blocks
   start at the residual, as it defines them. The first version of the script started `gdn_mixer` at
   the residual too, which made its `input_cotangent` the composite's through `input_layernorm` and

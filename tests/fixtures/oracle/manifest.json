@@ -73,10 +73,26 @@
       ]
     },
     "blocks": [
-      "gdn_mixer",
-      "attention_sublayer",
-      "mlp_sublayer"
+      {
+        "name": "gdn_mixer",
+        "layer": 0,
+        "with_adapter": false
+      },
+      {
+        "name": "attention_sublayer",
+        "layer": 3,
+        "with_adapter": false
+      },
+      {
+        "name": "mlp_sublayer",
+        "layer": 0,
+        "with_adapter": false
+      }
     ]
+  },
+  "block_adapter_control": {
+    "smallest_output_change": 8.7109261396526,
+    "what": "each stored block case recomputed on the adapter-wrapped model: the smallest max-abs difference from the stored output, which would be zero if the cases had been taken with the adapter in"
   },
   "tensors": {
     "seq0/input_ids": {
