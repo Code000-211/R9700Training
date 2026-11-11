@@ -233,11 +233,6 @@ void ForwardDriver::run_engine(const Batch& batch) {
     cfg.max_ctx = cfg_.max_ctx;
     cfg.max_seqs = cfg_.max_seqs;
     cfg.kv_cache_dtype = cfg_.kv_dtype;
-    if (!cfg_.lora.empty()) {
-        // Radiance's own loader reads the adapter directory; the prefill requests then name it.
-        cfg.lora.adapters.emplace_back("forward", cfg_.lora);
-        cfg.prefill_lora = "forward";
-    }
     // Off for training: nothing is drafted, nothing is predicted ahead, the vision tower is not
     // built, and every sequence runs from position 0 in this one step.
     cfg.n_spec = 0;

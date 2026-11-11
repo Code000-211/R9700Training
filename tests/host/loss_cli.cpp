@@ -1,7 +1,8 @@
 // tests/host/loss_cli.cpp -- `r97train loss` and radiance's KL record measure the same held-out
 // loss on tests/fixtures/chat_small.jsonl. The corpus radiance scores is the chat file's scored
 // runs, each as the prefix of its sequence up to the run: the docs' rows are then exactly the
-// rows the trainer scores.
+// rows the trainer scores. The second case runs the same comparison through an adapter directory
+// the fixture ships, so `--lora` is checked against radiance loading the same directory itself.
 #include "../support/fixture.h"
 #include "../support/test.h"
 
@@ -54,6 +55,12 @@ std::string chat_path() {
     return (here.parent_path().parent_path() / "fixtures" / "chat_small.jsonl").string();
 }
 
+// The fixture's LoRA adapter: PEFT's two files, for the fixture's own checkpoint.
+std::string adapter_path() {
+    const fs::path here = fs::absolute(fs::path(__FILE__));
+    return (here.parent_path().parent_path() / "fixtures" / "oracle" / "adapter").string();
+}
+
 double field(const std::string& output, const std::string& name) {
     const std::string key = name + ":";
     const size_t at = output.rfind(key);
@@ -78,11 +85,18 @@ std::vector<int32_t> read_tokens(const fs::path& path) {
     return ids;
 }
 
-}  // namespace
+// The chat file's scored runs, as radiance's own corpus: one document per run, prompt through the
+// run's last target, score_from the row that predicts the run's first target.
+struct Corpus {
+    fs::path dir;                 // the case's working directory
+    fs::path file;                // the corpus JSONL
+    int64_t rows = 0;             // scored positions
+    size_t max_doc_len = 0;       // tokens of the longest document's prompt
+    size_t docs = 0;
+    std::vector<int32_t> tokens;  // the chat file's tokens through the last scored run
+};
 
-R97_TEST(loss_cli_matches_radiance_kld) {
-    const r97::Fixture& f = r97::fixture();
-
+Corpus write_corpus(const r97::Fixture& f, const std::string& name) {
     r97::ChatData chat;
     if (!chat.open(f.container)) throw std::runtime_error("chat-data: " + chat.error());
     r97::Batch batch;
@@ -91,19 +105,14 @@ R97_TEST(loss_cli_matches_radiance_kld) {
         throw std::runtime_error("chat-data: " + chat.error());
     if (batch.empty()) throw std::runtime_error("the chat fixture tokenised to nothing");
 
-    const fs::path work = fs::path(radtest::tmpdir()) / "loss_cli";
+    Corpus c;
+    c.dir = fs::path(radtest::tmpdir()) / name;
     std::error_code ec;
-    fs::remove_all(work, ec);
-    fs::create_directories(work, ec);
-    const fs::path corpus = work / "corpus.jsonl";
-    const fs::path record = work / "kld";
-    std::ofstream out(corpus);
-    if (!out) throw std::runtime_error("cannot write " + corpus.string());
-
-    int64_t expected_rows = 0;
-    size_t max_doc_len = 0;
-    size_t docs = 0;
-    std::vector<int32_t> expected_tokens;
+    fs::remove_all(c.dir, ec);
+    fs::create_directories(c.dir, ec);
+    c.file = c.dir / "corpus.jsonl";
+    std::ofstream out(c.file);
+    if (!out) throw std::runtime_error("cannot write " + c.file.string());
 
     for (const r97::TokenSeq& seq : batch) {
         if (seq.score.empty() || seq.score[0] != 0)
@@ -124,28 +133,41 @@ R97_TEST(loss_cli_matches_radiance_kld) {
                 text += chat.token_text(seq.ids[j], j == 0, j + 1 == seq.ids.size());
             nlohmann::json doc = {{"prompt", text},
                                   {"score_from", int64_t(start - 1)},
-                                  {"source", "chat_small:" + std::to_string(docs)}};
+                                  {"source", "chat_small:" + std::to_string(c.docs)}};
             out << doc.dump() << "\n";
 
-            expected_tokens.insert(expected_tokens.end(), seq.ids.begin(), seq.ids.begin() + stop);
-            expected_rows += int64_t(stop - start);
-            max_doc_len = std::max(max_doc_len, stop);
-            ++docs;
+            c.tokens.insert(c.tokens.end(), seq.ids.begin(), seq.ids.begin() + stop);
+            c.rows += int64_t(stop - start);
+            c.max_doc_len = std::max(c.max_doc_len, stop);
+            ++c.docs;
         }
     }
-    out.close();
-    if (docs == 0) throw std::runtime_error("the chat fixture has no scored runs");
+    if (c.docs == 0) throw std::runtime_error("the chat fixture has no scored runs");
+    return c;
+}
+
+// Record the corpus's loss with radiance itself -- through `lora`, when one is named -- run
+// `r97train loss` over the same chat file, and check they agree.
+void check_against_record(const r97::Fixture& f, const std::string& name, const std::string& lora) {
+    const Corpus c = write_corpus(f, name);
+    const fs::path record = c.dir / "kld";
 
     rad::Config cfg;
     cfg.model            = f.container;
     cfg.radiance_home    = r97::detail::radiance_home();
     cfg.kernel_hierarchy = {"libavx", "libref"};
     cfg.n_spec           = 0;
-    cfg.max_tok          = int64_t(std::max<size_t>(512, max_doc_len));
-    cfg.max_seqs         = int32_t(std::max<size_t>(8, docs));
-    cfg.max_ctx          = int64_t(std::max<size_t>(512, max_doc_len));
-    cfg.kld_corpus       = corpus.string();
+    cfg.max_tok          = int64_t(std::max<size_t>(512, c.max_doc_len));
+    cfg.max_seqs         = int32_t(std::max<size_t>(8, c.docs));
+    cfg.max_ctx          = int64_t(std::max<size_t>(512, c.max_doc_len));
+    cfg.kld_corpus       = c.file.string();
     cfg.kld_record       = record.string();
+    if (!lora.empty()) {
+        // radiance's own route: the adapter is one of the startup ones, and every document runs
+        // through it (--lora NAME=DIR and --kld-lora NAME on its command line).
+        cfg.lora.adapters.emplace_back("forward", lora);
+        cfg.kld_lora = "forward";
+    }
 
     rad::Engine engine(std::move(cfg));
     int s = engine.start();
@@ -154,12 +176,11 @@ R97_TEST(loss_cli_matches_radiance_kld) {
                                  std::string(rad_strerror(s)));
     auto watch = std::make_unique<rad::StallWatch>("loss_cli kld", 60000);
     s = engine.serve(std::move(watch));
-    if (s < 0)
-        throw std::runtime_error("kld record: " + std::string(rad_strerror(s)));
+    if (s < 0) throw std::runtime_error("kld record: " + std::string(rad_strerror(s)));
 
     // The record's token stream is what the test put in, so both sides really score the chat file.
     const std::vector<int32_t> got_tokens = read_tokens(record / "tokens.i32");
-    if (got_tokens != expected_tokens)
+    if (got_tokens != c.tokens)
         throw std::runtime_error("the KL record tokenised the corpus differently from chat-data");
 
     const std::string python = std::getenv("PYTHON") ? std::getenv("PYTHON") : "python3";
@@ -170,19 +191,30 @@ R97_TEST(loss_cli_matches_radiance_kld) {
     const std::string cli_path = (fs::path(r97::detail::build_dir()) / "r97train").string();
     if (!fs::exists(cli_path))
         throw std::runtime_error("r97train is not beside the test binary at " + cli_path);
+    const std::string lora_flag = lora.empty() ? "" : " --lora " + quote(lora);
     const Run cli = run(quote(cli_path) + " loss --model " + quote(f.container) + " --data " +
-                        quote(chat_path()));
+                        quote(chat_path()) + lora_flag);
     if (cli.status != 0) throw std::runtime_error("r97train loss failed:\n" + cli.output);
 
     const double kld_loss = field(kld.output, "loss");
     const double cli_loss = field(cli.output, "loss");
-    if (int64_t(field(kld.output, "scored")) != expected_rows)
+    if (int64_t(field(kld.output, "scored")) != c.rows)
         throw std::runtime_error("kld_loss.py scored " + std::to_string(field(kld.output, "scored")) +
-                                 " rows, the chat file has " + std::to_string(expected_rows));
-    if (int64_t(field(cli.output, "scored")) != expected_rows)
+                                 " rows, the chat file has " + std::to_string(c.rows));
+    if (int64_t(field(cli.output, "scored")) != c.rows)
         throw std::runtime_error("r97train loss scored " + std::to_string(field(cli.output, "scored")) +
-                                 " tokens, the chat file has " + std::to_string(expected_rows));
-    check_close(cli_loss, kld_loss, "r97train loss against the KL record");
+                                 " tokens, the chat file has " + std::to_string(c.rows));
+    check_close(cli_loss, kld_loss, "r97train loss against the KL record" +
+                                        (lora.empty() ? std::string() : " through --lora"));
+}
+
+}  // namespace
+
+// Two cases: the base model, and the fixture's adapter through --lora.
+R97_TEST(loss_cli_matches_radiance_kld) { check_against_record(r97::fixture(), "loss_cli", ""); }
+
+R97_TEST(loss_cli_lora_matches_radiance_kld) {
+    check_against_record(r97::fixture(), "loss_cli_lora", adapter_path());
 }
 
 #endif  // R97_FORWARD

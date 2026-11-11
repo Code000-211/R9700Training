@@ -25,6 +25,11 @@ mask and the container's tokenizer. The forward is the one training uses: the co
 architecture on the host kernels, a bf16 key-value pool, speculation off.
 
 `--lora <dir>` loads an adapter directory through radiance's own loader and scores through it.
+The forward config has no adapter field -- the driver is the base model's -- so the run names the
+directory to radiance before the driver's first engine starts
+(`patches/training/0106-preload-adapter.patch`): every engine after that loads it the way
+`--lora` does and runs its prefill steps through it. A directory radiance cannot load fails the
+run with radiance's own error, not a trainer one.
 `--limit N` scores only the first N conversations of the file, for a quick look.
 
 The plugin home is `$RADIANCE_HOME`; beside the build it defaults to

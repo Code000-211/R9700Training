@@ -1,6 +1,7 @@
 // tools/loss.cpp -- the `loss` subcommand: a chat JSONL file tokenised by the container's own
 // chat-data code, run through the training forward driver, and the mean held-out loss of its
-// scored tokens printed. With --lora the adapter directory is loaded by radiance's own loader.
+// scored tokens printed. With --lora the adapter directory is handed to radiance before the
+// driver opens, and radiance's own loader is what reads it.
 #include "commands.h"
 
 #include "r97/chatdata.h"
@@ -20,6 +21,7 @@
 #if R97_FORWARD
 
 #include "engine.h"  // the complete rad::Engine behind ForwardDriver's unique_ptr
+#include "lora/preload.h"  // the adapter the driver's engines start with
 
 namespace r97tool {
 namespace {
@@ -131,7 +133,11 @@ int loss_main(int argc, char** argv) {
     cfg.max_tok = token_budget;
     cfg.max_ctx = context;
     cfg.max_seqs = 8;
-    cfg.lora = args.lora;
+
+    // The forward config carries no adapter -- the driver is the base model's -- so the run names
+    // it to radiance, which loads it with everything --lora loads and keeps it for the prefill
+    // steps every engine of this process runs.
+    if (!args.lora.empty()) rad::lora::preload_adapter("forward", args.lora);
 
     std::string err;
     std::unique_ptr<r97::ForwardDriver> driver = r97::ForwardDriver::open(cfg, &err);
