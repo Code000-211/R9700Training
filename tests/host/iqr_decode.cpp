@@ -28,7 +28,16 @@ namespace {
 using lq_decode_fn = int (*)(const RadEncoding*, int64_t, int64_t, const void* const*, int64_t,
                              int64_t, float*);
 
+// The libquant symbols are C++ ones (namespace lq); dlsym needs their mangled names.
+constexpr const char* kGridTcqDecode = "_ZN2lq15grid_tcq_decodeEPK11RadEncodingllPKPKvllPf";
+
+// The affine grid's reference is grid_decode, one value at a time, so it takes libquant's Grid and
+// BlockScale rather than an encoding.
+constexpr const char* kGridDecode = "_ZN2lq11grid_decodeERKNS_4GridERKNS_10BlockScaleEi";
+using lq_grid_decode_fn = float (*)(const lq::Grid&, const lq::BlockScale&, int);
+
 lq_decode_fn g_lq = nullptr;
+lq_grid_decode_fn g_grid = nullptr;
 
 // The reference library sits where the radiance build leaves it. The host test runs from the build
 // directory (ctest) or from wherever a person invokes it, so look up and down the tree too.
@@ -44,7 +53,6 @@ std::string find_libquant() {
 }
 
 // The libquant symbol is a C++ one (namespace lq); dlsym needs its mangled name.
-constexpr const char* kGridTcqDecode = "_ZN2lq15grid_tcq_decodeEPK11RadEncodingllPKPKvllPf";
 
 struct Synth {
     int bits = 4, state_bits = 16, run_rows = 256, rb = 1, mad = 0;
@@ -309,6 +317,130 @@ void one_case(const char* name, int bits, int L, int rb, int mad, int scale_dtyp
     }
 }
 
+// The affine grid, which the container's drafter head stores: unsigned codes under an integer zero
+// a block, no trellis above them and no codebook. libquant's reference is grid_decode, one value at
+// a time: (code - zero[r, block]) * scale.
+void one_affine_case(const char* name, int bits, int zero_bits, int scale_dtype, int64_t cols) {
+    const int64_t rows = 300;
+    const int64_t nkb = cols / 128;
+    const int64_t crow = (cols * bits + 7) / 8;
+    const int64_t zrow = (nkb * zero_bits + 7) / 8;
+    const int64_t srow = nkb * 2;   // f16 or bf16
+    const uint32_t sdt = scale_dtype == R97_IQR_F16 ? RAD_F16 : RAD_BF16;
+
+    const std::string nm = std::string("decode affine ") + name + " codes=u" + std::to_string(bits) +
+                           " zero=u" + std::to_string(zero_bits) + " " +
+                           (scale_dtype == R97_IQR_F16 ? "f16-128" : "bf16-128") +
+                           " cols=" + std::to_string(cols);
+
+    std::vector<uint8_t> codes((size_t)(rows * crow));
+    std::vector<uint8_t> zero((size_t)(rows * zrow));
+    std::vector<uint8_t> scale((size_t)(rows * srow));
+    uint32_t seed = 0x9E3779B9u;
+    auto rnd = [&]() { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return seed; };
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t j = 0; j < cols; ++j)
+            rad_store_bits(codes.data() + r * crow, bits, j, rnd() & ((1u << bits) - 1u));
+        for (int64_t g = 0; g < nkb; ++g) {
+            // A zero the code's own width, as a quantiser stores one: the centred code stays on
+            // the int8 grid.
+            rad_store_bits(zero.data() + r * zrow, zero_bits, g, rnd() % (1u << bits));
+            rad_store_f32(scale.data() + r * srow, sdt, g, 0.0004f + (float)(rnd() % 997) * 2.0e-5f);
+        }
+    }
+
+    R97IqrDecodeDesc d{};
+    d.rows_all = rows;
+    d.cols = cols;
+    d.row0 = 0;
+    d.rows = rows;
+    d.affine = 1;
+    d.bits = bits;
+    d.run_rows = 1;
+    d.rb = 1;
+    d.codes = codes.data();
+    d.codes_row_bytes = crow;
+    d.zero = zero.data();
+    d.zero_bits = zero_bits;
+    d.zero_row_bytes = zrow;
+    d.scale = scale.data();
+    d.scale_dtype = scale_dtype;
+    d.scale_block_cols = 128;
+    d.scale_row_bytes = srow;
+
+    std::vector<int8_t> hcodes((size_t)(rows * cols), 0);
+    std::vector<uint16_t> hscales((size_t)(rows * nkb), 0);
+    R97IqrDecodeDesc hd = d;
+    hd.out_codes = hcodes.data();
+    hd.out_scale = hscales.data();
+    expect(r97_iqr_validate(hd) == 0, nm + ": the description is valid");
+    expect(r97_iqr_decode_host(hd) == 0, nm + ": the host path returns");
+
+    // The grid: the code less its block's zero, and one bf16 scale the 128 columns.
+    std::vector<float> values((size_t)(rows * cols), 0.0f);
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t j = 0; j < cols; ++j) {
+            const int code = (int)rad_load_bits(codes.data() + r * crow, bits, j);
+            const int zed = (int)rad_load_bits(zero.data() + r * zrow, zero_bits, j >> 7);
+            const int8_t want = (int8_t)(code - zed);
+            expect(hcodes[(size_t)(r * cols + j)] == want,
+                   nm + ": the int8 grid is the code less the block's zero");
+            values[(size_t)(r * cols + j)] = (float)want * r97_iqr_block_scale(d, r, j >> 7);
+        }
+        for (int64_t g = 0; g < nkb; ++g)
+            expect(hscales[(size_t)(r * nkb + g)] ==
+                       r97_iqr_f32_to_bf16(r97_iqr_block_scale(d, r, g)),
+                   nm + ": the scale is the block's");
+    }
+
+    if (g_grid) {
+        lq::Grid grid{};
+        grid.asym = true;
+        size_t bad = 0, first = 0;
+        float first_ref = 0.0f;
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t j = 0; j < cols; ++j) {
+                const int64_t kb = j >> 7;
+                lq::BlockScale b;
+                b.s = r97_iqr_block_scale(d, r, kb);
+                b.zero = (int)rad_load_bits(zero.data() + r * zrow, zero_bits, kb);
+                const float ref = g_grid(grid, b, (int)rad_load_bits(codes.data() + r * crow, bits, j));
+                const size_t i = (size_t)(r * cols + j);
+                if (std::memcmp(&ref, &values[i], sizeof(float)) != 0) {
+                    if (!bad) { first = i; first_ref = ref; }
+                    ++bad;
+                }
+            }
+        }
+        expect(bad == 0, nm + ": the values are libquant's bits (" + std::to_string(bad) +
+                             " differ, first at " + std::to_string(first) + ": libquant " +
+                             std::to_string(first_ref) + ", ours " +
+                             std::to_string(values[first]) + ")");
+    }
+
+    // A chunk of the rows, as a vocabulary-sized head decodes it.
+    R97IqrDecodeDesc cd = d;
+    cd.row0 = 128;
+    cd.rows = 100;
+    cd.codes = d.codes + cd.row0 * d.codes_row_bytes;
+    cd.zero = d.zero + cd.row0 * d.zero_row_bytes;
+    cd.scale = d.scale + cd.row0 * d.scale_row_bytes;
+    std::vector<int8_t> cc((size_t)(cd.rows * cd.cols), 0);
+    std::vector<uint16_t> cs((size_t)(cd.rows * nkb), 0);
+    cd.out_codes = cc.data();
+    cd.out_scale = cs.data();
+    expect(r97_iqr_decode_host(cd) == 0, nm + ": the chunk decodes");
+    expect(std::memcmp(cc.data(), hcodes.data() + 128 * cols, cc.size()) == 0,
+           nm + ": the chunk's codes are the whole's");
+    expect(std::memcmp(cs.data(), hscales.data() + 128 * nkb, cs.size() * sizeof(uint16_t)) == 0,
+           nm + ": the chunk's scales are the whole's");
+
+    // The zero is the affine form's own plane: without it there is nothing to decode.
+    R97IqrDecodeDesc nz = d;
+    nz.zero = nullptr;
+    expect(r97_iqr_validate(nz) != 0, nm + ": an affine description without a zero is refused");
+}
+
 }  // namespace
 
 R97_TEST(iqr_decode) {
@@ -316,8 +448,12 @@ R97_TEST(iqr_decode) {
     if (h) {
         void* p = dlsym(h, kGridTcqDecode);
         if (p) std::memcpy(&g_lq, &p, sizeof(p));
+        p = dlsym(h, kGridDecode);
+        if (p) std::memcpy(&g_grid, &p, sizeof(p));
     }
     if (!g_lq) std::printf("note: libquant not found; the libquant comparisons are skipped\n");
+    else if (!g_grid)
+        std::printf("note: libquant's grid_decode not found; the affine comparisons are skipped\n");
 
     // Every form the container stores: computed and stored codebooks, the three scale layouts,
     // and the code widths the head's k3..k6 use.
@@ -337,6 +473,12 @@ R97_TEST(iqr_decode) {
     // A column count that leaves a partial workgroup on the card (5 * 128 = 640, not a multiple
     // of the kernel's 256 threads).
     one_case("partial-workgroup", 4, 16, 1, 1, R97_IQR_F32, true, false, 640, false);
+
+    // The affine grid of the drafter head (u2 codes, a u8 zero and an f16 scale the 128 columns),
+    // a narrower zero plane, and a bf16 scale.
+    one_affine_case("drafter", 2, 8, R97_IQR_F16, 512);
+    one_affine_case("drafter-narrow-zero", 2, 4, R97_IQR_F16, 384);
+    one_affine_case("drafter-bf16", 4, 8, R97_IQR_BF16, 256);
 
     if (h) dlclose(h);
 }
