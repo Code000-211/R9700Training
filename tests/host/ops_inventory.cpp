@@ -74,6 +74,12 @@ std::string build_dir() {
 
 // One run of the subcommand, as it prints for a person. The engine's own log lines go to stderr
 // and are dropped: this reads the inventory, and a run that failed says so in its exit status.
+//
+// The host kernel hierarchy is named, as the fixture's own conversion names it and as the
+// subcommand's usage line shows: this is the host tier's inventory, and with the build's device
+// kernels on the search path the w8a8 fixture's quantised op forms are placed on device bands whose
+// kernels serve the full-size model only, so the step refuses to start instead of recording what
+// the host forward issues.
 std::string inventory_text(const std::string& container) {
     const std::string build = build_dir();
     const std::string tool = build.empty() ? std::string("r97train") : build + "/r97train";
@@ -84,6 +90,7 @@ std::string inventory_text(const std::string& container) {
             std::filesystem::path(build) / "radiance-build" / "radiance_home";
         if (std::filesystem::exists(home, ec)) cmd += " --home " + shell_quote(home.string());
     }
+    cmd += " --kernels libavx,libref";
     cmd += " 2>/dev/null";
 
     std::FILE* pipe = ::popen(cmd.c_str(), "r");
