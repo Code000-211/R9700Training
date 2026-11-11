@@ -829,13 +829,14 @@ R97_TEST(host_step_gradient_against_the_exact_step_at_the_same_steps) {
                 "'s exact secant at 16*2^-11 is only " + std::to_string(exact_bias) +
                 " of the gradient away, so a step that small would answer the issue on the"
                 " driver's own loss too");
-        // The join against the exact step: the bf16 forward is the whole of what may move it.
+        // The join against the exact step: the bf16 forward is the whole of what may move it, and
+        // this guard is far wider than that forward and far narrower than a wrong walk.
         if (!(join_gap <= kJoinGap))
             throw std::runtime_error(
                 "host exact: direction " + std::to_string(trial) +
                 "'s gradient differs from the exact step's by " + std::to_string(join_gap) +
                 " relative, more than the " + std::to_string(kJoinGap) +
-                " the fixture's bf16 forward accounts for");
+                " this case allows for a direction that mixes fifty tensors");
 
         exact_worst = std::max(exact_worst, exact_error);
         join_worst = std::max(join_worst, join_gap);

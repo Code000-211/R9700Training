@@ -164,10 +164,10 @@ against the reference's 7.73519858105, 1.7e-8 of itself.
   and halving the step moves each of them by 1e-4 to 6e-4 of the gradient;
 * the exact step's own secant at the ten-direction case's steps, `16` and `32` units of `2^-11`:
   the secant's bias with the trunk's rounding taken out. It sits 57 % to 134 % of the gradient away
-  -- measured 0.575, 0.814, 0.873, 1.00, 1.07, 1.11, 1.15, 1.28, 1.34 -- so the ten-direction case's
-  steps are not a derivative even on an f64 forward, and the case fails if any direction comes in
-  under half the gradient there. That is the whole of the answer to direction 6 above: the step,
-  not the gradient;
+  -- measured 0.575, 0.814, 0.873, 0.874, 1.00, 1.07, 1.11, 1.15, 1.28, 1.34 -- so the
+  ten-direction case's steps are not a derivative even on an f64 forward, and the case fails if any
+  direction comes in under half the gradient there. That is the whole of the answer to direction 6
+  above: the step, not the gradient;
 * the join's gradient against the exact step's. The only thing between the two is the bf16 trunk,
   whose own agreement the oracle case below measures per boundary and per adapted linear, so each
   direction is held to `kJoinGap` (2.0) of the exact gradient: a direction mixes fifty tensors and
@@ -178,7 +178,7 @@ against the reference's 7.73519858105, 1.7e-8 of itself.
 The line it prints per direction is `exact g`, `fd(2^-18)`, `fd(2^-19)`, `fd16`, `fd32`, the join's
 `g`, `fd(2^-18)`, `fd(2^-19)` and `fd16`, then the exact error, the exact secant's bias, and how
 far each step's own difference moves when the step is halved. That last pair is what settles the
-issue's premise. Measured, the exact step's difference moves by 1e-4 to 6e-4 of the gradient when
+issue's premise. Measured, the exact step's difference moves by 3e-5 to 6e-4 of the gradient when
 the step goes from `2^-18` to `2^-19`, and the driver's moves by `12` to `4.2e6` times as much,
 changing sign as often as not: direction 1 reads `+2112` at `2^-18` and `+2322` at `2^-19`,
 direction 3 `+1351` and `-6268`, direction 6 `-608` and `+1961`. Below a step of about `2^-14` the
