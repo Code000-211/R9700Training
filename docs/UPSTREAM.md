@@ -43,6 +43,7 @@ replay tests by name. See `docs/reports/2026-11-11-patch-audit.md`.
 | `patches/training/0103-prefill-logits.patch` | training | 201 | 20 | 240 | not-submitted | a training-fixture prefill that keeps every position's logits, driven through the engine |
 | `patches/training/0104-prefill-lora.patch` | training | 16 | 0 | 25 | not-submitted | let the fixture prefill run one named adapter slot, so an in-memory update is one step away |
 | `patches/training/0105-prefill-not-sampled.patch` | training | 38 | 8 | 55 | not-submitted | a prefill that draws no token -- no sampler op, and a prompt of exactly the context fits |
+| `patches/training/0106-preload-adapter.patch` | training | 72 | 0 | 85 | not-submitted | a run with no command line names the adapter its prefill steps load, before any engine exists |
 | `patches/training/0119-issue-observer-hook.patch` | training | 12 | 0 | 20 | not-submitted | the training tape attaches to a RadCtx, and the Engine is the only owner of it |
 
 Every patch is `not-submitted` at this pin. None is `merged`: none is in radiance's `origin/main`.
