@@ -1,0 +1,109 @@
+Concern: a prefill request that draws no token, so no sampler op is issued over the training forward
+Upstream: not-submitted
+diff --git a/core/engine.cpp b/core/engine.cpp
+index c15b3a5..5aefdf2 100644
+--- a/core/engine.cpp
++++ b/core/engine.cpp
+@@ -866,6 +866,11 @@ int Engine::step_loop() {
+             if (!e.produces_token) continue;
+             so.first_row[i] = logit_row;
+             logit_row += 1 + e.n_spec;
++            /* A prefill-only request (Request::prefill_only) keeps its sampler row in the step's
++             * shape -- the scored rows' offset in the logits buffer and the lm_head's row count
++             * depend on it -- but is handed to no sampler, so the step issues no sampler op and
++             * that row is never read. It finishes at this step's commit. */
++            if (e.req && e.req->prefill_only) continue;
+             so.reqs.push_back(const_cast<Request*>(e.req));
+         }
+         so.n_rows = logit_row;
+@@ -1640,6 +1645,9 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
+     for (size_t i = 0; i < plan.e.size(); ++i) {
+         if (so.first_row[i] < 0) continue;
+         const StepEntry& e = plan.e[i];
++        /* A prefill-only request was handed to no sampler, so its sampler row holds no token: no
++         * token to read, no end-of-text test and no grammar step. It finishes at this commit. */
++        if (e.req && e.req->prefill_only) continue;
+ 
+         if (e.n_spec > 0) {
+             /* Accept draft[k] when it equals the token the target itself drew at position k. This
+diff --git a/core/rad_core.h b/core/rad_core.h
+index 8a62857..e1e9c22 100644
+--- a/core/rad_core.h
++++ b/core/rad_core.h
+@@ -762,6 +762,15 @@ struct Request {
+      * it. */
+     bool                 score = false;
+ 
++    /* A prefill request that draws no token. The training fixture asks for the forward over a
++     * prompt and reads its logits at every position, so nothing is sampled and no sampler op is
++     * issued. The step keeps the request's sampler row: the batch's out rows are the scored rows
++     * plus one per sampled sequence, and moving the scored rows changes the lm_head's row count,
++     * which moves its split-K rounding. That row is never read -- the request finishes at the
++     * commit of the step that places its last prompt position, and an entry of it is handed to no
++     * sampler, so it has no token, no end-of-text test and no grammar step. */
++    bool                 prefill_only = false;
++
+     /* End of a prefix other requests will start from, in prompt tokens; 0 for none. With linear
+      * state, a prefix hit resumes from a state checkpoint, written only on the checkpoint interval
+      * and at a long prompt's tail. The scheduler ends a prefill chunk here (rounded down to its
+diff --git a/core/sched/scheduler.cpp b/core/sched/scheduler.cpp
+index f14a3f3..f710e1f 100644
+--- a/core/sched/scheduler.cpp
++++ b/core/sched/scheduler.cpp
+@@ -2480,6 +2480,10 @@ const RadBatch* Scheduler::step_next_locked() {
+         if (r.token_scores && r.max_tokens > 0 &&
+             (int64_t)r.output.size() + 1 >= r.max_tokens) return nullptr;
+ 
++        /* A prefill-only request draws no token and finishes at the commit of the step in flight:
++         * its sampler row holds nothing to continue from, so no decode pass is issued behind it. */
++        if (r.prefill_only) return nullptr;
++
+         /* The furthest context the row can reach: every position this step verifies committed,
+          * counted from the last commit rather than this step's own bound (which would add a
+          * window of slack per step issued ahead). The card knows the real position; this sizes
+@@ -2649,11 +2653,11 @@ int Scheduler::commit(StepResult& res) {
+                  * overflow. */
+                 last_prefill_ids_.push_back(r.id);
+             }
+-            if (e.produces_token && res.token && r.embed) {
++            if (e.produces_token && res.token && !r.prefill_only && r.embed) {
+                 /* The answer is the pooled vector the engine already put in the sink; there is
+                  * no token to emit, and `eos` ends the request below. */
+                 if (!s.first_tok_us) s.first_tok_us = mono_us();
+-            } else if (e.produces_token && res.token) {
++            } else if (e.produces_token && res.token && !r.prefill_only) {
+                 if (!s.first_tok_us) s.first_tok_us = mono_us();
+                 r.output.push_back(res.token[i]);
+                 const TokenLogprobs* lp =
+@@ -2776,7 +2780,11 @@ int Scheduler::commit(StepResult& res) {
+ 
+         /* Finish. emit() already stops at max_tokens, so the resize below is a backstop: a >=
+          * test that can only be == is easy to break quietly later. */
+-        if (overflowed) {
++        if (r.prefill_only && e.is_prefill && r.n_computed >= (int64_t)r.prompt.size()) {
++            /* A prefill-only request has placed its whole prompt in this step and asked for no
++             * token: it is done, before any of the finishes below could read a token it has. */
++            close_request(s, ReqState::Finished, "prefill", carried);
++        } else if (overflowed) {
+             /* The sink has already failed the request; stop generating and return its blocks. */
+             close_request(s, ReqState::Failed, "sink_overflow", carried);
+         } else if (lp_failed) {
+diff --git a/core/train_prefill.cpp b/core/train_prefill.cpp
+index 1a84380..10c024d 100644
+--- a/core/train_prefill.cpp
++++ b/core/train_prefill.cpp
+@@ -74,10 +74,13 @@ int Engine::run_prefill() {
+         auto r = std::make_unique<Request>();
+         r->id                    = d + 1;
+         r->prompt                = prompts[d];
+-        r->max_tokens            = 1;      /* sampled from the last prefill row, never fed back */
++        r->max_tokens            = 1;      /* the sampler row the prefill leaves, never fed back */
+         r->ignore_eos            = true;
+         r->sp.temp               = 0.0f;
+         r->score                 = true;
++        /* No token is drawn: nothing is sampled, so no sampler op is issued over the forward
++         * whose logits the driver reads. */
++        r->prefill_only          = true;
+         r->sp.use_control_vector = cvec_default_on();
+         r->lora_slot             = lora_slot;
+         r->sink                  = sinks[d].get();
