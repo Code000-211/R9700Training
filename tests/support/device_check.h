@@ -11,7 +11,8 @@
 //   * builds a case's forward values with the op's f64 twin, so the device adjoint reads the same
 //     values a host adjoint would, and starts both dc sets at zero;
 //   * runs the registered device adjoint (or one handed in, for a deliberately wrong kernel) and
-//     the host reference on those values;
+//     the host reference on those values, and compares the elements the case asks for -- every one,
+//     or the rows it samples (see `Options`) -- against the tolerance it asks for;
 //   * resets the device scratch ledger, then reports the peak the device kernel asked for and
 //     fails the case when a kernel leaked;
 //   * with --bench, times the device adjoint and the op's forward twin in the same run and prints
@@ -57,6 +58,33 @@ namespace device_check {
 inline constexpr double kRelTol = 0.02;
 inline constexpr double kAbsTol = 1e-3;
 
+// The tolerance one case is compared with: the rule above, plus, when the case asks for it, a share
+// of the compared elements' RMS. A kernel that rounds to bf16 and sums a few hundred terms carries
+// the same absolute error whatever the sum cancels to, so a kernel whose output is a sum that
+// cancels -- a gradient times a frozen weight, where the products alternate in sign -- needs a
+// term that scales with the tensor and not with the element: 2% of an element that landed near
+// zero is no room for a rounding error the neighbouring elements are much larger than.
+struct Allowance {
+    double abs = kAbsTol;  // every element gets this much
+    double rel = kRelTol;  // ... and this much of its own host value
+    double rms = 0.0;      // ... and this much of the RMS of the elements the case compares
+};
+
+// How a case is compared. The defaults are the harness's: every element of every slot, against the
+// op's f64 twin and then its host row.
+struct Options {
+    Allowance allow;
+    // The rows of each dc slot to compare, empty for all of them. A case whose host row costs
+    // hundreds of GMAC at the model's shapes states a spread of rows here and passes a `HostRef`
+    // that computes just those rows; the harness then compares the rows each slot has and holds the
+    // rest of the tensor to nothing, which the doc of the kernel that does this has to say.
+    std::vector<int64_t> rows;
+    // False: do not run the op's f64 twin; take the read operands from the case and leave the
+    // written slots zero. For a case that samples rows -- the twin is the same unaffordable cost --
+    // and only when the adjoint reads no written operand.
+    bool twin = true;
+};
+
 inline int64_t numel(const std::vector<int64_t>& shape) {
     int64_t n = 1;
     for (int64_t d : shape) n *= d;
@@ -85,6 +113,8 @@ struct Report {
     double first_host = 0.0;
     int64_t mismatches = 0;
     int64_t scratch_peak = 0;  // bytes of device scratch the kernel held at its high-water mark
+    double rel_l2 = 0.0;       // the worst slot's ||device - host|| / ||host||, over the compared
+                               // elements; the summary the bf16 tolerance is often stated as
 };
 
 inline void require(const Report& r) {
@@ -197,15 +227,27 @@ inline AdValue random_value(const std::string& dtype, std::vector<int64_t> shape
 
 // Builds one call over a case: forward values from the twin, cotangents as the case gives them,
 // and a zeroed dc with one slot per operand in schema order. The caller owns the vectors the
-// returned call refers to.
-inline AdjointCall make_call(const Case& c, std::vector<AdValue>* fwd, std::vector<AdValue>* dc) {
-    TwinFn twin = twin_find(c.rec.op, c.rec.params, nullptr);
-    if (!twin) throw std::runtime_error("no twin for op '" + c.rec.op + "'");
-
+// returned call refers to. With `twin = false` the written slots are left zero instead, for a case
+// whose adjoint reads none of them and whose twin is a cost the case exists to avoid.
+inline AdjointCall make_call(const Case& c, std::vector<AdValue>* fwd, std::vector<AdValue>* dc,
+                             bool twin_values = true) {
     *fwd = c.in;
-    std::vector<AdValue> out;
-    twin(c.rec, c.in, &out);
-    fwd->insert(fwd->end(), out.begin(), out.end());
+    if (twin_values) {
+        TwinFn twin = twin_find(c.rec.op, c.rec.params, nullptr);
+        if (!twin) throw std::runtime_error("no twin for op '" + c.rec.op + "'");
+        std::vector<AdValue> out;
+        twin(c.rec, c.in, &out);
+        fwd->insert(fwd->end(), out.begin(), out.end());
+    } else {
+        for (const Operand& op : c.rec.operands) {
+            if (!op.written) continue;
+            AdValue v;
+            v.dtype = op.dtype;
+            v.shape = op.shape;
+            v.value.assign((size_t)numel(op.shape), 0.0);
+            fwd->push_back(std::move(v));
+        }
+    }
 
     dc->clear();
     for (const Operand& op : c.rec.operands) {
@@ -223,10 +265,31 @@ inline std::string op_name(const Case& c, size_t slot) {
     return "slot " + std::to_string(slot);
 }
 
-// Runs `device` and the host reference and compares every slot of dc. An empty `device` looks up
-// the op's registered device row; an empty `host` looks up its registered host row. Both lookups
-// are reported rather than thrown, so a test can assert that a missing registration fails too.
-inline Report check(const Case& c, AdjointFn device = nullptr, const HostRef& host = HostRef()) {
+// The elements a case compares in one slot: all of them, or one contiguous row per sampled row the
+// slot has. A slot whose first dimension is not the sampled one (a weight, a scale grid) is read by
+// rows of its own length.
+inline std::vector<std::pair<int64_t, int64_t>> compared_ranges(const std::vector<int64_t>& shape,
+                                                               int64_t count,
+                                                               const std::vector<int64_t>& rows) {
+    if (rows.empty() || shape.empty() || shape[0] <= 0 || count % shape[0] != 0)
+        return {{0, count}};
+    const int64_t nrows = shape[0];
+    const int64_t cols = count / nrows;
+    std::vector<std::pair<int64_t, int64_t>> out;
+    out.reserve(rows.size());
+    for (int64_t r : rows) {
+        if (r < 0 || r >= nrows) continue;
+        out.emplace_back(r * cols, (r + 1) * cols);
+    }
+    return out;
+}
+
+// Runs `device` and the host reference and compares the slots of dc the case asks for. An empty
+// `device` looks up the op's registered device row; an empty `host` looks up its registered host
+// row. Both lookups are reported rather than thrown, so a test can assert that a missing
+// registration fails too.
+inline Report check(const Case& c, AdjointFn device = nullptr, const HostRef& host = HostRef(),
+                    const Options& opts = Options{}) {
     Report r;
     r.label = c.label;
 
@@ -251,7 +314,7 @@ inline Report check(const Case& c, AdjointFn device = nullptr, const HostRef& ho
     std::vector<AdValue> device_fwd, device_dc;
     device::scratch_reset();
     {
-        AdjointCall call = make_call(c, &device_fwd, &device_dc);
+        AdjointCall call = make_call(c, &device_fwd, &device_dc, opts.twin);
         device(call);
     }
     const device::ScratchStats stats = device::scratch_stats();
@@ -286,23 +349,49 @@ inline Report check(const Case& c, AdjointFn device = nullptr, const HostRef& ho
                      + std::to_string(h.value.size());
             return r;
         }
-        for (size_t i = 0; i < d.value.size(); ++i) {
-            const double dv = d.value[i];
-            const double hv = h.value[i];
-            const double tol = kAbsTol + kRelTol * std::abs(hv);
-            if (std::isfinite(dv) && std::abs(dv - hv) <= tol) continue;
-            if (r.mismatches++ == 0) {
-                r.first_slot = (int64_t)slot;
-                r.first_index = (int64_t)i;
-                r.first_device = dv;
-                r.first_host = hv;
-                r.ok = false;
+        const std::vector<std::pair<int64_t, int64_t>> ranges =
+            compared_ranges(h.shape, (int64_t)h.value.size(), opts.rows);
+        double sum_sq_host = 0.0;
+        double sum_sq_diff = 0.0;
+        int64_t compared = 0;
+        for (const auto& range : ranges) {
+            for (int64_t i = range.first; i < range.second; ++i) {
+                sum_sq_host += h.value[(size_t)i] * h.value[(size_t)i];
+                ++compared;
             }
+        }
+        const double rms = compared > 0 ? std::sqrt(sum_sq_host / (double)compared) : 0.0;
+        for (const auto& range : ranges) {
+            for (int64_t i = range.first; i < range.second; ++i) {
+                const double dv = d.value[(size_t)i];
+                const double hv = h.value[(size_t)i];
+                const double diff = dv - hv;
+                sum_sq_diff += diff * diff;
+                const double tol = opts.allow.abs + opts.allow.rel * std::abs(hv)
+                                   + opts.allow.rms * rms;
+                if (std::isfinite(dv) && std::abs(diff) <= tol) continue;
+                if (r.mismatches++ == 0) {
+                    r.first_slot = (int64_t)slot;
+                    r.first_index = (int64_t)i;
+                    r.first_device = dv;
+                    r.first_host = hv;
+                    r.ok = false;
+                }
+            }
+        }
+        if (sum_sq_host > 0.0) {
+            r.rel_l2 = std::max(r.rel_l2, std::sqrt(sum_sq_diff / sum_sq_host));
         }
     }
     if (!r.ok) {
         char buf[256];
-        std::snprintf(buf, sizeof buf, " (tolerance %.3g + %.3g*|host|)", kAbsTol, kRelTol);
+        if (opts.allow.rms > 0.0) {
+            std::snprintf(buf, sizeof buf, " (tolerance %.3g + %.3g*|host| + %.3g*rms)",
+                          opts.allow.abs, opts.allow.rel, opts.allow.rms);
+        } else {
+            std::snprintf(buf, sizeof buf, " (tolerance %.3g + %.3g*|host|)", opts.allow.abs,
+                          opts.allow.rel);
+        }
         r.note = c.label + ": dc[" + std::to_string(r.first_slot) + "] (" + op_name(c, r.first_slot)
                  + ") index " + std::to_string(r.first_index) + ": device "
                  + std::to_string(r.first_device) + ", host " + std::to_string(r.first_host) + buf
@@ -322,8 +411,10 @@ struct Timing {
 
 // Times the device adjoint and the forward op it belongs to, in the same run over the same values.
 // The adjoint's number is the whole call, because the contract hands it f64 operands and takes f64
-// cotangents back; the forward is the f64 twin until a device forward exists for the op.
-inline Timing time_case(const Case& c, int reps = 20) {
+// cotangents back; the forward is the f64 twin until a device forward exists for the op. The twin
+// is timed `twin_reps` times, `reps` by default; a family whose twin costs minutes a call passes 1,
+// because the twin is a scalar loop whose rate does not depend on a warm cache.
+inline Timing time_case(const Case& c, int reps = 20, int twin_reps = 0) {
     AdjointFn device = adjoint_find(c.rec.op, Side::device, c.rec.params, nullptr);
     if (!device) throw std::runtime_error("no device adjoint for op '" + c.rec.op + "'");
     TwinFn twin = twin_find(c.rec.op, c.rec.params, nullptr);
@@ -331,6 +422,7 @@ inline Timing time_case(const Case& c, int reps = 20) {
 
     Timing t;
     if (reps < 1) reps = 1;
+    if (twin_reps < 1) twin_reps = reps;
 
     std::vector<AdValue> fwd, dc;
     AdjointCall call = make_call(c, &fwd, &dc);
@@ -351,25 +443,26 @@ inline Timing time_case(const Case& c, int reps = 20) {
     std::vector<AdValue> out;
     twin(c.rec, c.in, &out);
     auto t2 = std::chrono::steady_clock::now();
-    for (int i = 0; i < reps; ++i) {
+    for (int i = 0; i < twin_reps; ++i) {
         out.clear();
         twin(c.rec, c.in, &out);
     }
     auto t3 = std::chrono::steady_clock::now();
-    t.forward_ms = std::chrono::duration<double, std::milli>(t3 - t2).count() / reps;
+    t.forward_ms = std::chrono::duration<double, std::milli>(t3 - t2).count() / twin_reps;
     return t;
 }
 
 // The line a kernel's doc carries: the op, the shape, both times, the ratio, and the scratch the
 // kernel asked for. One line per case, so a doc can quote the run's output.
-inline void print_bench(const Case& c, int reps = 20) {
-    const Timing t = time_case(c, reps);
+inline Timing print_bench(const Case& c, int reps = 20, int twin_reps = 0) {
+    const Timing t = time_case(c, reps, twin_reps);
     const double ratio = t.forward_ms > 0.0 ? t.adjoint_ms / t.forward_ms : 0.0;
     std::printf("%-28s %8.3f ms adjoint  %8.3f ms forward twin  %6.2fx forward  "
                 "scratch peak %lld KiB\n",
                 (c.rec.op + " " + c.label).c_str(), t.adjoint_ms, t.forward_ms, ratio,
                 (long long)(t.scratch_peak / 1024));
     std::fflush(stdout);
+    return t;
 }
 
 }  // namespace device_check

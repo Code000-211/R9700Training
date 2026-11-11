@@ -91,6 +91,28 @@ undoes them.
 device_check::check(c, device_fn, [](AdjointCall& call) { host_b(call); host_a(call); });
 ```
 
+A case says how it is compared with a fourth argument, `device_check::Options`. The defaults are
+the whole tensor within the tolerance above.
+
+- `allow` is the tolerance itself: `abs`, `rel`, and `rms`, a share of the RMS of the compared
+  elements added to every element's allowance. A kernel whose output is a sum that cancels -- a
+  gradient times a frozen weight, where the products alternate in sign -- needs the last one: a
+  reduction's rounding error does not shrink when the sum cancels, so 2% of an element that landed
+  near zero is not room for an error the neighbouring elements are a few hundred times larger than.
+  `rms = 0.10` is the share the linear family asks for.
+- `rows` names the rows of each `dc` slot to compare, empty for all of them, for a shape whose host
+  row no test can pay for: a gradient times a frozen weight at 4096 tokens is about seven hundred
+  GMAC of f64 on one thread for one call. The test then passes a `HostRef` that runs the host
+  adjoint on a record of just those rows. The sample has to take the rows a kernel's tiles and a
+  batch's tail turn over at, and the kernel's doc says which rows it holds itself to.
+- `twin = false` skips the op's f64 twin, which is the same unaffordable cost: the read operands
+  come from the case and the written slots stay zero. Only for a case that samples rows, and only
+  when the adjoint reads no written operand.
+
+`Report::rel_l2` is the relative L2 distance between the two `dc` sets over the elements the case
+compares -- the summary a bf16 tolerance is usually stated as -- and `Report::mismatches` counts
+the elements outside the allowance.
+
 `check()` resets the scratch ledger before the device run, reports `scratch_peak` (bytes) and
 fails the case if the kernel left any scratch live. It reports a lookup failure, a leak and a
 mismatch as a `Report`; `require()` turns a failed report into a thrown `std::runtime_error` with
@@ -115,8 +137,10 @@ the ratio and its scratch peak.
 The adjoint's time is the whole call -- upload, launch, download -- because that is what the
 contract makes a device adjoint pay. The forward is the op's f64 host twin: until an op has a
 device forward, the twin is the honest reference for "the forward op it belongs to", and the line
-says so. Quote the line in the kernel's doc, with the card it was measured on; numbers are not
-comparable across cards.
+says so. `print_bench(c, reps, twin_reps)` times the twin `twin_reps` times rather than `reps`
+(`twin_reps` defaults to `reps`): a family whose twin is minutes a call passes 1, because the twin
+is a scalar loop whose rate does not depend on a warm cache. Quote the line in the kernel's doc,
+with the card it was measured on; numbers are not comparable across cards.
 
 ## Build and test
 
