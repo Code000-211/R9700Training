@@ -4,21 +4,21 @@
 // asks three questions of them.
 //
 //   agrees: the device row and the host row, handed the same record and the same values, write the
-//   same dx -- through tests/support/device_check.h, the harness every device adjoint is held to.
-//   At the fixture's shapes, and at the real model's hidden width with few rows, every element of
-//   both ops is compared. At the model's real shapes -- 1024 and 4096 tokens, and a packed batch of
-//   unequal lengths -- no test can pay for the host row of the whole tensor: 4096 rows of the
-//   widest linear is about seven hundred GMAC of f64 on one thread for a single call. The case
-//   states a spread of rows instead (`Options::rows`), the reference is the host adjoint on a
-//   record of those rows, and the harness compares every element of them to the same tolerance.
-//   The sample takes rows spread through the tensor, the two rows a 256-row band turns over at, and
-//   the last two, so the partial tail of a batch is in it too; rows are whole, so every block of K
-//   is.
+//   same dx. At the fixture's shapes, and at the real model's hidden width with few rows, every
+//   element of both ops is compared. At the model's real shapes -- 1024 and 4096 tokens, and a
+//   packed batch of unequal lengths -- no test can pay for the host row of the whole tensor: 4096
+//   rows of the widest linear is about seven hundred GMAC of f64 on one thread for a single call.
+//   The case states a spread of rows instead, the reference is the host adjoint on a record of
+//   those rows, and the same comparison holds every element of them. The sample takes rows spread
+//   through the tensor, the two rows a 256-row band turns over at, and the last two, so the partial
+//   tail of a batch is in it too; rows are whole, so every block of K is.
 //
-//   The tolerance is the harness's 2% of the host element plus 1e-3, plus a tenth of the RMS of the
-//   elements compared: a reduction's bf16 rounding error does not shrink when its sum cancels, so
-//   the per-element rule alone would fail a near-zero element of a kernel that is right. The
-//   relative L2 over the compared elements is held to 1e-2 as well.
+//   The comparison is this file's own (`Sample` and `compare` below), laid on the shared harness
+//   tests/support/device_check.h rather than in it, because CONTRIBUTING.md asks a family to add
+//   files and change no shared one. Its tolerance is 2% of the host element plus 1e-3, plus a tenth
+//   of the RMS of the elements compared: a reduction's bf16 rounding error does not shrink when its
+//   sum cancels, so the per-element rule alone would fail a near-zero element of a kernel that is
+//   right. The relative L2 over the compared elements is held to 1e-2 as well.
 //
 //   measures: every real shape prints one line of adjoint milliseconds, forward-twin milliseconds
 //   and scratch, as docs/kernels/README.md asks. The forward twin is timed once per shape rather
@@ -27,7 +27,7 @@
 //   the numbers.
 //
 //   teeth: the wrong kernels below -- the scale grid dropped, and half the reduction dropped -- are
-//   run through the same harness, which has to reject them.
+//   run through the same comparison, which has to reject them.
 //
 // The values follow tests/host/adjoint_linear.cpp -- integer codes, bf16-exact bf16 operands,
 // power-of-two scales -- so that the two sides start from what the host test's kernel check starts
@@ -304,37 +304,269 @@ void wrong_half_reduction(const AdjointCall& call) {
     }
 }
 
+// -- this family's comparison ------------------------------------------------------------------
+//
+// tests/support/device_check.h compares a device adjoint with the host row on the whole of every
+// slot, within 2% of the host element plus 1e-3. This family needs more than that, and
+// CONTRIBUTING.md asks a family to add files rather than change a shared one, so the rest lives
+// here, on top of the harness's case, card guard and lookup:
+//
+//   * a tolerance with a term scaled to the tensor. dx is a sum over the reduction whose products
+//     alternate in sign, and a reduction's bf16 rounding error does not shrink when its sum lands
+//     near zero, so 2% of an element that landed near zero is no room at all. Every element may
+//     miss by `Sample::rms` of the RMS of the elements compared on top of it.
+//   * rows. At the model's shapes the host row of the whole tensor is about seven hundred GMAC of
+//     f64 on one thread for one call; the case compares a sample of rows instead, against the host
+//     adjoint run on a record of just those rows (`host_ref_on_rows` above), whose other slots stay
+//     zero.
+//   * no twin. That reference is a fraction of the same unaffordable GEMM, so a case can skip the
+//     f64 twin and leave the written slots zero -- honest here, because the adjoint reads neither
+//     the linear's output nor anything else the forward wrote.
+//   * the relative L2 over the compared elements, which is how a bf16 tolerance is usually stated.
+
+// What a case asks of the comparison.
+struct Sample {
+    double rms = rms_share;      // the share of the compared RMS every element may miss by as well
+    std::vector<int64_t> rows;   // the token rows to compare; empty compares the whole slot
+    bool twin = true;            // false: no twin, the written slots stay zero
+};
+
+// What the comparison found: the harness's `Report`, with the relative L2 this family states its
+// tolerance as and no label to repeat in every message.
+struct Fit {
+    bool ok = true;
+    std::string note;
+    int64_t mismatches = 0;
+    int64_t first_slot = -1;
+    int64_t first_index = -1;
+    double first_device = 0.0;
+    double first_host = 0.0;
+    int64_t scratch_peak = 0;  // bytes of device scratch the kernel held at its high-water mark
+    double rel_l2 = 0.0;       // over the elements the case compared
+};
+
+void require(const Fit& f) {
+    if (!f.ok) throw std::runtime_error(f.note);
+}
+
+// One call over a case: the case's read operands, the written slots from the twin, the cotangent,
+// and a zeroed dc with one slot per operand in schema order. The caller owns the vectors the
+// returned call refers to.
+AdjointCall make_call(const device_check::Case& c, std::vector<AdValue>* fwd,
+                      std::vector<AdValue>* dc, bool twin) {
+    if (twin) return device_check::make_call(c, fwd, dc);
+    *fwd = c.in;
+    for (const Operand& o : c.rec.operands)
+        if (o.written) fwd->push_back(value_of(o));
+    dc->clear();
+    for (const Operand& o : c.rec.operands) dc->push_back(value_of(o));
+    return AdjointCall{c.rec, *fwd, c.cot, dc, nullptr, ""};
+}
+
+// The elements one slot is compared over: all of it, or one row at a time for each row the case
+// samples. A slot the tokens do not index -- the codes, their scale grid -- is a weight, read by
+// every row of dx, so the rows a case samples name its rows only where it has them.
+std::vector<std::pair<int64_t, int64_t>> compared_ranges(const AdValue& v,
+                                                         const std::vector<int64_t>& rows) {
+    const int64_t count = static_cast<int64_t>(v.value.size());
+    const std::vector<std::pair<int64_t, int64_t>> all{{0, count}};
+    if (rows.empty() || v.shape.empty() || v.shape[0] <= 0 || count % v.shape[0] != 0) return all;
+    const int64_t nrows = v.shape[0];
+    const int64_t cols = count / nrows;
+    std::vector<std::pair<int64_t, int64_t>> out;
+    for (int64_t r : rows) {
+        if (r < 0 || r >= nrows) continue;
+        out.emplace_back(r * cols, (r + 1) * cols);
+    }
+    return out.empty() ? all : out;
+}
+
+// Runs the device row and the reference on the same values and compares the slots of dc the case
+// asks for. An empty `device` looks up the op's registered device row and an empty `host` its
+// registered host row; a lookup failure comes back as a failed Fit rather than an exception, so a
+// case can assert that a missing or refused registration fails too.
+Fit compare(const device_check::Case& c, AdjointFn device = nullptr,
+            const device_check::HostRef& host = device_check::HostRef(),
+            const Sample& s = Sample{}) {
+    Fit f;
+    std::string why;
+    if (device == nullptr) device = adjoint_find(c.rec.op, Side::device, c.rec.params, &why);
+    if (device == nullptr) {
+        f.ok = false;
+        f.note = c.label + ": device adjoint: " + why;
+        return f;
+    }
+    device_check::HostRef reference = host;
+    if (!reference) {
+        const AdjointFn h = adjoint_find(c.rec.op, Side::host, c.rec.params, &why);
+        if (h == nullptr) {
+            f.ok = false;
+            f.note = c.label + ": host adjoint: " + why;
+            return f;
+        }
+        reference = [h](AdjointCall& call) { h(call); };
+    }
+
+    std::vector<AdValue> device_fwd, device_dc;
+    device::scratch_reset();
+    {
+        AdjointCall call = make_call(c, &device_fwd, &device_dc, s.twin);
+        device(call);
+    }
+    const device::ScratchStats stats = device::scratch_stats();
+    f.scratch_peak = stats.peak_bytes;
+    if (stats.live_bytes != 0) {
+        f.ok = false;
+        f.note = c.label + ": device kernel leaked " + std::to_string(stats.live_bytes)
+                 + " bytes of scratch";
+        return f;
+    }
+
+    // The reference sees the same forward values and the same cotangent as the device did; only the
+    // dc slots start at zero again.
+    std::vector<AdValue> host_dc = device_dc;
+    for (AdValue& v : host_dc) std::fill(v.value.begin(), v.value.end(), 0.0);
+    AdjointCall host_call{c.rec, device_fwd, c.cot, &host_dc, nullptr, ""};
+    reference(host_call);
+
+    if (device_dc.size() != host_dc.size()) {
+        f.ok = false;
+        f.note = c.label + ": device wrote " + std::to_string(device_dc.size())
+                 + " dc slots, host " + std::to_string(host_dc.size());
+        return f;
+    }
+    for (std::size_t slot = 0; slot < device_dc.size(); ++slot) {
+        const AdValue& d = device_dc[slot];
+        const AdValue& h = host_dc[slot];
+        if (d.value.size() != h.value.size()) {
+            f.ok = false;
+            f.note = c.label + ": dc[" + std::to_string(slot) + "] ("
+                     + device_check::op_name(c, slot) + ") has " + std::to_string(d.value.size())
+                     + " values, host " + std::to_string(h.value.size());
+            return f;
+        }
+        const std::vector<std::pair<int64_t, int64_t>> ranges = compared_ranges(h, s.rows);
+        double sum_sq_host = 0.0;
+        int64_t compared = 0;
+        for (const auto& range : ranges) {
+            for (int64_t i = range.first; i < range.second; ++i) {
+                sum_sq_host += h.value[static_cast<std::size_t>(i)] * h.value[static_cast<std::size_t>(i)];
+                ++compared;
+            }
+        }
+        const double rms = compared > 0 ? std::sqrt(sum_sq_host / static_cast<double>(compared)) : 0.0;
+        double sum_sq_diff = 0.0;
+        for (const auto& range : ranges) {
+            for (int64_t i = range.first; i < range.second; ++i) {
+                const double dv = d.value[static_cast<std::size_t>(i)];
+                const double hv = h.value[static_cast<std::size_t>(i)];
+                const double diff = dv - hv;
+                sum_sq_diff += diff * diff;
+                const double tol = device_check::kAbsTol + device_check::kRelTol * std::abs(hv)
+                                   + s.rms * rms;
+                if (std::isfinite(dv) && std::abs(diff) <= tol) continue;
+                if (f.mismatches++ == 0) {
+                    f.first_slot = static_cast<int64_t>(slot);
+                    f.first_index = i;
+                    f.first_device = dv;
+                    f.first_host = hv;
+                    f.ok = false;
+                }
+            }
+        }
+        if (sum_sq_host > 0.0)
+            f.rel_l2 = std::max(f.rel_l2, std::sqrt(sum_sq_diff / sum_sq_host));
+    }
+    if (!f.ok) {
+        char buf[128];
+        std::snprintf(buf, sizeof buf, " (tolerance %.3g + %.3g*|host| + %.3g*rms)",
+                      device_check::kAbsTol, device_check::kRelTol, s.rms);
+        f.note = c.label + ": dc[" + std::to_string(f.first_slot) + "] ("
+                 + device_check::op_name(c, static_cast<std::size_t>(f.first_slot)) + ") index "
+                 + std::to_string(f.first_index) + ": device " + std::to_string(f.first_device)
+                 + ", host " + std::to_string(f.first_host) + buf
+                 + (f.mismatches > 1 ? ", " + std::to_string(f.mismatches) + " mismatches"
+                                     : std::string());
+    }
+    return f;
+}
+
+// Times the device adjoint and the op's forward twin over the same values and prints the line
+// docs/kernels/README.md asks a kernel's doc to carry. The adjoint's number is the whole call --
+// upload, launch, download -- because that is what the contract makes a device adjoint pay. The
+// twin is timed `twin_reps` times, `reps` by default: this family's twin is minutes a call at the
+// model's shapes, and it is a scalar loop whose rate does not depend on a warm cache.
+device_check::Timing print_bench(const device_check::Case& c, int reps = 20, int twin_reps = 0) {
+    const AdjointFn device = adjoint_find(c.rec.op, Side::device, c.rec.params, nullptr);
+    if (device == nullptr) throw std::runtime_error("no device adjoint for op '" + c.rec.op + "'");
+    const TwinFn twin = twin_find(c.rec.op, c.rec.params, nullptr);
+    if (twin == nullptr) throw std::runtime_error("no twin for op '" + c.rec.op + "'");
+    if (reps < 1) reps = 1;
+    if (twin_reps < 1) twin_reps = reps;
+
+    device_check::Timing t;
+    std::vector<AdValue> fwd, dc;
+    AdjointCall call = make_call(c, &fwd, &dc, true);
+    device::scratch_reset();
+    device(call);  // warm-up: the first launch is where the kernel's module is finalized
+    auto zero_dc = [&dc] {
+        for (AdValue& v : dc) std::fill(v.value.begin(), v.value.end(), 0.0);
+    };
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < reps; ++i) {
+        zero_dc();
+        device(call);
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    t.adjoint_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / reps;
+    t.scratch_peak = device::scratch_stats().peak_bytes;
+
+    std::vector<AdValue> out;
+    twin(c.rec, c.in, &out);
+    auto t2 = std::chrono::steady_clock::now();
+    for (int i = 0; i < twin_reps; ++i) {
+        out.clear();
+        twin(c.rec, c.in, &out);
+    }
+    auto t3 = std::chrono::steady_clock::now();
+    t.forward_ms = std::chrono::duration<double, std::milli>(t3 - t2).count() / twin_reps;
+
+    const double ratio = t.forward_ms > 0.0 ? t.adjoint_ms / t.forward_ms : 0.0;
+    std::printf("%-28s %8.3f ms adjoint  %8.3f ms forward twin  %6.2fx forward  "
+                "scratch peak %lld KiB\n",
+                (c.rec.op + " " + c.label).c_str(), t.adjoint_ms, t.forward_ms, ratio,
+                static_cast<long long>(t.scratch_peak / 1024));
+    std::fflush(stdout);
+    return t;
+}
+
 // -- the two shapes of case ---------------------------------------------------------------------
 
-// The whole of dx through the harness, with the RMS term a cancelling reduction needs.
+// The whole of dx, with the RMS term a cancelling reduction needs.
 void agrees_whole(const device_check::Case& c) {
-    device_check::Options o;
-    o.allow.rms = rms_share;
-    const device_check::Report r = device_check::check(c, nullptr, device_check::HostRef(), o);
-    device_check::require(r);
-    R97_CHECK(r.rel_l2 <= bf16_tol);
-    R97_CHECK(r.scratch_peak > 0);
+    const Fit f = compare(c);
+    require(f);
+    R97_CHECK(f.rel_l2 <= bf16_tol);
+    R97_CHECK(f.scratch_peak > 0);
     std::printf("%-52s rel %.4f, every element, scratch peak %lld KiB\n", c.label.c_str(),
-                r.rel_l2, static_cast<long long>(r.scratch_peak / 1024));
+                f.rel_l2, static_cast<long long>(f.scratch_peak / 1024));
     std::fflush(stdout);
 }
 
 // The rows a model-shape case samples, the same tolerance, the host row of just those rows.
 void agrees_rows(const device_check::Case& c) {
-    device_check::Options o;
-    o.allow.rms = rms_share;
-    o.rows = sampled_rows(rows_of(c.rec));
-    o.twin = false;  // the twin is the same unaffordable GEMM, and no written slot is read
+    Sample s;
+    s.rows = sampled_rows(rows_of(c.rec));
+    s.twin = false;  // the twin is the same unaffordable GEMM, and no written slot is read
     double host_seconds = 0.0;
-    const device_check::Report r =
-        device_check::check(c, nullptr, host_ref_on_rows(o.rows, &host_seconds), o);
-    device_check::require(r);
-    R97_CHECK(r.rel_l2 <= bf16_tol);
-    R97_CHECK(r.scratch_peak > 0);
+    const Fit f = compare(c, nullptr, host_ref_on_rows(s.rows, &host_seconds), s);
+    require(f);
+    R97_CHECK(f.rel_l2 <= bf16_tol);
+    R97_CHECK(f.scratch_peak > 0);
     std::printf("%-52s rel %.4f, %zu rows of %lld, host row %.1f s, scratch peak %lld KiB\n",
-                c.label.c_str(), r.rel_l2, o.rows.size(),
+                c.label.c_str(), f.rel_l2, s.rows.size(),
                 static_cast<long long>(rows_of(c.rec)), host_seconds,
-                static_cast<long long>(r.scratch_peak / 1024));
+                static_cast<long long>(f.scratch_peak / 1024));
     std::fflush(stdout);
 }
 
@@ -383,7 +615,7 @@ R97_TEST(adjoint_linear_device_agrees) {
                         rec.op + " fixture " + std::to_string(rows_of(rec)) + "x" +
                             std::to_string(cols_of(rec)) + "x" + std::to_string(inner_of(rec)));
         agrees_whole(c);
-        if (r97test::bench()) device_check::print_bench(c, 20, 1);
+        if (r97test::bench()) print_bench(c, 20, 1);
     }
 
     // The real model's hidden width with few rows, whole: five scale blocks of K, both ops.
@@ -391,7 +623,7 @@ R97_TEST(adjoint_linear_device_agrees) {
         const device_check::Case c =
             linear_case(rec, 0x2100, rec.op + " hidden width 16x5120x5120 whole");
         agrees_whole(c);
-        if (r97test::bench()) device_check::print_bench(c, 20, 1);
+        if (r97test::bench()) print_bench(c, 20, 1);
     }
 
     // The real model's linears at one and four thousand tokens, on sampled rows: the hidden width,
@@ -422,7 +654,7 @@ R97_TEST(adjoint_linear_device_agrees) {
 
 R97_TEST(adjoint_linear_device_teeth) {
     // The comparison has teeth: a kernel that drops the weight's scale grid, and one that drops
-    // half the reduction, are kernels this harness has to reject.
+    // half the reduction, are kernels this comparison has to reject.
     const r97test::GuardOptions o = guard_options();
     const r97test::DeviceGuard guard(o);
     (void)device_check::load_plugin();
@@ -437,13 +669,13 @@ R97_TEST(adjoint_linear_device_teeth) {
          wrong_half_reduction},
     };
     for (const auto& [c, kernel] : wrong) {
-        const device_check::Report r = device_check::check(c, kernel);
-        R97_CHECK(!r.ok);
-        R97_CHECK(r.first_slot == operand_pos(c.rec, "a"));
+        const Fit f = compare(c, kernel);
+        R97_CHECK(!f.ok);
+        R97_CHECK(f.first_slot == operand_pos(c.rec, "a"));
         std::printf("%s: rejected, %lld mismatches, first at dc[%lld] index %lld\n",
-                    c.label.c_str(), static_cast<long long>(r.mismatches),
-                    static_cast<long long>(r.first_slot),
-                    static_cast<long long>(r.first_index));
+                    c.label.c_str(), static_cast<long long>(f.mismatches),
+                    static_cast<long long>(f.first_slot),
+                    static_cast<long long>(f.first_index));
         std::fflush(stdout);
     }
 }
@@ -484,8 +716,7 @@ R97_TEST(adjoint_linear_device_measures) {
         {gemm_nt_rec(4096, 5120, 6144), 0x400b, "4096 tok, ssm out bf16"},
     };
     for (const Measure& m : shapes) {
-        const device_check::Timing t =
-            device_check::print_bench(linear_case(m.rec, m.seed, m.label), 3, 1);
+        const device_check::Timing t = print_bench(linear_case(m.rec, m.seed, m.label), 3, 1);
         R97_CHECK(t.adjoint_ms > 0.0);
         R97_CHECK(t.forward_ms > 0.0);
     }

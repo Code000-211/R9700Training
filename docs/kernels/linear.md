@@ -2,8 +2,9 @@
 
 The frozen linears on the card. The rows are registered by `src/adjoint/device/linear.hip`, which
 is one of the kernels the device plugin builds into `libr97.so`
-(`src/adjoint/device/README.md`); the checks are `tests/gpu/adjoint_linear.cpp`, run through the
-harness every device adjoint uses (`tests/support/device_check.h`), and the arithmetic they
+(`src/adjoint/device/README.md`); the checks are `tests/gpu/adjoint_linear.cpp`, built on the
+harness every device adjoint uses (`tests/support/device_check.h`) for its case, card guard and
+lookup, with this family's own comparison in the test file beside them, and the arithmetic they
 implement is stated in [`docs/adjoints/linear.md`](../adjoints/linear.md), whose host rows they
 stand beside.
 
@@ -48,25 +49,34 @@ the host adjoint's f64 sum, and the reason the two are compared by tolerance rat
 equality: each term carries a relative error up to 2^-9, so a heavily cancelling sum can show a
 larger relative error than any single term.
 
-The test holds the kernel to the harness's tolerance with one term added, `Options::allow` in
-`tests/support/device_check.h`: every element it compares is within 2% of the host row's value plus
-`1e-3` plus a tenth of the RMS of the elements compared, and the relative L2 over those elements is
-under `bf16_tol` = `1e-2` in the test file. The RMS term is there because a sum over hundreds of
-terms carries the same absolute rounding error whatever it cancels to, so a rule relative to the
-element alone would fail a kernel that is right for an element that came out near zero.
+The test holds the kernel to a tolerance with one term added to the harness's: every element it
+compares is within 2% of the host row's value plus `1e-3` plus a tenth of the RMS of the elements
+compared, and the relative L2 over those elements is under `bf16_tol` = `1e-2` in the test file. The
+RMS term is there because a sum over hundreds of terms carries the same absolute rounding error
+whatever it cancels to, so a rule relative to the element alone would fail a kernel that is right
+for an element that came out near zero.
+
+That comparison is the family's own, `Sample` and `compare` in `tests/gpu/adjoint_linear.cpp`,
+rather than something the shared harness grew: `CONTRIBUTING.md` asks a family to add files and
+change no shared one, and `tests/support/device_check.h` is the header every device family compares
+through. What this family needs beyond the shared rule -- the RMS term, the rows a case samples, the
+case that skips the twin, and the relative L2 in the report -- therefore lives in the test file,
+which keeps the harness's case, card guard, plugin load and constants as they are. The rest of this
+section and the next say what the family's comparison adds.
 
 At the fixture's shapes, and at the model's hidden width with sixteen rows, the whole of `dx` is
 compared. At the model's real shapes no test can pay for the host row of the whole tensor -- 4096
 rows of the widest linear is about seven hundred GMAC of f64 on one thread, and the host row's inner
-loop strides the weight, which makes it slower still -- so the case samples rows (`Options::rows`)
-and the reference is the host adjoint, the registry's own host row, on a record of just those rows.
+loop strides the weight, which makes it slower still -- so the case names rows instead
+(`Sample::rows`) and the reference is the host adjoint, the registry's own host row, on a record of
+just those rows, with the twin skipped because the adjoint reads none of the slots the forward wrote.
 The sample is the first row, two spread through the tensor, the two rows a 256-row band turns over
 at, and the last two, so a partial band and a batch's tail are in it; the rows are compared whole,
 so every block of `K` is, and the seven rows are held to the same tolerance as the whole tensor.
 
 A comparison has to have teeth, so the test runs three deliberately wrong kernels through the same
-harness and requires it to reject them: `dx` from the codes without the weight's scale grid, and `dx`
-over half the reduction, in both weight forms. The card run put the relative L2 of the whole-tensor
+comparison and requires it to reject them: `dx` from the codes without the weight's scale grid, and
+`dx` over half the reduction, in both weight forms. The card run put the relative L2 of the whole-tensor
 cases at 0.0021-0.0031 and of the sampled rows at 0.0027-0.0028.
 
 ## The tile
@@ -223,9 +233,9 @@ on this machine while it is quiet: 20.1 s at `attn_k/v`, 121.7 s at `attn_output
 under a load of 91 on 48 cores, where the same loop measured 0.29-0.85 GMAC/s, so the other rows
 state the twin's product at 1.06 GMAC/s rather than a time off a contended machine. At the smallest
 shape that arithmetic gives 20.3 s against the 20.1 s timed, and at the widest one a call is about
-eleven and a half minutes. `print_bench(c, 3, 1)` times the twin once per shape rather than as often
-as the adjoint for the same reason: the whole column is three quarters of an hour of one core when
-the machine is quiet. A card's own forward, when an op has one, is what a kernel's `kernel` column
+eleven and a half minutes. The bench times the twin once per shape rather than as often as the
+adjoint for the same reason: the whole column is three quarters of an hour of one core when the
+machine is quiet. A card's own forward, when an op has one, is what a kernel's `kernel` column
 should be held against; the twin beside the adjoint says how much of a backward is the staging.
 
 The card tier runs its tests from `main` (`tests/gpu/main.cpp`), not from the exit-time runner the
