@@ -1,0 +1,45 @@
+Concern: let the fixture prefill run one named adapter slot, so an in-memory update is one step away
+Upstream: not-submitted
+diff --git a/core/rad_core.h b/core/rad_core.h
+--- a/core/rad_core.h
++++ b/core/rad_core.h
+@@ -1061,6 +1061,10 @@
+      * deployment leaves both empty. */
+     std::vector<std::vector<int32_t>> prefill_prompts;
+     std::vector<std::vector<float>>   prefill_logits;
++    /* The adapter every prefill request runs with, by the name it was loaded or opened under
++     * ("" for the base model). The run acquires it once, so a live slot can be updated after a
++     * step and the next prefill sees the new weights. */
++    std::string prefill_lora;
+     bool prefill() const { return !prefill_prompts.empty(); }
+ 
+     /* --mm-max-patches: the most patches one encoder pass carries, which bounds the largest image
+diff --git a/core/train_prefill.cpp b/core/train_prefill.cpp
+--- a/core/train_prefill.cpp
++++ b/core/train_prefill.cpp
+@@ -48,6 +48,17 @@
+         }
+     }
+ 
++    int32_t lora_slot = -1;
++    uint64_t lora_uid = 0;
++    std::shared_ptr<void> lora_hold;
++    if (!cfg_.prefill_lora.empty()) {
++        const int s = lora_acquire(cfg_.prefill_lora, &lora_slot, &lora_uid, &lora_hold);
++        if (s < 0) {
++            RAD_ERR("prefill: adapter '%s' is not loaded (error %d)", cfg_.prefill_lora.c_str(), s);
++            return s;
++        }
++    }
++
+     std::vector<std::vector<float>> rows(prompts.size());
+     prefill_prompt_.assign(prompts.size() + 1, -1);
+     for (size_t d = 0; d < prompts.size(); ++d) {
+@@ -68,6 +79,7 @@
+         r->sp.temp               = 0.0f;
+         r->score                 = true;
+         r->sp.use_control_vector = cvec_default_on();
++        r->lora_slot             = lora_slot;
+         r->sink                  = sinks[d].get();
+         sinks[d]->id             = r->id;
+         reqs[d]                  = std::move(r);

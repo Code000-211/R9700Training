@@ -86,10 +86,11 @@ message(STATUS "r97: radiance at ${R97_RADIANCE_COPY}, commit ${R97_RADIANCE_COM
                "patch set ${R97_PATCH_SET}, ${R97_PATCH_FILES} patches applied")
 
 # Build rad_core out of tree: the subproject is configured (Ninja, like us) and built for rad_core,
-# the two host kernel libraries, the qwen35_bf16 architecture plugin and rad-convert, which turns a
-# checkpoint into a container -- what a host test loads and runs. The radiance server and the other
-# tools are not this build's business. An IMPORTED target hands the archive to this project's
-# consumers, with the include directories and link libraries rad_core itself publishes (see
+# the host kernel libraries, the architecture plugins (qwen35_bf16 and qwen35_w8a8), the quantizer
+# libquant (the int8 fixture's conversion) and rad-convert, which turns a checkpoint into a
+# container -- what a host test loads and runs. The radiance server and the other tools are not this
+# build's business. An IMPORTED target hands the archive to this project's consumers, with the
+# include directories and link libraries rad_core itself publishes (see
 # third_party/core/CMakeLists.txt).
 include(ExternalProject)
 find_package(Threads REQUIRED)
@@ -136,7 +137,7 @@ ExternalProject_Add(radiance_core
     -DRAD_WITH_HIP=${RAD_WITH_HIP}
     -DRAD_GPU_TARGETS=${RAD_GPU_TARGETS}
     -DR97_PATCH_STAMP=${R97_PATCH_STAMP}
-  BUILD_COMMAND ${CMAKE_COMMAND} --build . --target rad_core libref libavx rad-convert qwen35_bf16
+  BUILD_COMMAND ${CMAKE_COMMAND} --build . --target rad_core libref libavx libquant rad-convert qwen35_bf16 qwen35_w8a8
   INSTALL_COMMAND ""
   BUILD_ALWAYS FALSE
   USES_TERMINAL_BUILD TRUE
@@ -208,6 +209,17 @@ else()
   # A subcommand that loads the device kernel plugin registers its adjoints into r97's registry,
   # so r97's symbols must be in the binary's dynamic table.
   set_target_properties(r97train PROPERTIES ENABLE_EXPORTS TRUE)
+
+  # The oracle's checkpoint writer: the tests' own tiny fixture, written to a directory the
+  # Python generator loads. It sits in its own subdirectory so it is not one of r97train's
+  # sources, and it is separate from the tests because only regenerating the reference needs it.
+  # It reads the fixture's header only, so it never looks an op up and links r97 as it comes.
+  add_executable(r97_write_fixture tools/oracle/write_fixture.cpp)
+  target_compile_features(r97_write_fixture PRIVATE cxx_std_20)
+  target_include_directories(r97_write_fixture PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    ${R97_RADIANCE_COPY}/tests)
+  target_link_libraries(r97_write_fixture PRIVATE r97)
 endif()
 
 # ---------------------------------------------------- device kernel plugin
@@ -289,7 +301,9 @@ if(R97_BUILD_TESTS)
     target_include_directories(r97_host_tests PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/tests
       ${R97_RADIANCE_COPY}/tests)   # radiance's write_qwen35, the fixture's checkpoint writer
-    target_compile_definitions(r97_host_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
+    target_compile_definitions(r97_host_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}"
+      # the int8 fixture's recipe, the one docs/FIXTURES.md prints
+      R97_FIXTURE_W8A8_RECIPE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/w8a8_fwht128.recipe")
   endif()
 
   # gpu tests: need the card, run serially. One binary, its main in tests/gpu/main.cpp; every

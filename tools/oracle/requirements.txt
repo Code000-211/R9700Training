@@ -1,0 +1,11 @@
+# The reference generator's environment. Exact versions: the reference is checked in, and a
+# regeneration must produce the same bytes on the same machine.
+#
+# `torch==2.15.0+cpu` is the CPU wheel; the extra index is where that wheel lives. Nothing here is
+# installed system-wide and nothing goes into /opt/hf.
+--extra-index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+torch==2.15.0+cpu
+transformers==5.22.2
+safetensors==0.8.0
+numpy==2.5.4
