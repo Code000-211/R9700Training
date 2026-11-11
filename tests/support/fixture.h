@@ -156,13 +156,10 @@ inline void write_chat_template(const std::string& dir) {
         throw std::runtime_error("fixture: cannot write " + path);
 }
 
-inline Fixture make() {
-    namespace fs = std::filesystem;
-
-    const fs::path dir = fs::path(radtest::tmpdir()) / "tiny_qwen35_bf16";
-    fs::remove_all(dir);
-    fs::create_directories(dir);
-
+// The tiny Qwen3.5 the fixture, the oracle writer and every test share: one definition, so a
+// change to the shape changes the checkpoint the reference was made from and the hash test says
+// so by name.
+inline tiny::Qwen35 qwen35_spec() {
     tiny::Qwen35 s;
     s.hidden   = 128;  // a multiple of 128: the int8 fixture converts this same checkpoint
     s.layers   = 4;    // (l + 1) % interval == 0 is full attention: 3 GDN layers, 1 attention
@@ -173,10 +170,30 @@ inline Fixture make() {
     s.ffn      = 256;
     s.vocab    = 320;
     s.ctx      = 4096;
-    if (!tiny::write_qwen35(dir.string(), s))
-        throw std::runtime_error("fixture: cannot write the tiny Qwen3.5 checkpoint at " +
-                                 dir.string());
-    write_chat_template(dir.string());
+    return s;
+}
+
+// The checkpoint alone, at `dir`: what tools/oracle/make_reference.py loads. make() converts it
+// afterwards. The bytes are the fixture's own, so the reference and the tests see one checkpoint.
+inline std::string write_checkpoint(const std::string& dir) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec)
+        throw std::runtime_error("fixture: cannot create " + dir + ": " + ec.message());
+    if (!tiny::write_qwen35(dir, qwen35_spec()))
+        throw std::runtime_error("fixture: cannot write the tiny Qwen3.5 checkpoint at " + dir);
+    write_chat_template(dir);
+    return dir;
+}
+
+inline Fixture make() {
+    namespace fs = std::filesystem;
+
+    const fs::path dir = fs::path(radtest::tmpdir()) / "tiny_qwen35_bf16";
+    fs::remove_all(dir);
+    write_checkpoint(dir.string());
+    const tiny::Qwen35 s = qwen35_spec();
 
     Fixture f;
     f.checkpoint = dir.string();
@@ -206,6 +223,11 @@ inline Fixture make() {
 }
 
 }  // namespace detail
+
+// Public form for tools/oracle/write_fixture.cpp: the checkpoint alone, without a container.
+inline std::string write_checkpoint(const std::string& dir) {
+    return detail::write_checkpoint(dir);
+}
 
 // The fixture for this test binary: written and converted on first use, then kept for its life.
 inline const Fixture& fixture() {
