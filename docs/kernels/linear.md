@@ -121,41 +121,60 @@ the allocations the call actually made.
 
 ## Measurement
 
-**Not measured here.** The run that wrote this file had no card it could open: `HIP` reported no
-ROCm-capable device (`/dev/kfd` is present and answers `EACCES` even to root, so the container the
-work was done in filters the device), so `tests/gpu/adjoint_linear.cpp` compiled and linked but its
-two card tests could not execute and no timing below is filled in. The rows themselves are checked
-without a card: the test's first test reads the registry and the predicates, and passes.
-
-Fill the table with
+**Measured.** One call per shape on one R9700 (gfx1201, 32 GB), `R97_DEVICE=0`, by
+`tests/gpu/adjoint_linear.cpp`, which prints one line per shape in this order as `staging`,
+`kernel`, TFLOP/s and `scratch`:
 
 ```console
 $ cmake -B build -G Ninja && cmake --build build -j
-$ build/r97_gpu_tests                     # R97_DEVICE=<n> for a card other than 0
+$ R97_DEVICE=0 build/r97_gpu_tests       # R97_DEVICE selects the card
 ```
-
-which prints one line per shape, in this order, as `staging`, `kernel`, TFLOP/s and `scratch`:
 
 | shape | staging (host conversion + transfer) | kernel | TFLOP/s | scratch |
 | --- | --- | --- | --- | --- |
-| `attn_k/v` 4096 x 1024 x 5120 | | | | |
-| `attn_output` 4096 x 5120 x 6144 | | | | |
-| `attn_qg` 1024 x 12288 x 5120 | | | | |
-| `attn_qg` 4096 x 12288 x 5120 | | | | |
-| `ssm_inz` 4096 x 16384 x 5120 | | | | |
-| `ffn_down` 4096 x 5120 x 17408 | | | | |
-| `ffn_gate_up` 1024 x 34816 x 5120 | | | | |
-| `ffn_gate_up` 4096 x 34816 x 5120 | | | | |
-| `ffn_gate_up` batch, 4023 rows | | | | |
-| `ssm_out` bf16 4096 x 5120 x 6144 | | | | |
+| `attn_k/v` 4096 x 1024 x 5120 | 50.5 ms | 1.06 ms | 40.6 | 53 MiB |
+| `attn_output` 4096 x 5120 x 6144 | 230.3 ms | 5.73 ms | 45.0 | 118 MiB |
+| `attn_qg` 1024 x 12288 x 5120 | 341.6 ms | 3.39 ms | 38.0 | 94 MiB |
+| `attn_qg` 4096 x 12288 x 5120 | 439.6 ms | 21.34 ms | 24.1 | 196 MiB |
+| `ssm_inz` 4096 x 16384 x 5120 | 582.3 ms | 35.00 ms | 19.6 | 249 MiB |
+| `ffn_down` 4096 x 5120 x 17408 | 765.1 ms | 18.47 ms | 39.5 | 262 MiB |
+| `ffn_gate_up` 1024 x 34816 x 5120 | 1014.3 ms | 11.38 ms | 32.1 | 250 MiB |
+| `ffn_gate_up` 4096 x 34816 x 5120 | 1231.2 ms | 53.91 ms | 27.1 | 484 MiB |
+| `ffn_gate_up` batch, 4023 rows | 1222.1 ms | 51.39 ms | 27.9 | 479 MiB |
+| `ssm_out` bf16 4096 x 5120 x 6144 | 138.0 ms | 5.39 ms | 47.8 | 148 MiB |
 
 `staging` is the host's f64 -> bf16 and f64 -> int8 conversion of `dy` and the weight, the scale
 grid, and the uploads, and `kernel` runs from the launch to `hipDeviceSynchronize`, so the second
-includes the download of `dx`. Each shape is called twice and the second call is the one reported,
-so the code object's first load is not in the number.
+includes the download of `dx`. TFLOP/s counts `2*M*N*K` over `kernel` only. Each shape is called
+twice and the second call is the one reported, so the code object's first load is not in the number.
+The scratch column is the sum of the allocations the call actually made, and it matches the formula
+above.
 
-The forward op's time per call, for the same shapes on the same run, is not in this file either: it
-is a radiance launch, and the harness that times a forward op beside its adjoint is the one the
+These are the last of three runs of this binary on a machine other contributors' builds share, and
+the columns move between them: the kernel column repeated within about 5% of itself for every shape
+but `attn_k/v` at 4096 rows, which the three runs put at 3.98, 1.68 and 1.06 ms, and the staging
+column, which is host work on a shared CPU, varied by up to three times (`ffn_gate_up` at 4096 rows:
+1.23 s to 4.02 s). Read a factor of two into a single kernel number for this reason, and the scratch
+column, which is arithmetic, as exact.
+
+The staging column is not what a backward pays. It is dominated by converting the weight from the
+harness's f64 values to the int8 codes the kernel wants -- 178 million elements at `ffn_gate_up`,
+which is why 1024 rows and 4096 rows cost nearly the same -- and a real call is handed codes that a
+`w8a8` container already holds, so only `dy` and the scale grid would be converted. `kernel` is
+therefore the column to hold the forward against, and the forward pays no staging at all.
+
+The agree test's tolerance is 1% whole-tensor relative error against the host row at the same
+inputs; across its eighteen cases (fixture shapes and model widths, 1024 and 4096 tokens,
+`gemm_nt_q` and `gemm_nt`, one sequence and a batch of unequal lengths) the measured error is
+0.0021-0.0028.
+
+The card tier runs its tests from `main` rather than from the exit-time runner the other tiers use:
+the same launch from the exit hook faults inside `hipLaunchKernel` once radiance's device layer has
+initialised, so a device test cannot wait until the binary exits
+(`tests/gpu/gpu_guard_smoke.cpp`).
+
+The forward op's time per call, for the same shapes on the same run, is not in this file: it is a
+radiance launch, and the harness that times a forward op beside its adjoint is the one the
 device-kernel plugin issue brings. Until it exists the comparison has to be made by hand, from the
-forward's own timing on the same card and the same shapes, and the number it should be compared with
-is `staging + kernel`, since a backward pass pays both.
+forward's own timing on the same card and the same shapes, against `kernel` -- which is why the
+paragraph above separates the staging from it.
