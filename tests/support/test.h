@@ -1,13 +1,13 @@
 // tests/support/test.h -- self-registering checks for the collected host test binary.
 //
 // Every source under tests/host/ becomes one executable, so only one of them may define
-// main (today tests/host/vector_tape.cpp does). A test file therefore brings no main of its
+// main (today tests/host/main.cpp does). A test file therefore brings no main of its
 // own: it writes its checks as
 //
 //   R97_TEST(name) { ... }
 //
 // and the runner runs every registered test before static teardown: the host and gpu binaries run
-// theirs from their own main (`tests/host/vector_tape.cpp`, `tests/gpu/main.cpp`), which keeps the
+// theirs from their own main (`tests/host/main.cpp`, `tests/gpu/main.cpp`), which keeps the
 // statics a test needs alive for the whole run, and the at-exit runner armed below is what the
 // model tier uses. A failure makes the process exit non-zero, which is what ctest reads, so adding
 // a test is adding one file and nothing else.
@@ -53,7 +53,7 @@ inline int run_all() {
 }
 
 // Runs the registered tests from exit(). The host and gpu binaries call run_all() from their own
-// main instead (`tests/host/vector_tape.cpp`, `tests/gpu/main.cpp`), because at exit the statics a
+// main instead (`tests/host/main.cpp`, `tests/gpu/main.cpp`), because at exit the statics a
 // test needs are gone; a binary whose main returns without running them -- the model tier -- lands
 // here.
 inline void run_at_exit() {

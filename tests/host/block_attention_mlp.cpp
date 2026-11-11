@@ -145,9 +145,11 @@ struct Blocks {
 };
 
 // A directory of this file's own, removed when the run ends. The checkpoint is written here
-// rather than read from tests/support/fixture.h's cached one, so this file's bytes are its own;
-// they are the fixture's own write (r97::write_checkpoint), so the reference and this file still
-// see one checkpoint.
+// rather than read from tests/support/fixture.h's cached one: that fixture is first used from a
+// static initializer (chatdata_mask.cpp's self-check), so the strings it holds are destroyed
+// before this binary's exit-time runner calls the tests -- a harness bug, reported, not this
+// issue's. The bytes are the fixture's own (r97::write_checkpoint), so the reference and this
+// file still see one checkpoint.
 struct CheckpointDir {
     char path[64];
 

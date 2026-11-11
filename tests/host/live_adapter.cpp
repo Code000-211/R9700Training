@@ -2,8 +2,8 @@
 // Label: host; needs the fixture's prefill (patch 0103) and the live-slot entry point
 // (patch 0201).
 //
-// The targets are built in a function rather than in a static vector, like everything else this
-// file hands the engine.
+// A test registered with R97_TEST runs from an atexit handler, after namespace-scope objects have
+// been destroyed, so this file keeps its targets in a function rather than in a static vector.
 #include "support/fixture.h"
 #include "support/test.h"
 

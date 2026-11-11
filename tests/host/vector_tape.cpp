@@ -1,13 +1,12 @@
 // tests/host/vector_tape.cpp -- VectorTape answers reads from its arrays and records them.
 //
-// This file also owns the collected host binary's entry point: its main runs every test another
-// host file registered with R97_TEST (support/test.h), then _Exits with the result.
+// The host tests are one binary with one main (tests/host/main.cpp); each test file registers its
+// checks with R97_TEST instead of carrying an entry point of its own.
 #include "support/test.h"
 #include "support/vector_tape.h"
 
 #include <cassert>
 #include <cstdio>
-#include <cstdlib>
 
 using r97::Batch;
 using r97::TokenSeq;
@@ -19,7 +18,7 @@ static Batch two_sequences() {
     return b;
 }
 
-int main() {
+R97_TEST(vector_tape) {
     // A logits buffer of 5 rows x 3 cols: rows 0..2 for the first sequence, 3..4 for the second.
     std::vector<float> logits = {
         0, 1, 2,    // row 0
@@ -64,18 +63,4 @@ int main() {
     assert(tape.reads_of("other").empty());
 
     std::puts("vector_tape ok");
-
-    // The registered tests run here, from main, rather than from the at-exit runner support/test.h
-    // arms at the first registration. That runner is armed during static initialisation and runs
-    // after the binary's static destructors have run, and the statics a host test needs are gone by
-    // then: chatdata_mask.cpp builds the fixture (support/fixture.h) from its own static
-    // initialiser, so the fixture, the temp directory behind it and radiance's device layer are
-    // destroyed before an armed handler would call a test. Running the tests inside main keeps
-    // every static alive for the whole run, whatever order the translation units initialise in;
-    // _Exit then skips the rest of exit(), so no destructor and no second run can hide the status.
-    // tests/gpu/main.cpp does the same, for the registry a plugin rebuilds as it loads.
-    const int failed = r97test::run_all();
-    std::fflush(stdout);
-    std::fflush(stderr);
-    std::_Exit(failed ? 1 : 0);
 }

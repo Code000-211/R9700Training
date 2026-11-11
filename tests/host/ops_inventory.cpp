@@ -8,11 +8,14 @@
 // block kinds, the on-path mark and the adjoint families are checked for shape too, so a
 // classifier that quietly collapses stops the test rather than the doc.
 //
-// The step is recorded in a child process, by `r97train ops`, which is what the subcommand this
-// issue adds does for a person, and it keeps a recording out of this process's fixtures. Each
+// The step is recorded in a child process, by `r97train ops`. The host binary runs its registered
+// tests from the at-exit runner (support/test.h), and by then the statics a recorded step needs
+// are gone: the fixture's own (support/fixture.h) and radiance's, whose device layer reads state
+// destructed with them, so a step recorded in this process dies instead of running. Each
 // fixture's container path is therefore copied into a POD while the fixtures are built at
-// startup, so the step is handed plain bytes. A serving build has no prefill mode, and this file
-// compiles to nothing there.
+// startup -- no destructor, so it is still readable at exit -- and the step runs in the child,
+// which is what the subcommand this issue adds does for a person. A serving build has no prefill
+// mode, and this file compiles to nothing there.
 #include "support/fixture.h"
 #include "support/fixture_w8a8.h"
 #include "support/test.h"

@@ -3,7 +3,7 @@
 Three test labels, and the variables that run them. ctest runs each tier's binary; the sources are
 globs of their directories (`tests/<tier>/*.cpp`), so a new test file needs no edit anywhere, and
 the tests inside one binary register themselves with `R97_TEST(name)` (`tests/support/test.h`).
-Each tier's binary holds one `main` in its own directory: `tests/host/vector_tape.cpp`,
+Each tier's binary holds one `main` in its own directory: `tests/host/main.cpp`,
 `tests/gpu/main.cpp`, `tests/model/info_meta.cpp`. The host and gpu mains run their registered
 tests from `main`, before the binary's statics are destroyed; only a main that returns, as the
 model tier's does, leaves the run to the at-exit runner. Checks are `R97_CHECK`, not
