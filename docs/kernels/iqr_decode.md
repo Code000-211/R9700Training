@@ -126,5 +126,10 @@ The GEMM check needs `libr4d.so`. radiance makes that module only for a HIP buil
 hold RDNA4 (`libr4d/CMakeLists.txt`), so the build asks for it on those same terms: when it does,
 `libr4d` joins radiance's `BUILD_COMMAND` and the gpu test gets its path as `R97_LIBR4D`; when it
 does not, `R97_LIBR4D` is left unset and the test looks beside the device plugin, where the radiance
-home puts both modules. The gpu test runs without a model container by skipping the container cases
-with a note; the synthetic host tier still runs.
+home puts both modules.
+
+Because it needs real tensors it is a `model` test, `R97_MODEL_TEST(iqr_decode)`: it resolves the
+container before it takes the card and skips with exit 77 when the container is absent, so ctest
+runs it as `gpu_model_tests` (`ctest -L model`), never as the plain `gpu_tests` run, which is the
+card's own cases and must not skip. Directly: `./build/r97_gpu_tests --model`. The forms a card can
+check without the container are covered synthetically in the host tier, above.

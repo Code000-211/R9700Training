@@ -1,6 +1,8 @@
 // The IQR decode kernel on the card: every form the first container stores, decoded to the int8
 // grid and checked against the host decode byte for byte, then radiance's int8 GEMM over that grid
-// against its IQR GEMM over the same codes.
+// against its IQR GEMM over the same codes. Real tensors are the point, so this is a model test: it
+// resolves the container first thing, skips (exit 77) when it is absent, and only then takes the
+// card.
 
 #include <dlfcn.h>
 
@@ -10,7 +12,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -566,7 +567,15 @@ void gemm_case(L4d& l, const std::string& plugin, rad::RadFile& f, const RadFile
 
 }  // namespace
 
-R97_TEST(iqr_decode) {
+R97_MODEL_TEST(iqr_decode) {
+    // A model test resolves the container before anything else: a machine without it skips here,
+    // before the card guard takes a card for a run that would decode nothing.
+#ifdef R97_MODEL_RAD
+    const std::string rad = r97test::container_or_skip(R97_MODEL_RAD);
+#else
+    const std::string rad = r97test::container_or_skip("");
+#endif
+
     r97test::GuardOptions o;
     const char* device_env = std::getenv("R97_DEVICE");
     o.device = r97test::parse_device(device_env ? device_env : "0");
@@ -582,19 +591,7 @@ R97_TEST(iqr_decode) {
     if (!h) throw std::runtime_error(std::string("dlopen: ") + dlerror());
 
     rad::RadFile f;
-    std::string why;
-#ifdef R97_MODEL_RAD
-    const std::optional<std::string> rad = r97test::resolve_container(R97_MODEL_RAD, &why);
-#else
-    const std::optional<std::string> rad = r97test::resolve_container("", &why);
-#endif
-    if (!rad) {
-        std::printf("note: the IQR container is absent; the container cases are skipped: %s\n",
-                    why.c_str());
-        dlclose(h);
-        return;
-    }
-    if (f.open(rad->c_str()) != RAD_OK) throw std::runtime_error("open " + *rad);
+    if (f.open(rad.c_str()) != RAD_OK) throw std::runtime_error("open " + rad);
 
     // One tensor per form the container stores, and the linear kinds around them: the trunk's
     // mad trellises at each code width and run, the head's two-level e4m3 scale, and the head-fed
