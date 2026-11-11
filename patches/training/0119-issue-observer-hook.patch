@@ -1,0 +1,38 @@
+Concern: the training tape attaches to a RadCtx, and the Engine is the only owner of it
+Upstream: not-submitted
+
+The tape (0101) attaches to a RadCtx through rad_set_issue_observer, but the Engine never hands its
+RadCtx out. Without a way in, `r97train ops` and the op-inventory host test would have to stand up
+their own prefill loop and would record something other than the step the engine actually runs. The
+hook is one accessor on Engine: rank 0's context, between start() and serve().
+
+--- a/core/engine.h
++++ b/core/engine.h
+@@ -84,6 +84,13 @@
+     const Program& program() const;
+     const Config&  config()  const { return cfg_; }
+ 
++    /* Rank 0's runtime context, for an issue observer (rad_runtime.h): the Engine owns the only
++     * RadCtx, so a tape (patches/training/0101) has no other way in. Null before start(). Attach
++     * between start() and serve() and detach before the Engine dies; a tensor-parallel engine
++     * records rank 0 only: the other ranks issue the same ops on their shards, and one tape is
++     * one stream. */
++    RadCtx* issue_ctx() const;
++
+     /* The startup report (core/diag/diag.h): every option with its value and source, the
+      * machine, and what on it costs speed or correctness. serve() prints it with RAD_OK before
+      * listening; main prints it with the error start() or serve() failed with, so a server that
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -4277,6 +4277,11 @@
+ 
+ const Program& Engine::program() const { return ranks_[0]->program; }
+ 
++RadCtx* Engine::issue_ctx() const {
++    if (ranks_.empty() || !ranks_[0]) return nullptr;
++    return &ranks_[0]->ctx;
++}
++
+ /* ================================================================== dump */
+ /* --debug-graph (spec §16); see Engine::dump in engine.h. */
+ int Engine::dump() {
