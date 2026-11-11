@@ -107,23 +107,31 @@ and the scratch fully freed -- for both rows:
 | real, one sequence | 24 / 4 | 256 | 1024 | 16 | 1024 |
 | real, unequal batch | 24 / 4 | 256 | 128, 256, 640 | 16 | 1024 |
 | real, full context | 24 / 4 | 256 | 4096 | 16 | 4096 |
+| real, full context, unequal batch | 24 / 4 | 256 | 2048, 1300, 748 | 16 | 4096 |
 
-The first three and the two 1024-token cases run against the fused row as well. The fixture's
-geometry is `tests/support/fixture.h`; the real one is a Qwen3.8-27B block's grouped query
-attention (hidden 5120, 24 query heads over 4 key-value heads of dimension 256). Each sequence's
-pages are its own blocks, laid out one sequence after another, with one block the step never filled
-left at −1 in its table entry.
+The first three and all of the real ones but the 4096-token single sequence run against the fused
+row as well. The fixture's geometry is `tests/support/fixture.h`; the real one is a Qwen3.8-27B
+block's grouped query attention (hidden 5120, 24 query heads over 4 key-value heads of dimension
+256). Each sequence's pages are its own blocks, laid out one sequence after another; a table entry
+past a sequence's last page is −1, which the 4096-token unequal batch exercises with its 128-, 82-
+and 47-page sequences in a table of 128.
 
-4096 tokens is a full context in one sequence: at the fixture's head geometry, and at the real one
-for `attn_paged`, whose reference there takes minutes (its f64 twin alone is 103 s a pass). The
-fusion at the real geometry and 4096 tokens is timed under `--bench` rather than compared, since
-its reference is that same host adjoint again; its own work is the gate's straight-through pass,
-linear in the tokens, and is compared at the shapes above.
+4096 tokens is a full context: in one sequence at the fixture's head geometry, and at the real one
+for `attn_paged`, whose reference there takes minutes (its f64 twin alone is 103 s a pass); and as
+a batch of unequal lengths at the real geometry, which both rows compare. That last case is
+affordable because the reference's work is the sum of the sequences' squares, not the square of
+their sum: 3.2M key visits against the 8.4M of the single sequence. The 1300- and 748-token
+sequences end part way into a page, so a part-filled last page is compared there too. The fusion at
+the real geometry and 4096 tokens in one sequence is timed under `--bench` rather than compared,
+since its reference is that same host adjoint again; its own work is the gate's straight-through
+pass, linear in the tokens, and is compared at the shapes above.
 
-A run of the test takes a minute and a half for the ten cases up to 1024 tokens and five more for
-the 4096-token real-geometry case, which is minutes of f64: the twin fills the forward's writes and
-the reference runs it again, 103 s a pass. `--bench` adds the fusion's 4096-token timing, one more
-pass of that twin.
+A run of the test takes a minute and a half for the ten cases up to 1024 tokens and the rest in
+the four 4096-token real-geometry ones, which are minutes of f64 each: the twin fills the forward's
+writes and the reference runs it again, 103 s a pass for one sequence. The run below, taken while
+the machine's CPUs were shared with other work, took 39 minutes for all thirteen comparisons and
+the one timed pass; on an idle machine the same test took seven before the two 4096-token batch
+cases were added.
 
 The fusion has no host row of its own, so its reference is `fused_host_reference` in the test, a
 `HostRef`: the host adjoints of `quant_act_i8g`, `mul` and `sigmoid` around the host adjoint of
@@ -136,30 +144,38 @@ left empty, which the harness must reject in the pool's slot.
 
 ## 5. Time and scratch
 
-One R9700 (gfx1201), `R97_DEVICE=1`, from `./build/r97_gpu_tests --bench` on an otherwise idle
-card, one call per measurement (`reps` is 1 above 64 rows; the small shapes use 20):
+One R9700 (gfx1201), `R97_DEVICE=1`, from `./build/r97_gpu_tests --bench` on a card no other run
+held, one call per measurement (`reps` is 1 above 64 rows; the small shapes use 20). The machine's
+CPUs were shared with other work during this run, which lengthens the twin's column -- the f64
+reference is CPU-bound -- but not the adjoint's, which is the card's:
 
 | shape | rows | adjoint | forward twin | adjoint / twin | scratch peak |
 |---|---|---|---|---|---|
-| fixture, one sequence | 12 | 2.97 ms | 0.02 ms | 122.9x | 31 KiB |
-| fixture, three sequences | 28 | 4.35 ms | 0.05 ms | 89.8x | 77 KiB |
-| fixture, full context | 4096 | 100.2 ms | 3713.2 ms | 0.03x | 9.3 MiB |
-| real, one sequence, 1024 | 1024 | 167.9 ms | 5177.9 ms | 0.03x | 76.3 MiB |
-| real, unequal batch, 1024 | 1024 | 112.1 ms | 1988.4 ms | 0.06x | 76.3 MiB |
-| real, one sequence, 4096 | 4096 | 1250.1 ms | 103199.1 ms | 0.01x | 305.2 MiB |
-| real, one sequence, 1024, fused | 1024 | 246.9 ms | 5906.0 ms | 0.04x | 196.5 MiB |
-| real, unequal batch, 1024, fused | 1024 | 218.5 ms | 2444.8 ms | 0.09x | 196.5 MiB |
-| real, one sequence, 4096, fused | 4096 | 1748.5 ms | 138185.2 ms | 0.01x | 785.9 MiB |
+| fixture, one sequence | 12 | 1.70 ms | 0.02 ms | 93.3x | 31 KiB |
+| fixture, three sequences | 28 | 1.69 ms | 0.06 ms | 28.5x | 77 KiB |
+| fixture, full context | 4096 | 68.0 ms | 1813.8 ms | 0.04x | 9.3 MiB |
+| real, one sequence, 1024 | 1024 | 132.5 ms | 5446.9 ms | 0.02x | 76.3 MiB |
+| real, unequal batch, 1024 | 1024 | 105.6 ms | 2247.5 ms | 0.05x | 76.3 MiB |
+| real, one sequence, 4096 | 4096 | 1240.2 ms | 261229.9 ms | 0.00x | 305.2 MiB |
+| real, unequal batch, 4096 | 4096 | 632.6 ms | 31965.8 ms | 0.02x | 305.5 MiB |
+| real, one sequence, 1024, fused | 1024 | 249.3 ms | 5411.2 ms | 0.05x | 196.5 MiB |
+| real, unequal batch, 1024, fused | 1024 | 220.7 ms | 2786.5 ms | 0.08x | 196.5 MiB |
+| real, one sequence, 4096, fused | 4096 | 2712.7 ms | 154954.2 ms | 0.02x | 785.9 MiB |
+| real, unequal batch, 4096, fused | 4096 | 1335.4 ms | 51652.5 ms | 0.03x | 786.2 MiB |
 
 The two small shapes are fixed cost: one call there is a few hundred kilobytes of upload, a launch
-per row-group and one synchronisation, about 2.3 ms that the forward twin does not pay. From the
-fixture's 4096-token row upwards the card wins, and at the real geometry it wins by 30x; the
-adjoint's cost is linear in the tokens times their average reach, which is why the 1024-token
-sequence (one full causal block) costs the card more than the 4096-token fixture (24 query heads of
-256 against 4 of 32). The fusion is the plain row plus the gate's straight-through pass and three
-more operands to upload: 50 to 110 ms at these shapes, and at 4096 tokens 1.75 s against the plain
-row's 1.25 s. Its scratch is the three extra operands wide: 196.5 MiB against 76.3 MiB at 1024
-tokens, 785.9 MiB against 305.2 MiB at 4096.
+per row-group and one synchronisation, under 2 ms that the forward twin does not pay. From the
+fixture's 4096-token row upwards the card wins: 26x the twin's speed there, and 12x to 200x at the
+real geometry (the twin's half of a ratio is the longer for this run's shared CPUs). The adjoint's
+cost is linear in the tokens times their average reach, which is why the 1024-token sequence (one
+full causal block) costs the card more than the 4096-token fixture (24 query heads of 256 against 4
+of 32), and why 4096 tokens as a batch of 2048, 1300 and 748 costs half what the same 4096 in one
+sequence does: the reach of a row is its own sequence, so the batch sees 3.2M keys where the single
+sequence sees 8.4M. The fusion is the plain row plus the gate's straight-through pass and three
+more operands to upload: 115 ms more at 1024 tokens, and 0.7 s more at the 4096-token batch and
+1.5 s more at the 4096-token single sequence -- the gate's part is linear in the tokens, so it
+weighs most where the attention is cheapest. Its scratch is the three extra operands wide: 196.5
+MiB against 76.3 MiB at 1024 tokens, 786.2 MiB against 305.5 MiB at 4096.
 
 The line is `tests/support/bench.h`'s: the adjoint's time per call and, beside it, the same
 harness's forward twin on the same shape. That twin is the f64 CPU reference, not the card's
@@ -177,9 +193,9 @@ cotangent. The fusion adds its gate, the gated output and the codes' cotangent.
 ## 6. What it does not cover
 
 - The forward's real geometry is `24/4/256` at up to 4096 tokens; the test compares that geometry
-  at 1024 tokens as one sequence and as an unequal batch, and as 4096 tokens in one sequence, and
-  the fusion of the 4096-token case is timed rather than compared (section 4). No other length is
-  run, and 4096 tokens as a batch of unequal lengths is not run at all.
+  at 1024 tokens as one sequence and as an unequal batch, and at 4096 tokens in one sequence (the
+  plain row) and as a batch of unequal lengths (both rows). Every other length is one the fixture
+  or a 1024-token batch already shows, and no shape above 4096 tokens is run.
 - The pool the test hands the kernel is bf16, and both cotangents are rounded to it once, on the
   way out: the query's in the kernel (its accumulator is bf16) and the pool's in `collect`. For any
   other pool dtype the pool's cotangent comes back at f32, as the host adjoint's does -- an fp8
