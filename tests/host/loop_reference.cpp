@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <iterator>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -85,8 +86,11 @@ r97::Config config_for(const std::string& out, int64_t steps) {
     return cfg;
 }
 
-// The recorded program is one fixed three-sequence batch; the loop is what this test exercises,
-// not the batcher's packing (the toy test covers that), so every step gets that whole batch.
+// The recorded program is one fixed three-sequence batch, in its own order; the loop is what this
+// test exercises, not the batcher's packing (the toy test covers that), so every step gets that
+// whole batch. The batcher still hands a batch of its own -- one sequence of the three, since the
+// harness runs with one sequence a batch -- and the step checks that it is drawn from the program's
+// three, so a batcher fed something else fails here instead of being silently ignored.
 // `model` is the one the harness initialised: the step applies the delta through it, and a
 // second model's uninitialised delta would not know its targets.
 r97::StepFn fixed_step(const r97::Model& model, const std::string& container) {
@@ -95,7 +99,16 @@ r97::StepFn fixed_step(const r97::Model& model, const std::string& container) {
     opts.program = program_file().string();
     r97::StepFn inner = r97::make_reference_step(model, opts);
     r97::Batch fixed = oracle_batch();
-    return [inner, fixed](const r97::Batch&, const r97::ParamSet& p, r97::ParamSet* g) {
+    return [inner, fixed](const r97::Batch& given, const r97::ParamSet& p, r97::ParamSet* g) {
+        if (given.empty())
+            throw std::runtime_error("loop_reference: the batcher handed an empty batch");
+        for (const r97::TokenSeq& s : given) {
+            bool from_program = false;
+            for (const r97::TokenSeq& f : fixed) from_program = from_program || f.ids == s.ids;
+            if (!from_program)
+                throw std::runtime_error(
+                    "loop_reference: the batcher handed a sequence the program does not hold");
+        }
         return inner(fixed, p, g);
     };
 }
