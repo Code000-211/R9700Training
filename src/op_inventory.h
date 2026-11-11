@@ -68,6 +68,14 @@ bool record_prefill_step(const std::string& container, const std::string& radian
                          const std::vector<std::string>& kernels,
                          const std::vector<int32_t>& token_ids, Tape& tape, std::string* error);
 
+// The same step for a batch of prompts, laid out in this order: one step, text only, speculation
+// off. The reference step runs its live trace through this, and `r97train ops --record --batch`
+// writes the program it produces.
+bool record_prefill_batch(const std::string& container, const std::string& radiance_home,
+                          const std::vector<std::string>& kernels,
+                          const std::vector<std::vector<int32_t>>& prompts, Tape& tape,
+                          std::string* error);
+
 // Resolve a recorded step into rows. `seeds` are the named boundaries the forward driver exposes
 // to an objective, `logits` in the plain forward and `ce`, `gate_logits` in the rollout driver; an
 // op carries the seed whose buffer it writes.

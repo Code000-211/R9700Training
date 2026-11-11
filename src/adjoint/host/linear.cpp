@@ -7,6 +7,7 @@
 #include "r97/adjoint.h"
 
 #include <algorithm>
+#include <map>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -50,6 +51,23 @@ double param_double(const OpRecord& rec, const char* name, double fallback) {
 int operand_pos(const OpRecord& rec, const char* name) {
     for (std::size_t i = 0; i < rec.operands.size(); ++i) {
         if (rec.operands[i].buffer == name) return static_cast<int>(i);
+    }
+    // A composed graph keeps the fixture's own buffer names; the schema name then identifies a
+    // read by its position in the op's operand list.
+    static const std::map<std::string, std::vector<std::string>> kSchema = {
+        {"gemm_nt", {"a", "b"}},
+        {"gemm_nt_q", {"a", "b", "a_scale", "b_scale"}},
+        {"logits_gemm", {"x", "lm_head"}},
+        {"gather_rows", {"x", "idx"}},
+        {"embed_lookup", {"tokens", "wte"}},
+    };
+    const auto it = kSchema.find(rec.op);
+    if (it == kSchema.end()) return -1;
+    std::size_t read = 0;
+    for (std::size_t i = 0; i < rec.operands.size(); ++i) {
+        if (rec.operands[i].written) continue;
+        if (read < it->second.size() && it->second[read] == name) return static_cast<int>(i);
+        ++read;
     }
     return -1;
 }

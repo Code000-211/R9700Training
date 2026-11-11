@@ -183,16 +183,24 @@ bool resolve(const OpRecord& rec, const std::vector<AdValue>& fwd, Call* c) {
     c->q = &fwd[kQ];
     c->kv = &fwd[kKv];
     /* q is [rows][heads][head_dim], or one rank above with a batch dimension the rows flatten
-     * across; the pool is radiance's [block][key/value head][slot][2 * head_dim]. */
-    if (c->q->shape.size() < 3 || c->kv->shape.size() != 4) return false;
-    c->head_dim = c->q->shape.back();
+     * across, or the tape's flat [rows][heads * head_dim]; the pool is radiance's
+     * [block][key/value head][slot][2 * head_dim]. */
+    if (c->q->shape.size() < 2 || c->kv->shape.size() != 4) return false;
     c->kv_heads = c->kv->shape[1];
+    int64_t heads = 0;
+    if (c->q->shape.size() >= 3) {
+        c->head_dim = c->q->shape.back();
+        heads = c->q->shape[c->q->shape.size() - 2];
+        /* head_dim is a derived parameter: when the record spells it out it must say the same. */
+        if (param_int(rec, "head_dim", c->head_dim) != c->head_dim) return false;
+    } else {
+        c->head_dim = param_int(rec, "head_dim", 0);
+        if (c->head_dim <= 0 || c->q->shape[1] % c->head_dim != 0) return false;
+        heads = c->q->shape[1] / c->head_dim;
+    }
     if (c->head_dim <= 0 || c->kv_heads <= 0) return false;
     if (c->kv->shape[3] < 2 * c->head_dim) return false;
-    /* head_dim is a derived parameter: when the record spells it out it must say the same. */
-    if (param_int(rec, "head_dim", c->head_dim) != c->head_dim) return false;
 
-    const int64_t heads = c->q->shape[c->q->shape.size() - 2];
     c->gqa = param_int(rec, "gqa", 0);
     if (c->gqa <= 0) c->gqa = (heads % c->kv_heads == 0) ? heads / c->kv_heads : 1;
     c->q_heads = c->gqa * c->kv_heads;
