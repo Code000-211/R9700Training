@@ -79,6 +79,9 @@ struct ReplayStep {
 
     ReplayStep() = default;
     ~ReplayStep() {
+        if (recorder) recorder->detach();
+        recorder.reset();
+        tape.detach();
         engine.reset();
         if (!dir.empty()) {
             std::error_code ec;
@@ -143,6 +146,7 @@ struct ReplayStep {
                                      rad_strerror(s));
         store = recorder->store();
         recorder->detach();
+        tape.detach();
     }
 };
 
