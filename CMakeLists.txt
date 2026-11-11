@@ -369,6 +369,14 @@ if(R97_BUILD_TESTS)
                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/patch_sets_test.cmake)
   set_tests_properties(patch_sets PROPERTIES LABELS host)
 
+  # The patch audit: every patch's budget and upstream status in docs/UPSTREAM.md, its two header
+  # lines, and the serving set's isolation from the training set. The test drives the failures on
+  # copies, so the audit's pass on this tree is checked together with its reasons to fail.
+  add_test(NAME patch_audit
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/patch_audit_test.sh
+                   ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(patch_audit PROPERTIES LABELS host)
+
   if(TARGET r97_gpu_tests)
     add_test(NAME gpu_tests COMMAND r97_gpu_tests)
     set_tests_properties(gpu_tests PROPERTIES LABELS gpu RUN_SERIAL TRUE)
