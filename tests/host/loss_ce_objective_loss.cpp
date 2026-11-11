@@ -63,9 +63,11 @@ static void hand_computed() {
 // The whole step in one window: the objective's loss and count are ce_loss's on the same logits,
 // bit for bit (same scored rows, same order, same f64 accumulation).
 static void whole_call_is_the_loss() {
-    const std::vector<int64_t> shape{5, 4};
-    const std::vector<float> logits = small_logits(5, 4);
-    const r97::CeSum want = r97::ce_loss(scored_sequence(), logits, 4);
+    // Five rows of six logits: the tokens run 0..5, so the vocabulary must hold the last scored
+    // token's id 5 (ce_position's row[id] is only an assert, which RelWithDebInfo compiles out).
+    const std::vector<int64_t> shape{5, 6};
+    const std::vector<float> logits = small_logits(5, 6);
+    const r97::CeSum want = r97::ce_loss(scored_sequence(), logits, 6);
     CHECK(want.scored == 3);
     CHECK(want.loss > 0.0);
 
@@ -87,10 +89,10 @@ static void whole_call_is_the_loss() {
 // Window by window: each window's loss is the sum over exactly the scored rows ce_grad_rows
 // names for it, and the windows add up to the whole call.
 static void windows_are_the_sum() {
-    const std::vector<int64_t> shape{5, 4};
-    const std::vector<float> logits = small_logits(5, 4);
+    const std::vector<int64_t> shape{5, 6};
+    const std::vector<float> logits = small_logits(5, 6);
     const Batch b = scored_sequence();
-    const r97::CeSum whole = r97::ce_loss(b, logits, 4);
+    const r97::CeSum whole = r97::ce_loss(b, logits, 6);
 
     double loss = 0.0;
     int64_t scored = 0;
@@ -104,7 +106,7 @@ static void windows_are_the_sum() {
 
         // The wrapped function over the same window's rows: the same f64 sum, in the same order.
         const r97::CeSum want =
-            r97::ce_sum(logits.data(), 4, r97::ce_grad_rows(b, w[0], w[1]), nullptr, 1.0);
+            r97::ce_sum(logits.data(), 6, r97::ce_grad_rows(b, w[0], w[1]), nullptr, 1.0);
         CHECK(got.scored == want.scored);
         CHECK(got.loss == want.loss);
 
