@@ -88,9 +88,10 @@ fixture's delta-net geometry (2 key heads over 4 value heads, 16 lanes, chunk 64
 below one chunk, exactly one, two chunks with a short last, a three-sequence batch, and one
 geometry without grouping (one key head per value head, 32 lanes); four more are the real model's
 (16 key heads over 48 value heads, 128 lanes, chunk 64, `docs/DESIGN.md`): 1024 tokens as one
-sequence, 1024 as a batch of unequal lengths, 4096 as one sequence, and 4096 as a batch of unequal
-lengths. The batches are there because `cu_seqlens` addresses rows: a chunk must not take the next
-sequence's keys for its own.
+sequence, 1024 as a batch of unequal lengths (`250+750+24`, the third shorter than one chunk), 4096
+as one sequence, and 4096 as a batch of unequal lengths (`1000+3000+96`). The batches are there
+because `cu_seqlens` addresses rows: a chunk must not take the next sequence's keys for its own,
+and a sequence's first chunk starts one row past the previous sequence's last short chunk.
 
 The test also runs the harness against a deliberately wrong kernel (the right cotangents with
 `dg`'s sign thrown away) and requires the harness to reject it in `dg`'s slot — otherwise a
@@ -127,34 +128,39 @@ the op's f64 host twin over the same operands in the same run, which `docs/kerne
 the honest reference until an op has a device forward. `grp = 3` at the real geometry.
 
 ```
-gdn_kkt_solve 5 x 4 heads of 16, chunk 64    1.093 ms adjoint     0.003 ms forward twin  399.46x forward  scratch peak 11 KiB
-gdn_kkt_solve 64 x 4 heads of 16, chunk 64    4.028 ms adjoint     0.221 ms forward twin   18.19x forward  scratch peak 144 KiB
-gdn_kkt_solve 101 x 4 heads of 16, chunk 64    3.434 ms adjoint     0.282 ms forward twin   12.16x forward  scratch peak 227 KiB
-gdn_kkt_solve 5+64+150 x 4 heads of 16, chunk 64 batch    3.722 ms adjoint     0.689 ms forward twin    5.40x forward  scratch peak 492 KiB
-gdn_kkt_solve 90 x 2 heads of 32, chunk 64    2.892 ms adjoint     0.178 ms forward twin   16.20x forward  scratch peak 126 KiB
-gdn_kkt_solve 1024 x 48 heads of 128, chunk 64   33.272 ms adjoint   200.457 ms forward twin    0.17x forward  scratch peak 37632 KiB
-gdn_kkt_solve 1024+512+2560 x 48 heads of 128, chunk 64 batch  201.261 ms adjoint   885.677 ms forward twin    0.23x forward  scratch peak 150528 KiB
-gdn_kkt_solve 4096 x 48 heads of 128, chunk 64  201.409 ms adjoint   899.255 ms forward twin    0.22x forward  scratch peak 150528 KiB
-gdn_kkt_solve 1000+3000+96 x 48 heads of 128, chunk 64 batch  200.431 ms adjoint   872.787 ms forward twin    0.23x forward  scratch peak 150528 KiB
+gdn_kkt_solve 5 x 4 heads of 16, chunk 64    1.190 ms adjoint     0.003 ms forward twin  435.28x forward  scratch peak 11 KiB
+gdn_kkt_solve 64 x 4 heads of 16, chunk 64    4.236 ms adjoint     0.383 ms forward twin   11.06x forward  scratch peak 144 KiB
+gdn_kkt_solve 101 x 4 heads of 16, chunk 64    3.962 ms adjoint     0.285 ms forward twin   13.88x forward  scratch peak 227 KiB
+gdn_kkt_solve 5+64+150 x 4 heads of 16, chunk 64 batch    4.026 ms adjoint     0.937 ms forward twin    4.30x forward  scratch peak 492 KiB
+gdn_kkt_solve 90 x 2 heads of 32, chunk 64    3.239 ms adjoint     0.179 ms forward twin   18.13x forward  scratch peak 126 KiB
+gdn_kkt_solve 1024 x 48 heads of 128, chunk 64   36.782 ms adjoint   206.739 ms forward twin    0.18x forward  scratch peak 37632 KiB
+gdn_kkt_solve 250+750+24 x 48 heads of 128, chunk 64 batch   33.970 ms adjoint   193.507 ms forward twin    0.18x forward  scratch peak 37632 KiB
+gdn_kkt_solve 4096 x 48 heads of 128, chunk 64  200.562 ms adjoint   908.599 ms forward twin    0.22x forward  scratch peak 150528 KiB
+gdn_kkt_solve 1000+3000+96 x 48 heads of 128, chunk 64 batch  201.601 ms adjoint   877.472 ms forward twin    0.23x forward  scratch peak 150528 KiB
 ```
 
 A batch costs what one sequence costs for the same tokens: 4096 tokens is 201 ms whether it is one
-sequence or three, and 1000+3000+96 is 200 ms, because a chunk's work depends on its own rows and
-the block count is the number of (sequence, chunk, key head) triples. The call is 4.5× to 5×
-cheaper than the f64 host twin at the real shapes. The per-token cost is not flat between 1024 and
-4096 tokens (33 ms for 1024 against 201 for 4096): the 4096 call moves four times the f32 operand
-volume through the same upload path. At the fixture's geometric sizes the number is launch and copy
-overhead, not the kernel, and the ratio means nothing there.
+sequence or three, 1000+3000+96 is 202 ms, and 1024 tokens is 37 ms as one sequence and 34 ms as
+250+750+24 — a few percent apart, which is noise, and the batch is not cheaper in principle: it
+carries one more chunk block than the single sequence. A chunk's work depends on its own rows, and
+the block count is the number of (sequence, chunk, key head) triples. The call is 4.4× to 5.7×
+cheaper than the f64 host twin at the real shapes. The per-token cost is not flat between 1024
+and 4096 tokens (37 ms for 1024 against 201 for 4096): the 4096 call moves four times the f32
+operand volume through the same upload path. At the fixture's geometric sizes the number is launch
+and copy overhead, not the kernel, and the ratio means nothing there.
 
 The scratch peak is the whole call's device footprint, which is dominated by `A` and `Ac` at f32
-(48 MiB each at 4096 tokens), then `k` (32 MiB) and `dk` (16 MiB); 36,864 KiB at 1024 tokens and
-150,528 KiB at 4096 is that same list scaled. It is the peak the harness's allocator ledger records,
-not the kernel's shared memory (§2: 50.25 KiB per block).
+(48 MiB each at 4096 tokens), then `k` (32 MiB) and `dk` (16 MiB); 37,632 KiB at 1024 tokens and
+150,528 KiB at 4096 is that same list scaled (36,864 and 147,456 KiB of it), plus the `beta` and
+`g` operands with their gradients. It is the peak the harness's allocator ledger records, not the
+kernel's shared memory (§2: 50.25 KiB per block).
 
-Numbers from a shared card: a second run of the same binary moved the 4096-token adjoint from 201
-to 230 ms and its twin from 899 to 1022 ms while another tenant was busy, so treat the ratios as
-what this machine measured at the time, not as a specification, and do not compare them across
-cards.
+Numbers from a shared card: the block above is one run, taken while other contributors were
+building (load average 15 to 27 of 48 cores); it put the 1024-token adjoint at 37 ms where an
+earlier, quieter run had 33 ms. The same binary on the same card moved the 4096-token adjoint from
+201 to 578 ms and its twin from 899 to 3575 ms while the machine sat at a load average of 110, so
+treat the ratios as what this machine measured at the time, not as a specification, and do not
+compare them across cards.
 
 ## 6. Running it
 

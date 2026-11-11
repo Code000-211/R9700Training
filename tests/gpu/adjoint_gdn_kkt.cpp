@@ -6,9 +6,10 @@
 //     value heads, 16 lanes, chunk 64, docs/FIXTURES.md) and at the real model's (5120 hidden, 16
 //     key heads over 48 value heads, 128 lanes, chunk 64, docs/DESIGN.md);
 //   * a chunk is solved on its own operands, so the fixture covers below one chunk, exactly one,
-//     and a short last chunk; the real model covers 1024 tokens as one sequence, 4096 tokens as
-//     one sequence, and each as a batch of unequal lengths, because cu_seqlens addresses rows and
-//     a batch must not hand a chunk another sequence's keys;
+//     and a short last chunk; the real model covers 1024 tokens as one sequence, 1024 as a batch
+//     of unequal lengths (250+750+24), 4096 tokens as one sequence, and 4096 as a batch of unequal
+//     lengths (1000+3000+96), because cu_seqlens addresses rows and a batch must not hand a chunk
+//     another sequence's keys;
 //   * the 4096-token call's largest error against the f64 host adjoint is printed, with how many
 //     elements sit outside the tolerance, and beside it the same solve with Y and Et rounded to
 //     bf16 as they are formed -- the arithmetic the kernel does not do, and the number
@@ -347,7 +348,9 @@ std::vector<Timed> real_cases() {
     Geometry one = g;
     one.lens = {1024};
     out.push_back({kkt_case(one, 0x9d010001ull), 5});
-    one.lens = {1024, 512, 2560};
+    // 1024 tokens over three sequences, each with a short last chunk and the third shorter than
+    // one chunk, so a sequence's chunk grid cannot be the previous one's plus the chunk length.
+    one.lens = {250, 750, 24};
     out.push_back({kkt_case(one, 0x9d010002ull), 5});
     one.lens = {4096};
     out.push_back({kkt_case(one, 0x9d010003ull), 3});
