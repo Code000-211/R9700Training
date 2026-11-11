@@ -1,0 +1,23 @@
+Concern: an operand whose kernel also reads the value it replaces is marked as such
+Upstream: not-submitted
+
+--- a/abi/rad_runtime.h
++++ b/abi/rad_runtime.h
+@@ -943,6 +943,7 @@
+     int64_t  view_stride[RAD_MAX_RANK];
+     int64_t  view_off;
+     uint8_t  written;      /* 1 for RAD_OPD_OUT and RAD_OPD_INOUT, 0 otherwise */
++    uint8_t  inout;        /* 1 for RAD_OPD_INOUT, whose previous value the kernel also reads */
+ } RadIssueOperand;
+ 
+ typedef struct RadIssueOp {
+--- a/core/runtime/issue.cpp
++++ b/core/runtime/issue.cpp
+@@ -1383,6 +1383,7 @@
+         const int role = (p.info && p.info->schema && i < p.info->schema->n_operands)
+                              ? p.info->schema->operands[i].role : RAD_OPD_IN;
+         e.written = (role == RAD_OPD_OUT || role == RAD_OPD_INOUT) ? 1 : 0;
++        e.inout = role == RAD_OPD_INOUT ? 1 : 0;
+     }
+     RadIssueOp ev{};
+     ev.op         = h;
