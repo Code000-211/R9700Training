@@ -5,7 +5,6 @@
 #include "support/test.h"
 #include "support/vector_tape.h"
 
-#include <cassert>
 #include <cstdio>
 
 using r97::Batch;
@@ -34,33 +33,33 @@ R97_TEST(vector_tape) {
 
     // Rows [1, 3) come back whole, in order, as f32.
     std::vector<float> got = tape.read("logits", 1, 3, true);
-    assert((got == std::vector<float>{3, 4, 5, 6, 7, 8}));
+    R97_CHECK(got == std::vector<float>({3, 4, 5, 6, 7, 8}));
 
     // The window is the whole buffer until a test restricts it.
     int64_t lo = -1, hi = -1;
     tape.window("logits", &lo, &hi);
-    assert(lo == 0 && hi == 5);
+    R97_CHECK(lo == 0 && hi == 5);
 
     tape.set_window("logits", 2, 5);
     tape.window("logits", &lo, &hi);
-    assert(lo == 2 && hi == 5);
+    R97_CHECK(lo == 2 && hi == 5);
 
     // Only rows inside the window read out of the restricted range, row counts per shape.
-    assert(tape.shape("logits") == std::vector<int64_t>({5, 3}));
-    assert(tape.boundaries() == std::vector<std::string>({"logits"}));
-    assert(tape.total_scored() == 4);
-    assert(tape.batch().size() == 2 && tape.batch()[1].ids[2] == 7);
+    R97_CHECK(tape.shape("logits") == std::vector<int64_t>({5, 3}));
+    R97_CHECK(tape.boundaries() == std::vector<std::string>({"logits"}));
+    R97_CHECK(tape.total_scored() == 4);
+    R97_CHECK(tape.batch().size() == 2 && tape.batch()[1].ids[2] == 7);
 
     // The record holds every read, with its range and its differentiated flag; a read of another
     // buffer would not be folded into the first's record.
-    assert(tape.reads_of("logits").size() == 1);
-    assert(tape.reads_of("logits")[0].row_lo == 1 && tape.reads_of("logits")[0].row_hi == 3);
-    assert(tape.reads_of("logits")[0].differentiated == true);
+    R97_CHECK(tape.reads_of("logits").size() == 1);
+    R97_CHECK(tape.reads_of("logits")[0].row_lo == 1 && tape.reads_of("logits")[0].row_hi == 3);
+    R97_CHECK(tape.reads_of("logits")[0].differentiated == true);
     tape.read("logits", 0, 1, false);
     tape.read("logits", 1, 2, true);
-    assert(tape.reads().size() == 3);
-    assert(!tape.reads()[1].differentiated && tape.reads()[2].differentiated);
-    assert(tape.reads_of("other").empty());
+    R97_CHECK(tape.reads().size() == 3);
+    R97_CHECK(!tape.reads()[1].differentiated && tape.reads()[2].differentiated);
+    R97_CHECK(tape.reads_of("other").empty());
 
     std::puts("vector_tape ok");
 }
