@@ -7,9 +7,10 @@
 // re-issues only that block. The residual the block leaves must be the bytes the store took from
 // the forward's same buffer, both in the forward order and in reverse.
 //
-// The block brackets and the post-issue observer are training patches on radiance
+// The block brackets and the issue observer are training patches on radiance
 // (patches/training/0101 and 0102); a serving build applies neither, so this test compiles to
-// nothing there.
+// nothing there. A build with 0102 left out (-DR97_PATCH_SKIP=0102) has the observer but no replay:
+// the two tests are skipped by name, not failed.
 #include "support/replay_step.h"
 
 #if defined(R97_REPLAY) && R97_FIXTURE_PREFILL
@@ -148,6 +149,32 @@ struct ReplayAtExit {
             std::fprintf(stderr, "replay: could not register the runner\n");
     }
 } replay_at_exit;
+
+}  // namespace
+
+#else
+
+// A build without the patch (or without the tiny prefill fixture) cannot replay a layer. Say so by
+// name so the host tier's output distinguishes a skip from a test that passed or never existed.
+#undef CHECK
+#include "support/self_check.h"
+
+namespace {
+
+struct ReplaySkips {
+    ReplaySkips() {
+#if !defined(RAD_ISSUE_OBSERVER)
+        constexpr const char* why = "the issue observer patch 0101 is not in this build";
+#elif !defined(RAD_REPLAY_BLOCK)
+        constexpr const char* why = "the replay patch 0102 is not in this build: "
+                                    "-DR97_PATCH_SKIP took it out (RAD_REPLAY_BLOCK is undefined)";
+#else
+        constexpr const char* why = "the tiny prefill fixture is not in this build";
+#endif
+        ::r97test::skip("layer_replay_keeps_every_boundary_and_is_bit_identical", why);
+        ::r97test::skip("layer_replay_runs_in_reverse_order", why);
+    }
+} replay_skips;
 
 }  // namespace
 

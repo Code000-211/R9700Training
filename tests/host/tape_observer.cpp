@@ -374,9 +374,10 @@ R97_TEST(tape_observer_detached_leaves_the_runtime_alone) {
     R97_CHECK(g_calls.size() == 4);
 }
 
-// keep_contents makes the tape copy each operand's bytes as the op is issued. Without it a content
-// is the buffer, so a reader sees whatever the last writer left there; with it, the bytes a step's
-// ops read outlive the step, which is what a comparison between an op and a later one needs.
+// keep_contents makes the tape copy each operand's bytes when it records the op, which the
+// issue observer does after the op ran. Without it a content is the buffer, so a reader sees
+// whatever the last writer left there; with it, the bytes a step's ops touched outlive the step,
+// which is what a comparison between an op and a later one needs.
 R97_TEST(tape_observer_keeps_the_contents_when_asked) {
     Fixture f;
     R97_CHECK(f.start() == RAD_OK);

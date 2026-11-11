@@ -307,10 +307,11 @@ inline Matrix matrix(const Tape& t, size_t op, size_t operand, int64_t cols) {
 }
 
 // One place an adapter lands: the trunk weight, the GEMM that reads it, the shrink radiance puts
-// before it and the expand after it, and the copy that holds the site's output. The output is the
-// buffer's value after the expand added its delta, which is the copy of the first op after it that
-// names the same buffer: the observer runs before its op, so that copy is the buffer the expand
-// left. Without one, the site's output is not readable after the step and `has_output()` is false.
+// before it and the expand after it, and the copy that holds the site's output. The observer runs
+// after its op (patches/training/0101-issue-observer.patch), so the expand's own `y` (:inout)
+// operand is copied once the delta is in it: that copy is the site's output, base plus delta. A
+// site whose expand did not name the whole output is not readable after the step and
+// `has_output()` is false.
 struct Site {
     std::string weight;                  // "blk.3.ffn_down.weight"
     size_t      gemm = 0, shrink = 0, expand = 0;
@@ -353,19 +354,14 @@ inline std::vector<Site> sites(const Tape& t) {
         s.k    = int_param(ops[s.gemm], "K");
         s.rank = int_param(ops[s.expand], "R");
 
-        const std::string& y    = ops[s.expand].operands[4].buffer;
-        const size_t       want = (size_t)(s.rows * s.n * 2);   // bf16 rows of the site's output
-        bool               found = false;
-        for (size_t j = s.expand + 1; j < ops.size() && !found; ++j)
-            for (size_t k = 0; k < ops[j].operands.size(); ++k) {
-                const Operand& o = ops[j].operands[k];
-                if (o.buffer != y || o.rows != s.rows) continue;
-                if (t.content(j, k).bytes != want) continue;
-                s.out_op      = j;
-                s.out_operand = k;
-                found         = true;
-                break;
-            }
+        // The expand's `y` is its last operand (:inout), and the copy of it is taken after the
+        // expand ran. The GEMM's output is the same buffer, so this copy is base plus delta.
+        const size_t want = (size_t)(s.rows * s.n * 2);   // bf16 rows of the site's output
+        if (ops[s.expand].operands.size() > 4 && ops[s.expand].operands[4].rows == s.rows &&
+            t.content(s.expand, 4).bytes == want) {
+            s.out_op      = s.expand;
+            s.out_operand = 4;
+        }
         out.push_back(std::move(s));
     }
     return out;

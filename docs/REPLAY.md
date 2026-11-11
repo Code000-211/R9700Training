@@ -26,29 +26,30 @@ step, not that either matches an oracle.
 
 ## Recording
 
-`BoundaryRecorder` installs radiance's replay observer (the `issued` callback that runs after an
-op, `patches/training/0102`) and watches the block brackets of `0101`. An operand is the residual
-when it is written and is exactly `tokens * hidden * 2` bytes. The first one seen names the
-buffer, and later operands must carry the same name, so a norm or a calibration tap of the same
-size is not mistaken for the residual. At a block begin the recorder remembers the last residual
-write for boundary 0, and at the block end it keeps that write as boundary `block + 1`. Detach
-before a replay: there is one observer slot per context.
+`BoundaryRecorder` subscribes to the tape's issue hook and block-bracket hook, so the tape remains
+the one holder of the context's observer; it is constructed with the attached tape. The observer
+runs after each op, so an operand is the residual when it is written, names a declared buffer,
+and is exactly `tokens * hidden * 2` bytes. The first one seen names the buffer, and later
+operands must carry the same name, so a norm, a calibration tap of the same size or a KV write
+(whose tape identity is synthetic) is not mistaken for the residual. At a block begin the
+recorder remembers the last residual write for boundary 0, and at the block end it keeps that
+write as boundary `block + 1`. Detach before a replay: the replay replaces those two hooks.
 
 ## Replaying one layer
 
-`LayerReplay` copies the tape's op records and block ranges at construction and detaches the tape,
-because the replay needs the observer slot itself. `replay(layer)`:
+`LayerReplay` copies the tape's op records and block ranges at construction and detaches the tape.
+`replay(layer)` attaches that same tape again for the replayed block, with the replay's own hooks:
 
 1. copies stored boundary `layer` into the buffer the forward wrote boundary `layer` from, so the
    block starts from its stored input;
-2. installs its own observer and calls `Engine::replay_block(layer)`, which clears the stateful
-   groups' slots for the step's sequences (the batch's own `state_index`, the same slots the step
-   used) and runs the step with the replay block set;
+2. attaches the tape, whose issue hook is now the replay's, and calls `Engine::replay_block(layer)`,
+   which clears the stateful groups' slots for the step's sequences (the batch's own
+   `state_index`, the same slots the step used) and runs the step with the replay block set;
 3. `qwen35_bf16`'s step, with the replay block set, skips the embeddings and the head and calls the
    recorded layer's `run_layer()` alone, calibration taps included;
-4. the observer calls the caller's `after` once per op, in the forward's order, before the next op
-   can reuse a transient buffer. Nothing written by an earlier op may be assumed to survive that
-   call.
+4. the tape's issue hook calls the caller's `after` once per op, in the forward's order, before the
+   next op can reuse a transient buffer. Nothing written by an earlier op may be assumed to survive
+   that call.
 
 The gated-delta-net state must start at zero, not where the forward left it; clearing the slots
 does that. The paged key-value pages need no reset: the batch's used counts and slot map are the
@@ -62,8 +63,11 @@ The engine must outlive the replay, and the recorded step must be the engine's l
 
 The code is guarded by `RAD_ISSUE_OBSERVER` (patch 0101) and `RAD_REPLAY_BLOCK` (patch 0102), so a
 serving build compiles it away and has no replay rather than one that would run the whole model.
-Both patches are training-set patches and apply in name order; 0102 does not depend on a radiance
-version newer than the submodule's.
+Both patches are training-set patches and apply in name order; 0102 adds the replay block and the
+architecture's agreement to honour it, and no observer of its own. A build with
+`-DR97_PATCH_SKIP=0102` has the observer and the brackets but no replay: the two host tests skip by
+name rather than fail. `docs/UPSTREAM.md` carries each patch's budget and `ci/patch_audit.sh`
+enforces it.
 
 ## The host test
 

@@ -14,13 +14,16 @@
 # directories, is applied in that order. Training patches are numbered 01xx, serving patches 02xx,
 # so "all" applies training hooks before the LoRA serving support.
 
-# r97_selected_patches(<patches_root> <set> <out>)
+# r97_selected_patches(<patches_root> <set> <out> [skip])
 #   Glob the selected patch sets into <out>, sorted by file name.
-#   <set> is "all" (serving + training) or "serving" (serving only).
+#   <set> is "all" (serving + training) or "serving" (serving only). <skip> is a patch's number
+#   (its leading digits, e.g. 0102): every patch with that number is left out, which is how a
+#   build checks that one patch is optional. A skip that matches no selected patch is an error.
 function(r97_selected_patches patches_root set out)
   if(NOT set STREQUAL "all" AND NOT set STREQUAL "serving")
     message(FATAL_ERROR "r97: R97_PATCH_SET is '${set}', expected 'all' or 'serving'.")
   endif()
+  set(skip "${ARGV3}")
   set(pairs "")
   foreach(dir serving training)
     if(set STREQUAL "all" OR dir STREQUAL "serving")
@@ -35,20 +38,31 @@ function(r97_selected_patches patches_root set out)
   # training's; sorting the file names gives the one global order.
   list(SORT pairs)
   set(patches "")
+  set(skipped 0)
   foreach(pair ${pairs})
     string(REGEX REPLACE "^[^|]*\\|" "" p "${pair}")
-    list(APPEND patches "${p}")
+    get_filename_component(name "${p}" NAME)
+    string(REGEX MATCH "^[0-9]+" number "${name}")
+    if(skip AND number STREQUAL skip)
+      math(EXPR skipped "${skipped} + 1")
+    else()
+      list(APPEND patches "${p}")
+    endif()
   endforeach()
+  if(skip AND skipped EQUAL 0)
+    message(FATAL_ERROR "r97: R97_PATCH_SKIP=${skip} names no patch of the '${set}' set.")
+  endif()
   set(${out} "${patches}" PARENT_SCOPE)
 endfunction()
 
-# r97_apply_patches(<src_dir> <patches_root> <set>)
+# r97_apply_patches(<src_dir> <patches_root> <set> [skip])
 #   Apply every patch of the selected sets, in name order, to the source tree at <src_dir>.
 #   A patch that does not apply, or lacks its two header lines, stops the configure (or script)
 #   with a message naming the patch. Idempotent by construction: each call re-applies from the
 #   pristine copy the caller prepared.
 function(r97_apply_patches src_dir patches_root set)
-  r97_selected_patches("${patches_root}" "${set}" patches)
+  set(skip "${ARGV3}")
+  r97_selected_patches("${patches_root}" "${set}" patches "${skip}")
 
   find_program(PATCH_EXECUTABLE patch REQUIRED)
 

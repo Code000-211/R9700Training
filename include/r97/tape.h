@@ -29,10 +29,13 @@
 namespace r97 {
 
 // One operand's content at the issue: the slice the kernel saw, not the whole declared buffer.
-// `bytes` is 0 when the slice is not one contiguous span.
+// `bytes` is 0 when the slice is not one contiguous span. `named` says the operand named a
+// declared buffer or weight; the tape's identities for KV, raw and table operands are synthetic, so
+// a reader that must find one declared buffer by name (the replay's residual) ignores those.
 struct OperandContent {
     const void* data = nullptr;
     size_t bytes = 0;
+    bool named = false;
 };
 
 class Tape {
@@ -63,7 +66,7 @@ public:
     // after the step has to turn this on: a later block reuses the same activation buffers, so by
     // the end of the step an address holds the last writer's values rather than the ones the op
     // saw. Off by default, because on it keeps the step's whole operand traffic. The observer runs
-    // before the op does, so a written operand's copy is its content before the op.
+    // after the op does, so a written operand's copy is what the op left.
     void keep_contents(bool on) { keep_ = on; }
     bool keeps_contents() const { return keep_; }
 
@@ -72,6 +75,13 @@ public:
     // the ops before it are recorded, and false at its exit, when the block's own are.
     using BracketHook = std::function<void(const Tape& tape, int64_t block, bool begin)>;
     void set_bracket_hook(BracketHook hook);
+
+    // Called after an op is recorded and while the step's buffers still hold what it read and
+    // wrote, so a reader that must copy an op's output does it here, before the planner reuses the
+    // buffer. `operands` is contents(op.position). One hook; a later set replaces it.
+    using IssueHook = std::function<void(const Tape& tape, const OpRecord& op,
+                                         const std::vector<OperandContent>& operands)>;
+    void set_issue_hook(IssueHook hook);
 
     const std::vector<OpRecord>& ops() const { return ops_; }
     const std::vector<Block>& blocks() const { return blocks_; }
@@ -93,6 +103,7 @@ private:
 
     RadCtx* ctx_ = nullptr;
     BracketHook bracket_hook_;
+    IssueHook issue_hook_;
     int64_t block_ = -1;
     bool keep_ = false;
     std::vector<OpRecord> ops_;
