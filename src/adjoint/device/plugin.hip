@@ -15,6 +15,7 @@
 #include "rad_abi_layout.h"
 
 #include "r97/adjoint.h"
+#include "r97/head.h"
 
 #include "scratch.h"
 
@@ -53,6 +54,10 @@ extern "C" const RadKernelInfo* rad_kernel_at(int) { return nullptr; }
 namespace r97 {
 
 void adjoint_register(const char*, Side, AdjointFn, const std::vector<int>&, ParamPred) {}
+
+// The head's chunk kernel is not an op's adjoint: the loss registers it (include/r97/head.h) so the
+// walk in src/head.cpp can run a chunk on the card.
+void head_ce_register(HeadCeKernel) {}
 
 namespace device {
 
