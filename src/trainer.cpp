@@ -309,8 +309,9 @@ ConfigError::ConfigError(const std::string& key, const std::string& message)
                                      : "r97: config: '" + key + "': " + message),
       key_(key) {}
 
-Config parse_config(const std::string& text, const std::string& source) {
-    Config config;
+namespace {
+
+void parse_config_into(Config& config, const std::string& text, const std::string& source) {
     std::istringstream in(text);
     std::string line;
     int64_t line_number = 0;
@@ -328,17 +329,30 @@ Config parse_config(const std::string& text, const std::string& source) {
         if (key.empty()) refuse("", "missing a key before '='" + where);
         set_key(config, key, trim(stripped.substr(equals + 1)), where);
     }
-    return config;
 }
 
-Config read_config(const std::string& path) {
+void read_config_into(const std::string& path, Config& config) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("r97: config: cannot read '" + path + "'");
     std::ostringstream text;
     text << in.rdbuf();
     if (!in.good() && !in.eof())
         throw std::runtime_error("r97: config: cannot read '" + path + "'");
-    return parse_config(text.str(), path);
+    parse_config_into(config, text.str(), path);
+}
+
+}  // namespace
+
+Config parse_config(const std::string& text, const std::string& source) {
+    Config config;
+    parse_config_into(config, text, source);
+    return config;
+}
+
+Config read_config(const std::string& path) {
+    Config config;
+    read_config_into(path, config);
+    return config;
 }
 
 void apply_config_flag(Config& config, const std::string& key, const std::string& value) {
@@ -405,8 +419,10 @@ void validate_config(const Config& config) {
     require(!trim(config.out).empty(), "out", "must not be empty");
 }
 
-Config load_config(const std::string& path, const std::vector<std::string>& flags) {
-    Config config = path.empty() ? Config{} : read_config(path);
+Config load_config(const std::string& path, const std::vector<std::string>& flags,
+                   const Config& defaults) {
+    Config config = defaults;
+    if (!path.empty()) read_config_into(path, config);
     apply_config_flags(config, flags);
     validate_config(config);
     return config;

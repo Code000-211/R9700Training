@@ -75,13 +75,15 @@ int train_main(int argc, char** argv) {
     }
 
     try {
-        r97::Config cfg = config_path.empty() ? r97::Config{} : r97::read_config(config_path);
-        cfg.token_budget = 2048;
-        cfg.steps = 1;
-        cfg.lr = 1e-3;
-        cfg.accumulation = 1;
-        r97::apply_config_flags(cfg, flags);
-        r97::validate_config(cfg);
+        // The command's fallbacks sit under --config and the other flags: load_config() reads the
+        // file over them and applies the flags last, so a file's lr, steps, accumulation and
+        // token_budget are used and a flag still wins over both.
+        r97::Config fallback;
+        fallback.token_budget = 2048;
+        fallback.steps = 1;
+        fallback.lr = 1e-3;
+        fallback.accumulation = 1;
+        r97::Config cfg = r97::load_config(config_path, flags, fallback);
         if (cfg.data.empty()) cfg.data = "tests/fixtures/chat_small.jsonl";
 
         r97::ChatData chat;

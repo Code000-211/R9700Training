@@ -54,10 +54,13 @@ void apply_config_flags(Config& config, const std::vector<std::string>& args);
 // Every range docs/TRAINING.md documents. Throws ConfigError naming the key that is wrong.
 void validate_config(const Config& config);
 
-// Read the file (when `path` is not empty), apply the flags over it, then validate. This is what
-// a command line calls; `--config` itself is the caller's flag, not a configuration key.
+// Read the file (when `path` is not empty) over `defaults`, apply the flags over that, then
+// validate. This is what a command line calls; `--config` itself is the caller's flag, not a
+// configuration key. A command's own fallbacks go in `defaults`, so a key the file sets is never
+// overwritten by the command and a flag still wins over both.
 Config load_config(const std::string& path = "",
-                   const std::vector<std::string>& flags = {});
+                   const std::vector<std::string>& flags = {},
+                   const Config& defaults = Config{});
 
 // The optimiser settings the loop assumes for this configuration: the learning rate, weight
 // decay, warm-up, accumulation, and the cosine horizon (steps / accumulation, or no horizon when
