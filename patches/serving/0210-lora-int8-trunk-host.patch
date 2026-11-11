@@ -1,0 +1,369 @@
+Concern: a LoRA adapter on the rotated int8 trunk, through the host kernels
+Upstream: not-submitted
+diff --git a/core/engine_lora.cpp b/core/engine_lora.cpp
+index a8e0a08..0811ac2 100644
+--- a/core/engine_lora.cpp
++++ b/core/engine_lora.cpp
+@@ -59,6 +59,27 @@ int read_targets(const std::string& dir, std::set<std::string>* out, std::string
+     return RAD_OK;
+ }
+ 
++/* adapter_config.json's radiance_input_basis (lora::InputBasis, docs/ADAPTER.md §4): "" when the
++ * adapter declares no key. A value radiance serves no kernel for is refused here, naming it. */
++int read_input_basis(const std::string& name, const std::string& dir, std::string* out,
++                     std::string* err) {
++    const std::string path = dir + "/adapter_config.json";
++    std::ifstream f(path);
++    if (!f) { *err = "cannot read " + path; return RAD_E_NOTFOUND; }
++    nlohmann::json j;
++    try { f >> j; } catch (const std::exception& e) { *err = path + ": " + e.what(); return RAD_E_INVAL; }
++    const auto it = j.find("radiance_input_basis");
++    if (it == j.end() || it->is_null()) return RAD_OK;
++    if (!it->is_string()) { *err = path + ": radiance_input_basis is not a string"; return RAD_E_INVAL; }
++    *out = it->get<std::string>();
++    std::string why;
++    if (lora::parse_input_basis(*out, nullptr, &why) < 0) {
++        *err = fmt("adapter '%s': %s", name.c_str(), why.c_str());
++        return RAD_E_UNSUPPORTED;
++    }
++    return RAD_OK;
++}
++
+ /* A generator's adapter name: a file stem under --lora-dir, possibly in a subdirectory, never
+  * leaving it. */
+ bool valid_name(const std::string& n) {
+@@ -103,6 +124,41 @@ int Engine::lora_targets() {
+         }
+         if (cfg_.lora.adapters.empty()) lora_targets_.insert("*");
+     }
++    /* The basis the startup adapters' A factors are stored in: every site's GEMM is fed the same
++     * activation, so all of them must declare the same one. */
++    std::string basis_of, keyless;
++    for (const auto& [name, dir] : cfg_.lora.adapters) {
++        if (is_file(dir)) continue;   /* a generator's adapter file declares no targets here */
++        std::string err, b;
++        const int s = read_input_basis(name, dir, &b, &err);
++        if (s < 0) {
++            RAD_ERR("lora: %s", err.c_str());
++            return s;
++        }
++        if (b.empty()) {
++            if (keyless.empty()) keyless = name;
++            continue;
++        }
++        if (!cfg_.lora.input_basis.empty() && cfg_.lora.input_basis != b) {
++            RAD_ERR("lora: adapter '%s' declares \"radiance_input_basis\": \"%s\" and adapter '%s' "
++                    "declares \"%s\"; the sites' GEMMs are fed one activation, so every adapter "
++                    "must declare the same basis", basis_of.c_str(), cfg_.lora.input_basis.c_str(),
++                    name.c_str(), b.c_str());
++            return RAD_E_UNSUPPORTED;
++        }
++        if (cfg_.lora.input_basis.empty()) basis_of = name;
++        cfg_.lora.input_basis = b;
++    }
++    /* An adapter with no key leaves the sites' basis undetermined for it: with one adapter it is
++     * refused at the sites themselves (a weight in a transform basis), but beside one that did
++     * declare the key it would be applied in that basis, silently. */
++    if (!cfg_.lora.input_basis.empty() && !keyless.empty()) {
++        RAD_ERR("lora: adapter '%s' declares \"radiance_input_basis\": \"%s\" and adapter '%s' "
++                "declares none; one activation feeds every site, so an adapter stored in no "
++                "declared basis cannot ride along", basis_of.c_str(), cfg_.lora.input_basis.c_str(),
++                keyless.c_str());
++        return RAD_E_UNSUPPORTED;
++    }
+     lora_table_.reset(cfg_.lora.slots(), &lora_epoch_);
+     return RAD_OK;
+ }
+diff --git a/core/lora/config.h b/core/lora/config.h
+index bf08120..2680a35 100644
+--- a/core/lora/config.h
++++ b/core/lora/config.h
+@@ -35,6 +35,11 @@ struct LoraConfig {
+     /* HF module leaf names (q_proj, gate_proj, in_proj_qkv, ...) the sites are built for, sorted
+      * and unique. Empty: the union of the startup adapters' target_modules. */
+     std::vector<std::string> targets;
++    /* The basis the startup adapters' A factors are stored in (their adapter_config.json's
++     * radiance_input_basis): "" when they declare no key, "fwht128" for the rotated int8 trunk.
++     * declare refuses a value radiance serves no kernel for, and a value no weight of the trunk is
++     * stored in. */
++    std::string input_basis;
+ 
+     bool enabled() const { return max_loras > 0 || !adapters.empty() || !dir.empty(); }
+     int  slots() const {
+diff --git a/core/lora/declare.cpp b/core/lora/declare.cpp
+index ad04866..3fee53a 100644
+--- a/core/lora/declare.cpp
++++ b/core/lora/declare.cpp
+@@ -109,10 +109,29 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
+         return RAD_E_INVAL;
+     }
+ 
++    /* The basis the adapters' A factors are stored in (their adapter_config.json's
++     * "radiance_input_basis", docs/ADAPTER.md §4): kInputNatural unless the adapter declares the
++     * rotated basis, which only a trunk that rotates its activations carries. */
++    lora::InputBasis basis = lora::kInputNatural;
++    {
++        std::string why;
++        if (lora::parse_input_basis(d.cfg->input_basis, &basis, &why) < 0) {
++            RAD_ERR("lora: %s", why.c_str());
++            return RAD_E_UNSUPPORTED;
++        }
++        if (basis == lora::kInputFwht128 && !lora::trunk_transformed(P)) {
++            RAD_ERR("lora: an adapter declares \"radiance_input_basis\": \"%s\" and this model's "
++                    "weights are stored in no transform basis: its GEMMs are fed the activation "
++                    "as it is, so an A factor stored in a rotated basis multiplies the wrong thing",
++                    d.cfg->input_basis.c_str());
++            return RAD_E_UNSUPPORTED;
++        }
++    }
++
+     /* Every reader of a targeted weight carries the delta, or startup refuses: a weight some op
+      * multiplies without the adapter would be the base in one place and the adapter in another. */
+     std::vector<lora::UnsupportedUse> bad;
+-    int s = lora::find_unsupported_uses(P, d.targets, &bad);
++    int s = lora::find_unsupported_uses(P, d.targets, &bad, basis);
+     if (s < 0) return s;
+     if (!bad.empty()) {
+         for (const lora::UnsupportedUse& u : bad)
+@@ -126,7 +145,7 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
+     std::vector<lora::Site>  sites;
+     std::vector<std::string> pool_weights;
+     std::string              err;
+-    s = lora::build_sites(P, d.targets, max_rank, &sites, &err, &pool_weights);
++    s = lora::build_sites(P, d.targets, max_rank, &sites, &err, &pool_weights, basis);
+     if (s < 0) {
+         RAD_ERR("lora: %s", err.c_str());
+         return s;
+diff --git a/core/lora/lora.cpp b/core/lora/lora.cpp
+index 708784a..9bd1044 100644
+--- a/core/lora/lora.cpp
++++ b/core/lora/lora.cpp
+@@ -566,6 +566,27 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
+ 
+ }  /* namespace */
+ 
++/* ---------------------------------------------------------------- the input basis (lora.h) */
++int parse_input_basis(const std::string& s, InputBasis* out, std::string* err) {
++    if (s.empty()) {
++        if (out) *out = kInputNatural;
++        return RAD_OK;
++    }
++    if (s == "fwht128") {
++        if (out) *out = kInputFwht128;
++        return RAD_OK;
++    }
++    return fail(err, RAD_E_UNSUPPORTED,
++                fmt("radiance_input_basis is '%s'; radiance serves no adapter whose A factors are "
++                    "stored in that basis (only 'fwht128')", s.c_str()));
++}
++
++bool trunk_transformed(const Program& prog) {
++    for (size_t h = 1; h < prog.weights.size(); ++h)
++        if (prog.weights[h].enc_known && prog.weights[h].enc.transform[0]) return true;
++    return false;
++}
++
+ /* ================================================================== predicates */
+ bool weight_targeted(const Program& prog, rad_weight w, const TargetSet& targets) {
+     if (targets.empty() || w == 0 || w >= prog.weights.size()) return false;
+@@ -578,7 +599,8 @@ bool weight_targeted(const Program& prog, rad_weight w, const TargetSet& targets
+     return targeted_core(prog, wi, maps, targets);
+ }
+ 
+-bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::string* why) {
++bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::string* why,
++                InputBasis basis) {
+     auto no = [&](const std::string& m) { if (why) *why = m; return false; };
+     if (b_out) *b_out = 0;
+     const bool g = op.op == "gemm_nt", gb = op.op == "gemm_nt_bias", gq = op.op == "gemm_nt_q",
+@@ -616,14 +638,31 @@ bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::s
+             return no(fmt("%s reads K=%lld against a weight of %lld columns (a widened, rotated "
+                           "input)", op.op.c_str(), k, (long long)w.decl.shape[1]));
+     }
+-    if (w.enc_known && w.enc.transform[0])
+-        return no(fmt("weight '%s' is stored in the '%.*s' transform basis, so its GEMM is fed a "
+-                      "transformed activation", w.name.c_str(), (int)RAD_ENC_STR, w.enc.transform));
++    if (w.enc_known && w.enc.transform[0]) {
++        /* The GEMM is fed the rotated activation, so only an A stored in that same basis can
++         * multiply it (docs/ADAPTER.md, §4). */
++        if (basis == kInputNatural)
++            return no(fmt("weight '%s' is stored in the '%.*s' transform basis, so its GEMM is fed "
++                          "a transformed activation", w.name.c_str(), (int)RAD_ENC_STR,
++                          w.enc.transform));
++        if (std::strncmp(w.enc.transform, "fwht128", RAD_ENC_STR) != 0)
++            return no(fmt("weight '%s' is stored in the '%.*s' transform basis, and radiance serves "
++                          "no adapter in that basis (only 'fwht128')", w.name.c_str(),
++                          (int)RAD_ENC_STR, w.enc.transform));
++    } else if (basis == kInputFwht128) {
++        /* The adapter says its A factors are in the rotated basis; a site whose GEMM is fed a
++         * natural activation would then apply them in the wrong one, as silently as the case
++         * above. A trunk that is transformed need not have every weight be (blk.<l>.ssm_out of
++         * the w8a8 recipe stays bf16 at a K the recipe does not rotate). */
++        return no(fmt("weight '%s' is not stored in a transform basis, so its GEMM is fed a "
++                      "natural activation, and the adapter declares 'radiance_input_basis: "
++                      "fwht128'", w.name.c_str()));
++    }
+     return true;
+ }
+ 
+ int find_unsupported_uses(const Program& prog, const TargetSet& targets,
+-                          std::vector<UnsupportedUse>* out) {
++                          std::vector<UnsupportedUse>* out, InputBasis basis) {
+     if (out) out->clear();
+     if (targets.empty() || gen_scope(prog)) return 0;
+     const MapIndex mi(prog);
+@@ -633,7 +672,7 @@ int find_unsupported_uses(const Program& prog, const TargetSet& targets,
+         if (op.weights.empty() || !op_live(op)) continue;
+         rad_weight b = 0;
+         std::string why;
+-        const bool site = op_is_site(prog, op, &b, &why);
++        const bool site = op_is_site(prog, op, &b, &why, basis);
+         for (rad_weight h : op.weights) {
+             if (!targeted_idx(prog, mi, h, targets)) continue;
+             /* Every view of a targeted weight read by a site over the same logical weight is the
+@@ -662,7 +701,8 @@ int find_unsupported_uses(const Program& prog, const TargetSet& targets,
+ }
+ 
+ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
+-                std::vector<Site>* out, std::string* err, std::vector<std::string>* pool_weights) {
++                std::vector<Site>* out, std::string* err, std::vector<std::string>* pool_weights,
++                InputBasis basis) {
+     if (!out) return fail(err, RAD_E_INVAL, "build_sites: null output");
+     out->clear();
+     if (pool_weights) pool_weights->clear();
+@@ -677,7 +717,7 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
+             const OpInfo& op = prog.ops[i];
+             if (op.weights.empty() || !op_live(op)) continue;
+             rad_weight b = 0;
+-            const bool site = op_is_site(prog, op, &b, nullptr);
++            const bool site = op_is_site(prog, op, &b, nullptr, basis);
+             for (rad_weight h : op.weights)
+                 if (h && h < prog.weights.size() &&
+                     (!site || !b || prog.weights[b].source != prog.weights[h].source))
+@@ -687,7 +727,7 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
+     std::vector<size_t> first_site;
+     for (size_t i = 1; i < prog.ops.size(); ++i) {
+         rad_weight b = 0;
+-        if (!op_live(prog.ops[i]) || !op_is_site(prog, prog.ops[i], &b, nullptr)) continue;
++        if (!op_live(prog.ops[i]) || !op_is_site(prog, prog.ops[i], &b, nullptr, basis)) continue;
+         if (!targeted_idx(prog, mi, b, targets)) continue;
+         if (other_reader.count(prog.weights[b].source)) continue;
+         if (gen_scope(prog)) {
+@@ -731,7 +771,8 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
+     return RAD_OK;
+ }
+ 
+-std::string explain_module(const Program& prog, const TargetSet& targets, const std::string& module) {
++std::string explain_module(const Program& prog, const TargetSet& targets, const std::string& module,
++                           InputBasis basis) {
+     const std::string want[3] = {
+         module,
+         module.starts_with("model.") && !module.starts_with("model.language_model.")
+@@ -773,7 +814,7 @@ std::string explain_module(const Program& prog, const TargetSet& targets, const
+                 if (!uses) continue;
+                 rad_weight b = 0;
+                 std::string no;
+-                if (op_is_site(prog, op, &b, &no) && b == w) { site = true; continue; }
++                if (op_is_site(prog, op, &b, &no, basis) && b == w) { site = true; continue; }
+                 reads += fmt("%sop %zu %s (%s)", reads.empty() ? "" : "; ", i, op.op.c_str(), no.c_str());
+             }
+             if (!reads.empty()) why = std::string("'") + m.declared + "' is read by " + reads;
+@@ -865,6 +906,14 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
+                    cfg["use_rslora"].get<bool>();
+     if (cfg.contains("base_model_name_or_path") && cfg["base_model_name_or_path"].is_string())
+         info->base_model = cfg["base_model_name_or_path"].get<std::string>();
++    /* The basis this adapter's A factors are stored in (docs/ADAPTER.md §4). A value radiance
++     * serves no kernel for is refused here, naming it. */
++    if (cfg.contains("radiance_input_basis") && !cfg["radiance_input_basis"].is_null()) {
++        if (!cfg["radiance_input_basis"].is_string())
++            return fail(err, RAD_E_FORMAT, cfg_path + ": radiance_input_basis is not a string");
++        info->input_basis = cfg["radiance_input_basis"].get<std::string>();
++    }
++    if (int st = parse_input_basis(info->input_basis, nullptr, err); st < 0) return st;
+     if (cfg.contains("target_modules")) {
+         const ojson& t = cfg["target_modules"];
+         if (t.is_string()) info->target_modules.push_back(t.get<std::string>());
+@@ -1234,13 +1283,15 @@ int pack_modules(const std::vector<Site>& sites, int max_rank,
+ int check_placed(const std::vector<AdapterInfo>& per_rank, std::string* err, const Program* prog,
+                  const TargetSet* targets) {
+     if (per_rank.empty()) return RAD_OK;
++    InputBasis basis = kInputNatural;
++    if (parse_input_basis(per_rank[0].input_basis, &basis, nullptr) < 0) basis = kInputNatural;
+     for (const AdapterInfo::Module& m : per_rank[0].modules) {
+         bool anywhere = false;
+         for (const AdapterInfo& a : per_rank)
+             for (const AdapterInfo::Module& x : a.modules)
+                 if (x.name == m.name && x.pool >= 0) anywhere = true;
+         if (anywhere) continue;
+-        std::string why = prog && targets ? explain_module(*prog, *targets, m.name) : "";
++        std::string why = prog && targets ? explain_module(*prog, *targets, m.name, basis) : "";
+         return fail(err, RAD_E_NOTFOUND,
+                     "adapter module " + m.name + " is not a LoRA site on any rank" +
+                         (why.empty() ? std::string() : ": " + why));
+diff --git a/core/lora/lora.h b/core/lora/lora.h
+index 11156ce..ed5929b 100644
+--- a/core/lora/lora.h
++++ b/core/lora/lora.h
+@@ -101,6 +101,7 @@ struct AdapterInfo {
+     std::string dir;
+     std::string base_model;        /* base_model_name_or_path */
+     std::string peft_type;         /* "LORA" */
++    std::string input_basis;       /* radiance_input_basis: "" or "fwht128" */
+     int64_t     r = 0;             /* config r */
+     double      alpha = 0.0;       /* config lora_alpha */
+     bool        rslora = false;
+@@ -138,21 +139,40 @@ struct UnsupportedUse {
+  * A routed expert IS targeted when its leaf is (so its moe op is reported, never skipped). */
+ bool weight_targeted(const Program& prog, rad_weight w, const TargetSet& targets);
+ 
++/* The basis an adapter's A factors are stored in, which is the basis its sites' activations arrive
++ * in ("radiance_input_basis" in adapter_config.json, docs/ADAPTER.md, §4): kInputNatural when the
++ * adapter declares no key, kInputFwht128 for the 128-wide Hadamard the int8 trunk rotates every
++ * activation by before quantising it. */
++enum InputBasis { kInputNatural = 0, kInputFwht128 = 1 };
++
++/* The basis `s` names ("" -> kInputNatural, "fwht128" -> kInputFwht128), or a negative code after
++ * `err` names a value radiance serves no adapter in. */
++int parse_input_basis(const std::string& s, InputBasis* out, std::string* err);
++
++/* Whether any weight of this rank's Program is stored in a transform basis (the rotated int8 trunk
++ * does, a bf16 or plain-i8a8 trunk does not). */
++bool trunk_transformed(const Program& prog);
++
+ /* Is this op a LoRA-capable GEMM over weight handle `w` (as its `b` operand)? `why` says why not.
+  * gemm_nt; gemm_nt_bias without `act`; gemm_nt_q without `pb1`/`pb2`, with K == the weight's K,
+- * over a weight whose known encoding has no `transform`; gemm_nt_q_bias (same encoding rule). */
+-bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::string* why);
++ * over a weight whose known encoding has no `transform` -- or one whose transform is the basis the
++ * adapter declares (kInputFwht128), so its rotated activation is what an A stored in that basis
++ * multiplies; gemm_nt_q_bias (the same rules). */
++bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::string* why,
++                InputBasis basis = kInputNatural);
+ 
+ /* Every op that reads a targeted weight (any view of it) and is not a capable site over it. */
+ int find_unsupported_uses(const Program& prog, const TargetSet& targets,
+-                          std::vector<UnsupportedUse>* out);
++                          std::vector<UnsupportedUse>* out,
++                          InputBasis basis = kInputNatural);
+ 
+ /* The Sites of one rank's Program. `pool_weights` (optional) receives the per-weight pool list:
+  * Site::pool indexes it, and its order is the order the pools' first sites appear in. RAD_OK or a
+  * negative code with `err` naming the weight. Pool handles are left 0. */
+ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
+                 std::vector<Site>* out, std::string* err,
+-                std::vector<std::string>* pool_weights = nullptr);
++                std::vector<std::string>* pool_weights = nullptr,
++                InputBasis basis = kInputNatural);
+ 
+ /* One adapter for one rank: `packed` gets one PackedSite per pool (index = Site::pool), in the
+  * slot layout of the pool's sites. Refusals return a negative code and name module, expected and
+@@ -187,7 +207,8 @@ int check_placed(const std::vector<AdapterInfo>& per_rank, std::string* err,
+                  const Program* prog = nullptr, const TargetSet* targets = nullptr);
+ 
+ /* Why a module path is not a site on this Program, in one sentence ("" when it is one). */
+-std::string explain_module(const Program& prog, const TargetSet& targets, const std::string& module);
++std::string explain_module(const Program& prog, const TargetSet& targets, const std::string& module,
++                           InputBasis basis = kInputNatural);
+ 
+ }  /* namespace lora */
+ }  /* namespace rad */

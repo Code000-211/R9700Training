@@ -54,6 +54,14 @@ public:
     // Drop the recorded step. The observer stays attached.
     void clear();
 
+    // Copy each operand's bytes at the issue instead of keeping its address. A reader that runs
+    // after the step has to turn this on: a later block reuses the same activation buffers, so by
+    // the end of the step an address holds the last writer's values rather than the ones the op
+    // saw. Off by default, because on it keeps the step's whole operand traffic. The observer runs
+    // before the op does, so a written operand's copy is its content before the op.
+    void keep_contents(bool on) { keep_ = on; }
+    bool keeps_contents() const { return keep_; }
+
     const std::vector<OpRecord>& ops() const { return ops_; }
     const std::vector<Block>& blocks() const { return blocks_; }
 
@@ -74,8 +82,12 @@ private:
 
     RadCtx* ctx_ = nullptr;
     int64_t block_ = -1;
+    bool keep_ = false;
     std::vector<OpRecord> ops_;
     std::vector<std::vector<OperandContent>> contents_;
+    // One heap block per operand copy; `contents_` points into them, so growth of this vector
+    // moves the vector heads and not the bytes.
+    std::vector<std::vector<uint8_t>> copies_;
     std::vector<Block> blocks_;
 };
 
