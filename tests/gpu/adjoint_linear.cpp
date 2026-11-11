@@ -303,7 +303,7 @@ Timing time_call(const device_check::Case& c, int reps) {
     std::vector<AdValue> fwd, dc;
     AdjointCall call = build_call(c, &fwd, &dc);
     device::scratch_reset();
-    row(call);  // warm-up: the first launch is where the kernel's module is finalized
+    row(call);  // warm-up: the first call's code load and faults stay out of the number
     auto zero_dc = [&dc] {
         for (AdValue& v : dc) std::fill(v.value.begin(), v.value.end(), 0.0);
     };
