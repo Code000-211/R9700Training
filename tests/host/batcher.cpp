@@ -653,6 +653,50 @@ R97_TEST(batcher_single_bucket_shuffle) {
     }
 }
 
+// An epoch is a new shuffle, not a new rotation of one. The one-bucket case once shuffled that
+// bucket under the seed alone and rotated the one permutation by the epoch, which reads as a new
+// order every epoch only for as long as the epoch count stays under the bucket's size -- and then
+// hands the first epoch's order out again: 20 sequences of one length gave 20 plans over 60
+// epochs, and epoch 20 was epoch 0. Neither is visible from adjacent epochs alone. So: the epoch
+// that many on must not be the first, and three times the bucket's size in epochs must hand out
+// more plans than the bucket has sequences, because one per rotation and no more is exactly the
+// cycle. Every case here is one bucket after grouping, which is where the cycle lived.
+R97_TEST(batcher_single_bucket_does_not_cycle) {
+    struct Case {
+        int64_t count;
+        int64_t len;
+        int64_t budget;
+        int devices;
+        uint64_t seed;
+    };
+    const std::vector<Case> cases = {
+        {20, 50, 500, 2, 4},  // the shape the earlier round measured: one bucket of 20, one step
+        {8, 12, 36, 2, 7},    // one bucket of 8: the budget holds 3 a sub-batch, 6 a step
+        {12, 7, 30, 2, 9},    // one bucket of 12: 4 a sub-batch, 8 a step
+        {20, 50, 500, 1, 4},  // same bucket on one device: the order is the whole plan
+    };
+    for (const Case& c : cases) {
+        std::vector<int64_t> lens(static_cast<size_t>(c.count), c.len);
+        auto seqs = make_sequences(lens);
+
+        r97::BatcherConfig cfg;
+        cfg.token_budget = c.budget;
+        cfg.devices = c.devices;
+        cfg.seed = c.seed;
+        Batcher b(seqs, cfg);
+
+        const int64_t k = c.count;
+        std::vector<EpochShape> plans;
+        for (int64_t e = 0; e < 3 * k; ++e) {
+            b.seek({e, 0});
+            plans.push_back(shape(run_epoch(b)));
+        }
+        R97_CHECK(plans[(size_t)k] != plans[0]);
+        std::set<EpochShape> uniq(plans.begin(), plans.end());
+        R97_CHECK(uniq.size() > (size_t)k);
+    }
+}
+
 // Grouping: a batch does not mix one long sequence with many short ones. Two length classes 40x
 // apart with a budget that would happily hold one long sequence beside dozens of shorts. The
 // counts matter: 32 longs are exactly one bucket by themselves, so they cannot expose a step that
