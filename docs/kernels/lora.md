@@ -94,10 +94,9 @@ between them.
 ## The gradients
 
 `dA` is the leaf `<prefix>.lora_A`, shape `{R, K}`; `dB` is `<prefix>.lora_B`, shape `{N, R}`.
-With no prefix, the lora kind's case, the leaf is `<weight>.lora_A`/`<weight>.lora_B` from the
-record's `lora.<weight>.a`/`.b` operand. Those are the names and shapes the host rows use
-(`docs/adjoints/lora.md` §4), and each token's contribution lands in its own pool row's block —
-for the model's pools, which have one slot, that is the whole leaf.
+Those are the names and shapes the host rows use (`docs/adjoints/lora.md` §4), and each token's
+contribution lands in its own pool row's block — for the model's pools, which have one slot, that
+is the whole leaf.
 
 The step's sum runs on the card, and the leaf stays off it. `dA` and `dB` are host memory by the
 contract (`include/r97/params.h`), so a row that copied a call's sum into the leaf when the call

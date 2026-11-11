@@ -45,9 +45,7 @@ kernel says so instead of passing quietly.
    order, one entry per operand the op wrote), adds its share to the cotangent of
    each read operand in `call.dc->at(i)` (add, never overwrite; frozen slots stay
    untouched), and, if the op has trainable leaves, adds a `Param` to
-   `call.grads` named `<prefix>.<leaf>` with the prefix `call.prefix` supplies; an empty
-   prefix leaves the name to the record (a kind whose parameters carry their module names it
-   after the record's weight operand).
+   `call.grads` named `<prefix>.<leaf>` with the prefix `call.prefix` supplies.
    Host adjoints compute in f64. `call.fwd` and `call.dc` are the record's schema
    positions throughout -- every operand where the record puts it -- so an op
    whose schema writes before it reads (an INOUT operand) keeps that order.

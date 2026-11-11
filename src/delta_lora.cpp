@@ -3,8 +3,8 @@
 // docs/ADAPTER.md owns this shape: one A [r, K] and one B [N, r] per targeted linear, A from
 // PEFT's own initialisation and B zero, and a wire site per linear carrying its factors, its
 // address (the declared weight it lands in and its slot there) and the scale alpha/r. The
-// ParamSet names are `<module>.lora_A` and `<module>.lora_B`, so the adjoint's `<prefix>.lora_A`
-// needs no prefix of its own: grad_prefix() is empty and each site carries its module.
+// ParamSet names are `<module>.lora_A` and `<module>.lora_B`, so the delta has no module prefix to
+// give: grad_prefix() is empty and each site carries its module (`WireBuffers::Site`).
 //
 // The module names are the ones read_model_meta gives (r97/adapter_io.h): the container's
 // targetable linears in PEFT's spelling. A target may name one by its whole path
@@ -143,10 +143,11 @@ public:
         return params;
     }
 
-    // The parameters are already named `<module>.lora_A`, so the delta adds no prefix of its own.
-    // The adjoint names each pool's gradient after the record's weight (`lora.<weight>.a`/`.b`),
-    // so a trainer can split a fused weight's pool by the site's slot before the optimiser sees it;
-    // an empty prefix here therefore does not merge a block's pools into one leaf.
+    // The parameters carry their module (`<module>.lora_A`), and one prefix cannot spell several
+    // modules, so the delta adds none. docs/adjoints/lora.md names each adjoint's leaf
+    // `<prefix>.lora_A`, so with this empty prefix the gradients arrive under the bare leaf;
+    // naming them per module is the adjoint's grad_prefix plumbing, not this file's (a site
+    // names its module in `to_wire`, which is what a trainer has to split a fused pool by).
     const char* grad_prefix() const override { return ""; }
 
     // One site per targeted linear, with the factor pair the ParamSet holds for it and the scale
