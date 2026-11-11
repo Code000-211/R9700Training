@@ -6,7 +6,9 @@
 // as long as the buffer lives, which for the training engine is the step.
 //
 // Block ranges are recorded from the begin/end calls the architecture makes around a layer. Ops
-// outside any block have block -1 and appear in ops() but in no range.
+// outside any block have block -1 and appear in ops() but in no range. An architecture writes its
+// residual stream in place, so the value a bracket names is gone once the next block has run: a
+// caller that must copy a boundary while the step is in flight subscribes with set_bracket_hook.
 //
 // The observer is a training patch on radiance (patches/training/0101-issue-observer.patch), and a
 // serving build applies none of the training set. A runtime without the observer has no graph to
@@ -20,6 +22,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <utility>
 #include <vector>
 
 namespace r97 {
@@ -50,8 +54,9 @@ public:
     // detaches from the first context. The context must outlive the tape's attachment.
     void attach(RadCtx* ctx);
     void detach();
+    bool attached() const { return ctx_ != nullptr; }
 
-    // Drop the recorded step. The observer stays attached.
+    // Drop the recorded step. The observer stays attached, and so does the bracket hook.
     void clear();
 
     // Copy each operand's bytes at the issue instead of keeping its address. A reader that runs
@@ -61,6 +66,12 @@ public:
     // before the op does, so a written operand's copy is its content before the op.
     void keep_contents(bool on) { keep_ = on; }
     bool keeps_contents() const { return keep_; }
+
+    // A block bracket reached while the step runs, called after the bracket is recorded and while
+    // the buffers of the step still hold what it names. `begin` is true at the block's entry, when
+    // the ops before it are recorded, and false at its exit, when the block's own are.
+    using BracketHook = std::function<void(const Tape& tape, int64_t block, bool begin)>;
+    void set_bracket_hook(BracketHook hook);
 
     const std::vector<OpRecord>& ops() const { return ops_; }
     const std::vector<Block>& blocks() const { return blocks_; }
@@ -81,6 +92,7 @@ private:
     void close_block(int64_t block);
 
     RadCtx* ctx_ = nullptr;
+    BracketHook bracket_hook_;
     int64_t block_ = -1;
     bool keep_ = false;
     std::vector<OpRecord> ops_;

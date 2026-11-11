@@ -1,4 +1,4 @@
-Concern: a prefill request that draws no token, so no sampler op is issued over the training forward
+Concern: a prefill that draws no token -- no sampler op, and a prompt of exactly the context fits
 Upstream: not-submitted
 diff --git a/core/engine.cpp b/core/engine.cpp
 index c15b3a5..5aefdf2 100644
@@ -47,10 +47,28 @@ index 8a62857..e1e9c22 100644
       * state, a prefix hit resumes from a state checkpoint, written only on the checkpoint interval
       * and at a long prompt's tail. The scheduler ends a prefill chunk here (rounded down to its
 diff --git a/core/sched/scheduler.cpp b/core/sched/scheduler.cpp
-index f14a3f3..f710e1f 100644
+index f14a3f3..7803320 100644
 --- a/core/sched/scheduler.cpp
 +++ b/core/sched/scheduler.cpp
-@@ -2480,6 +2480,10 @@ const RadBatch* Scheduler::step_next_locked() {
+@@ -2085,11 +2085,13 @@ const RadBatch* Scheduler::step() {
+             if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
+             int32_t slot = waiting_[at];
+             SchedReq& s = *reqs_[(size_t)slot];
+-            /* Generation reserves one position after the prompt. An embedding consumes just
+-             * the prompt, so its exact context boundary fits without a generation slot.
+-             * close_request removes a refused input from waiting_, so `at` names the next one. */
++            /* Generation reserves one position after the prompt. An embedding, or a prefill-only
++             * request that draws no token, consumes just the prompt, so its exact context boundary
++             * fits without a generation slot. close_request removes a refused input from waiting_,
++             * so `at` names the next one. */
+             if (ctx_limit_ > 0 &&
+-                (s.seq_len() > ctx_limit_ || (!s.req->embed && s.seq_len() == ctx_limit_))) {
++                (s.seq_len() > ctx_limit_ ||
++                 (!s.req->embed && !s.req->prefill_only && s.seq_len() == ctx_limit_))) {
+                 RAD_WARN("request %llu failed: %lld tokens leave no room in a %lld-token context",
+                          (unsigned long long)s.req->id, (long long)s.seq_len(),
+                          (long long)ctx_limit_);
+@@ -2480,6 +2482,10 @@ const RadBatch* Scheduler::step_next_locked() {
          if (r.token_scores && r.max_tokens > 0 &&
              (int64_t)r.output.size() + 1 >= r.max_tokens) return nullptr;
  
@@ -61,7 +79,7 @@ index f14a3f3..f710e1f 100644
          /* The furthest context the row can reach: every position this step verifies committed,
           * counted from the last commit rather than this step's own bound (which would add a
           * window of slack per step issued ahead). The card knows the real position; this sizes
-@@ -2649,11 +2653,11 @@ int Scheduler::commit(StepResult& res) {
+@@ -2649,11 +2655,11 @@ int Scheduler::commit(StepResult& res) {
                   * overflow. */
                  last_prefill_ids_.push_back(r.id);
              }
@@ -75,7 +93,7 @@ index f14a3f3..f710e1f 100644
                  if (!s.first_tok_us) s.first_tok_us = mono_us();
                  r.output.push_back(res.token[i]);
                  const TokenLogprobs* lp =
-@@ -2776,7 +2780,11 @@ int Scheduler::commit(StepResult& res) {
+@@ -2776,7 +2782,11 @@ int Scheduler::commit(StepResult& res) {
  
          /* Finish. emit() already stops at max_tokens, so the resize below is a backstop: a >=
           * test that can only be == is easy to break quietly later. */

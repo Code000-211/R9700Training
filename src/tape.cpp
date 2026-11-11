@@ -72,6 +72,8 @@ const std::vector<OperandContent>& Tape::contents(size_t op) const {
 
 OperandContent Tape::content(size_t op, size_t operand) const { return contents_.at(op).at(operand); }
 
+void Tape::set_bracket_hook(BracketHook hook) { bracket_hook_ = std::move(hook); }
+
 void Tape::observe_op(void* user, RadCtx* /*ctx*/, const RadIssueOp* issue) {
     if (user && issue) static_cast<Tape*>(user)->record(*issue);
 }
@@ -110,7 +112,7 @@ void Tape::record(const RadIssueOp& issue) {
         op.buffer = identity(o, i);
         op.dtype = rad_dtype_name(o.dtype);
         op.shape.clear();
-        if (o.rank > 0 && o.shape) op.shape.assign(o.shape, o.shape + o.rank);
+        if (o.rank > 0) op.shape.assign(o.shape, o.shape + o.rank);
         op.row_lo = first_row(o);
         op.rows = o.rows;
         op.written = o.written != 0;
@@ -145,11 +147,13 @@ void Tape::record(const RadIssueOp& issue) {
 void Tape::open_block(int64_t block) {
     block_ = block;
     blocks_.push_back(Block{block, ops_.size(), ops_.size()});
+    if (bracket_hook_) bracket_hook_(*this, block, true);
 }
 
 void Tape::close_block(int64_t block) {
     if (!blocks_.empty() && blocks_.back().index == block) blocks_.back().end = ops_.size();
     if (block_ == block) block_ = -1;
+    if (bracket_hook_) bracket_hook_(*this, block, false);
 }
 
 }  // namespace r97

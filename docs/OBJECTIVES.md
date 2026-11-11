@@ -103,8 +103,14 @@ binary, the subcommands in `r97train`.
 
 ## Registered today
 
-Nothing is registered yet: `r97train objectives` and `r97train deltas` print the live list,
-and the issue that registers a loss or a kind adds its line here and changes nothing else.
+- `ce` — the reference cross-entropy loss, `CeObjective` in `src/loss.cpp`
+  (`include/r97/loss.h`), registered by `src/objective_ce_register.cpp`. It divides by
+  `total_scored()`, seeds once per window over the first to the last scored row, and reads
+  nothing when a window holds no scored row. See `docs/losses/ce-objective.md` and
+  `docs/FORWARD.md` for the driver that calls it.
+
+`r97train objectives` and `r97train deltas` print the live list, and the issue that registers a
+loss or a kind adds its line here and changes nothing else.
 
 The registries in `r97train` and in a test binary are separate: the test objective and
 test delta under `tests/support/` are registered only in the host test binary.
