@@ -6,7 +6,9 @@
 //     and on the real container's (24 query heads over 4 key-value heads, head_dim 256, hidden
 //     5120, docs/DESIGN.md), for one sequence and for a batch of unequal lengths, at 1024 and at
 //     4096 tokens, the device adjoint matches src/adjoint/host/attention.cpp within the harness's
-//     bf16 tolerance;
+//     bf16 tolerance -- on both rows, save the fusion's 4096-token single sequence, which is
+//     timed rather than compared because its reference is the plain row's again (section 4 of
+//     docs/kernels/attention.md);
 //   * `attn_paged_gate_quant`, the card's fusion of the attention, the output gate and the
 //     quantising producer, matches the composition of the host adjoints of its parts: the host
 //     `attn_paged`, `quant_act_i8g`, `mul` and `sigmoid`;
@@ -396,6 +398,12 @@ void run() {
         make_case(kReal, {1024}, false, 0x51ed1003ull),
         make_case(kReal, {128, 256, 640}, false, 0x51ed1004ull),
         make_case(kReal, {4096}, false, 0x51ed1006ull),
+        // 4096 tokens as a batch of unequal lengths at the real geometry: one long sequence and
+        // two shorter ones. The shorter two are not a whole number of pages, so each ends part way
+        // into one, and their tables are padded with -1 past it. Cheaper than the 4096-token
+        // single sequence above -- the reference's work is the sum of the squares, not the square
+        // of the sum -- so its comparison is affordable.
+        make_case(kReal, {2048, 1300, 748}, false, 0x51ed1007ull),
     };
     const std::vector<device_check::Case> fused_cases = {
         make_case(kFixture, {12}, true, 0x51ed2001ull),
@@ -403,6 +411,7 @@ void run() {
         make_case(kFixture, {4096}, true, 0x51ed2005ull),
         make_case(kReal, {1024}, true, 0x51ed2003ull),
         make_case(kReal, {128, 256, 640}, true, 0x51ed2004ull),
+        make_case(kReal, {2048, 1300, 748}, true, 0x51ed2007ull),
     };
 
     for (const device_check::Case& c : cases) {
