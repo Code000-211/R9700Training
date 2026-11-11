@@ -35,7 +35,7 @@ struct ChatDataStats {
     int64_t conversations = 0;   // JSONL lines that held a conversation
     int64_t kept = 0;            // conversations that produced a sequence (shortened ones too)
     int64_t shortened = 0;       // conversations that fit only after trailing turns were dropped
-    int64_t skipped = 0;         // conversations with no assistant turn or a first exchange too long
+    int64_t skipped = 0;         // no assistant turn, or a first exchange that does not fit
     int64_t tokens = 0;          // tokens over the kept sequences
     int64_t scored = 0;          // scored tokens over the kept sequences
 };

@@ -6,14 +6,9 @@
 //
 //   R97_TEST(name) { ... }
 //
-// and the runner armed here -- at exit, after the binary's main has returned, or from a main
-// that calls run_all() itself -- runs every registered test in name order. A failure makes the
-// process exit non-zero, which is what ctest reads, so adding a test is adding one file and
-// nothing else.
-//
-// A main that has work of its own calls run_all() before returning. Running inside main, not at
-// exit, leaves the libraries' static state alive: rad_core's chat template loads the vendored
-// chat parser, whose tables are namespace-scope statics destroyed before any atexit handler.
+// and the runner armed here -- at exit, after the binary's main has returned -- runs every
+// registered test in name order. A failure makes the process exit non-zero, which is what
+// ctest reads, so adding a test is adding one file and nothing else.
 #pragma once
 
 #include <cstdio>
@@ -38,15 +33,7 @@ struct Reg {
     Reg(const char* name, void (*fn)());
 };
 
-// Whether run_all() has run already, so a binary that runs it from main does not run the tests
-// a second time at exit.
-inline bool& ran() {
-    static bool state = false;
-    return state;
-}
-
 inline int run_all() {
-    ran() = true;
     int failed = 0;
     for (const Test& t : tests()) {
         try {
@@ -64,7 +51,6 @@ inline int run_all() {
 }
 
 inline void run_at_exit() {
-    if (ran()) return;  // main ran them itself, with every static still alive
     const int failed = run_all();
     std::fflush(stdout);
     std::fflush(stderr);

@@ -1,5 +1,4 @@
 // tests/host/vector_tape.cpp -- VectorTape answers reads from its arrays and records them.
-#include "../support/test.h"
 #include "support/vector_tape.h"
 
 #include <cassert>
@@ -60,5 +59,5 @@ int main() {
     assert(tape.reads_of("other").empty());
 
     std::puts("vector_tape ok");
-    return r97test::run_all();
+    return 0;
 }

@@ -7,7 +7,12 @@
 #include "r97/chatdata.h"
 
 #include "support/fixture.h"
-#include "support/test.h"
+
+// radiance's tests/rad_test.h, which the fixture header brings in, defines CHECK for its own
+// TEST() registry; self_check.h aliases CHECK to R97_CHECK and would redefine it. This file checks
+// with R97_CHECK only, so the alias is dropped here rather than warned about at every build.
+#undef CHECK
+#include "support/self_check.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -99,7 +104,7 @@ std::string chat_small_jsonl() {
 
 }  // namespace
 
-R97_TEST(chatdata_mask_one_turn) {
+static void chatdata_mask_one_turn() {
     const r97::ChatData data = opened_fixture();
     const r97::TokenSeq seq =
         render(data, kOneTurn, r97::ChatData::kDefaultMaxTokens, r97::ChatDataOutcome::Kept);
@@ -110,7 +115,7 @@ R97_TEST(chatdata_mask_one_turn) {
     R97_CHECK(seq.score.front() == 0);
 }
 
-R97_TEST(chatdata_mask_three_turns) {
+static void chatdata_mask_three_turns() {
     const r97::ChatData data = opened_fixture();
     const r97::TokenSeq seq =
         render(data, kThreeTurns, r97::ChatData::kDefaultMaxTokens, r97::ChatDataOutcome::Kept);
@@ -122,7 +127,7 @@ R97_TEST(chatdata_mask_three_turns) {
               std::count(want.score.begin(), want.score.end(), 1));
 }
 
-R97_TEST(chatdata_mask_with_system_message) {
+static void chatdata_mask_with_system_message() {
     const r97::ChatData data = opened_fixture();
     const r97::TokenSeq seq =
         render(data, kWithSystem, r97::ChatData::kDefaultMaxTokens, r97::ChatDataOutcome::Kept);
@@ -133,7 +138,7 @@ R97_TEST(chatdata_mask_with_system_message) {
     R97_CHECK(seq.score[1] == 0);
 }
 
-R97_TEST(chatdata_shortens_trailing_turns_until_it_fits) {
+static void chatdata_shortens_trailing_turns_until_it_fits() {
     const r97::ChatData data = opened_fixture();
     const Expected one =
         expected(std::vector<r97::ChatMessage>(kThreeTurns.begin(), kThreeTurns.begin() + 2));
@@ -158,7 +163,7 @@ R97_TEST(chatdata_shortens_trailing_turns_until_it_fits) {
     R97_CHECK(seq.ids.empty() && seq.score.empty());
 }
 
-R97_TEST(chatdata_reads_the_small_chat_file) {
+static void chatdata_reads_the_small_chat_file() {
     const r97::ChatData data = opened_fixture();
     r97::Batch batch;
     r97::ChatDataStats stats;
@@ -182,7 +187,7 @@ R97_TEST(chatdata_reads_the_small_chat_file) {
     R97_CHECK(stats.scored == scored);
 }
 
-R97_TEST(chatdata_skips_a_conversation_with_no_assistant_turn) {
+static void chatdata_skips_a_conversation_with_no_assistant_turn() {
     const r97::ChatData data = opened_fixture();
     r97::Batch batch;
     r97::ChatDataStats stats;
@@ -194,7 +199,7 @@ R97_TEST(chatdata_skips_a_conversation_with_no_assistant_turn) {
     R97_CHECK(batch.empty());
 }
 
-R97_TEST(chatdata_reports_a_malformed_line_and_its_number) {
+static void chatdata_reports_a_malformed_line_and_its_number() {
     const r97::ChatData data = opened_fixture();
     r97::Batch batch;
     r97::ChatDataStats stats;
@@ -205,3 +210,11 @@ R97_TEST(chatdata_reports_a_malformed_line_and_its_number) {
     R97_CHECK(data.error().rfind("line 2:", 0) == 0);
     R97_CHECK(batch.size() == 1);   // the first line still counted and appended
 }
+
+R97_SELF_CHECK(chatdata_mask_one_turn)
+R97_SELF_CHECK(chatdata_mask_three_turns)
+R97_SELF_CHECK(chatdata_mask_with_system_message)
+R97_SELF_CHECK(chatdata_shortens_trailing_turns_until_it_fits)
+R97_SELF_CHECK(chatdata_reads_the_small_chat_file)
+R97_SELF_CHECK(chatdata_skips_a_conversation_with_no_assistant_turn)
+R97_SELF_CHECK(chatdata_reports_a_malformed_line_and_its_number)

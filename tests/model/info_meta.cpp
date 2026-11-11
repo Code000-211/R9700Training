@@ -1,7 +1,6 @@
 // tests/model/info_meta.cpp -- `info` prints the container's metadata through rad_core.
 // Needs the real container (a model test); it skips, exit 77, when the container is absent.
 #include "../src/info.h"
-#include "../support/test.h"
 
 #include <fstream>
 #include <iostream>
@@ -41,5 +40,5 @@ int main() {
             return 1;
         }
     }
-    return r97test::run_all();
+    return 0;
 }

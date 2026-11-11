@@ -8,7 +8,7 @@
 #include "r97/chatdata.h"
 
 #include "../support/model_dir.h"
-#include "../support/test.h"
+#include "../support/self_check.h"
 
 #include "format/radfile.h"
 #include "rad_internal.h"
@@ -72,7 +72,7 @@ std::vector<int32_t> radiance_ids(const std::string& rad,
 
 }  // namespace
 
-R97_TEST(chatdata_render_matches_radiance_chat_rendering) {
+static void chatdata_render_matches_radiance_chat_rendering() {
     const std::string rad = r97test::container_or_skip(R97_MODEL_RAD);
 
     r97::ChatData data;
@@ -103,9 +103,10 @@ R97_TEST(chatdata_render_matches_radiance_chat_rendering) {
 
     // The last scored token is the second answer's end-of-turn token, not whatever the template
     // writes after it (ChatML's newline), which is why the mask does not run to the end.
-    const auto last =
-        size_t(std::find(seq.score.rbegin(), seq.score.rend(), uint8_t(1)).base() - seq.score.begin()) -
-        1;
+    const auto scored_end = std::find(seq.score.rbegin(), seq.score.rend(), uint8_t(1)).base();
+    const size_t last = size_t(scored_end - seq.score.begin()) - 1;
     R97_CHECK(last + 1 < seq.ids.size());
     R97_CHECK(!seq.score.back());
 }
+
+R97_SELF_CHECK(chatdata_render_matches_radiance_chat_rendering)
