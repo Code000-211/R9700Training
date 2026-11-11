@@ -6,9 +6,9 @@
 #include "../support/fixture.h"
 
 // radiance's tests/rad_test.h, which the fixture header brings in, defines CHECK for its own
-// TEST() registry; this file checks through R97_CHECK, so drop the alias before test.h.
+// TEST() registry; this file checks through R97_CHECK, so drop the alias before self_check.h.
 #undef CHECK
-#include "../support/test.h"
+#include "../support/self_check.h"
 
 #include <algorithm>
 #include <cmath>
@@ -195,21 +195,25 @@ Corpus write_corpus(const r97::Fixture& f, const std::string& name) {
 
 // The fixture and the corpus, built before main.
 //
-// The host runner calls an R97_TEST from an exit handler, after the binary's namespace-scope
-// objects are destroyed, and by then radiance's own chat-template machinery is gone: ChatData
-// cannot open a container any more. So the corpus is built here, at static-initialiser time,
-// where ChatData does work (the chat-data checks use it there). The engine at the other end is
-// the reverse -- it allocates through radiance's device ledger, whose constructor runs later in
-// the binary's static initialisation -- so an engine starts only from the exit-time test. One
-// test, two moments; nothing about the comparison changes.
+// ChatData compiles the container's chat template and tokenises, and by the time the checks below
+// run from their exit handler (see the arming block at the end of this file) radiance's tokeniser
+// tables -- process-wide statics that the chat-data checks build at static-initialisation time --
+// have been destroyed: ChatData cannot open a container there, and an engine's corpus load dies
+// inside the tokeniser. The corpus is therefore built here, at static-initialiser time, where
+// ChatData does work (the chat-data checks use it there). The engine is the reverse: it allocates
+// through radiance's device ledger, whose constructor runs later in the binary's static
+// initialisation, so an engine starts only from the exit handler. One test, two moments; nothing
+// about the comparison changes.
 //
-// The prepared state is leaked on purpose: it has to outlive the exit-time test, and a static of
-// its own would be destroyed before the runner runs.
+// The prepared state is leaked on purpose: it has to outlive the exit handler, and a static of
+// its own would be destroyed before the handler runs.
 struct Prepared {
     bool ok = false;
     std::string error;
     r97::Fixture fixture;
     Corpus corpus;
+    std::string radiance_home;  // build_dir() and radiance_home() read statics that are gone at exit
+    std::string cli_path;       // <build>/r97train
 };
 
 Prepared& prepared() {
@@ -218,6 +222,10 @@ Prepared& prepared() {
         try {
             q->fixture = r97::detail::make();
             q->corpus = write_corpus(q->fixture, "loss_cli");
+            q->radiance_home = r97::detail::radiance_home();
+            q->cli_path = (fs::path(r97::detail::build_dir()) / "r97train").string();
+            if (q->radiance_home.empty())
+                throw std::runtime_error("no radiance home beside the build");
             q->ok = true;
         } catch (const std::exception& e) {
             q->error = e.what();
@@ -238,7 +246,7 @@ void check_against_record(const Prepared& p, const std::string& name, const std:
 
     rad::Config cfg;
     cfg.model            = f.container;
-    cfg.radiance_home    = r97::detail::radiance_home();
+    cfg.radiance_home    = p.radiance_home;
     cfg.kernel_hierarchy = {"libavx", "libref"};
     cfg.n_spec           = 0;
     cfg.max_tok          = int64_t(std::max<size_t>(512, c.max_doc_len));
@@ -269,11 +277,10 @@ void check_against_record(const Prepared& p, const std::string& name, const std:
 
     const RecordLoss kld = record_loss(record);
 
-    const std::string cli_path = (fs::path(r97::detail::build_dir()) / "r97train").string();
-    if (!fs::exists(cli_path))
-        throw std::runtime_error("r97train is not beside the test binary at " + cli_path);
+    if (!fs::exists(p.cli_path))
+        throw std::runtime_error("r97train is not beside the test binary at " + p.cli_path);
     const std::string lora_flag = lora.empty() ? "" : " --lora " + quote(lora);
-    const Run cli = run(quote(cli_path) + " loss --model " + quote(f.container) + " --data " +
+    const Run cli = run(quote(p.cli_path) + " loss --model " + quote(f.container) + " --data " +
                         quote(chat_path()) + lora_flag);
     if (cli.status != 0) throw std::runtime_error("r97train loss failed:\n" + cli.output);
 
@@ -290,13 +297,13 @@ void check_against_record(const Prepared& p, const std::string& name, const std:
 }
 
 // Two cases: the base model, and the fixture's adapter through --lora.
-R97_TEST(loss_cli_matches_radiance_kld) {
+void test_loss_cli_matches_radiance_kld() {
     const Prepared& p = prepared();
     if (!p.ok) throw std::runtime_error(p.error);
     check_against_record(p, "base", "");
 }
 
-R97_TEST(loss_cli_lora_matches_radiance_kld) {
+void test_loss_cli_lora_matches_radiance_kld() {
     const Prepared& p = prepared();
     if (!p.ok) throw std::runtime_error(p.error);
     check_against_record(p, "lora", adapter_path());
@@ -305,20 +312,19 @@ R97_TEST(loss_cli_lora_matches_radiance_kld) {
 // A directory radiance cannot load must end the run with a message and a non-zero status, not take
 // the process down: the driver reports a failed engine start by throwing, and loss_main must catch
 // it. Radiance logs the reason the loader refused the directory.
-R97_TEST(loss_cli_reports_an_unloadable_lora) {
+void test_loss_cli_reports_an_unloadable_lora() {
     const Prepared& p = prepared();
     if (!p.ok) throw std::runtime_error(p.error);
     const r97::Fixture& f = p.fixture;
-    const std::string cli_path = (fs::path(r97::detail::build_dir()) / "r97train").string();
-    if (!fs::exists(cli_path))
-        throw std::runtime_error("r97train is not beside the test binary at " + cli_path);
+    if (!fs::exists(p.cli_path))
+        throw std::runtime_error("r97train is not beside the test binary at " + p.cli_path);
 
     const fs::path empty = p.corpus.dir / "no_adapter";
     std::error_code ec;
     fs::remove_all(empty, ec);
     fs::create_directories(empty, ec);
 
-    const Run cli = run(quote(cli_path) + " loss --model " + quote(f.container) + " --data " +
+    const Run cli = run(quote(p.cli_path) + " loss --model " + quote(f.container) + " --data " +
                         quote(chat_path()) + " --lora " + quote(empty.string()));
     if (cli.status != 3)
         throw std::runtime_error("an unloadable adapter directory exited " +
@@ -326,6 +332,33 @@ R97_TEST(loss_cli_reports_an_unloadable_lora) {
     if (cli.output.find("adapter_config.json") == std::string::npos)
         throw std::runtime_error("the run did not report radiance's loader error:\n" + cli.output);
 }
+
+// The tier's own runner (tests/support/test.h) runs an R97_TEST from the atexit handler armed by
+// the first test file to register one -- adjoint_add.cpp, the first in link order. The chat-data
+// checks tokenise at static-initialisation time, so radiance's tokeniser tables are built then and
+// their destructors are registered after that runner's handler: the runner runs after the tables
+// are gone, and an engine started from any of its tests fails inside the tokeniser. (The fixture
+// and forward tests hit the same wall.)
+//
+// This file arms its own handler from its static initialiser instead. The linker reaches that
+// initialiser after the chat-data file's and before radiance's tables are torn down, so the
+// handler runs while they are alive; r97test::run prints each check and aborts on a failure, which
+// is what makes ctest see it. When the tier's runner runs before the static destructors, these
+// become plain R97_TESTs and this block goes away.
+void run_loss_cli_checks() {
+    ::r97test::run("loss_cli_matches_radiance_kld", test_loss_cli_matches_radiance_kld);
+    ::r97test::run("loss_cli_lora_matches_radiance_kld", test_loss_cli_lora_matches_radiance_kld);
+    ::r97test::run("loss_cli_reports_an_unloadable_lora", test_loss_cli_reports_an_unloadable_lora);
+}
+
+struct ArmLossCliChecks {
+    ArmLossCliChecks() {
+        if (std::atexit(&run_loss_cli_checks) != 0)
+            std::fprintf(stderr, "loss_cli: could not register the exit handler\n");
+    }
+};
+
+const ArmLossCliChecks arm_loss_cli_checks;
 
 }  // namespace
 
