@@ -674,21 +674,121 @@ def check_gradcheck(model, modeling, config, gen) -> None:
             raise SystemExit(f"oracle: gradcheck failed for {name}")
 
 
-def check_delta_agreement(modeling, gen) -> float:
-    """The chunked and recurrent delta rule, in f64, on the reference's own kind of input."""
-    batch, seq, k_heads, v_heads, kd, vd = 2, 40, 4, 4, 16, 16
-    q = torch.randn(batch, seq, k_heads, kd, generator=gen, dtype=torch.float64)
-    k = torch.randn(batch, seq, k_heads, kd, generator=gen, dtype=torch.float64)
-    v = torch.randn(batch, seq, v_heads, vd, generator=gen, dtype=torch.float64)
-    g = -F.softplus(torch.randn(batch, seq, v_heads, generator=gen, dtype=torch.float64))
-    beta = torch.sigmoid(torch.randn(batch, seq, v_heads, generator=gen, dtype=torch.float64))
-    chunk, _ = modeling.torch_chunk_gated_delta_rule(q, k, v, g, beta, output_final_state=False)
-    recurrent, _ = modeling.torch_recurrent_gated_delta_rule(q, k, v, g, beta, output_final_state=False)
-    denom = recurrent.abs().clamp_min(1e-30)
-    rel = ((chunk - recurrent).abs() / denom).max().item()
-    if rel > 1e-10:
-        raise SystemExit(f"oracle: chunked and recurrent delta rule differ by {rel:g} relative")
-    return rel
+DELTA_RULE_ARGUMENTS = ("query", "key", "value", "g", "beta")
+
+
+def capture_delta_rule_inputs(model, modeling, config, ids, mask, positions):
+    """Run the reference batch once and keep what the trunk hands the chunked delta rule.
+
+    The agreement check has to be about the tensors the reference itself uses, and the sequence it
+    uses has to cross chunk boundaries: the batch is padded to 140 tokens, three 64-token chunks of
+    the scan. A shorter input would agree just as well and say nothing about the multi-chunk path,
+    which is the reason the 140-token sequence is in the reference at all.
+
+    The trunk resolves `torch_chunk_gated_delta_rule` in the modeling module's namespace at call
+    time, so wrapping that name records every gated delta net's query, key, value, g and beta
+    without re-deriving them here. Nothing is drawn from the generator, so the capture cannot move
+    a reference tensor.
+    """
+    original = modeling.torch_chunk_gated_delta_rule
+    calls = []
+
+    def recording(*args, **kwargs):
+        output = original(*args, **kwargs)
+        calls.append((args, kwargs, output))
+        return output
+
+    modeling.torch_chunk_gated_delta_rule = recording
+    try:
+        with torch.no_grad():
+            model.model(
+                input_ids=ids, attention_mask=mask, position_ids=positions, use_cache=False
+            )
+    finally:
+        modeling.torch_chunk_gated_delta_rule = original
+
+    expected = sum(1 for kind in config.layer_types if kind == "linear_attention")
+    if len(calls) != expected:
+        raise SystemExit(
+            f"oracle: the trunk called the chunked delta rule {len(calls)} times, expected {expected}"
+        )
+    return calls
+
+
+def check_delta_agreement(modeling, calls) -> dict[str, object]:
+    """The chunked and the recurrent delta rule, in f64, on the reference's own inputs.
+
+    `calls` is what capture_delta_rule_inputs() recorded from the reference batch's forward pass:
+    the exact query, key, value, g and beta of every gated delta net layer. The recurrent form is
+    run on the same tensors and compared over the whole 140-token sequence, so the comparison
+    covers the chunk boundaries the chunked form has to stitch together.
+    """
+    chunk_signature = inspect.signature(modeling.torch_chunk_gated_delta_rule)
+    for name in DELTA_RULE_ARGUMENTS:
+        if name not in chunk_signature.parameters:
+            raise SystemExit(f"oracle: the chunked delta rule has no {name!r} parameter")
+
+    worst = (0.0, None)
+    worst_elementwise = 0.0
+    shape = None
+    chunk_size = None
+    for layer, (args, kwargs, output) in enumerate(calls):
+        bound = chunk_signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        named = bound.arguments
+        for name in DELTA_RULE_ARGUMENTS[:3]:
+            if not bool(named[name].any()):
+                raise SystemExit(f"oracle: the captured {name} of layer {layer} is all zero")
+        chunk = output[0] if isinstance(output, tuple) else output
+        recurrent, _ = modeling.torch_recurrent_gated_delta_rule(
+            *(named[name] for name in DELTA_RULE_ARGUMENTS),
+            initial_state=named.get("initial_state"),
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=named.get("use_qk_l2norm_in_kernel", False),
+            **named.get("kwargs", {}),
+        )
+        # Two zeros would agree perfectly and prove nothing.
+        if not bool(chunk.any()) or not bool(recurrent.any()):
+            raise SystemExit(f"oracle: the delta rule returned all zeros at layer {layer}")
+        difference = (chunk - recurrent).abs()
+        # Over the tensor, not elementwise: a single output near zero would otherwise decide the
+        # number on its own (the same measure the host tests use for the logits).
+        relative = float(difference.norm() / recurrent.norm().clamp_min(1e-30))
+        if relative > worst[0]:
+            worst = (relative, layer)
+        elementwise = float((difference / recurrent.abs().clamp_min(1e-30)).max())
+        worst_elementwise = max(worst_elementwise, elementwise)
+        shape = list(named["query"].shape)
+        chunk_size = int(named["chunk_size"])
+
+    if shape is None:
+        raise SystemExit("oracle: the reference batch called the delta rule no times")
+    sequence_length = shape[1]
+    chunks = -(-sequence_length // chunk_size)
+    if chunks <= 2:
+        raise SystemExit(
+            f"oracle: the delta rule agreement check would not cross a chunk boundary: "
+            f"{sequence_length} tokens in {chunk_size}-token chunks"
+        )
+    if max(worst[0], worst_elementwise) > 1e-10:
+        raise SystemExit(
+            f"oracle: chunked and recurrent delta rule differ by {worst[0]:g} relative "
+            f"over the tensor and {worst_elementwise:g} elementwise (layer {worst[1]})"
+        )
+    return {
+        "relative_difference": worst[0],
+        "max_elementwise_relative_difference": worst_elementwise,
+        "gdn_layer_of_worst": worst[1],
+        "layers_checked": len(calls),
+        "sequence_length": sequence_length,
+        "chunk_size": chunk_size,
+        "chunks": chunks,
+        "shape": shape,
+        "inputs": (
+            "the reference batch's forward pass, without the adapter: query, key, value, g and "
+            "beta at every gated delta net layer"
+        ),
+    }
 
 
 def tensor_case_names(cases: dict[str, torch.Tensor]) -> dict[str, dict[str, object]]:
@@ -723,14 +823,17 @@ def main() -> int:
     stock = patch_dtype_casts(modeling)
     prepare_f64_constants(model, modeling, config)
     dtype_proof = prove_dtype_only(modeling, config, stock)
-    chunk_rel = check_delta_agreement(modeling, gen)
-    check_gradcheck(model, modeling, config, gen)
-    print(f"oracle: dtype overrides match stock in f32; delta rules agree to {chunk_rel:.3g} relative")
-
     fixture_sha = sha256_file(args.checkpoint / "model.safetensors")
     lengths = [140, 73, 31]
     ids, score, mask, positions = batch_inputs(lengths, gen, config.vocab_size)
 
+    delta_calls = capture_delta_rule_inputs(model, modeling, config, ids, mask, positions)
+    delta_rule = check_delta_agreement(modeling, delta_calls)
+    check_gradcheck(model, modeling, config, gen)
+    print(
+        "oracle: dtype overrides match stock in f32; the chunked and the recurrent delta rule "
+        f"agree to {delta_rule['relative_difference']:.3g} relative over {delta_rule['chunks']} chunks"
+    )
     with torch.no_grad():
         _, _, logits_before, _, _ = run_model(
             model, modeling, config, ids, score, mask, positions, keep_grad=False
@@ -783,7 +886,7 @@ def main() -> int:
             "config_sha256": sha256_file(args.checkpoint / "config.json"),
         },
         "dtype_overrides": dtype_proof,
-        "delta_rule_relative_difference": chunk_rel,
+        "delta_rule": delta_rule,
         "lora": {"rank": args.lora_rank, "alpha": args.lora_alpha, "targets": list(LORA_TARGETS)},
         "cases": {
             "sequences": {

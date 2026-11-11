@@ -22,7 +22,22 @@
     "delta_chunk": 0.0,
     "delta_recurrent": 0.0
   },
-  "delta_rule_relative_difference": 4.343558202335743e-12,
+  "delta_rule": {
+    "relative_difference": 8.80515575305821e-16,
+    "max_elementwise_relative_difference": 1.6330847708036762e-11,
+    "gdn_layer_of_worst": 2,
+    "layers_checked": 3,
+    "sequence_length": 140,
+    "chunk_size": 64,
+    "chunks": 3,
+    "shape": [
+      3,
+      140,
+      4,
+      16
+    ],
+    "inputs": "the reference batch's forward pass, without the adapter: query, key, value, g and beta at every gated delta net layer"
+  },
   "lora": {
     "rank": 4,
     "alpha": 8.0,

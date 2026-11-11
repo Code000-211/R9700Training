@@ -46,13 +46,15 @@ The script checks, in this order:
 1. that `fla`, `causal_conv1d` and hub `kernels` are absent and the pure-PyTorch delta rule and
    convolution are the ones in use;
 2. that every f64 override equals the stock module in f32 to the bit (see `docs/ORACLE.md`);
-3. that the chunked and recurrent delta rules agree to 1e-10 relative;
+3. that the chunked and recurrent delta rules agree to 1e-10 relative on the reference's own
+   inputs, the batch of three sequences, captured from its forward pass, so the comparison crosses
+   three 64-token chunks;
 4. that `torch.autograd.gradcheck` passes in f64 on the three block cases.
 
-Then it writes the reference. On this machine the generator takes about 15 seconds (14.0 s in the
-last run, 34 s under load); the fresh venv's `pip install` takes about two minutes and building the
-writer about three. Two runs from the same environment produce byte-identical files. The
-environment lives at `.venv` under the checkout, which `.gitignore` already covers.
+Then it writes the reference. On this machine the generator takes about 20 seconds (16.9 s and
+21.7 s in the last two runs, 34 s under load); the fresh venv's `pip install` takes about three
+minutes and building the writer about six. Two runs from the same environment produce byte-identical
+files. The environment lives at `.venv` under the checkout, which `.gitignore` already covers.
 
 ## What not to do
 

@@ -29,11 +29,12 @@ system-wide and nothing goes into `/opt/hf`. The pinned versions are `torch==2.1
 says where the CPU wheel comes from. The writer is the fixture's own helper
 (`tests/support/fixture.h`), so the script and the tests see the same checkpoint bytes.
 
-On this machine, with the environment and the writer already built, the generator takes about 15
-seconds: 14.0 s in the last run, 33 s of CPU time. The shared machine's load can stretch the wall
-time to a minute or more (34 s in another run). A fresh virtual environment takes about two
-minutes for the CPU torch wheel, and building `r97_write_fixture` took about three minutes.
-Two runs from the same environment produce byte-identical files (checked with `sha256sum`).
+On this machine, with the environment and the writer already built, the generator takes about 20
+seconds: 16.9 s, 21.7 s and 39.5 s in the last three runs. The shared machine's load can stretch
+the wall time to a minute or more (34 s under load in another run). A fresh virtual environment
+takes about three minutes for the CPU torch wheel (3 m 18 s here), and building
+`r97_write_fixture` took six minutes once the radiance submodule had been fetched. Two runs from
+the same environment produce byte-identical files (checked with `sha256sum`).
 
 `--check-only` runs every check and writes nothing. `--out DIR` writes elsewhere.
 
@@ -82,9 +83,22 @@ match exactly once stops the script, so a transformers update cannot silently pr
 reference. The `@torch.no_grad()` and `@dynamic_rope_update` decorators on the rotary forward stay
 on the override.
 
-The chunked and the recurrent delta rule, both in f64 on the reference's kind of input, agree to
-4.34e-12 relative; the manifest records the value. `torch.autograd.gradcheck` passes in f64 on all
-three block cases (`eps=1e-6`, `atol=1e-6`, `rtol=1e-5`, one sequence each).
+The chunked and the recurrent delta rule, both in f64, agree to 8.81e-16 relative on the reference's
+own inputs, and to 1.63e-11 in the worst element. The check does not invent its inputs: it runs the
+reference batch through the trunk once (without the adapter, and drawing nothing from the
+generator, so the capture cannot move a reference tensor) and records the query, key, value, g and
+beta that every gated delta net layer hands `torch_chunk_gated_delta_rule`, then runs the recurrent
+form on those same tensors. The batch is padded to 140 tokens, so the chunked form really does
+stitch three 64-token chunks together; a shorter input would pass the same check and say nothing
+about the multi-chunk path, which is the reason the 140-token sequence is in the reference. The
+check fails if the captured sequence would cover two chunks or fewer. The relative number is over
+the whole tensor, `||chunk - recurrent|| / ||recurrent||`, for the same reason the logits
+comparison is not elementwise: one output near zero would otherwise decide it. The elementwise
+maximum is held to 1e-10 as well and recorded beside it. The manifest records all of this under
+`delta_rule`: the shape, the chunk size, the number of chunks, the layers checked, and which gated
+delta net had the worst difference (`gdn_layer_of_worst`, 0-based, 2 of 3).
+`torch.autograd.gradcheck` passes in f64 on all three block cases (`eps=1e-6`, `atol=1e-6`,
+`rtol=1e-5`, one sequence each).
 
 ## What the reference holds
 
@@ -162,9 +176,15 @@ more than a bf16 rounding in a few places.
 
 | sequence | relative L2 | worst absolute difference | where |
 | --- | --- | --- | --- |
-| 0 (140 tokens) | 3.06% | 1.384 | position 35, token 302 |
-| 1 (73 tokens) | 1.23% | 0.263 | position 6, token 167 |
-| 2 (31 tokens) | 1.89% | 0.298 | position 16, token 268 |
+| 0 (140 tokens) | 1.94% | 0.595 | position 74, token 66 |
+| 1 (73 tokens) | 2.40% | 0.783 | position 23, token 233 |
+| 2 (31 tokens) | 1.17% | 0.166 | position 26, token 188 |
+
+The batch was regenerated once, when the delta rule agreement check moved onto the reference's own
+inputs and so had to draw the sequences first; that changed the generator's draw order and with it
+the token ids, and the table is from the checked-in batch. The earlier batch's ids gave the same
+picture (3.06%, 1.23%, 1.89% in relative L2); the emulation figures below were measured on it and
+have not been re-run, because they are about the shape of the disagreement, not about this batch.
 
 The cause is the precision of the two bf16 delta nets, not the checkpoint or the reference:
 
