@@ -126,13 +126,13 @@ and the caller's `rad_stream_sync` on that queue, best of five, with the planes 
 
 | weight | shape `[out, in]` | out | scales | decode |
 |---|---|---:|---:|---:|
-| `blk.0.ffn_gate_up.weight` (largest) | 5120 × 34816 | 170.0 MiB | 2.66 MiB | 1.43 ms (116 GiB/s) |
+| `blk.0.ffn_gate_up.weight` (largest) | 34816 × 5120 | 170.0 MiB | 2.66 MiB | 1.43 ms (116 GiB/s) |
 | `blk.0.ffn_down.weight` | 5120 × 17408 | 85.0 MiB | 1.33 MiB | 0.95 ms (88 GiB/s) |
-| `blk.0.ssm_inz.weight` | 5120 × 16384 | 80.0 MiB | 1.25 MiB | 0.95 ms (82 GiB/s) |
+| `blk.0.ssm_inz.weight` | 16384 × 5120 | 80.0 MiB | 1.25 MiB | 0.95 ms (82 GiB/s) |
 | `blk.0.ssm_out.weight` | 5120 × 6144 | 30.0 MiB | 0.47 MiB | 0.38 ms (78 GiB/s) |
-| `blk.3.attn_qg.weight` | 5120 × 12288 | 60.0 MiB | 0.94 MiB | 0.63 ms (93 GiB/s) |
-| `blk.3.attn_k.weight` | 5120 × 1024 | 5.0 MiB | 0.08 MiB | 0.141 ms (35 GiB/s) |
-| `blk.3.attn_v.weight` | 5120 × 1024 | 5.0 MiB | 0.08 MiB | 0.141 ms (35 GiB/s) |
+| `blk.3.attn_qg.weight` | 12288 × 5120 | 60.0 MiB | 0.94 MiB | 0.63 ms (93 GiB/s) |
+| `blk.3.attn_k.weight` | 1024 × 5120 | 5.0 MiB | 0.08 MiB | 0.141 ms (35 GiB/s) |
+| `blk.3.attn_v.weight` | 1024 × 5120 | 5.0 MiB | 0.08 MiB | 0.141 ms (35 GiB/s) |
 | `blk.3.attn_output.weight` | 5120 × 6144 | 30.0 MiB | 0.47 MiB | 0.37 ms (78 GiB/s) |
 | `output.k3.weight`, 256-row head chunk | 256 × 5120 | 1.2 MiB | 0.02 MiB | 0.140 ms (8.7 GiB/s) |
 | `token_embd.weight`, 256-row head chunk | 256 × 5120 | 1.2 MiB | 0.02 MiB | 0.204 ms (6.0 GiB/s) |
