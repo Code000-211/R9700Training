@@ -1,0 +1,99 @@
+Concern: put an adapter slot in service from factors already in memory, not only from a directory
+Upstream: not-submitted
+diff --git a/core/engine.h b/core/engine.h
+index c913d1c..f583ccd 100644
+--- a/core/engine.h
++++ b/core/engine.h
+@@ -185,6 +185,13 @@ private:
+     int lora_start();
+ public:
+     int lora_load(const std::string& name, const std::string& dir, std::string* err);
++    /* Set a slot from factors already in memory, without reading a directory. The first call for
++     * `name` reserves and publishes the slot; a later call replaces that adapter's weights in
++     * place (one copy per rank, no reload). Empty `mods` opens the slot at zero: the base model's
++     * logits. The slot must not be serving when its weights are replaced. */
++    int lora_set_weights(const std::string& name,
++                         const std::map<std::string, lora::AdModule>& mods,
++                         int32_t* slot, std::string* err);
+     /* Unpublish an adapter (lora::SlotTable::unload). Idle, its slot is freed at once; in use, it
+      * drains: *in_flight says how many requests still hold it, no new request may name it, and the
+      * last of them frees the slot, which cools before reuse (lora/slots.h). */
+diff --git a/core/engine_lora.cpp b/core/engine_lora.cpp
+index a8e0a08..353a637 100644
+--- a/core/engine_lora.cpp
++++ b/core/engine_lora.cpp
+@@ -253,6 +253,74 @@ int Engine::lora_load(const std::string& name, const std::string& dir, std::stri
+     return RAD_OK;
+ }
+ 
++int Engine::lora_set_weights(const std::string& name,
++                             const std::map<std::string, lora::AdModule>& mods,
++                             int32_t* slot_out, std::string* err) {
++    std::lock_guard<std::mutex> lk(lora_mu_);
++    if (!cfg_.lora.enabled()) {
++        if (err) *err = "the engine was started without adapters";
++        return RAD_E_STATE;
++    }
++    if (name.empty()) {
++        if (err) *err = "an adapter needs a name";
++        return RAD_E_INVAL;
++    }
++    if (lora_gen_) {
++        if (err) *err = "in-memory adapter weights are for a model's slots, not a generator's library";
++        return RAD_E_UNSUPPORTED;
++    }
++
++    int slot = -1;
++    uint64_t uid = 0;
++    std::shared_ptr<void> hold;
++    bool loaded = false;
++    const int got = lora_table_.acquire(name, &slot, &uid, &hold);
++    if (got >= 0) {
++        loaded = true;
++    } else if (got == RAD_E_NOTFOUND) {
++        /* The same wait as lora_load: a slot still cooling is a few milliseconds, not a failure. */
++        const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(2);
++        for (;;) {
++            bool cooling = false;
++            const int s = lora_table_.reserve(name, &slot, &cooling, err);
++            if (s >= 0) break;
++            if (s != RAD_E_FULL || !cooling || stopping_.load(std::memory_order_acquire) ||
++                std::chrono::steady_clock::now() >= give_up)
++                return s;
++            std::this_thread::sleep_for(std::chrono::milliseconds(2));
++        }
++    } else {
++        return got;
++    }
++
++    std::vector<lora::AdapterInfo> infos(ranks_.size());
++    std::vector<std::vector<lora::PackedSite>> packed(ranks_.size());
++    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
++        const int s = lora::pack_modules(ranks_[ri]->lora_sites, (int)cfg_.lora.rank(false), mods,
++                                         &infos[ri], &packed[ri], err);
++        if (s < 0) {
++            if (ranks_.size() > 1 && err) *err = fmt("rank %zu: ", ri) + *err;
++            return s;
++        }
++    }
++    {
++        const int s = lora::check_placed(infos, err, &ranks_[0]->program, &lora_targets_);
++        if (s < 0) return s;
++    }
++
++    const int copied = lora_copy(slot, packed, err);
++    if (copied < 0) return copied;
++    if (!loaded) lora_table_.publish(slot, name, "memory");
++    if (slot_out) *slot_out = slot;
++    if (!infos.empty()) {
++        const lora::AdapterInfo& a = infos[0];
++        RAD_INFO("lora: '%s' in slot %d -- %zu modules, rank %lld, alpha %g%s, in memory", name.c_str(),
++                 slot, a.modules.size(), (long long)a.max_module_rank, a.alpha,
++                 a.rslora ? " (rsLoRA)" : "");
++    }
++    return RAD_OK;
++}
++
+ int Engine::lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>& packed,
+                       std::string* err) {
+     /* Each rank on a stream of its own: the compute stream may be recording a pass. */
