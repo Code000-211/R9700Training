@@ -123,6 +123,16 @@ else()
 endif()
 set(RAD_GPU_TARGETS "gfx1201" CACHE STRING "AMDGPU architectures radiance's HIP kernels target")
 
+# The int8 GEMM row the IQR decode test compares with is `libr4d`'s; it is a HIP module, so only
+# ask radiance for it when the build is building the card side at all.
+set(R97_LIBR4D_TARGET "")
+set(R97_LIBR4D_BYPRODUCT "")
+if(RAD_WITH_HIP)
+  set(R97_LIBR4D_TARGET libr4d)
+  set(R97_LIBR4D_BYPRODUCT
+      ${CMAKE_BINARY_DIR}/radiance-build/radiance_home/kernels/libr4d.so)
+endif()
+
 ExternalProject_Add(radiance_core
   PREFIX  ${CMAKE_BINARY_DIR}/radiance-ext
   SOURCE_DIR ${R97_RADIANCE_COPY}
@@ -137,13 +147,15 @@ ExternalProject_Add(radiance_core
     -DRAD_WITH_HIP=${RAD_WITH_HIP}
     -DRAD_GPU_TARGETS=${RAD_GPU_TARGETS}
     -DR97_PATCH_STAMP=${R97_PATCH_STAMP}
-  BUILD_COMMAND ${CMAKE_COMMAND} --build . --target rad_core libref libavx libquant rad-convert qwen35_bf16 qwen35_w8a8
+  BUILD_COMMAND ${CMAKE_COMMAND} --build . --target rad_core libref libavx libquant
+                ${R97_LIBR4D_TARGET} rad-convert qwen35_bf16 qwen35_w8a8
   INSTALL_COMMAND ""
   BUILD_ALWAYS FALSE
   USES_TERMINAL_BUILD TRUE
   BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/radiance-build/core/librad_core.a
                    ${CMAKE_BINARY_DIR}/radiance-build/vendor/librad_vendor_llama.a
-                   ${CMAKE_BINARY_DIR}/radiance-build/vendor/librad_vendor_httplib.a)
+                   ${CMAKE_BINARY_DIR}/radiance-build/vendor/librad_vendor_httplib.a
+                   ${R97_LIBR4D_BYPRODUCT})
 
 set(R97_RADIANCE_LIB ${CMAKE_BINARY_DIR}/radiance-build/core/librad_core.a)
 # rad_core links the vendored llama (the tokeniser, the chat templates) and cpp-httplib, so a
@@ -319,10 +331,12 @@ if(R97_BUILD_TESTS)
     target_include_directories(r97_gpu_tests PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/tests
       ${CMAKE_CURRENT_SOURCE_DIR}/src)   # the device harness reads the scratch ledger
+    target_compile_definitions(r97_gpu_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
     if(TARGET libr97)
       add_dependencies(r97_gpu_tests libr97)
       target_compile_definitions(r97_gpu_tests PRIVATE
-        "R97_DEVICE_PLUGIN=\"$<TARGET_FILE:libr97>\"")
+        "R97_DEVICE_PLUGIN=\"$<TARGET_FILE:libr97>\""
+        "R97_LIBR4D=\"${CMAKE_BINARY_DIR}/radiance-build/radiance_home/kernels/libr4d.so\"")
     endif()
   endif()
 
@@ -361,7 +375,13 @@ if(R97_BUILD_TESTS)
 
   if(TARGET r97_gpu_tests)
     add_test(NAME gpu_tests COMMAND r97_gpu_tests)
-    set_tests_properties(gpu_tests PROPERTIES LABELS gpu RUN_SERIAL TRUE)
+    # The container cases in the gpu binary make it a model test too, when the container the
+    # build found is on disk; without one the binary skips them and stays a gpu test.
+    set(R97_GPU_TEST_LABELS gpu)
+    if(EXISTS "${R97_MODEL_RAD}")
+      list(APPEND R97_GPU_TEST_LABELS model)
+    endif()
+    set_tests_properties(gpu_tests PROPERTIES LABELS "${R97_GPU_TEST_LABELS}" RUN_SERIAL TRUE)
   endif()
 
   if(TARGET r97_model_tests)
