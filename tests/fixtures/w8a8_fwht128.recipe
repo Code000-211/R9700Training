@@ -1,10 +1,8 @@
-# The tiny int8 fixture: the trunk of radiance's data/recipes/q38-27b-w8a8-df2.recipe -- every
-# trunk linear an i8 code, a bf16 scale per 128 of K, the 128-wide Hadamard and symmetric clipping,
-# the scale's rounding searched per group -- with two lines left out:
+# The tiny int8 fixture: radiance's data/recipes/q38-27b-w8a8-df2.recipe at this checkpoint's
+# shapes -- the reference's trunk and head lines, each an i8 code, a bf16 scale per 128 of K, the
+# 128-wide Hadamard for the trunk linears and symmetric clipping, the scale's rounding searched per
+# group -- with one line left out:
 #
-#   output.weight          the reference makes the lm_head int8 too (logits_gemm_i8). That op is
-#                          device-only, so the tiny head stays bf16: the acceptance compares
-#                          next-token distributions, which a bf16 head gives all the same.
 #   blk.*.ssm_out.weight   the tiny model's delta-net value width is 64 (lin_v_heads 4 x
 #                          lin_v_dim 16), and the served i8a8h form wants a scale per 128 of K;
 #                          64 does not divide. It stays bf16, and is the only trunk linear that
@@ -19,3 +17,5 @@ blk.*.attn_output.weight             rtn  codes=i8 group=128 scale=bf16 transfor
 blk.*.ssm_inz.weight                 rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
 blk.*.ffn_gate_up.weight             rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
 blk.*.ffn_down.weight                rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+
+output.weight                        rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search

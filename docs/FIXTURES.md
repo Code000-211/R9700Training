@@ -59,10 +59,11 @@ const r97::Fixture& s = r97::shuffled_fixture();  // the control: rows rotated, 
 ## The tiny int8 Qwen3.5
 
 `r97::w8a8_fixture()` is the same checkpoint, converted a second time with
-`tests/fixtures/w8a8_fwht128.recipe`: the trunk of radiance's
-`data/recipes/q38-27b-w8a8-df2.recipe`, with two lines left out. The container lands beside the
-bf16 one as `tiny_qwen35_w8a8.rad`, states the quantisation `w8a8_fwht128`, and the
-`qwen35_w8a8` plugin serves it on the same host kernel libraries (`libavx`, then `libref`).
+`tests/fixtures/w8a8_fwht128.recipe`: radiance's
+`data/recipes/q38-27b-w8a8-df2.recipe` at this checkpoint's shapes, with one line left out. The
+container lands beside the bf16 one as `tiny_qwen35_w8a8.rad`, states the quantisation
+`w8a8_fwht128`, and the `qwen35_w8a8` plugin serves it on the same host kernel libraries (`libavx`,
+then `libref`).
 
 The recipe, as `tests/fixtures/w8a8_fwht128.recipe` holds it:
 
@@ -74,15 +75,15 @@ blk.*.attn_output.weight             rtn  codes=i8 group=128 scale=bf16 transfor
 blk.*.ssm_inz.weight                 rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
 blk.*.ffn_gate_up.weight             rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
 blk.*.ffn_down.weight                rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+
+output.weight                        rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
 ```
 
-So every trunk linear the host chain can carry is an i8 code, a bf16 scale per 128 of K, the
-128-wide Hadamard and symmetric clipping, with the scale's rounding searched per group. Two of
-the reference recipe's lines are left out, because this checkpoint's shapes cannot take them:
+So every trunk linear is an i8 code, a bf16 scale per 128 of K, the 128-wide Hadamard and
+symmetric clipping, with the scale's rounding searched per group; the `lm_head` is the reference's
+own unrotated int8 line. One of the reference recipe's lines is left out, because this
+checkpoint's shape cannot take it:
 
-- `output.weight`: its line makes an int8 `lm_head`, and `logits_gemm_i8` has a row in `libr4d`
-  (device) only. The head stays bf16; the acceptance compares next-token distributions, which a
-  bf16 head gives all the same.
 - `blk.*.ssm_out.weight`: the delta-net value width of this checkpoint is 64 (4 value heads of
   16), and the served `i8a8h` form wants a scale per 128 of K; 64 does not divide, so it stays
   bf16. It is the only trunk linear that does.
@@ -128,11 +129,12 @@ prefill graph, sampling tail included.
 | `sigmoid`, `mul` | 1 each | the attention output gate, unfused |
 | `add` | 1 | the attention layer's residual |
 | `gather_rows` | 1 | the last position's row for the head |
-| `logits_gemm` | 1 | the bf16 `lm_head` |
+| `logits_gemm` | 1 | the int8 `lm_head`: i8 codes, a bf16 scale per 128 of K, unrotated |
 | `sample_*` | 14 | the sampling chain every engine declares; a prefill returns the logits, so a caller never reads a sample |
 
 No kernel plugin of this repository was needed: each name in the table has a row in `libref`
-(the `i8a8h` operands of `gemm_nt_q` included), so `libr97ref` does not exist.
+(the `i8a8h` operands of `gemm_nt_q` and the int8 head's operands included), so `libr97ref` does
+not exist.
 
 ### The attention gate on a narrow head
 
@@ -152,7 +154,7 @@ no full-width model.
 fixture, the int8 fixture, and a control, and reports the per-position mean and worst
 KL(bf16 || other) of the next-token distributions:
 
-- int8 fixture: mean 1.9e-2, worst 7.3e-1 (the worst is one position where the two models
+- int8 fixture: mean 1.9e-2, worst 7.2e-1 (the worst is one position where the two models
 disagree about a near-tie);
 - control: mean 3.7e+0, worst 7.5e+0 — 190 times the int8 mean.
 

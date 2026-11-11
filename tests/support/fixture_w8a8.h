@@ -2,10 +2,10 @@
 // checkpoint, and a shuffled-weight control for it.
 //
 // The checkpoint is the same one: `fixture()` writes it once, and this header converts it a second
-// time with tests/fixtures/w8a8_fwht128.recipe, the trunk of radiance's
-// data/recipes/q38-27b-w8a8-df2.recipe. The resulting descriptor is `w8a8_fwht128`, which the
-// qwen35_w8a8 plugin selects; the engine drives it through run_prefill() exactly as it drives the
-// bf16 container.
+// time with tests/fixtures/w8a8_fwht128.recipe, radiance's
+// data/recipes/q38-27b-w8a8-df2.recipe at this checkpoint's shapes. The resulting descriptor is
+// `w8a8_fwht128`, which the qwen35_w8a8 plugin selects; the engine drives it through
+// run_prefill() exactly as it drives the bf16 container.
 //
 // The control is a checkpoint with every matrix's rows permuted: the same values, each in the
 // wrong place, converted bf16. The KL of its next-token distributions against the
