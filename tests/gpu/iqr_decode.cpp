@@ -1,8 +1,8 @@
 // The IQR decode kernel on the card: every form the first container stores, decoded to the int8
 // grid and checked against the host decode byte for byte, then radiance's int8 GEMM over that grid
-// against its IQR GEMM over the same codes. Real tensors are the point, so this is a model test: it
-// resolves the container first thing, skips (exit 77) when it is absent, and only then takes the
-// card.
+// against its IQR GEMM over the same codes. Real tensors are the point, so this is a model test
+// (support/model_case.h): it resolves the container first thing, skips (exit 77) when it is absent,
+// and only then takes the card.
 
 #include <dlfcn.h>
 
@@ -24,8 +24,8 @@
 #include "iqr_decode.h"
 #include "support/device_check.h"
 #include "support/gpu_guard.h"
+#include "support/model_case.h"
 #include "support/model_dir.h"
-#include "support/test.h"
 
 namespace {
 
@@ -361,15 +361,12 @@ std::string sibling(const std::string& so, const char* name) {
 }
 
 void load_l4d(L4d& l, const std::string& plugin) {
-    // Where libr4d is: the environment's override, the build's own radiance home when this build
-    // makes the module, or beside the device plugin -- radiance's home kernels/ directory, which is
-    // where both plugins land. A path that is not there falls through to the next.
+    // Where libr4d is: the environment's override, or beside the device plugin -- radiance's home
+    // kernels/ directory, which is where both modules land. A path that is not there falls through
+    // to the next.
     std::vector<std::string> paths;
     const char* env = std::getenv("R97_LIBR4D");
     if (env && *env) paths.push_back(env);
-#ifdef R97_LIBR4D
-    paths.push_back(R97_LIBR4D);
-#endif
     paths.push_back(sibling(plugin, "libr4d.so"));
 
     std::string why;

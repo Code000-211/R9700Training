@@ -341,12 +341,6 @@ if(R97_BUILD_TESTS)
       add_dependencies(r97_gpu_tests libr97)
       target_compile_definitions(r97_gpu_tests PRIVATE
         "R97_DEVICE_PLUGIN=\"$<TARGET_FILE:libr97>\"")
-      # Where the IQR GEMM comparison finds radiance's int8 rows, when this build makes them; the
-      # test looks beside the device plugin otherwise (both land in the radiance home's kernels/).
-      if(R97_LIBR4D_TARGET)
-        target_compile_definitions(r97_gpu_tests PRIVATE
-          "R97_LIBR4D=\"${CMAKE_BINARY_DIR}/radiance-build/radiance_home/kernels/libr4d.so\"")
-      endif()
     endif()
   endif()
 
@@ -390,12 +384,14 @@ if(R97_BUILD_TESTS)
     # kind. The card's own tests:
     add_test(NAME gpu_tests COMMAND r97_gpu_tests)
     set_tests_properties(gpu_tests PROPERTIES LABELS gpu RUN_SERIAL TRUE)
-    # ... and the tests that also need the real container (`R97_MODEL_TEST`), which is what makes
-    # the IQR decode a `gpu` `model` test:
-    add_test(NAME gpu_model_tests COMMAND r97_gpu_tests --model)
+    # ... and the tests that also need the real container (`R97_MODEL_TEST`, tests/support/
+    # model_case.h). They run in a second start of the same binary; R97_MODEL_CASES is the whole
+    # difference between the two runs:
+    add_test(NAME gpu_model_tests COMMAND r97_gpu_tests)
     set_tests_properties(gpu_model_tests PROPERTIES
       LABELS "gpu;model"
       RUN_SERIAL TRUE
+      ENVIRONMENT "R97_MODEL_CASES=1"
       SKIP_RETURN_CODE 77)   # the model cases skip when the container is absent, like model_tests
   endif()
 

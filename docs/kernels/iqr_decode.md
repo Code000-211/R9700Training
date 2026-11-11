@@ -131,12 +131,19 @@ grid is in the rotated basis.
 
 The GEMM check needs `libr4d.so`. radiance makes that module only for a HIP build whose targets
 hold RDNA4 (`libr4d/CMakeLists.txt`), so the build asks for it on those same terms: when it does,
-`libr4d` joins radiance's `BUILD_COMMAND` and the gpu test gets its path as `R97_LIBR4D`; when it
-does not, `R97_LIBR4D` is left unset and the test looks beside the device plugin, where the radiance
-home puts both modules.
+`libr4d` joins radiance's `BUILD_COMMAND`, and the test finds it beside the device plugin, where
+the radiance home puts both modules (`R97_LIBR4D` overrides the path); when it does not, no target
+is named and the test fails by name rather than silently comparing nothing.
 
-Because it needs real tensors it is a `model` test, `R97_MODEL_TEST(iqr_decode)`: it resolves the
-container before it takes the card and skips with exit 77 when the container is absent, so ctest
-runs it as `gpu_model_tests` (`ctest -L model`), never as the plain `gpu_tests` run, which is the
-card's own cases and must not skip. Directly: `./build/r97_gpu_tests --model`. The forms a card can
-check without the container are covered synthetically in the host tier, above.
+Because it needs real tensors it is a `model` test, `R97_MODEL_TEST(iqr_decode)`, registered from
+`tests/support/model_case.h`: it resolves the container before it takes the card and skips with
+exit 77 when the container is absent. The gpu binary is started twice, and the two runs differ by
+one environment variable. ctest runs it as `gpu_model_tests` (`LABELS gpu;model`, `R97_MODEL_CASES=1`
+and `SKIP_RETURN_CODE 77`), never as the plain `gpu_tests` run, which is the card's own cases and
+must not skip. Directly: `R97_MODEL_CASES=1 ./build/r97_gpu_tests`, which is also where the timings
+above come from. The forms a card can check without the container are covered synthetically in the
+host tier, above.
+
+That the second label needs the card as well has a consequence for the shared machine: `ctest -L
+model` includes `gpu_model_tests`, so on a machine with the container and no card it fails on the
+card guard. Run `ctest -L model -E gpu_model_tests` there, or take the whole thing on the card.

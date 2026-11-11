@@ -14,11 +14,7 @@
 // status either way, which is what ctest reads.
 //
 // `--bench` adds a timed pass to each device case (tests/support/bench.h); the correctness
-// comparison runs either way. `--model` runs the model cases -- the ones that also need the real
-// container, registered with R97_MODEL_TEST -- and, like every model test, skips (exit 77) when
-// the container is absent; without it the run is the card's own tests, which never skip. ctest
-// starts this binary once per kind (CMakeLists.txt), because one process cannot be both a `gpu`
-// run that never skips and a `model` run that skips. Anything else is a usage error.
+// comparison runs either way. Anything else is a usage error.
 #include "support/bench.h"
 #include "support/test.h"
 
@@ -27,21 +23,16 @@
 #include <cstring>
 
 int main(int argc, char** argv) {
-    r97test::Select sel = r97test::Select::card;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--bench") == 0) {
             r97test::bench_flag() = true;
             continue;
         }
-        if (std::strcmp(argv[i], "--model") == 0) {
-            sel = r97test::Select::model;
-            continue;
-        }
-        std::fprintf(stderr, "usage: %s [--bench] [--model]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [--bench]\n", argv[0]);
         std::_Exit(2);  // a usage error runs no tests
     }
 
-    const int failed = r97test::run_all(sel);
+    const int failed = r97test::run_all();
     std::fflush(stdout);
     std::fflush(stderr);
     std::_Exit(failed ? 1 : 0);
