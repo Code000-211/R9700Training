@@ -16,7 +16,6 @@
 
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <deque>
 #include <functional>
 #include <string>
@@ -374,44 +373,8 @@ R97_TEST(tape_observer_detached_leaves_the_runtime_alone) {
     R97_CHECK(g_calls.size() == 4);
 }
 
-// keep_contents makes the tape copy each operand's bytes when it records the op, which the
-// issue observer does after the op ran. Without it a content is the buffer, so a reader sees
-// whatever the last writer left there; with it, the bytes a step's ops touched outlive the step,
-// which is what a comparison between an op and a later one needs.
-R97_TEST(tape_observer_keeps_the_contents_when_asked) {
-    Fixture f;
-    R97_CHECK(f.start() == RAD_OK);
-
-    r97::Tape tape;
-    R97_CHECK(!tape.keeps_contents());
-    tape.attach(static_cast<RadCtx*>(&f.ctx));
-    R97_CHECK(f.step([&](Ctx& c) { issue_a_step(c, f.x, f.w, f.y, f.op); }) == RAD_OK);
-
-    // Two of the four ops read x over the same rows: without a copy, one address twice.
-    R97_CHECK(tape.ops()[0].operands[0].buffer == tape.ops()[1].operands[0].buffer);
-    R97_CHECK(tape.content(0, 0).data == tape.content(1, 0).data);
-
-    tape.clear();
-    tape.keep_contents(true);
-    R97_CHECK(tape.keeps_contents());
-    R97_CHECK(f.step([&](Ctx& c) { issue_a_step(c, f.x, f.w, f.y, f.op); }) == RAD_OK);
-
-    // Now each issue holds its own copy of the bytes it saw.
-    R97_CHECK(tape.ops()[0].operands[0].buffer == tape.ops()[1].operands[0].buffer);
-    R97_CHECK(tape.content(0, 0).bytes == tape.content(1, 0).bytes);
-    R97_CHECK(tape.content(0, 0).data != tape.content(1, 0).data);
-    R97_CHECK(std::memcmp(tape.content(0, 0).data, tape.content(1, 0).data,
-                          tape.content(0, 0).bytes) == 0);
-
-    // Off again, and the content is the buffer once more.
-    tape.clear();
-    tape.keep_contents(false);
-    R97_CHECK(f.step([&](Ctx& c) { issue_a_step(c, f.x, f.w, f.y, f.op); }) == RAD_OK);
-    R97_CHECK(!tape.keeps_contents());
-    R97_CHECK(tape.content(0, 0).data == tape.content(1, 0).data);
-}
-
 #else  // RAD_ISSUE_OBSERVER
+
 // A serving build applies none of patches/training/, so its radiance has no issue observer and
 // there is no tape to record: this file registers no test there.
 

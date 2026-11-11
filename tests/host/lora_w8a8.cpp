@@ -154,6 +154,7 @@ R97_TEST(lora_w8a8_sites_compute_base_plus_the_delta) {
     Tape          tape;
     const Prefill with = r97::lora_w8a8::run(f, prompt(), dir, &tape);
     R97_CHECK(!with.logits.empty());
+    R97_CHECK(tape.keeps_contents());
 
     double worst = 0, weakest = 1e9;
     for (const r97::lora_w8a8::Site& s : r97::lora_w8a8::sites(tape)) {
