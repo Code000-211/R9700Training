@@ -34,8 +34,8 @@ struct BatcherConfig {
 class Batcher {
 public:
     struct Position {
-        int64_t epoch = 0;  // which shuffle
-        int64_t step = 0;   // the step's index within that epoch
+        int64_t epoch = 0;  // which shuffle; seek() clamps a negative one to the first
+        int64_t step = 0;   // the step's index within that epoch; seek() clamps it to the epoch
     };
 
     Batcher() = default;
@@ -51,6 +51,9 @@ public:
 
     const Position& position() const;  // where the next next() reads
     void reset();                      // to (0, 0), same seed
+    // Clamps the position into its valid range -- a negative epoch is the first, a step below
+    // the epoch's first is its first, past its end is its end -- so a position restored from
+    // stored data can never index outside a plan.
     void seek(const Position& p);
 
     // Indices into the input's sequences that exceed the budget, in input order; the caller

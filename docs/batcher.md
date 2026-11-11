@@ -57,7 +57,11 @@ The iteration position is `(epoch, step)`. `position()` reads it, `seek()` moves
 goes to `(0, 0)`. `next()` returns the step at the position and advances it; at an epoch's end it
 returns false without consuming anything, and `seek({epoch + 1, 0})` moves on. Because a plan is
 a pure function of `(seed, epoch, sequences)`, a resumed run that seeks to a saved position sees
-exactly the batches the original run produced from there.
+exactly the batches the original run produced from there. A position restored from stored data is
+treated as data and clamped into the valid range: a negative epoch becomes the first, a step
+below the epoch's first becomes its first, and a step past its end becomes its end (where
+`next()` returns false). A stepped-back or corrupted `epoch`/`step` therefore never indexes a
+plan out of bounds.
 
 ## Determinism
 
@@ -95,7 +99,9 @@ beside 32 shorts with one device, comes out in steps that hold one class only, t
 first. The 32 case is exactly two buckets; the 33 case leaves a bucket that would hold one long
 and the shorts after it in the sorted order, so it is the case that mixes classes unless the
 bucket is cut at the length class and a step stops at the bucket edge — the grouping that a plain
-shuffle, or buckets of 32 without the class cut, would lose.
+shuffle, or buckets of 32 without the class cut, would lose. A saved position with a negative step
+or epoch resumes at the epoch's first step or shuffle, and one past the epoch's end sits at its
+end and hands out nothing, so a stepped-back or corrupted position cannot read outside the plan.
 `tests/headers/hdr_batcher.cpp` is the standalone-compile check of the header.
 
 The host test binary has a single `main`, in `tests/host/vector_tape.cpp`; a second one cannot

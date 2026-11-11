@@ -611,6 +611,51 @@ void check_short_tail_balance() {
     }
 }
 
+// A saved Position is plain data, and seek() promises no validity beyond what a previous
+// position() returned. A stepped-back or corrupted epoch/step must not index a plan out of bounds:
+// seek() clamps it into the valid range, so a negative step resumes at the first step, a negative
+// epoch resumes at the first shuffle, and a step past the end leaves the traversal at the epoch's
+// end rather than reading a step that is not there.
+void check_position_is_range_checked() {
+    auto lens = lengths_for(80, 31);
+    auto seqs = make_sequences(lens);
+
+    r97::BatcherConfig cfg;
+    cfg.token_budget = 512;
+    cfg.devices = 2;
+    cfg.seed = 808;
+    Batcher b(seqs, cfg);
+
+    b.seek({0, 0});
+    auto first = run_epoch(b);
+    assert(!first.empty());
+
+    b.seek({0, -1});
+    assert(b.position().epoch == 0 && b.position().step == 0);
+    assert(id_order(run_epoch(b)) == id_order(first));  // the first step, not plan[-1]
+
+    b.seek({0, -123456});
+    assert(b.position().step == 0);
+    assert(id_order(run_epoch(b)) == id_order(first));
+
+    b.seek({0, 2});
+    auto from_two = run_epoch(b);
+    b.seek({-7, 2});
+    assert(b.position().epoch == 0 && b.position().step == 2);
+    assert(id_order(run_epoch(b)) == id_order(from_two));
+
+    b.seek({-7, -7});
+    assert(b.position().epoch == 0 && b.position().step == 0);
+    assert(id_order(run_epoch(b)) == id_order(first));
+
+    const int64_t end = b.steps_in_epoch(0);
+    b.seek({0, end + 1000});
+    assert(b.position().step == end);
+    std::vector<Batch> step;
+    assert(!b.next(&step));
+    assert(b.position().step == end);
+}
+
 void run_checks() {
     check_budget_coverage_and_resume();
     check_budget_is_per_batch();
@@ -619,6 +664,7 @@ void run_checks() {
     check_single_step_split();
     check_short_tail_balance();
     check_reset_and_config_errors();
+    check_position_is_range_checked();
     std::puts("batcher ok");
 }
 

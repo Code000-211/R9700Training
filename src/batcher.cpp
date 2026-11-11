@@ -276,7 +276,12 @@ Batcher::Batcher(std::vector<TokenSeq> sequences, const BatcherConfig& config)
 
 bool Batcher::next(std::vector<Batch>* step) {
     const EpochPlan& p = plan(position_.epoch);
-    if (position_.step >= (int64_t)p.steps.size()) return false;
+    if (position_.step < 0 || position_.step >= (int64_t)p.steps.size()) {
+        // seek() clamps every position into the plan, but next() must not trust one either: leave
+        // it at the epoch's end instead of indexing outside the plan.
+        position_.step = (int64_t)p.steps.size();
+        return false;
+    }
     const auto& idx = p.steps[(size_t)position_.step];
     step->clear();
     for (size_t d = 0; d < idx.size(); ++d) {
@@ -295,7 +300,13 @@ const Batcher::Position& Batcher::position() const { return position_; }
 
 void Batcher::reset() { position_ = Position{}; }
 
-void Batcher::seek(const Position& p) { position_ = p; }
+void Batcher::seek(const Position& p) {
+    // A position comes back from stored data, not from an index expression: clamp it into the
+    // valid range so a stepped-back, corrupted or out-of-range one cannot index the plan out of
+    // bounds. The epoch's end is a valid position (next() there returns false), hence inclusive.
+    position_.epoch = std::max<int64_t>(p.epoch, 0);
+    position_.step = std::clamp<int64_t>(p.step, 0, steps_in_epoch(position_.epoch));
+}
 
 const std::vector<size_t>& Batcher::skipped() const { return skipped_; }
 
