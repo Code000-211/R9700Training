@@ -119,11 +119,12 @@ m_j        =  1 if |u_j| ≤ 127,  0 if |u_j| > 127        (the clamp's own deri
 ∂L/∂x      =  Wᵀ (m ⊙ ḡ / s)  =  W (m ⊙ ḡ / s)            quant_act_i8g: the identity
 ```
 
-The estimator the issue states it as, in the dequantised domain `q = s · c`, is the same function:
-the cotangent there is `g_j = s · ḡ_j` (`∂q/∂c = s`), and
+The estimator the issue states it as, in the dequantised domain `q = s · c`, is the same function.
+With `g_j = ∂L/∂q_j` the cotangent a walk over the dequantised product hands back, `q = s · c`
+gives `ḡ_j = ∂L/∂c_j = s · g_j` (`∂q/∂c = s`), that is `g_j = ḡ_j / s`, and
 
 ```
-∂L/∂x  =  Wᵀ (m ⊙ g)          g_j = ∂L/∂q_j.
+∂L/∂x  =  Wᵀ (m ⊙ g)          g_j = ∂L/∂q_j  =  ḡ_j / s.
 ```
 
 The division by `s` in the first form is not a factor of the adjoint; it is the change of units
