@@ -29,9 +29,10 @@
 #include "r97/tape.h"
 
 // The prefill is patches/training/'s: 0103-prefill-logits.patch adds run_prefill(),
-// 0104-prefill-lora.patch lets that prefill run a named adapter, and 0101-issue-observer.patch the
-// tape. A serving build applies none of the set, so the body compiles to nothing there
-// (docs/FIXTURES.md) and an includer needs no guard of its own.
+// 0104-prefill-lora.patch lets that prefill run a named adapter, 0101-issue-observer.patch the
+// tape, and 0119-issue-observer-hook.patch the Engine accessor it attaches through. A serving
+// build applies none of the set, so the body compiles to nothing there (docs/FIXTURES.md) and an
+// includer needs no guard of its own.
 #if R97_FIXTURE_PREFILL && defined(RAD_ISSUE_OBSERVER)
 
 namespace r97 {
@@ -187,7 +188,7 @@ inline Prefill run(const Fixture& f, const std::vector<int32_t>& ids, const std:
                                  f.container + ": " + rad_strerror(s));
     if (tape != nullptr) {
         tape->keep_contents(true);
-        tape->attach(engine.rank_ctx(0));
+        tape->attach(engine.issue_ctx());
     }
     const int served = engine.serve(std::unique_ptr<rad::StallWatch>());
     if (tape != nullptr) tape->detach();
