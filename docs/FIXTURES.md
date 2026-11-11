@@ -108,7 +108,8 @@ when the answer is no. On the host every fused producer that would write int8 co
 (`gate_had_quant_i8g`, `gate_quant_fp8`, `attn_paged_gate_quant`, `rmsnorm_had_quant_i8g`,
 `gated_had_quant_i8g`, `qk_norm_rope_gate`), so the chain below is the declared graph for this
 fixture, in declaration order, deduplicated over the four layers; counts are for the whole 96-token
-prefill graph, sampling tail included.
+prefill graph. There is no sampling tail: the request is prefill-only (`run_prefill` below), so no
+sampler op is issued.
 
 | op | n | what it does here |
 | --- | --- | --- |
@@ -172,8 +173,10 @@ std::vector<r97::Prefill> all = r97::run_prefill(f, prompts);  // a batch
 
 `run_prefill` starts an `Engine` on the container with the host kernel libraries (`libavx`, then
 `libref` for the rows `libavx` does not cover), speculation off, and submits the prompts as
-scoring requests with `max_tokens = 1`: one prefill step each, from position 0, with no decode.
-Every position's logits are kept, so
+scoring requests that are prefill-only (`Request::prefill_only`, patch
+`patches/training/0105-prefill-not-sampled.patch`): one prefill step each, from position 0, no
+decode, and no sampler -- the step draws no token, so it issues no sampler op, and the request
+finishes once its prompt is placed. Every position's logits are kept, so
 
 - `Prefill::n_tokens` is the prompt length,
 - `Prefill::n_vocab` is the vocabulary of the container (320),
