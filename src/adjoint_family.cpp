@@ -80,12 +80,14 @@ R97_REGISTER_ADJOINT_FAMILY(Quant, "rmsnorm_quant_fp8", "gated_quant_fp8", "quan
 // fixture's tape, but the registry has both.
 R97_REGISTER_ADJOINT_FAMILY(Lora, "lora_shrink", "lora_expand", "lora_expand_mm");
 
-// The rotary embedding and its table, plus the fused norm-rope-gate form that stores the paged KV.
+// The rotary embedding and its table, the fused norm-rope-gate form that stores the paged KV, and
+// the write that fills the pool the paged attention later reads.
 R97_REGISTER_ADJOINT_FAMILY(Qk, "rope", "rope_table", "qk_norm_rope_gate",
-                            "qk_norm_rope_gate_kv_store", "qk_norm_rope_gate_kv_store_streamed");
+                            "qk_norm_rope_gate_kv_store", "qk_norm_rope_gate_kv_store_streamed",
+                            "kv_store");
 
-// The paged attention itself and the write that prepares its KV pool.
-R97_REGISTER_ADJOINT_FAMILY(Attention, "attn_paged", "kv_store");
+// The paged attention itself. The write that prepares its KV pool is the qk family's.
+R97_REGISTER_ADJOINT_FAMILY(Attention, "attn_paged");
 
 // The conv prep, its norm, and the decode-only updates whose backward lives in the same file: the
 // prefill forward never issues the updates, so they are not inventory rows.

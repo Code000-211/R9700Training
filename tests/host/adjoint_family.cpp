@@ -9,9 +9,9 @@
 //
 // The table in src/adjoint_family.cpp claims the ops that already had a backward; this file claims
 // one of its own the way an op file would, so the checks below run both paths.
-#include "support/test.h"
+#include "../support/test.h"
 
-#include "../src/adjoint_family.h"
+#include "../../src/adjoint_family.h"
 
 #include <string>
 
@@ -50,7 +50,7 @@ R97_TEST(adjoint_family_each_family_claims_its_ops) {
     R97_CHECK(r97::family_find("lora_expand_mm") == r97::AdjointFamily::Lora);
     R97_CHECK(r97::family_find("rope") == r97::AdjointFamily::Qk);
     R97_CHECK(r97::family_find("rope_table") == r97::AdjointFamily::Qk);
-    R97_CHECK(r97::family_find("kv_store") == r97::AdjointFamily::Attention);
+    R97_CHECK(r97::family_find("kv_store") == r97::AdjointFamily::Qk);
     R97_CHECK(r97::family_find("attn_paged") == r97::AdjointFamily::Attention);
     R97_CHECK(r97::family_find("gdn_conv_prep") == r97::AdjointFamily::GdnPrep);
     R97_CHECK(r97::family_find("gdn_gated_rmsnorm") == r97::AdjointFamily::GdnPrep);

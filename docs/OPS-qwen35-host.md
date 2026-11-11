@@ -104,7 +104,7 @@ One prefill step: 65 issues, 23 op forms.
 | `rmsnorm` | full-attention | dtype=bf16 | 3 | yes | yes | - | - | yes | elementwise |
 | `gemm_nt` | full-attention | dtype=bf16 | 4 | yes | yes | - | - | yes | linear |
 | `rope` | full-attention | mode=mrope | 2 | - | - | - | - | yes | qk |
-| `kv_store` | full-attention | kv_dtype=bf16 | 1 | - | - | - | - | yes | attention |
+| `kv_store` | full-attention | kv_dtype=bf16 | 1 | - | - | - | - | yes | qk |
 | `attn_paged` | full-attention | q_dtype=bf16 kv_dtype=bf16 | 1 | yes | yes | - | - | yes | attention |
 | `sigmoid` | full-attention | dtype=bf16 | 1 | yes | yes | - | - | yes | elementwise |
 | `mul` | full-attention | dtype=bf16 | 1 | yes | yes | - | - | yes | elementwise |
@@ -139,7 +139,7 @@ One prefill step: 78 issues, 29 op forms.
 | `gemm_nt_q` | full-attention | dtype=i8a8h | 4 | yes | yes | - | - | yes | linear |
 | `rmsnorm` | full-attention | dtype=bf16 | 2 | yes | yes | - | - | yes | elementwise |
 | `rope` | full-attention | mode=mrope | 2 | - | - | - | - | yes | qk |
-| `kv_store` | full-attention | kv_dtype=bf16 | 1 | - | - | - | - | yes | attention |
+| `kv_store` | full-attention | kv_dtype=bf16 | 1 | - | - | - | - | yes | qk |
 | `attn_paged` | full-attention | q_dtype=bf16 kv_dtype=bf16 | 1 | yes | yes | - | - | yes | attention |
 | `sigmoid` | full-attention | dtype=bf16 | 1 | yes | yes | - | - | yes | elementwise |
 | `mul` | full-attention | dtype=bf16 | 1 | yes | yes | - | - | yes | elementwise |
@@ -206,7 +206,7 @@ claims are in `src/adjoint_family.cpp`):
 | `quant_act_fp8` | gated-delta-net, full-attention | `quant` |
 | `rope` | full-attention | `qk` |
 | `rope_table` | full-attention | `qk` |
-| `kv_store` | full-attention | `attention` |
+| `kv_store` | full-attention | `qk` |
 | `attn_paged` | full-attention | `attention` |
 | `gdn_conv_prep` | gated-delta-net | `gdn_prep` |
 | `gdn_gated_rmsnorm` | gated-delta-net | `gdn_prep` |
@@ -226,4 +226,7 @@ Three readings worth stating because the mapping is not mechanical:
   the quantiser's backward (the scale's cotangent and the rounding's), which is the same walk for
   every op that fuses a quantiser into a norm or an activation. `rmsnorm` without the quantiser is
   `elementwise`.
+- `kv_store` is `qk`, not `attention`: it writes the paged KV pool that `attn_paged` later reads,
+  and its backward sits with the rope and the gate in `src/adjoint/host/qk.cpp`
+  (`docs/adjoints/qk.md`); only the paged attention itself is `attention`.
 
