@@ -16,22 +16,33 @@ sequences:
 | 0 | `q` | `[T, Hg, K]` | bf16 | read |
 | 1 | `k` | `[T, Hg, K]` | bf16 | read |
 | 2 | `v` | `[T, H, V]` | bf16 | read |
-| 3 | `A` | `[T, H, chunk]` | f32 | read, unit lower triangular within a chunk |
+| 3 | `A` | `[T, H, chunk]` | bf16 | read, unit lower triangular within a chunk |
 | 4 | `g` | `[T, H]` | f32 | read, within-chunk cumsum |
 | 5 | `beta` | `[T, H]` | f32 | read |
-| 6 | `h0` | `[S, H, V, K]` | f32 | read, initial state; zero here |
+| 6 | `h0` | `[Nslots, H, V, K]` | f32 | read, initial state; zero here |
 | 7 | `cu` | `[S+1]` | i32 | read, sequence boundaries |
 | 8 | `o` | `[T, H, V]` | bf16 | written |
-| 9 | `ht` | `[S, H, V, K]` | f32 | written, final state |
+| 9 | `ht` | `[Nslots, H, V, K]` | f32 | written, final state |
 | 10 | `state_idx` | `[S]` | i32 | optional read, state-cache slot |
 
-`H = Hg * grp`, `grp` value heads per key head. `scale` is the op's optional f64
-parameter and is `1` here; the tape carries parameters as integers and strings,
-so this family's records use the default. `h0`, `cu` and `state_idx` are
-structure, not data: the host adjoint registers them frozen. A prefill starts
-from the zero state, so `h0` has no cotangent; when it is nonzero, its cotangent
-is still discarded. The state is held transposed as `St[d][e]` in the kernels
-and in this code, while `ht`/`h0` are stored `[slot, head, e, d]`.
+`H = Hg * grp`, `grp` value heads per key head. `h0` and `ht` are
+`[Nslots, H, V, K]`, one block per state-cache slot; `state_idx` names the slot
+row `n` owns, and without it row `n` owns slot `n`. `h0`, `cu` and `state_idx`
+are structure, not data: the host adjoint registers them frozen. A prefill
+starts from the zero state, so `h0` has no cotangent; when it is nonzero, its
+cotangent is still discarded. The state is held transposed as `St[d][e]` in the
+kernels and in this code, while `ht`/`h0` are stored `[slot, head, e, d]`.
+
+`scale` is the op's optional real parameter. The kernel's own default is `1`,
+but the architecture issues it as `1/sqrt(head_k)` at every delta-net layer, and
+the tape carries parameters as integers and strings, so the f64 does not survive
+a recorded step: a record off the tape carries no `scale` at all. The twin reads
+`scale` when the record names it (an integer or a decimal string) and otherwise
+uses `1/sqrt(head_k)`, the value the model ran with. Falling back to the
+kernel's `1` instead would make every scan's `o` `sqrt(head_k)` too large (11.3x
+at `K = 128`, 4x at the tiny fixture's `K = 16`). Each kernel check states a
+`scale` of its own, and `adjoint_gdn_chunk_scan_defaults_scale_to_the_architectures`
+pins the fallback.
 
 Only the lower triangle `j <= i` of each `A` row is read. The upper triangle is
 written as zero by `gdn_kkt_solve` and is not part of the scan; its cotangent is
@@ -138,16 +149,16 @@ At the real prefill geometry `T = 4096`, `chunk = 64` (64 chunks), `Hg = 16`,
 | `q` (`[64,16,128]` bf16) | 131,072 | 262,144 |
 | `k` (`[64,16,128]` bf16) | 131,072 | 262,144 |
 | `v` (`[64,48,128]` bf16) | 393,216 | 786,432 |
-| `A` (`[64,48,64]` f32) | 196,608 | 786,432 |
+| `A` (`[64,48,64]` bf16) | 196,608 | 393,216 |
 | `g` (`[64,48]` f32) | 3,072 | 12,288 |
 | `beta` (`[64,48]` f32) | 3,072 | 12,288 |
-| **operands from the forward** | | **2,121,728 (2.02 MiB)** |
+| **operands from the forward** | | **1,728,512 (1.65 MiB)** |
 | entering state `S0` (`[48,128,128]` f32), if saved | 786,432 | 3,145,728 (3 MiB) |
-| **with saved states** | | **5,267,456 (5.02 MiB)** |
+| **with saved states** | | **4,874,240 (4.65 MiB)** |
 
-Over the 64 chunks of a 4096-token sequence the operands are 135,790,592 bytes
-(129.5 MiB); saving every boundary state adds 201,326,592 bytes (192 MiB), for
-337,117,184 bytes (321.5 MiB) in total. The recompute variant used here keeps no
+Over the 64 chunks of a 4096-token sequence the operands are 110,624,768 bytes
+(105.5 MiB); saving every boundary state adds 201,326,592 bytes (192 MiB), for
+311,951,360 bytes (297.5 MiB) in total. The recompute variant used here keeps no
 boundary states in the forward. During the backward it holds one head's
 `St1`/`dS0` (`128*128*8 = 131,072` bytes each in f64) and, for the head being
 processed, that head's 64 entering states (`64*128*128*8 = 8,388,608` bytes,
