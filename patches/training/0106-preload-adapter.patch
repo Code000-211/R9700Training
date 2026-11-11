@@ -1,0 +1,109 @@
+Concern: a run with no command line names the adapter its prefill steps load, before any engine exists
+Upstream: not-submitted
+A trainer that drives radiance through an interface of its own -- r97train's loss pass -- has no
+command line for radiance to parse and no Engine to load an adapter into: it opens a forward
+driver, and the driver opens the engines. lora/preload.h is how such a run reaches the loader: it
+names the adapter at startup, every engine started afterwards joins it to its startup adapters, and
+its prefill steps run through it. Everything after that is --lora's own path: read_targets(),
+lora_start() and the slot table. The named adapter fills cfg_.prefill_lora, the field the earlier
+training patch 0104-prefill-lora.patch adds, so this patch is applied after it.
+
+diff --git a/core/engine_lora.cpp b/core/engine_lora.cpp
+--- a/core/engine_lora.cpp
++++ b/core/engine_lora.cpp
+@@ -12,6 +12,7 @@
+  * or the least recently used one no request holds, and later ones find it there. */
+ #include "engine_priv.h"
+ #include "lora/lora.h"
++#include "lora/preload.h"
+ 
+ #include <nlohmann/json.hpp>
+ 
+@@ -86,6 +87,14 @@
+ }  /* namespace */
+ 
+ int Engine::lora_targets() {
++    /* A run with no command line of its own -- the trainer's loss pass -- names its adapter before
++     * the first engine exists (lora/preload.h). It joins the startup adapters, so the loader reads
++     * it like a --lora one, and every prefill step of this engine runs through it. */
++    const lora::PreloadedAdapter pre = lora::preloaded_adapter();
++    if (!pre.name.empty() && cfg_.lora.adapters.empty()) {
++        cfg_.lora.adapters.emplace_back(pre.name, pre.dir);
++        if (cfg_.prefill_lora.empty()) cfg_.prefill_lora = pre.name;
++    }
+     if (!cfg_.lora.enabled()) return RAD_OK;
+     lora_targets_ = std::set<std::string>(cfg_.lora.targets.begin(), cfg_.lora.targets.end());
+     if (lora_targets_.empty()) {
+diff --git a/core/lora/preload.cpp b/core/lora/preload.cpp
+new file mode 100644
+--- /dev/null
++++ b/core/lora/preload.cpp
+@@ -0,0 +1,33 @@
++/* preload.cpp -- see preload.h. */
++#include "lora/preload.h"
++
++#include <mutex>
++
++namespace rad {
++namespace lora {
++namespace {
++
++std::mutex& preload_mu() {
++    static std::mutex m;
++    return m;
++}
++
++PreloadedAdapter& preload_slot() {
++    static PreloadedAdapter a;
++    return a;
++}
++
++}  /* namespace */
++
++void preload_adapter(const std::string& name, const std::string& dir) {
++    const std::lock_guard<std::mutex> lock(preload_mu());
++    preload_slot() = PreloadedAdapter{name, dir};
++}
++
++PreloadedAdapter preloaded_adapter() {
++    const std::lock_guard<std::mutex> lock(preload_mu());
++    return preload_slot();
++}
++
++}  /* namespace lora */
++}  /* namespace rad */
+diff --git a/core/lora/preload.h b/core/lora/preload.h
+new file mode 100644
+--- /dev/null
++++ b/core/lora/preload.h
+@@ -0,0 +1,30 @@
++/* preload.h -- the adapter a run's next engines start with, named before any engine exists.
++ *
++ * A trainer that drives radiance through an interface of its own (r97train loss) has no command
++ * line for the engine to parse and no Engine to load an adapter into: it opens a driver and the
++ * driver opens engines. Naming the adapter here, at startup, is how such a run reaches the loader
++ * -- every engine started afterwards loads it the way --lora would, and runs its prefill steps
++ * through it (core/engine_lora.cpp, core/train_prefill.cpp).
++ *
++ * One default per process, read by every engine: a serving process never calls it, and a run that
++ * wants no adapter (the default, an empty name) leaves it alone. */
++#pragma once
++
++#include <string>
++
++namespace rad {
++namespace lora {
++
++struct PreloadedAdapter {
++    std::string name;  /* the name the slots publish it under; empty: none */
++    std::string dir;   /* the PEFT directory (or a generator's .safetensors) to load */
++};
++
++/* Name the adapter every later engine starts with. Empty name: the base model. */
++void preload_adapter(const std::string& name, const std::string& dir);
++
++/* What preload_adapter() last named. */
++PreloadedAdapter preloaded_adapter();
++
++}  /* namespace lora */
++}  /* namespace rad */
