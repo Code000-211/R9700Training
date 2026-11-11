@@ -47,11 +47,22 @@ Two kinds of write are also a read even though no separate operand names the inp
 record has only the write: rope's operand 0 (it rewrites q or k in place, and its adjoint's
 cotangent for that operand is the read's), and a write into a `kv:` buffer (the cache and the
 recurrent/conv state are updated in place, and the pool the adjoint sees is the state before the
-write) unless a separate read operand names that same `kv:` buffer. Every other write is taken as
-new content, so an ordinary op's written buffer is never mistaken for its input.
+write) unless a separate read operand names that same `kv:` buffer. The issue record marks such
+an operand itself (`Operand::in_place`, a `RAD_OPD_INOUT` operand), and the mark is believed
+first; the two shapes above are read for a record built from a program rather than from the live
+tape, which does not carry the mark. Every other write is taken as new content, so an ordinary
+op's written buffer is never mistaken for its input.
 
 The reverse pass then never hands a cotangent to a version
 that is already gone: every reader of a version sits after its writer.
+
+## Slot names
+
+`BackwardOptions::slot_prefix` is optional, for a delta whose fused weight covers several sites
+in one record: given the record and a `slot`, it answers the name prefix for that site, and the
+leaf's suffix is appended as it is for `prefix`. The record is part of the call because the
+weight in it says which pool the slot belongs to, and several fused weights have overlapping slot
+numbers. Empty means every slot uses `prefix`.
 
 ## Stops
 

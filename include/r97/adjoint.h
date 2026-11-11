@@ -64,9 +64,10 @@ struct AdjointCall {
     std::vector<AdValue>* dc;        // every operand, in schema order, added to, never overwritten
     ParamSet* grads;                 // the trainable leaves, or null when the walk runs without
     const char* prefix;              // the name prefix grads entries carry (Delta::grad_prefix)
-    // When set, a trainable leaf's name is this callback's answer for its slot plus the leaf's
-    // suffix, instead of `prefix`. A fused weight's lora record carries several modules in one
-    // pool, and only the record's `slot` operand tells them apart.
+    // Optional: when set, a trainable leaf's name is this callback's answer for its slot plus the
+    // leaf's suffix, instead of `prefix`. A site's name prefix for one record that covers several
+    // sites of a fused weight: the lora rows ask it for a slot, and only the record's `slot`
+    // operand tells the modules in its pool apart. Empty means every slot uses `prefix`.
     std::function<std::string(int64_t slot)> slot_prefix;
 };
 

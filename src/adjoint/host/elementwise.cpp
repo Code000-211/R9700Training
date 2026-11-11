@@ -368,7 +368,8 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
     const AdValue* w = call.fwd.size() > 1 && !call.fwd[1].value.empty() ? &call.fwd[1] : nullptr;
     const AdValue& dy = call.cot[0];
     const int64_t n = width_of(call.rec, x.shape);
-    const int64_t rows = rows_of(x, n);
+    // The write is the step's rows; a whole-buffer read can be longer than it on the engine.
+    const int64_t rows = std::min(rows_of(x, n), rows_of(dy, n));
     if (rows <= 0) return;
     if (w && (int64_t)w->value.size() < n) return;
     const double eps = param_num(call.rec, "eps", 1e-6);

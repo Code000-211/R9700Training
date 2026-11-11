@@ -69,9 +69,11 @@ struct BackwardOptions {
     Side side = Side::host;          // which adjoint rows the walk asks the registry for
     ParamSet* grads = nullptr;       // added to, or null when the walk adds no gradients
     const char* prefix = "";         // the name prefix the grads entries carry (Delta::grad_prefix)
-    // When set, a fused lora record's per-slot leaf names come from this callback instead of
-    // `prefix` (slot -> module path). Empty for a delta with no fused slots.
-    std::function<std::string(int64_t slot)> slot_prefix;
+    // Optional: when set, a fused lora record's per-slot leaf names come from this callback instead
+    // of `prefix` (slot -> module path). It is given the record, because a fused weight's lora
+    // record carries several modules in one pool and the caller needs the record's weight to say
+    // which pool the slot belongs to. Empty for a delta with no fused slots.
+    std::function<std::string(const OpRecord&, int64_t)> slot_prefix;
     // Op names whose path ends here: their adjoint never runs and no cotangent reaches their
     // reads. The record still consumes the cotangent of what it wrote.
     std::vector<std::string> stops;

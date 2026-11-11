@@ -329,6 +329,15 @@ std::vector<NormOp> normalize(const std::vector<OpRecord>& input, const ModelMet
                 n.rec.operands[i].row_lo = 0;
                 n.rec.operands[i].rows = 0;
             }
+            /* The live tape names the tensor the kernel received when it is a view of the
+             * declared buffer (the gate half of the interleaved q|g, say). This step's
+             * environment holds whole buffers at the shape the record declares and has no
+             * strides to give a view, so the view must not reach a twin or the backward: the
+             * fused op's twin takes the whole buffer here, exactly as it does when the same op
+             * list arrives from a recorded program, which carries no view at all. */
+            n.rec.operands[i].view_shape.clear();
+            n.rec.operands[i].view_stride.clear();
+            n.rec.operands[i].view_off = 0;
         }
         n.rec.n = active;
         if (active > 0) {
@@ -1031,7 +1040,7 @@ private:
         BackwardOptions bo;
         bo.grads = grads;
         bo.prefix = "";
-        bo.slot_prefix = [this](int64_t slot) {
+        bo.slot_prefix = [this](const OpRecord&, int64_t slot) {
             auto it = slot_module_.find(slot);
             if (it == slot_module_.end())
                 throw std::runtime_error("reference step: adapter slot " + std::to_string(slot) +
