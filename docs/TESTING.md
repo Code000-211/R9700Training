@@ -13,7 +13,7 @@ Each tier's binary holds one `main` in its own directory: `tests/host/vector_tap
 |---|---|---|---|
 | `host` | `r97_host_tests` | no card | never — runs anywhere |
 | `gpu` | `r97_gpu_tests` | one card, under the guard | never — a missing card is a failure |
-| `model` | `r97_model_tests` | the real container | skipped, exit 77, naming where it looked |
+| `model` | `r97_model_tests`, and `gpu_model_tests` (see below) | the real container; one entry also a card | skipped, exit 77, naming where it looked |
 
 ```sh
 cmake -B build -G Ninja && cmake --build build
@@ -21,6 +21,17 @@ ctest --test-dir build -L host    # no card needed
 ctest --test-dir build -L gpu     # the card, serially
 ctest --test-dir build -L model   # the container, exit 77 (skip) when absent
 ```
+
+### A test that needs the container *and* the card
+
+The labels above promise one need each, so a case that needs both registers with `R97_MODEL_TEST`
+(`tests/support/model_case.h`) instead of `R97_TEST`. The gpu binary is then started a second time,
+as ctest's `gpu_model_tests`, with `R97_MODEL_CASES=1` set, and that is the only run that registers
+those cases. The entry carries the `model` label and not `gpu`: it skips with 77 when the container
+is absent, which a `gpu` test may never do, and the plain `gpu` run does not hold the case at all,
+so nothing there reports a case it did not start. One consequence: on a machine that has the
+container and no card, `ctest -L model` fails in that entry, because a `model` run promises the
+container and not the card; exclude it there (`ctest -L model -E gpu_model_tests`).
 
 ## The GPU test guard
 

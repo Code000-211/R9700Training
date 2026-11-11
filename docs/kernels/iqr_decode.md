@@ -194,12 +194,13 @@ is named and the test fails by name rather than silently comparing nothing.
 Because it needs real tensors it is a `model` test, `R97_MODEL_TEST(iqr_decode)`, registered from
 `tests/support/model_case.h`: it resolves the container before it takes the card and skips with
 exit 77 when the container is absent. The gpu binary is started twice, and the two runs differ by
-one environment variable. ctest runs it as `gpu_model_tests` (`LABELS gpu;model`, `R97_MODEL_CASES=1`
+one environment variable. ctest runs it as `gpu_model_tests` (`LABELS model`, `R97_MODEL_CASES=1`
 and `SKIP_RETURN_CODE 77`), never as the plain `gpu_tests` run, which is the card's own cases and
-must not skip. Directly: `R97_MODEL_CASES=1 ./build/r97_gpu_tests`, which is also where the timings
+must not skip: in that run the case is not registered at all, so nothing reports it as passed.
+Directly: `R97_MODEL_CASES=1 ./build/r97_gpu_tests`, which is also where the timings
 above come from. The forms a card can check without the container are covered synthetically in the
 host tier, above, and the range taller than `grid.y` in `tests/gpu/iqr_decode_range.cpp`.
 
-That the second label needs the card as well has a consequence for the shared machine: `ctest -L
-model` includes `gpu_model_tests`, so on a machine with the container and no card it fails on the
-card guard. Run `ctest -L model -E gpu_model_tests` there, or take the whole thing on the card.
+That the entry also needs the card has a consequence for the shared machine: `ctest -L model`
+includes `gpu_model_tests`, so on a machine with the container and no card it fails on the card
+guard. Run `ctest -L model -E gpu_model_tests` there, or take the whole thing on the card.

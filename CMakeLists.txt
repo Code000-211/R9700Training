@@ -386,10 +386,11 @@ if(R97_BUILD_TESTS)
     set_tests_properties(gpu_tests PROPERTIES LABELS gpu RUN_SERIAL TRUE)
     # ... and the tests that also need the real container (`R97_MODEL_TEST`, tests/support/
     # model_case.h). They run in a second start of the same binary; R97_MODEL_CASES is the whole
-    # difference between the two runs:
+    # difference between the two runs. This entry carries `model` and not `gpu`: it skips when the
+    # container is absent, which is what `model` promises and what a `gpu` test may never do.
     add_test(NAME gpu_model_tests COMMAND r97_gpu_tests)
     set_tests_properties(gpu_model_tests PROPERTIES
-      LABELS "gpu;model"
+      LABELS model
       RUN_SERIAL TRUE
       ENVIRONMENT "R97_MODEL_CASES=1"
       SKIP_RETURN_CODE 77)   # the model cases skip when the container is absent, like model_tests
