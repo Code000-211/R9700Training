@@ -126,6 +126,13 @@ The block cases' weights are the fixture checkpoint's own layer 0 and layer 3 te
 `tests/support/fixture.h` reads them: the manifest's `cases.blocks` names the layers, and the
 checkpoint the writer writes is the one the reference was computed from.
 
+The checkpoint keeps `mlp.gate_proj.weight` and `mlp.up_proj.weight` separate; no tensor holds the
+fused projection. The converter concatenates their rows, gate first, into the one
+`[2·ffn, hidden]` parameter the block reads (radiance's `rad_block_mlp.h`, `map_concat`), so the
+test builds the same weight the same way and the block's single `gemm_nt` sees exactly what the
+fixture's single record sees. The block issues one projection, as the table above says, not two
+that the test then joins.
+
 The test writes that checkpoint itself, with `r97::write_checkpoint` into a directory of its own,
 instead of calling `r97::fixture()`. Its sha256 is the manifest's `fixture.sha256`, so the bytes are
 the fixture's; what a `mkdtemp` buys is that the directory outlives the test. See the next section.
@@ -140,11 +147,12 @@ Both are in the harness and predate this test; both are reported, not worked aro
   have been destroyed, so every fixture-based test that runs there sees empty paths: on an untouched
   tree the host binary reports 60 tests and 14 failures, all of them missing fixture, plugin or
   oracle files. This test does not depend on them.
-- `test_loss_ce_objective_loss` fails a `CHECK` (`tests/host/loss_ce_objective_loss.cpp:109`,
-  `got.loss == want.loss` for a window of the objective) and `R97_SELF_CHECK`'s `CHECK` calls
-  `std::abort()`. It runs during static initialisation, so the whole host binary aborts there and no
-  `R97_TEST` in it runs at all. Run by hand with that one self-check skipped, this tree's host
-  binary reports 60 tests and 14 failures, the same 14 as above.
+- `test_loss_ce_objective_loss` fails two `CHECK`s: `tests/host/loss_ce_objective_loss.cpp:109`
+  (`got.loss == want.loss` for a window of the objective) and `:116` (the sum over the windows),
+  and `R97_SELF_CHECK`'s `CHECK` calls `std::abort()`. It runs during static initialisation, so the
+  whole host binary aborts there and no `R97_TEST` in it runs at all. Run by hand with that one
+  self-check skipped, this tree's host binary reports 64 tests and 14 failures, the same 14 as
+  above; the four block tests are among the 50 that pass.
 
 ## Reproducing
 
@@ -155,4 +163,4 @@ cmake --build build --target r97_host_tests
 ```
 
 On this tree the binary aborts in a self-check before any `R97_TEST` runs, as the section above
-says, so the four tests are read out of it with that one check skipped locally.
+says, so the four tests are read out of it with that one self-check skipped locally.

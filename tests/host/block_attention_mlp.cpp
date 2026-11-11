@@ -136,7 +136,7 @@ std::vector<double> values_of(const tiny::Tensor& t) {
 
 struct Layer {
     std::vector<double> input_norm, q_proj, q_norm, k_proj, k_norm, v_proj, o_proj;
-    std::vector<double> post_norm, gate_proj, up_proj, down_proj;
+    std::vector<double> post_norm, gate_up, down_proj;
 };
 
 struct Blocks {
@@ -199,15 +199,24 @@ Layer attention_layer(int64_t l) {
     return L;
 }
 
-// The MLP weights of layer `l`: a post-attention norm and the three projections. The reference's
-// mlp_sublayer case is layer 0's, per the manifest's cases.blocks; the block reads nothing of the
-// mixer that comes before it, so the layer is only which weights it uses.
+// The MLP weights of layer `l`: a post-attention norm, the fused gate-and-up projection and the
+// down projection. The checkpoint carries gate and up separately; the converter concatenates their
+// rows, gate first, into the one [2 * ffn, hidden] parameter the block reads (radiance's
+// rad_block_mlp.h map_concat), and this file builds the same weight the same way, so the block's
+// one gemm_nt sees what the fixture's does. The reference's mlp_sublayer case is layer 0's, per the
+// manifest's cases.blocks; the block reads nothing of the mixer that comes before it, so the layer
+// is only which weights it uses.
 Layer mlp_layer(int64_t l) {
     const std::string p = "model.language_model.layers." + std::to_string(l) + ".";
     Layer L;
     L.post_norm = weight(p + "post_attention_layernorm.weight");
-    L.gate_proj = weight(p + "mlp.gate_proj.weight");
-    L.up_proj = weight(p + "mlp.up_proj.weight");
+    const auto gate = weight(p + "mlp.gate_proj.weight");
+    const auto up = weight(p + "mlp.up_proj.weight");
+    if (gate.size() != (size_t)(kFfn * kHidden) || up.size() != gate.size())
+        throw std::runtime_error("block: layer " + std::to_string(l) +
+                                 "'s gate and up projections are not both [ffn, hidden]");
+    L.gate_up = gate;
+    L.gate_up.insert(L.gate_up.end(), up.begin(), up.end());
     L.down_proj = weight(p + "mlp.down_proj.weight");
     return L;
 }
@@ -630,20 +639,11 @@ BlockResult mlp_block(const Blocks& B, const Batch& b, const std::vector<double>
     const auto h = bc::twin_run(rmsnorm_rec(T, kHidden),
                                 {bc::value({T, kHidden}, x),
                                  bc::value({kHidden}, L.post_norm)})[0].value;
-    const auto gate = bc::twin_run(gemm_rec(T, kFfn, kHidden),
-                                   {bc::value({T, kHidden}, h),
-                                    bc::value({kFfn, kHidden}, L.gate_proj)})[0].value;
-    const auto up = bc::twin_run(gemm_rec(T, kFfn, kHidden),
+    // one projection over the fused weight: [T, hidden] -> [T, 2 * ffn], gate in the low half of
+    // each row, which is how silu_mul reads it
+    const auto gu = bc::twin_run(gemm_rec(T, 2 * kFfn, kHidden),
                                  {bc::value({T, kHidden}, h),
-                                  bc::value({kFfn, kHidden}, L.up_proj)})[0].value;
-    // the fixture fuses gate and up into one [T, 2 * ffn] row, gate half first (r4d_fuse.cpp)
-    std::vector<double> gu((size_t)(T * 2 * kFfn));
-    for (int64_t t = 0; t < T; ++t) {
-        std::copy_n(gate.begin() + (size_t)(t * kFfn), (size_t)kFfn,
-                    gu.begin() + (size_t)(t * 2 * kFfn));
-        std::copy_n(up.begin() + (size_t)(t * kFfn), (size_t)kFfn,
-                    gu.begin() + (size_t)(t * 2 * kFfn + kFfn));
-    }
+                                  bc::value({2 * kFfn, kHidden}, L.gate_up)})[0].value;
     const auto ffn = bc::twin_run(silu_mul_rec(T, kFfn), {bc::value({T, 2 * kFfn}, gu)})[0].value;
     const auto o = bc::twin_run(gemm_rec(T, kHidden, kFfn),
                                 {bc::value({T, kFfn}, ffn),
@@ -669,25 +669,11 @@ BlockResult mlp_block(const Blocks& B, const Batch& b, const std::vector<double>
     const auto d_gu = bc::adjoint_run(silu_mul_rec(T, kFfn),
                                       {bc::value({T, 2 * kFfn}, gu), bc::value({T, kFfn}, ffn)},
                                       {bc::value({T, kFfn}, d_down[0].value)})[0].value;
-    std::vector<double> d_gate((size_t)(T * kFfn)), d_up((size_t)(T * kFfn));
-    for (int64_t t = 0; t < T; ++t) {
-        std::copy_n(d_gu.begin() + (size_t)(t * 2 * kFfn), (size_t)kFfn,
-                    d_gate.begin() + (size_t)(t * kFfn));
-        std::copy_n(d_gu.begin() + (size_t)(t * 2 * kFfn + kFfn), (size_t)kFfn,
-                    d_up.begin() + (size_t)(t * kFfn));
-    }
-    const auto gemm_input = [&](const std::vector<double>& w, const std::vector<double>& out,
-                                const std::vector<double>& d_out) {
-        const auto d = bc::adjoint_run(gemm_rec(T, kFfn, kHidden),
-                                       {bc::value({T, kHidden}, h), bc::value({kFfn, kHidden}, w),
-                                        bc::value({T, kFfn}, out)},
-                                       {bc::value({T, kFfn}, d_out)});
-        return d[0].value;
-    };
-    const auto d_gate_in = gemm_input(L.gate_proj, gate, d_gate);
-    const auto d_up_in = gemm_input(L.up_proj, up, d_up);
-    std::vector<double> d_h((size_t)(T * kHidden));
-    for (size_t i = 0; i < d_h.size(); ++i) d_h[i] = d_gate_in[i] + d_up_in[i];
+    const auto d_h = bc::adjoint_run(gemm_rec(T, 2 * kFfn, kHidden),
+                                     {bc::value({T, kHidden}, h),
+                                      bc::value({2 * kFfn, kHidden}, L.gate_up),
+                                      bc::value({T, 2 * kFfn}, gu)},
+                                     {bc::value({T, 2 * kFfn}, d_gu)})[0].value;
     const auto d_norm = bc::adjoint_run(rmsnorm_rec(T, kHidden),
                                         {bc::value({T, kHidden}, x),
                                          bc::value({kHidden}, L.post_norm),
@@ -779,19 +765,9 @@ std::vector<double> mlp_kernel_chain(const Blocks& B, const Batch& b,
     const auto h = bc::kernel_run(rmsnorm_rec(T, kHidden),
                                   {bc::value({T, kHidden}, x),
                                    bc::value({kHidden}, L.post_norm)})[0].value;
-    const auto gate = bc::kernel_run(gemm_rec(T, kFfn, kHidden),
-                                     {bc::value({T, kHidden}, h),
-                                      bc::value({kFfn, kHidden}, L.gate_proj)})[0].value;
-    const auto up = bc::kernel_run(gemm_rec(T, kFfn, kHidden),
+    const auto gu = bc::kernel_run(gemm_rec(T, 2 * kFfn, kHidden),
                                    {bc::value({T, kHidden}, h),
-                                    bc::value({kFfn, kHidden}, L.up_proj)})[0].value;
-    std::vector<double> gu((size_t)(T * 2 * kFfn));
-    for (int64_t t = 0; t < T; ++t) {
-        std::copy_n(gate.begin() + (size_t)(t * kFfn), (size_t)kFfn,
-                    gu.begin() + (size_t)(t * 2 * kFfn));
-        std::copy_n(up.begin() + (size_t)(t * kFfn), (size_t)kFfn,
-                    gu.begin() + (size_t)(t * 2 * kFfn + kFfn));
-    }
+                                    bc::value({2 * kFfn, kHidden}, L.gate_up)})[0].value;
     const auto ffn = bc::kernel_run(silu_mul_rec(T, kFfn), {bc::value({T, 2 * kFfn}, gu)})[0].value;
     const auto o = bc::kernel_run(gemm_rec(T, kHidden, kFfn),
                                   {bc::value({T, kFfn}, ffn),
