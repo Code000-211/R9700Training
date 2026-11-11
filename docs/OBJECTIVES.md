@@ -103,8 +103,11 @@ binary, the subcommands in `r97train`.
 
 ## Registered today
 
-Nothing is registered yet: `r97train objectives` and `r97train deltas` print the live list,
-and the issue that registers a loss or a kind adds its line here and changes nothing else.
+- `lora` -- the trainable kind `docs/ADAPTER.md` describes: PEFT's A and B factors for each
+  targeted linear (`src/delta_lora.cpp`).
+
+`r97train objectives` and `r97train deltas` print the live list, and the issue that registers a
+loss or a kind adds its line here and changes nothing else.
 
 The registries in `r97train` and in a test binary are separate: the test objective and
 test delta under `tests/support/` are registered only in the host test binary.

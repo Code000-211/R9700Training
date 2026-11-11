@@ -8,15 +8,16 @@
 //   * a target selects the modules it names, in three spellings, and an unknown one is an error
 //     that lists the valid names;
 //   * to_wire is one site per targeted linear, carrying that linear's factors, with scale alpha/r;
-//   * the registry builds the kind by name and refuses one it does not know.
+//   * the registry's list has the kind, and building it by name gives the same Delta.
 //
 // Label: host (the fixture container needs rad-convert, no card).
 #include "support/late_fixture.h"
 #include "support/test.h"
 
 #include "r97/adapter_io.h"
+#include "r97/config.h"
 #include "r97/delta.h"
-#include "r97/delta_registry.h"
+#include "r97/model.h"
 #include "r97/params.h"
 
 #include <algorithm>
@@ -48,6 +49,13 @@ DeltaConfig config(int64_t rank, double alpha, std::vector<std::string> targets 
     return cfg;
 }
 
+// The kind, built the way make_model builds it: the registry's row for the name (r97/model.h).
+std::shared_ptr<Delta> lora() {
+    Config cfg;
+    cfg.delta.kind = "lora";
+    return delta_registry().at(cfg.delta.kind)(cfg);
+}
+
 bool same_values(const std::vector<float>& a, const std::vector<float>& b) {
     return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
 }
@@ -72,7 +80,7 @@ R97_TEST(delta_lora_init_shapes_and_starting_values) {
     R97_CHECK(meta.targetable.size() == 25);
 
     constexpr int64_t kRank = 4;
-    ParamSet params = make_delta("lora")->init(meta, config(kRank, 8.0), 11);
+    ParamSet params = lora()->init(meta, config(kRank, 8.0), 11);
     R97_CHECK(params.size() == 2 * meta.targetable.size());
 
     size_t at = 0;
@@ -99,9 +107,9 @@ R97_TEST(delta_lora_init_shapes_and_starting_values) {
 R97_TEST(delta_lora_init_is_seeded) {
     const ModelMeta& meta = fixture_meta();
     const DeltaConfig cfg = config(4, 8.0);
-    const ParamSet first = make_delta("lora")->init(meta, cfg, 99);
-    const ParamSet again = make_delta("lora")->init(meta, cfg, 99);
-    const ParamSet other = make_delta("lora")->init(meta, cfg, 100);
+    const ParamSet first = lora()->init(meta, cfg, 99);
+    const ParamSet again = lora()->init(meta, cfg, 99);
+    const ParamSet other = lora()->init(meta, cfg, 100);
 
     R97_CHECK(first.size() == again.size());
     for (size_t i = 0; i < first.size(); ++i) R97_CHECK(same_values(first[i].value, again[i].value));
@@ -117,26 +125,26 @@ R97_TEST(delta_lora_init_is_seeded) {
 R97_TEST(delta_lora_targets_select_modules) {
     const ModelMeta& meta = fixture_meta();
 
-    const ParamSet leaf = make_delta("lora")->init(meta, config(4, 8.0, {"q_proj"}), 5);
+    const ParamSet leaf = lora()->init(meta, config(4, 8.0, {"q_proj"}), 5);
     R97_CHECK(leaf.size() == 2);  // the one full-attention layer
     R97_CHECK(module_of(leaf[0].name) == "model.layers.3.self_attn.q_proj");
 
-    const ParamSet inner = make_delta("lora")->init(meta, config(4, 8.0, {"self_attn.q_proj"}), 5);
+    const ParamSet inner = lora()->init(meta, config(4, 8.0, {"self_attn.q_proj"}), 5);
     R97_CHECK(inner.size() == leaf.size());
     for (size_t i = 0; i < leaf.size(); ++i) R97_CHECK(inner[i].name == leaf[i].name);
 
     const ParamSet whole =
-        make_delta("lora")->init(meta, config(4, 8.0, {"model.layers.0.mlp.down_proj"}), 5);
+        lora()->init(meta, config(4, 8.0, {"model.layers.0.mlp.down_proj"}), 5);
     R97_CHECK(whole.size() == 2);
     R97_CHECK(whole[0].name == "model.layers.0.mlp.down_proj.lora_A");
 
     // Overlapping targets name each linear once.
-    const ParamSet both = make_delta("lora")->init(meta, config(4, 8.0, {"q_proj", "self_attn.q_proj"}),
-                                                  5);
+    const ParamSet both =
+        lora()->init(meta, config(4, 8.0, {"q_proj", "self_attn.q_proj"}), 5);
     R97_CHECK(both.size() == 2);
 
     // The delta net's modules on all three of its layers.
-    const ParamSet z = make_delta("lora")->init(meta, config(4, 8.0, {"in_proj_z"}), 5);
+    const ParamSet z = lora()->init(meta, config(4, 8.0, {"in_proj_z"}), 5);
     R97_CHECK(z.size() == 3 * 2);
 }
 
@@ -146,7 +154,7 @@ R97_TEST(delta_lora_refuses_an_unknown_target) {
     std::string message;
     bool threw = false;
     try {
-        make_delta("lora")->init(meta, config(4, 8.0, {"q_proj", "no_such_proj"}), 5);
+        lora()->init(meta, config(4, 8.0, {"q_proj", "no_such_proj"}), 5);
     } catch (const std::invalid_argument& e) {
         threw = true;
         message = e.what();
@@ -161,7 +169,7 @@ R97_TEST(delta_lora_refuses_an_unknown_target) {
 // alpha/r. A different alpha moves the scale and nothing else.
 R97_TEST(delta_lora_to_wire_is_one_site_per_linear) {
     const ModelMeta& meta = fixture_meta();
-    auto delta = make_delta("lora");
+    auto delta = lora();
     const ParamSet params = delta->init(meta, config(16, 32.0), 3);
 
     WireBuffers wire;
@@ -184,7 +192,7 @@ R97_TEST(delta_lora_to_wire_is_one_site_per_linear) {
         R97_CHECK(site.b.size() == size_t(lin.out * 16));
     }
 
-    auto scaled = make_delta("lora");
+    auto scaled = lora();
     const ParamSet small = scaled->init(meta, config(4, 16.0, {"q_proj"}), 3);
     WireBuffers wide;
     scaled->to_wire(small, &wide);
@@ -192,26 +200,15 @@ R97_TEST(delta_lora_to_wire_is_one_site_per_linear) {
     R97_CHECK(wide.sites[0].scale == 4.0);
 }
 
-// The registry: the kind builds by name, and a name it does not know is refused with the kinds it
-// does have.
+// The registration: the registry's list has the kind, and building it by name gives a Delta whose
+// gradient names need no prefix (the parameters carry their modules).
 R97_TEST(delta_lora_registers_its_kind) {
-    const std::vector<std::string> kinds = delta_kinds();
+    const std::vector<std::string> kinds = delta_names();
     R97_CHECK(std::find(kinds.begin(), kinds.end(), "lora") != kinds.end());
 
-    const std::shared_ptr<Delta> delta = make_delta("lora");
+    const std::shared_ptr<Delta> delta = lora();
     R97_CHECK(delta != nullptr);
-    R97_CHECK(std::string(delta->grad_prefix()).empty());  // the parameters carry their modules
-
-    std::string message;
-    bool threw = false;
-    try {
-        make_delta("no_such_kind");
-    } catch (const std::invalid_argument& e) {
-        threw = true;
-        message = e.what();
-    }
-    R97_CHECK(threw);
-    R97_CHECK(message.find("lora") != std::string::npos);
+    R97_CHECK(std::string(delta->grad_prefix()).empty());
 }
 
 // A degenerate config is an error, not a bad ParamSet.
@@ -220,7 +217,7 @@ R97_TEST(delta_lora_refuses_a_bad_config) {
     for (const DeltaConfig& bad : {config(0, 8.0), config(-1, 8.0), config(4, std::nan(""))}) {
         bool threw = false;
         try {
-            make_delta("lora")->init(meta, bad, 1);
+            lora()->init(meta, bad, 1);
         } catch (const std::invalid_argument&) {
             threw = true;
         }

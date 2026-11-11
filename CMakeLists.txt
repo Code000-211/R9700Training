@@ -190,8 +190,8 @@ target_link_libraries(r97 PUBLIC rad_core)
 
 # An op's twin and adjoint register themselves from a static object in the op's own file, so no
 # file lists the ops (r97/adjoint.h). An archive link drops the members nothing references, so
-# the binaries that ask a registry -- r97train, the host and gpu test tiers, and the model tier
-# (which builds a delta kind by name) -- link r97 whole.
+# the binaries that ask the registry -- r97train and the host and gpu test tiers -- link r97
+# whole; the model tier never looks an op up.
 set(R97_LINK_WHOLE "$<LINK_LIBRARY:WHOLE_ARCHIVE,r97>")
 
 if(NOT R97_PATCH_SET STREQUAL "all")
@@ -330,9 +330,7 @@ if(R97_BUILD_TESTS)
        ${CMAKE_CURRENT_SOURCE_DIR}/tests/model/*.cpp)
   if(NOT R97_MODEL_TEST_SOURCES STREQUAL "")
     add_executable(r97_model_tests ${R97_MODEL_TEST_SOURCES})
-    # Whole-archive: the model tier builds a delta kind by name (LoraDelta), and a kind registers
-    # from a static object in its own file, which a plain archive link would drop.
-    target_link_libraries(r97_model_tests PRIVATE ${R97_LINK_WHOLE})
+    target_link_libraries(r97_model_tests PRIVATE r97)
     target_include_directories(r97_model_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(r97_model_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
   endif()

@@ -6,22 +6,23 @@
 // delta-net layers. The count only needs the container's metadata (read_model_meta) and the
 // ParamSet's own sizes, so no card is involved.
 //
-// It runs from an atexit handler rather than an R97_SELF_CHECK initialiser: a delta kind registers
-// itself from a static object in the library's own file, and a test object's static initialisers
-// run before the library's, so a check that asked the registry there would find it empty.
+// It names the kind's factory (../src/delta_lora.h) rather than looking it up: the model tier links
+// r97 as it comes, so the kind's file is in this binary only because this test mentions a symbol in
+// it, and an archive link keeps it only for that reason (docs/OBJECTIVES.md, "Where a registration
+// runs").
 //
 // Label: model. Skipped when the container is absent.
 #include "r97/adapter_io.h"
+#include "r97/config.h"
 #include "r97/delta.h"
-#include "r97/delta_registry.h"
 #include "r97/params.h"
 
+#include "../src/delta_lora.h"
 #include "../support/model_dir.h"
 #include "../support/self_check.h"
 
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <string>
 
 namespace {
@@ -37,12 +38,12 @@ void delta_lora_parameter_count() {
     CHECK(meta.hidden == 5120);
     CHECK(meta.targetable.size() == 16 * 7 + 48 * 6);
 
-    r97::DeltaConfig cfg;
-    cfg.kind = "lora";
-    cfg.rank = kRank;
-    cfg.alpha = 32.0;
+    r97::Config config;
+    config.delta.kind = "lora";
+    config.delta.rank = kRank;
+    config.delta.alpha = 32.0;
 
-    const r97::ParamSet params = r97::make_delta("lora")->init(meta, cfg, 1);
+    const r97::ParamSet params = r97::make_lora_delta(config)->init(meta, config.delta, 1);
     CHECK(params.size() == 2 * meta.targetable.size());
 
     int64_t total = 0;
@@ -53,8 +54,6 @@ void delta_lora_parameter_count() {
     CHECK(total == kWant);
 }
 
-void run_at_exit() { r97test::run("delta_lora_parameter_count", delta_lora_parameter_count); }
-
-[[maybe_unused]] const int registered = std::atexit(run_at_exit);
-
 }  // namespace
+
+R97_SELF_CHECK(delta_lora_parameter_count)

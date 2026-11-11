@@ -1,4 +1,4 @@
-// src/delta_lora.cpp -- the `lora` trainable kind.
+// src/delta_lora.cpp -- the `lora` trainable kind, registered under the kind "lora".
 //
 // docs/ADAPTER.md owns this shape: one A [r, K] and one B [N, r] per targeted linear, A from
 // PEFT's own initialisation and B zero, and a wire site per linear whose scale is alpha/r. The
@@ -10,8 +10,11 @@
 // (`model.layers.3.self_attn.q_proj`), by the name inside a block (`self_attn.q_proj`, the way
 // docs/ADAPTER.md's table lists them) or by its leaf (`q_proj`, the way PEFT writes
 // target_modules); anything else is an error that lists the names the container does have.
+#include "delta_lora.h"
+
+#include "r97/config.h"
 #include "r97/delta.h"
-#include "r97/delta_registry.h"
+#include "r97/model.h"
 #include "r97/params.h"
 
 #include <algorithm>
@@ -88,6 +91,8 @@ int64_t product(const std::vector<int64_t>& shape) {
 // One trainable kind: PEFT's A/B factors for every targeted linear.
 class LoraDelta final : public Delta {
 public:
+    explicit LoraDelta(double alpha) : alpha_(alpha) {}
+
     ParamSet init(const ModelMeta& meta, const DeltaConfig& cfg, uint64_t seed) override {
         if (cfg.rank < 1)
             throw std::invalid_argument("r97: LoraDelta: rank must be at least 1, not " +
@@ -178,13 +183,17 @@ public:
     }
 
 private:
-    double alpha_ = 32.0;  // the config's alpha; the wire site's scale is alpha/r
+    double alpha_;  // the config's alpha; the wire site's scale is alpha/r
 };
-
-std::shared_ptr<Delta> make_lora() { return std::make_shared<LoraDelta>(); }
 
 }  // namespace
 
-R97_REGISTER_DELTA("lora", make_lora)
+// The factory the registry holds (r97/model.h). The DeltaConfig reaches init(), not the
+// constructor, so one kind serves every rank and target set; only alpha is carried, for to_wire.
+std::shared_ptr<Delta> make_lora_delta(const Config& cfg) {
+    return std::make_shared<LoraDelta>(cfg.delta.alpha);
+}
+
+R97_REGISTER_DELTA(lora, make_lora_delta);
 
 }  // namespace r97
