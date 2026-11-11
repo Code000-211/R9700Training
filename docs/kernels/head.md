@@ -65,6 +65,13 @@ window of a `ForwardTape`, reading the window's `"logits"`, ids from `fwd.batch(
 indistinguishable from the reference: same sum, same cotangent rows, same zeros on the unscored
 rows a window spans.
 
+The seed's rows are the step's, not the window's: `row_lo` is the buffer's row of the window's
+first scored row, so from the second window on it is past the window's start, and `row_hi` is the
+row after its last scored row. That is the numbering the transposed product's rows of the
+cotangent line up with. A window whose rows are all unscored seeds nothing and reads nothing, as
+the reference does -- `score[0] == 0` and an assistant-only mask make such windows routine, and a
+window that reads no logits has nothing to seed.
+
 The seed's cotangent is f32 on the host. That vector is the contract's, and it is what the tests
 use to hold this loss to the reference, but it is not what a device join spends: the join fills and
 sinks the chunk loop itself -- the head product writing `logits`, this kernel writing `grad`, the
@@ -125,10 +132,15 @@ launch and to `head_row.h`'s walk, not to the interface this issue fixes. As it 
 - the loop against `ce_sum` on the real vocabulary, chunk sizes 1, 64 and 512: the summed loss
   and every gradient entry, each entry held relatively;
 - the loop against `ce_loss` and `ce_grad` on the tiny fixture's recorded logits
-  (`docs/FIXTURES.md`, three sequences of 140, 73 and 31 tokens, vocab 320, unscored rows
-  included), the same chunk sizes;
-- `HeadCeObjective` against `CeObjective` on a `VectorTape`, one window per sequence --
-  the loss, the scored count and every cotangent entry;
+  (`docs/FIXTURES.md`, three sequences of 140, 73 and 31 tokens, vocab 320), the same chunk
+  sizes;
+- the same logits under a score mask such as a step carries -- rows unscored at both ends of a
+  sequence's window and in runs inside it -- where the ids are `-1`: the zeroed gradient rows, the
+  scored count the mean's scale is taken over, and the same sum, at the same chunk sizes;
+- `HeadCeObjective` against `CeObjective` on a `VectorTape` of the whole step's rows, one window
+  per sequence, so every window but the first starts past row 0 and the seed's rows are the
+  step's; on both masks, and on a window of nothing but unscored rows -- the loss, the scored
+  count, the seed's own rows and every cotangent entry;
 - logits at 1e30 and 3e38 staying finite, against the reference's f64 answer;
 - the comparison itself: a deliberately wrong kernel -- the reference's loss and its target
   entries and zeros everywhere else -- is refused, after its loss and its target entries have

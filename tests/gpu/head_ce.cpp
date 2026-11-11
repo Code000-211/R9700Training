@@ -8,12 +8,17 @@
 //     held relatively, with no absolute floor under it, because bf16 rounds relatively and an
 //     off-target entry of that width is 1.3e-6;
 //   * so does the tiny fixture's own recorded logits -- three sequences of 140, 73 and 31 tokens,
-//     unscored rows included, vocab 320 (docs/FIXTURES.md) -- against ce_loss and ce_grad;
+//     vocab 320 (docs/FIXTURES.md) -- against ce_loss and ce_grad, and so does the same batch
+//     under a score mask that leaves rows unscored, as a step's does: the -1 ids, the zeroed
+//     gradient rows, and the scored count the mean's scale is taken over
+//     (chunks_on_unscored_rows);
 //   * the comparison has teeth: a deliberately wrong kernel, which writes the reference's loss and
 //     its target entry and zeros everywhere else, is the one a floor would have let through, and
 //     the comparison refuses it (the_comparison_has_teeth);
-//   * the Objective form (HeadCeObjective) is CeObjective's loss and cotangent on a tape, so the
-//     device loss can stand where the reference does;
+//   * the Objective form (HeadCeObjective) is CeObjective's loss and cotangent on a tape -- one
+//     window per sequence of the whole step, so every window but the first starts past row 0 and
+//     the seed's rows are the step's, on the fixture's mask and on the unscored one, with a window
+//     of nothing but unscored rows seeding nothing (objective_windows);
 //   * logits near 1e30 stay finite, which is what the two-piece log-sum-exp is for.
 //
 // Needs one R9700 (gfx1201, 32 GB) or similar, under the GPU test guard; no container is read, so
@@ -88,6 +93,14 @@ void require_copy(int rc, const char* what) {
 
 // ----------------------------------------------------------------------------- the tiny fixture
 
+// The per-row target of a batch's concatenated prediction rows, -1 where the row is not scored:
+// exactly the ids the loop uploads.
+std::vector<int32_t> row_ids(const Batch& batch, int64_t rows) {
+    std::vector<int32_t> ids(size_t(rows), -1);
+    for (const ScoredRow& r : ce_grad_rows(batch, 0, rows)) ids[size_t(r.row)] = r.id;
+    return ids;
+}
+
 // The fixture's recorded logits, one row per prediction: a sequence of L tokens has L-1 rows, so
 // the reference's last row of a sequence (which predicts nothing) is dropped, as ce_loss counts
 // them. The values are the reference's f64 logits rounded to bf16 and widened again, so both sides
@@ -135,8 +148,36 @@ FixtureRows fixture_rows() {
         out.batch.push_back(std::move(seq));
     }
     out.rows = int64_t(out.logits.size()) / out.vocab;
-    out.ids.assign(size_t(out.rows), -1);
-    for (const ScoredRow& r : ce_grad_rows(out.batch, 0, out.rows)) out.ids[size_t(r.row)] = r.id;
+    out.ids = row_ids(out.batch, out.rows);
+    return out;
+}
+
+// The fixture's recorded score masks score every prediction row they have (seq0 139/139, seq1
+// 72/72, seq2 30/30; only score[0] is 0, and nothing predicts token 0). A real step's mask does
+// not: the prompt's rows and a run of rows anywhere stay unscored, and the loss, the kernel and the
+// Objective all have to leave them alone. So the same logits also run under a step's own mask,
+// carried by this list of unscored rows -- absolute rows of the batch, one list per sequence, the
+// row a sequence's token i + 1 is predicted at. Sequence 0 has both ends of its window unscored and
+// a run inside it, sequence 1 opens and closes unscored, sequence 2 has a run inside.
+const std::vector<std::vector<int64_t>>& unscored_rows() {
+    static const std::vector<std::vector<int64_t>> rows = {
+        {0, 1, 17, 60, 61, 62, 138},  // seq0, 139 rows
+        {0, 35, 71},                  // seq1, 72 rows
+        {10, 11, 29},                 // seq2, 30 rows
+    };
+    return rows;
+}
+
+Batch masked_batch(const Batch& batch) {
+    Batch out = batch;
+    R97_CHECK(out.size() == unscored_rows().size());
+    for (size_t s = 0; s < out.size(); ++s) {
+        TokenSeq& seq = out[s];
+        for (int64_t row : unscored_rows()[s]) {
+            R97_CHECK(row + 1 < int64_t(seq.score.size()));
+            seq.score[size_t(row + 1)] = 0;  // token row + 1 is what row predicts
+        }
+    }
     return out;
 }
 
@@ -421,8 +462,8 @@ void chunks_on_the_real_vocabulary() {
     }
 }
 
-// The tiny fixture's recorded logits, its own score mask (unscored rows and all), chunk sizes 1,
-// 64 and 512, against ce_loss and ce_grad.
+// The tiny fixture's recorded logits, its own score mask, chunk sizes 1, 64 and 512, against
+// ce_loss and ce_grad.
 void chunks_on_the_fixture() {
     const FixtureRows f = fixture_rows();
     R97_CHECK(f.rows == 241);
@@ -442,40 +483,122 @@ void chunks_on_the_fixture() {
     }
 }
 
-// The Objective form stands where the reference does: on a tape of the fixture's logits, one window
-// per sequence, HeadCeObjective is CeObjective's loss and cotangent.
-void objective_on_the_fixture() {
+// The same logits under a step's score mask, so a share of the rows are unscored: the ids are -1
+// there, the kernel's answer for such a row is a zero loss and a zero gradient row, and the loop's
+// sum and scored count are still ce_loss and ce_grad's -- a loop that added an unscored row's loss,
+// or counted it, would scale a mean it did not take. compare_walk holds those rows to the
+// reference's exact zeros, since the gradient comparison carries no absolute floor.
+void chunks_on_unscored_rows() {
     const FixtureRows f = fixture_rows();
-    int64_t offset = 0;
-    for (int64_t seq = 0; seq < int64_t(f.batch.size()); ++seq) {
-        const int64_t rows = int64_t(f.batch[size_t(seq)].ids.size()) - 1;
-        const std::vector<float> window(f.logits.begin() + offset * f.vocab,
-                                        f.logits.begin() + (offset + rows) * f.vocab);
-        r97test::VectorTape tape;
-        tape.set_batch(f.batch).set_scored(97).set_buffer("logits", {rows, f.vocab}, window);
+    const Batch masked = masked_batch(f.batch);
+    const std::vector<int32_t> ids = row_ids(masked, f.rows);
+    R97_CHECK(std::count(ids.begin(), ids.end(), -1) > 0);
 
-        const ObjectiveResult want = CeObjective(tape, ParamSet{});
-        R97_CHECK(want.seeds.size() == 1);
-        for (int64_t chunk : {int64_t(1), int64_t(64), int64_t(512)}) {
-            const Objective got = HeadCeObjective(chunk);
-            const ObjectiveResult have = got(tape, ParamSet{});
-            const std::string where = "fixture window " + std::to_string(seq) + ", chunk "
-                                      + std::to_string(chunk);
-            R97_CHECK(have.scored == want.scored);
-            require_loss_close(where + " loss", have.loss, want.loss);
-            R97_CHECK(have.seeds.size() == 1);
-            R97_CHECK(have.seeds[0].buffer == "logits");
-            R97_CHECK(have.seeds[0].row_lo == want.seeds[0].row_lo);
-            R97_CHECK(have.seeds[0].row_hi == want.seeds[0].row_hi);
-            R97_CHECK(have.seeds[0].cotangent.size() == want.seeds[0].cotangent.size());
-            for (size_t i = 0; i < want.seeds[0].cotangent.size(); ++i)
-                require_grad_close(where + " cotangent", int64_t(i), have.seeds[0].cotangent[i],
-                                   want.seeds[0].cotangent[i]);
+    const CeSum want_sum = ce_loss(masked, f.logits, f.vocab);
+    R97_CHECK(want_sum.scored > 0);
+    R97_CHECK(want_sum.scored < f.rows);  // the mask this test is about left rows unscored
+
+    std::vector<float> want(size_t(f.rows * f.vocab), 0.0f);
+    ce_grad(masked, f.logits.data(), f.vocab, 1.0 / double(want_sum.scored), want.data());
+
+    for (int64_t chunk : {int64_t(1), int64_t(64), int64_t(512)}) {
+        const Walk got =
+            run_loop(f.logits, ids, f.rows, f.vocab, chunk, 1.0 / double(want_sum.scored));
+        const std::string where = "unscored rows, chunk " + std::to_string(chunk);
+        compare_walk(where, got, want_sum, want, f.rows, f.vocab);
+        std::printf("head_ce: %s: loss %.6f over %lld of %lld rows, gradient agrees\n", where.c_str(),
+                    got.loss, (long long)got.scored, (long long)f.rows);
+    }
+}
+
+// The Objective form stands where the reference does: on a tape of the whole step's rows, one
+// window per sequence, HeadCeObjective is CeObjective's loss and cotangent. Only the first window
+// starts at row 0, so the seed's rows are the step's rows and not the window's -- a seed counted
+// from a window's first row would be right only there -- and the second step's mask leaves rows
+// unscored inside the seed's span and at both ends of it, which the seed's zeros and the seed's
+// row_lo both have to carry. A window of nothing but unscored rows seeds nothing and reads
+// nothing.
+void objective_windows() {
+    const FixtureRows f = fixture_rows();
+    const Batch steps[] = {f.batch, masked_batch(f.batch)};
+    const char* const names[] = {"fixture", "unscored"};
+
+    for (int which = 0; which < 2; ++which) {
+        const Batch& batch = steps[which];
+        const int64_t total_scored = int64_t(ce_grad_rows(batch, 0, f.rows).size());
+        R97_CHECK(total_scored > 0);
+
+        // One buffer of the whole step, as the forward records it; the tape's window is what moves.
+        r97test::VectorTape tape;
+        tape.set_batch(batch).set_scored(total_scored).set_buffer("logits", {f.rows, f.vocab},
+                                                               f.logits);
+
+        int64_t offset = 0;
+        for (int64_t seq = 0; seq < int64_t(batch.size()); ++seq) {
+            const int64_t rows = int64_t(batch[size_t(seq)].ids.size()) - 1;
+            const int64_t lo = offset, hi = offset + rows;
+            tape.set_window("logits", lo, hi);
+
+            const std::vector<ScoredRow> scored_rows = ce_grad_rows(batch, lo, hi);
+            R97_CHECK(!scored_rows.empty());
+
+            const ObjectiveResult want = CeObjective(tape, ParamSet{});
+            R97_CHECK(want.seeds.size() == 1);
+            // The seed's rows are the step's: its first is this window's first scored row, which is
+            // past row 0 from the second window on.
+            R97_CHECK(want.seeds[0].row_lo == scored_rows.front().row);
+            R97_CHECK(want.seeds[0].row_hi == scored_rows.back().row + 1);
+            if (which == 1)  // the unscored step: the seed spans unscored rows inside it too
+                R97_CHECK(want.seeds[0].row_hi - want.seeds[0].row_lo >
+                          int64_t(scored_rows.size()));
+
+            for (int64_t chunk : {int64_t(1), int64_t(64), int64_t(512)}) {
+                const ObjectiveResult have = HeadCeObjective(chunk)(tape, ParamSet{});
+                const std::string where = std::string(names[which]) + " window "
+                                          + std::to_string(seq) + ", chunk "
+                                          + std::to_string(chunk);
+                R97_CHECK(have.scored == want.scored);
+                require_loss_close(where + " loss", have.loss, want.loss);
+                R97_CHECK(have.seeds.size() == 1);
+                R97_CHECK(have.seeds[0].buffer == "logits");
+                R97_CHECK(have.seeds[0].row_lo == want.seeds[0].row_lo);
+                R97_CHECK(have.seeds[0].row_hi == want.seeds[0].row_hi);
+                R97_CHECK(have.seeds[0].row_lo >= lo);
+                R97_CHECK(have.seeds[0].row_hi <= hi);
+                R97_CHECK(have.seeds[0].cotangent.size() == want.seeds[0].cotangent.size());
+                for (size_t i = 0; i < want.seeds[0].cotangent.size(); ++i)
+                    require_grad_close(where + " cotangent", int64_t(i), have.seeds[0].cotangent[i],
+                                       want.seeds[0].cotangent[i]);
+            }
+            std::printf("head_ce: %s window %lld, rows [%lld, %lld), seed [%lld, %lld): the Objective "
+                        "matches CeObjective\n",
+                        names[which], (long long)seq, (long long)lo, (long long)hi,
+                        (long long)want.seeds[0].row_lo, (long long)want.seeds[0].row_hi);
+            offset = hi;
         }
-        std::printf("head_ce: fixture window %lld (%lld rows, total_scored 97): the Objective "
-                    "matches CeObjective\n",
-                    (long long)seq, (long long)rows);
-        offset += rows;
+
+        // A window of one row the mask does not score: no seed, no read of the logits and no work
+        // on the card, which is the reference's early out too.
+        const std::vector<int32_t> ids = row_ids(batch, f.rows);
+        const auto at = std::find(ids.begin(), ids.end(), -1);
+        if (at == ids.end()) continue;  // the fixture's own mask leaves no such row
+        const int64_t row = int64_t(at - ids.begin());
+        tape.set_window("logits", row, row + 1);
+        const size_t reads_before = tape.reads_of("logits").size();
+        const ObjectiveResult want = CeObjective(tape, ParamSet{});
+        R97_CHECK(want.seeds.empty());
+        R97_CHECK(want.scored == 0);
+        R97_CHECK(tape.reads_of("logits").size() == reads_before);
+        for (int64_t chunk : {int64_t(1), int64_t(64)}) {
+            const ObjectiveResult have = HeadCeObjective(chunk)(tape, ParamSet{});
+            R97_CHECK(have.seeds.empty());
+            R97_CHECK(have.scored == 0);
+            require_loss_close("unscored window loss", have.loss, want.loss);
+        }
+        R97_CHECK(tape.reads_of("logits").size() == reads_before);
+        std::printf("head_ce: %s window [%lld, %lld) is unscored: no seed and no read, as the "
+                    "reference\n",
+                    names[which], (long long)row, (long long)row + 1);
     }
 }
 
@@ -588,7 +711,8 @@ void run() {
 
     chunks_on_the_real_vocabulary();
     chunks_on_the_fixture();
-    objective_on_the_fixture();
+    chunks_on_unscored_rows();
+    objective_windows();
     very_large_logits_stay_finite();
     the_comparison_has_teeth();
     if (r97test::bench()) bench_the_loop();
