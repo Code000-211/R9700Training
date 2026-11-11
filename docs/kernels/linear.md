@@ -53,8 +53,9 @@ thread, it is 512 spread `(m,k)` probes against the same f64 sum the host adjoin
 
 ## The tile
 
-One CTA holds a 256-row band of `dx` and one 128-wide block of `k`: eight waves, each wave two
-16-row tiles, and all eight `k` steps of the block in flight as 16 accumulators of 8 f32 (128 VGPRs).
+One CTA holds a 256-row band of `dx` and one 128-wide block of `k`, in eight waves of 32 lanes; each
+wave holds two 16-row tiles and all eight `k` steps of the block at once, as 16 accumulators of 8 f32
+-- 128 VGPRs a lane.
 The reduction runs in 16-channel steps; each step's 16 x 128 weight slice is staged in shared memory
 in its own `[n][k]` order (`16 * 136` bf16, a 136-element pitch so a thread's eight-element chunk
 lands 8-byte aligned), and read as the transposed fragment: WMMA wants the B operand's rows on `dx`'s
@@ -81,8 +82,8 @@ sixteen lanes write 32 contiguous bytes of one row of `dx` per step, and the row
 | fixture, `gemm_nt_q` | 4 | 256 | 128 |
 | fixture, `gemm_nt_q` | 1 | 128 | 256 |
 | fixture, `gemm_nt_q` | 7 | 320 | 384 |
-| fixture, gated-delta-net projection | 3 | 8 | 128 |
-| fixture, `gemm_nt` | 3 | 8 | 128 |
+| fixture, the gated-delta-net projection's width, int8 form | 3 | 8 | 128 |
+| fixture, the gated-delta-net projection, bf16 | 3 | 8 | 128 |
 | fixture, `ssm_out` | 2 | 128 | 64 |
 | `attn_k/v` | 4096 | 1024 | 5120 |
 | `attn_output` | 4096 | 5120 | 6144 |
@@ -95,8 +96,8 @@ sixteen lanes write 32 contiguous bytes of one row of `dx` per step, and the row
 
 The two 4096-token bands and the packed batch of 317, 1009 and 2697 rows are what a step's token
 count looks like; the widths are the ones [`docs/ADAPTER.md`](../ADAPTER.md) writes down for
-`qwen3.8-27b-iqr-v4`. No `model`-labelled test is needed for them: the rows take their shapes from
-the record, and the container is what the forward measured beside them was run from.
+`qwen3.8-27b-iqr-v4`. No `model`-labelled test is needed for them: a device row takes its shape from
+the record, not from the container, so the numbers below are the only thing a card run needs.
 
 Limits, each checked rather than assumed, and each leaving the record to the host row:
 
@@ -106,8 +107,8 @@ Limits, each checked rather than assumed, and each leaving the record to the hos
   the last chunk can be clamped to end on `K`;
 - `M * N` and `M * K` must fit a 32-bit element offset -- 1.4e8 elements at the largest shape above;
 - `N` is padded up to a multiple of 16 with zero weight rows and zero `dy` columns, because the
-  reduction tile is 16 channels wide. The fixture's eight- and twelve-channel projections take that
-  path, and the padded rows cannot add to the sum.
+  reduction tile is 16 channels wide. The fixture's eight-channel projections take that path,
+  and the padded rows cannot add to the sum.
 
 ## Scratch memory
 
