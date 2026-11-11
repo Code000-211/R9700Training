@@ -26,6 +26,10 @@ endif()
 set(R97_PATCH_SET "all" CACHE STRING "all | serving -- which patch sets apply to radiance")
 set_property(CACHE R97_PATCH_SET PROPERTY STRINGS all serving)
 
+# Leave out one patch, by its number (e.g. 0102), to build and test a tree that does without it.
+# Empty applies them all. The tests that need the patch skip by name; see docs/UPSTREAM.md.
+set(R97_PATCH_SKIP "" CACHE STRING "patch number to leave out (e.g. 0102); empty applies all")
+
 # A string, not option(): AUTO lets radiance's own detection decide; OFF gives a host-only build.
 set(R97_WITH_HIP "AUTO" CACHE STRING "ON | OFF | AUTO -- build radiance's HIP device kernels")
 set_property(CACHE R97_WITH_HIP PROPERTY STRINGS ON OFF AUTO)
@@ -43,10 +47,10 @@ set(R97_RADIANCE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/radiance)
 set(R97_RADIANCE_COPY ${CMAKE_BINARY_DIR}/radiance)
 set(R97_PATCHES ${CMAKE_CURRENT_SOURCE_DIR}/patches)
 
-r97_selected_patches("${R97_PATCHES}" "${R97_PATCH_SET}" R97_PATCH_FILES)
+r97_selected_patches("${R97_PATCHES}" "${R97_PATCH_SET}" R97_PATCH_FILES "${R97_PATCH_SKIP}")
 
-# The fingerprint of what the copy must contain: the submodule's commit, the selection and the
-# patch list. Unchanged (a repeated configure) means the copy is kept as is, so configuring is
+# The fingerprint of what the copy must contain: the submodule's commit, the selection, the skip
+# and each patch's content. Unchanged (a repeated configure) means the copy is kept as is, so configuring is
 # idempotent and cheap; anything else means a fresh copy and a fresh application.
 find_package(Git QUIET)
 if(NOT GIT_FOUND)
@@ -61,11 +65,17 @@ if(NOT _rc EQUAL 0)
   message(FATAL_ERROR "r97: third_party/radiance is not initialised. "
                       "Run: git submodule update --init")
 endif()
-set(R97_PATCH_STAMP "${R97_RADIANCE_COMMIT}|${R97_PATCH_SET}")
+set(R97_PATCH_STAMP "${R97_RADIANCE_COMMIT}|${R97_PATCH_SET}|${R97_PATCH_SKIP}")
 foreach(p ${R97_PATCH_FILES})
   get_filename_component(n "${p}" NAME)
-  string(APPEND R97_PATCH_STAMP "|${n}")
+  # The content too, not only the name: a patch that grew must land on the copy, not be kept
+  # because its file name did not change.
+  file(SHA1 "${p}" digest)
+  string(APPEND R97_PATCH_STAMP "|${n}:${digest}")
 endforeach()
+if(R97_PATCH_SKIP)
+  message(STATUS "r97: R97_PATCH_SKIP=${R97_PATCH_SKIP}: leaving that patch out")
+endif()
 set(R97_STAMP_FILE "${R97_RADIANCE_COPY}/.r97-patch-stamp")
 
 if(EXISTS "${R97_STAMP_FILE}")
@@ -79,7 +89,7 @@ if(NOT stamp STREQUAL R97_PATCH_STAMP)
   # The copied .git file is the submodule's pointer into the superproject's module store; the
   # copy stands on its own and must not look like the submodule's worktree.
   file(REMOVE "${R97_RADIANCE_COPY}/.git")
-  r97_apply_patches("${R97_RADIANCE_COPY}" "${R97_PATCHES}" "${R97_PATCH_SET}")
+  r97_apply_patches("${R97_RADIANCE_COPY}" "${R97_PATCHES}" "${R97_PATCH_SET}" "${R97_PATCH_SKIP}")
   file(WRITE "${R97_STAMP_FILE}" "${R97_PATCH_STAMP}")
 endif()
 message(STATUS "r97: radiance at ${R97_RADIANCE_COPY}, commit ${R97_RADIANCE_COMMIT}, "
