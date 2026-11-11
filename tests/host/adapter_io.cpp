@@ -12,7 +12,7 @@
 //     table states -- q/k/v/o, the ssm_inz split, gate/up, down -- and a natural basis.
 //
 // Label: host. The fixture container is converted by rad-convert, which needs no card.
-#include "support/fixture.h"
+#include "support/late_fixture.h"
 #include "support/test.h"
 
 #include "r97/adapter_io.h"
@@ -33,6 +33,9 @@ namespace {
 namespace fs = std::filesystem;
 using namespace r97;
 
+// The paths this file's checks use, taken here rather than at exit: see support/late_fixture.h.
+const std::string& kTmpDir = r97test::late_paths().tmpdir;
+
 fs::path fixtures() {
     return fs::path(__FILE__).parent_path().parent_path() / "fixtures";
 }
@@ -40,7 +43,7 @@ fs::path fixtures() {
 // A directory of this test's own, emptied first: a leftover from an earlier run must not make a
 // failing write look like a passing one.
 fs::path scratch(const char* name) {
-    const fs::path dir = fs::path(radtest::tmpdir()) / name;
+    const fs::path dir = fs::path(kTmpDir) / name;
     std::error_code ec;
     fs::remove_all(dir, ec);
     return dir;
@@ -76,12 +79,6 @@ AdapterConfig reference_config() {
     c.alpha = 4.0;
     c.targets = {"down_proj"};
     return c;
-}
-
-int64_t product(const std::vector<int64_t>& shape) {
-    int64_t n = 1;
-    for (int64_t s : shape) n *= s;
-    return n;
 }
 
 bool same_param(const Param& a, const Param& b) {
@@ -190,7 +187,7 @@ R97_TEST(adapter_io_bf16_is_the_rounded_copy) {
 // 128, ffn 256, four layers of which (l + 1) % 4 == 0 is full attention, so layer 3 has the
 // attention block and layers 0..2 the delta net's.
 R97_TEST(adapter_io_model_meta_of_the_fixture) {
-    const ModelMeta meta = read_model_meta(fixture().container);
+    const ModelMeta meta = read_model_meta(r97test::late_container());
 
     R97_CHECK(meta.layers == 4);
     R97_CHECK(meta.hidden == 128);

@@ -1,6 +1,6 @@
 // tests/host/delta_lora.cpp -- the `lora` trainable kind, against docs/ADAPTER.md.
 //
-// The container is the tiny fixture's (tests/support/fixture.h), whose metadata read_model_meta
+// The container is the tiny fixture's (tests/support/late_fixture.h), whose metadata read_model_meta
 // turns into 25 targetable linears: four layers, layer 3 full attention, so 3 * 6 + 7. The checks:
 //
 //   * init names and shapes: A [r, K] and B [N, r] per linear, A in PEFT's bound 1/sqrt(K), B zero;
@@ -11,7 +11,7 @@
 //   * the registry builds the kind by name and refuses one it does not know.
 //
 // Label: host (the fixture container needs rad-convert, no card).
-#include "support/fixture.h"
+#include "support/late_fixture.h"
 #include "support/test.h"
 
 #include "r97/adapter_io.h"
@@ -30,8 +30,12 @@ namespace {
 
 using namespace r97;
 
+// The container is converted here rather than at exit: see support/late_fixture.h. The reference
+// is what brings that about.
+[[maybe_unused]] const std::string& kTmpDir = r97test::late_paths().tmpdir;
+
 const ModelMeta& fixture_meta() {
-    static const ModelMeta meta = read_model_meta(fixture().container);
+    static const ModelMeta meta = read_model_meta(r97test::late_container());
     return meta;
 }
 
