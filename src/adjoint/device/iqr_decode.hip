@@ -7,6 +7,10 @@
 // they read consecutive codes of the same packed row: the access is coalesced. The math is
 // src/iqr_decode.h's, the same the host test checks against libquant.
 //
+// The affine grid (the container's drafter head) has no state above a row, so its run is one row
+// and the workgroup decodes that row's columns with no seam: the same launch, a row instead of a
+// trellis run as the unit.
+//
 // The launch follows docs/kernels/README.md's discipline: it runs on the stream the caller hands
 // in, so the copies around it and the wait for them are the caller's queue rather than the whole
 // device's. The kernel does not sync: the caller's rad_stream_sync on that same stream is what

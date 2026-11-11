@@ -11,6 +11,11 @@
 // grid_tcq_decode (libquant/lq_grid.cpp): the same tail-biting seam, the same mad LUT, the same
 // two-level scale, and the same tcq_rb rounding.
 //
+// The container's drafter head (`dflash.draft_head.weight`) is not a trellis: it is an affine grid
+// (radiance's "affine" scheme, libquant's asymmetric Grid), a zero a 128-column block beside the
+// scale and no codebook above it. That form is the same description with `affine` set, and one
+// value of it is libquant's grid_decode: the code less the block's zero, on the block's scale.
+//
 // What is not applied: the fwht transform (the int8 grid is the codes' basis, not W) and the
 // scale.col factor (the forward folds it into the activation's per-128 scale, so the weight side
 // keeps the codes libquant's tcq_colf multiplies it into). Callers that need W in the logical
@@ -76,6 +81,17 @@ struct R97IqrDecodeDesc {
     int32_t        scale_dtype;
     int64_t        scale_block_cols;
     int64_t        scale_row_bytes;
+
+    // The affine grid (libquant's asymmetric one, radiance's "affine" scheme and kZero IQR form):
+    // the value of a code c is (c - zero[r, block]) * scale, with no trellis above it. Set
+    // `affine` to decode this form: `codes` then holds plain unsigned codes, `zero` the plane of
+    // `zero_bits`-wide integer zeros TILED like the scale, and the trellis fields above are unused
+    // (validation requires run_rows = 1, rb = 1, no scale.1 and no codebook). The int8 grid holds
+    // the centred code c - zero, which is exact because the zero is an integer.
+    int32_t        affine;
+    const uint8_t* zero;
+    int32_t        zero_bits;
+    int64_t        zero_row_bytes;
 
     // The second level (scale.1), one f32 a block of the first: block rows/cols of 0 mean the
     // whole tensor, the same convention radiance's plane blocks use.
@@ -188,11 +204,18 @@ R97_IQR_HD int32_t r97_iqr_state_value(const R97IqrDecodeDesc& d, uint32_t st) {
     return (int32_t)d.lut[st];
 }
 
+// The group of 128-column block `kb` in a plane TILED beside the scale: one entry a
+// `scale_block_cols` columns, or the whole row when the container tiles per row.
+R97_IQR_HD int64_t r97_iqr_scale_group(const R97IqrDecodeDesc& d, int64_t kb) {
+    const int64_t bc = d.scale_block_cols > 0 ? d.scale_block_cols : d.cols;
+    return bc == d.cols ? 0 : (kb * 128) / bc;
+}
+
 // The scale of row r's 128-column block `kb`, with the second level settled to bf16 as libquant
 // does. `kb` is the index into the output's per-128 scales.
 R97_IQR_HD float r97_iqr_block_scale(const R97IqrDecodeDesc& d, int64_t r, int64_t kb) {
     const int64_t bc = d.scale_block_cols > 0 ? d.scale_block_cols : d.cols;
-    const int64_t gb = bc == d.cols ? 0 : (kb * 128) / bc;
+    const int64_t gb = r97_iqr_scale_group(d, kb);
     const uint8_t* row = d.scale + (r - d.row0) * d.scale_row_bytes;
     float v = r97_iqr_load_scalar(row, d.scale_dtype, gb);
     if (d.scale2) {
@@ -243,10 +266,27 @@ R97_IQR_HD int32_t r97_iqr_value(const R97IqrDecodeDesc& d, uint32_t st, int64_t
 
 // ---------------------------------------------------------------- a run of one column
 
+// One row of column j on an affine grid: libquant's grid_decode at a single value, as the int8
+// grid's code and the block's scale. There is no state above a row, so a row is its own run.
+R97_IQR_HD void r97_iqr_decode_affine_column(const R97IqrDecodeDesc& d, int64_t r, int64_t j) {
+    const int64_t kb = j >> 7;
+    const uint32_t code = r97_iqr_load_bits(d.codes + (r - d.row0) * d.codes_row_bytes, d.bits, j);
+    const uint32_t zero = r97_iqr_load_bits(d.zero + (r - d.row0) * d.zero_row_bytes, d.zero_bits,
+                                            r97_iqr_scale_group(d, kb));
+    d.out_codes[(r - d.row0) * d.cols + j] = (int8_t)((int32_t)code - (int32_t)zero);
+    if ((j & 127) == 0)
+        d.out_scale[(r - d.row0) * (d.cols >> 7) + kb] =
+            r97_iqr_f32_to_bf16(r97_iqr_block_scale(d, r, kb));
+}
+
 // Decode rows [run_start, run_end) of column j. run_start is a multiple of run_rows, and run_end
 // is the run's end: the whole run, or the weight's last, shorter one.
 R97_IQR_HD void r97_iqr_decode_column(const R97IqrDecodeDesc& d, int64_t run_start, int64_t run_end,
                                       int64_t j) {
+    if (d.affine) {
+        for (int64_t r = run_start; r < run_end; ++r) r97_iqr_decode_affine_column(d, r, j);
+        return;
+    }
     const int32_t c = (d.state_bits + d.bits - 1) / d.bits;
     const uint32_t mask = (1u << d.state_bits) - 1u;
     // The seam: the state before the run's first row is the state after its last.
@@ -275,12 +315,19 @@ R97_IQR_HD int32_t r97_iqr_validate(const R97IqrDecodeDesc& d) {
     if (!d.codes || !d.out_codes || !d.out_scale) return 1;
     if (d.rows <= 0 || d.row0 < 0 || d.rows_all <= 0 || d.rows > d.rows_all - d.row0) return 1;
     if (d.cols <= 0 || (d.cols & 127) != 0) return 1;
-    if (d.bits < 1 || d.bits > 16 || d.state_bits < 1 || d.state_bits > 24) return 1;
     if (d.run_rows <= 0 || d.rb <= 0 || d.run_rows % d.rb != 0) return 1;
     if (d.row0 % d.run_rows != 0) return 1;
     if (d.rows % d.run_rows != 0 && d.row0 + d.rows != d.rows_all) return 1;
     const int64_t bc = d.scale_block_cols > 0 ? d.scale_block_cols : d.cols;
     if (bc != 128 && bc != d.cols) return 1;
+    if (d.affine) {
+        // The affine grid has no trellis to seed, no codebook above its codes and no second level:
+        // a row stands alone, and the centred code must fit the int8 grid.
+        if (!d.zero || d.bits < 1 || d.bits > 7 || d.zero_bits < 1 || d.zero_bits > 8) return 1;
+        if (d.run_rows != 1 || d.rb != 1 || d.scale2) return 1;
+        return 0;
+    }
+    if (d.bits < 1 || d.bits > 16 || d.state_bits < 1 || d.state_bits > 24) return 1;
     if (!d.mad && !d.lut) return 1;
     if (d.scale2 && (d.scale2_block_rows < 0 || d.scale2_block_cols < 0)) return 1;
     // The output has one scale a 128-column block, so the second level must be constant over one.
