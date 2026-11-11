@@ -46,7 +46,11 @@ public:
     DeltaRegistration(const char* kind, DeltaFactory factory);
 };
 
-// One line at file scope, with a semicolon, is the whole change to the trainer.
+// One line at file scope, with a semicolon, is the whole change to the trainer: the file sits
+// where the library's glob collects it (src/, src/adjoint/host/, src/adjoint/device/) and nothing
+// else is edited. A registration is a static initialiser, so the binary that lists the name must
+// actually link the file -- a static archive drops a member nothing references (see
+// docs/OBJECTIVES.md, "Where a registration runs").
 #define R97_REGISTER_OBJECTIVE(name, factory)                                              \
     static r97::ObjectiveRegistration r97_reg_objective_##name(#name, factory)
 

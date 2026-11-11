@@ -81,15 +81,25 @@ refused, so a driver cannot pass the check unrecorded.
    `R97_REGISTER_OBJECTIVE(name, factory);` or `R97_REGISTER_DELTA(kind, factory);` — the
    factory takes `const Config&` and gives an `Objective` or a `std::shared_ptr<Delta>`.
    The `name`/`kind` must be a bare identifier; registering the same one twice is refused
-   when the binary starts. The file may live anywhere under `src/`: the glob collects it
-   into the `r97` library, so no existing file changes. `r97` is an object library, so every
-   target that links it links all of its objects; the registration's static initialiser
-   runs even when the file exports nothing else. `r97train objectives` (or `r97train
-   deltas`) is where you see it.
+   when the binary starts. The file goes in one of the three directories the library's glob
+   collects — `src/`, `src/adjoint/host/` or `src/adjoint/device/` — so no existing file
+   changes. `r97train objectives` (or `r97train deltas`) is where you see it.
 3. **Document it.** Add the name and one line on what it does to the list below, and, for
    a new trainable kind, its meaning to `docs/ADAPTER.md`. Nothing else changes:
    `r97train objectives` and `r97train deltas` print whatever is registered, so the new
    name shows up there with no edit to the tools.
+
+### Where a registration runs
+
+A registration is a static initialiser in the registering file, so it runs only in a binary
+whose link kept that file. A static archive drops a member nothing references, and a file
+whose only export is its registration is exactly such a member: `r97` is a static archive,
+so a loss or a kind that ships from `src/` is reachable only once the targets that list it
+link the library whole (an object library, or `$<LINK_LIBRARY:WHOLE_ARCHIVE>`). That is a
+decision about every target in the build, so it belongs to a build issue and not to the file
+that adds a loss. What the registries in this repository exercise today is registered from
+files their own binary compiles: the test objective and the test delta in the host test
+binary, the subcommands in `r97train`.
 
 ## Registered today
 
