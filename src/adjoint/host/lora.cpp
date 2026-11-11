@@ -46,10 +46,29 @@ int64_t numel(const std::vector<int64_t>& shape) {
     return n;
 }
 
-/* The width of one scale group: a stream of `groups` columns over K is read in widths of
- * ceil(K / groups), which is how radiance's make_scales states a stream's grid. */
+/* The width of one scale group over K, read back from a stream of `groups` columns the way
+ * radiance's make_scales does (grid_block in ref_gemm.h): the power of two whose ceiling division
+ * gives `groups`, so a partial last group keeps the width its neighbours have. 300 over three
+ * columns is groups of 128, 128 and 44 -- not three groups of 100, which would misassign
+ * 100..127 -- and it is the 128 a coded checkpoint's `group` states. A single column spans the
+ * whole row. */
 int64_t group_width(int64_t k, int64_t groups) {
-    return groups <= 0 ? k : (k + groups - 1) / groups;
+    if (k <= 0) return 1;
+    if (groups <= 1) return k;
+    const int64_t lo = (k + groups - 1) / groups;
+    int64_t b = 1;
+    while (b < lo) b <<= 1;
+    return (k + b - 1) / b == groups ? b : lo;
+}
+
+/* An integer parameter, 0 when the record does not carry one (a parameter is an int64 or a
+ * string; `group` is the only one this family reads as a number). */
+int64_t param_int(const std::vector<OpParam>& params, const char* name) {
+    for (const OpParam& p : params) {
+        if (p.first != name) continue;
+        if (const auto* i = std::get_if<int64_t>(&p.second)) return *i;
+    }
+    return 0;
 }
 
 /* Whether the record's activation is a code stream: the `dtype` parameter names one of the coded
@@ -147,6 +166,13 @@ bool shrink_layout(const OpRecord& rec, const AdValue* v, size_t n, Shrink* sh) 
     sh->S = S;
     sh->groups = as ? as->shape[1] : 0;
     sh->group = as ? group_width(K, sh->groups) : 0;
+    /* The record's `group` is a consistency statement, not the width the kernel reads with: the
+     * stream's column grid is what make_scales turns back into a width, and radiance's row refuses
+     * a record whose `group` divides K into a different number of groups (ref_registry.cpp: K=300
+     * with a `group` of 128 needs three columns, not two or four). So a record this twin lays out
+     * is one the kernel would run, and it reads a partial last group the way the kernel does. */
+    const int64_t stated = as ? param_int(rec.params, "group") : 0;
+    if (stated > 0 && (K + stated - 1) / stated != (K + sh->group - 1) / sh->group) return false;
     return true;
 }
 

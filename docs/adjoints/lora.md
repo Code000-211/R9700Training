@@ -37,10 +37,17 @@ trunk (`docs/ADAPTER.md` 1):
 | rotated int8 | i8 `[M, K]` codes | f32 `[M, ceil(K / group)]` | `a[m, k] * a_scale[m, k / group]` |
 
 so the dequantisation is one product, `x = code * scale`, and `group` is the scale's group width
-(128 in the checkpoint this repository stores, `docs/ADAPTER.md` 1). The scale's grid is
-`ceil(K / group)` columns per row, which is what `make_scales` in the reference states; the twin
-takes that per-row stream and lays out no other (radiance also reads a block grid over rows for
-weights, which the adapter path does not use).
+(128 in the checkpoint this repository stores, `docs/ADAPTER.md` 1). Radiance's shape function
+reads the `group` parameter to give the scale stream `ceil(K / group)` columns per row
+(`ref_shapes.cpp`), and its kernel does not divide K by that column count: `make_scales` derives
+the width over K from the stream's grid with `grid_block` (`ref_gemm.h`), the power of two whose
+ceiling division gives those columns, so a partial last group keeps the width its neighbours have.
+`K = 300` over three columns is groups of 128, 128 and 44 wide — not three groups of 100, which
+would read the scale of 100..127 for the codes of 100..127. The twin reads the stream back the
+same way (`group_width` in `src/adjoint/host/lora.cpp`) and uses the record's `group` only as the
+consistency statement radiance's row treats it as: if the count `ceil(K / group)` differs from the
+stream's column count, the record is one the kernel would refuse with `RAD_E_SHAPE`, and the twin
+lays it out for no one.
 
 `lora_expand` reads `t [M, r]`, `slot`, `lora_b [S, N, r]`, `scale [S, N]`, and adds to
 `y [M, N]`:
@@ -83,6 +90,9 @@ and the three routes out of it are:
 | the codes | `dc a[m, k] += g[m, k] * a_scale[m, k / group]` |
 | the group scale | `dc a_scale[m, ke] += sum_{k in group ke} g[m, k] * a[m, k]` |
 | the weight | `dA[j, k] += sum_{m: slot[m] = s} cot t[m, j] * x(m, k)` |
+
+where `group` is the width section 1 derives from the stream's grid, so the last group of a row
+whose K is not a multiple of it is narrower and holds `ke = groups - 1` only up to `K`.
 
 i.e. the coded form splits the value-space cotangent over the two operands its dequantisation is
 made of (`d/d code` is the scale, `d/d scale` is the code); a base row contributes to none of them.
@@ -139,7 +149,7 @@ against the twin.
 
 ## 4. What the tests cover
 
-Five sites, one of them the tiny fixture's (`tests/support/fixture.h`: hidden 128, ffn 256), at
+Six sites, one of them the tiny fixture's (`tests/support/fixture.h`: hidden 128, ffn 256), at
 ranks 16 and 4:
 
 | site | M | K | N | r | S | trunk |
@@ -149,17 +159,20 @@ ranks 16 and 4:
 | `tiny_down_proj` | 4 | 256 | 128 | 4 | 1 | bf16 |
 | `coded_q_proj` | 3 | 128 | 128 | 4 | 2 | int8, group 128 |
 | `coded_down_proj` | 4 | 256 | 128 | 4 | 1 | int8, group 128 |
+| `coded_up_proj` | 5 | 300 | 96 | 4 | 2 | int8, group 128 |
 
 Every site has a base row spelled `-1` and one spelled past the pool (`S`), the two spellings a
 record uses.
 
-The two coded sites are widths apart on purpose. At `K = 128` a row has one scale group, so
+The three coded sites are widths apart on purpose. At `K = 128` a row has one scale group, so
 every `k` reads `a_scale[m, 0]` and any group index at all agrees; at `K = 256` a row has two
-groups of 128, so an index that is wrong — `k % groups`, say, or a group width derived from
-something other than the stream's grid — reads a different scale over half the row and
-`check_kernel` fails on radiance's `lora_shrink`. That is the check that has to catch it: the
-adjoint and gradient checks read the same twin, so a twin wrong about the group index agrees with
-its own differences.
+groups of 128, so an index that is wrong — `k % groups`, say — reads a different scale over half
+the row; and at `K = 300` a row has three groups, the last 44 wide, which is the shape that
+catches a width that is not the group's: `ceil(K / groups)` is 100 there and misreads 100..127 and
+200..255, while `grid_block` gives the 128 the record states. `check_kernel` fails on radiance's
+`lora_shrink` for either mistake (300 over 128 is exactly the case `grid_block`'s own comment
+names). That is the check that has to catch it: the adjoint and gradient checks read the same
+twin, so a twin wrong about the group index agrees with its own differences.
 
 | check | what it proves | tolerance |
 |---|---|---|
