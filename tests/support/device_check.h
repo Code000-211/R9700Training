@@ -202,24 +202,10 @@ inline AdjointCall make_call(const Case& c, std::vector<AdValue>* fwd, std::vect
     TwinFn twin = twin_find(c.rec.op, c.rec.params, nullptr);
     if (!twin) throw std::runtime_error("no twin for op '" + c.rec.op + "'");
 
-    // `call.fwd` is every operand where the record puts it (include/r97/adjoint.h), so the twin's
-    // writes do not simply follow the reads the case gives: an op's schema can put a read after its
-    // writes, as `gdn_chunk_scan`'s optional `state_idx` does.
+    *fwd = c.in;
     std::vector<AdValue> out;
     twin(c.rec, c.in, &out);
-    fwd->clear();
-    fwd->reserve(c.rec.operands.size());
-    for (size_t i = 0, r = 0, w = 0; i < c.rec.operands.size(); ++i) {
-        if (c.rec.operands[i].written) {
-            if (w >= out.size())
-                throw std::runtime_error("the twin wrote fewer operands than the record");
-            fwd->push_back(out[w++]);
-        } else {
-            if (r >= c.in.size())
-                throw std::runtime_error("the case gives fewer reads than the record");
-            fwd->push_back(c.in[r++]);
-        }
-    }
+    fwd->insert(fwd->end(), out.begin(), out.end());
 
     dc->clear();
     for (const Operand& op : c.rec.operands) {

@@ -130,6 +130,13 @@ It also checks the frozen set, that the kernel leaves no scratch live, and that 
 teeth: a device row that drops the gate's cotangent -- the term of the reverse pass a kernel is
 most likely to leave out -- must be rejected in `dc[4]`.
 
+The harness (`tests/support/device_check.h`) builds a case's forward values as its reads in schema
+order followed by the twin's writes in theirs, which is the record's order only while the writes
+come last; this op's schema has `state_idx` after `o` and `ht`, so both rows would index the wrong
+values. `tests/support/gdn_scan_check.h`, this family's own header, moves the call into schema
+order before either row sees it and leaves the shared harness alone; for a record whose reads all
+precede its writes -- every shape above but the two state pools -- the move changes nothing.
+
 ## Measurement
 
 Measured with the gpu tier's `--bench` pass on an AMD Radeon AI PRO R9700 (gfx1201, 32 GB): the

@@ -25,9 +25,14 @@
 // The test also prints what docs/kernels/gdn_scan.md quotes: the largest deviation from the f64
 // host row at the real shapes, and, under `--bench`, the time per call beside the forward twin's,
 // and the scratch peak.
+//
+// The harness hands a case's forward values as its reads followed by the twin's writes, and this
+// op's schema puts the optional `state_idx` after its two writes; `tests/support/gdn_scan_check.h`
+// is where this family's call is put in schema order before either row sees it.
 #include "r97/adjoint.h"
 
 #include "support/device_check.h"
+#include "support/gdn_scan_check.h"
 #include "support/gpu_guard.h"
 #include "support/test.h"
 
@@ -292,14 +297,16 @@ struct Deviation {
 };
 
 Deviation deviation(const device_check::Case& c) {
-    std::vector<AdValue> fwd_d, dc_d, fwd_h, dc_h;
-    AdjointCall cd = device_check::make_call(c, &fwd_d, &dc_d);
-    AdjointCall ch = device_check::make_call(c, &fwd_h, &dc_h);
+    std::vector<AdValue> fwd, dc_d, dc_h;
+    const AdjointCall built = device_check::make_call(c, &fwd, &dc_d);
+    const std::vector<AdValue> ordered = gdn_scan_check::ordered_fwd(built);
     AdjointFn device = adjoint_find(c.rec.op, Side::device, c.rec.params, nullptr);
     AdjointFn host = adjoint_find(c.rec.op, Side::host, c.rec.params, nullptr);
     if (!device || !host) throw std::runtime_error(c.label + ": a registry row is missing");
-    device(cd);
-    host(ch);
+    device(AdjointCall{built.rec, ordered, built.cot, &dc_d, nullptr, ""});
+    dc_h = dc_d;
+    for (AdValue& v : dc_h) std::fill(v.value.begin(), v.value.end(), 0.0);
+    host(AdjointCall{built.rec, ordered, built.cot, &dc_h, nullptr, ""});
 
     Deviation d;
     for (size_t slot = 0; slot < c.rec.operands.size() && slot < dc_d.size(); ++slot) {
@@ -324,7 +331,8 @@ Deviation deviation(const device_check::Case& c) {
 void gate_dropped(const AdjointCall& call) {
     AdjointFn real = adjoint_find(call.rec.op, Side::device, call.rec.params, nullptr);
     if (!real) return;
-    real(call);
+    const std::vector<AdValue> fwd = gdn_scan_check::ordered_fwd(call);
+    real(AdjointCall{call.rec, fwd, call.cot, call.dc, call.grads, call.prefix});
     if (call.dc && call.dc->size() > 4)
         call.dc->at(4).value.assign(call.dc->at(4).value.size(), 0.0);
 }
@@ -332,7 +340,7 @@ void gate_dropped(const AdjointCall& call) {
 // One case: the harness's comparison against the host row, then the deviation the doc quotes.
 void run_case(const ScanShape& s, uint64_t seed, bool measure) {
     const device_check::Case c = scan_case(s, s.name, seed);
-    const device_check::Report r = device_check::check(c);
+    const device_check::Report r = gdn_scan_check::check(c);
     if (!r.ok) throw std::runtime_error("gdn_chunk_scan " + std::string(s.name) + ": " + r.note);
     std::printf("gdn_chunk_scan %s: device == host, scratch peak %lld KiB\n", s.name,
                 (long long)(r.scratch_peak / 1024));
@@ -359,8 +367,8 @@ void run_fixture() {
 
     // The comparison has teeth: a kernel that drops the gate's cotangent is rejected there.
     const device_check::Report wrong =
-        device_check::check(scan_case(fixture_shapes()[1], "gate dropped", 0x9d1c0ffeeull),
-                            gate_dropped);
+        gdn_scan_check::check(scan_case(fixture_shapes()[1], "gate dropped", 0x9d1c0ffeeull),
+                              gate_dropped);
     R97_CHECK(!wrong.ok);
     R97_CHECK(wrong.first_slot == 4);
     std::printf("rejected the kernel that dropped the gate: %s\n", wrong.note.c_str());
@@ -376,8 +384,12 @@ void run_real() {
 
     if (r97test::bench()) {
         // Both sides are measured over the same case, and the reference is f64 on the host: the
-        // 4096-token case gets one repetition and the shorter ones a few.
+        // 4096-token case gets one repetition and the shorter ones a few. The bench builds its
+        // call the harness's way, which is the schema's order exactly when a record's reads all
+        // precede its writes -- true of every shape timed here; only the fixture's state pools
+        // carry `state_idx`, and they are not timed.
         for (const ScanShape& s : real_shapes()) {
+            R97_CHECK(s.sidx.empty());
             const device_check::Case c = scan_case(s, s.name, 0x5eed0badull);
             device_check::print_bench(c, s.tokens() >= 4096 ? 1 : 3);
         }
