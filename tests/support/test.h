@@ -6,9 +6,11 @@
 //
 //   R97_TEST(name) { ... }
 //
-// and the runner armed here -- at exit, after the binary's main has returned -- runs every
-// registered test in name order. A failure makes the process exit non-zero, which is what
-// ctest reads, so adding a test is adding one file and nothing else.
+// and the runner runs every registered test before static teardown: the host and gpu binaries run
+// theirs from their own main (`tests/host/vector_tape.cpp`, `tests/gpu/main.cpp`), which keeps the
+// statics a test needs alive for the whole run, and the at-exit runner armed below is what the
+// model tier uses. A failure makes the process exit non-zero, which is what ctest reads, so adding
+// a test is adding one file and nothing else.
 #pragma once
 
 #include <cstdio>
@@ -50,6 +52,10 @@ inline int run_all() {
     return failed ? 1 : 0;
 }
 
+// Runs the registered tests from exit(). The host and gpu binaries call run_all() from their own
+// main instead (`tests/host/vector_tape.cpp`, `tests/gpu/main.cpp`), because at exit the statics a
+// test needs are gone; a binary whose main returns without running them -- the model tier -- lands
+// here.
 inline void run_at_exit() {
     const int failed = run_all();
     std::fflush(stdout);

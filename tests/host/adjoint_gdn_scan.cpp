@@ -66,9 +66,8 @@ struct ScanShape {
 /* The first is the tiny fixture's gdn geometry -- two key heads and four value
  * heads of 16, 4-token chunks -- with a sequence shorter than its chunk. The
  * others put a sequence exactly on a chunk boundary, one across several chunks,
- * and a ragged batch whose three lengths cover shorter, equal and several. Built
- * per call: the runner runs the tests from an atexit handler, and a namespace-
- * scope object with a destructor would already be gone by then. */
+ * and a ragged batch whose three lengths cover shorter, equal and several. Built per
+ * call, like everything else the tests hand the checkers. */
 std::vector<ScanShape> scan_shapes() {
     return {
         {"tiny-fixture-short", 16, 16, 2, 4, 4, 0.5, {3}},

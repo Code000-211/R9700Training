@@ -60,9 +60,8 @@ struct ConvShape {
  * everything else: two sequences with one shorter than the convolution's window,
  * and a single head with the widths the other way round.
  *
- * Built per call, like everything else the tests hand the checkers: the runner runs
- * the tests from an atexit handler, and a namespace-scope object with a destructor
- * is gone by then, its storage already reused. */
+ * Built per call, like everything else the tests hand the checkers, rather than once
+ * in a namespace-scope object. */
 std::vector<ConvShape> conv_shapes() {
     return {
         {"tiny-fixture", 16, 16, 2, 4, 4, 4, {8}},

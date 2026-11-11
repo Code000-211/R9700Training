@@ -25,8 +25,8 @@ R97_REGISTER_DELTA(test_bias, r97test::make_bias_delta);
 namespace r97test {
 namespace {
 
-// Taken after the command files above have registered, on the heap so it outlives the command
-// table's own static destructor: the host tests read it from their exit-time handler.
+// Taken after the command files above have registered, on the heap so the table a test reads
+// stays readable whatever order this binary's statics are destroyed in.
 std::map<std::string, r97tool::Command>* command_copy = nullptr;
 
 struct CommandTableCopy {

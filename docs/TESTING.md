@@ -4,7 +4,9 @@ Three test labels, and the variables that run them. ctest runs each tier's binar
 globs of their directories (`tests/<tier>/*.cpp`), so a new test file needs no edit anywhere, and
 the tests inside one binary register themselves with `R97_TEST(name)` (`tests/support/test.h`).
 Each tier's binary holds one `main` in its own directory: `tests/host/vector_tape.cpp`,
-`tests/gpu/main.cpp`, `tests/model/info_meta.cpp`. Checks are `R97_CHECK`, not
+`tests/gpu/main.cpp`, `tests/model/info_meta.cpp`. The host and gpu mains run their registered
+tests from `main`, before the binary's statics are destroyed; only a main that returns, as the
+model tier's does, leaves the run to the at-exit runner. Checks are `R97_CHECK`, not
 `assert`: the default build is `RelWithDebInfo`, which defines `NDEBUG` and compiles `assert` out.
 
 ## The three labels
@@ -127,7 +129,10 @@ hf download StillDeadcode/qwen3.8-27b-iqr-v4 qwen3.8-27b-iq4r-s-v4.rad
   To see two copies serialise, start two: `./build/r97_gpu_tests & ./build/r97_gpu_tests & wait`.
 - The guard holds a lock, never ownership: it never stops a process it did not start. If a stale
   holder is wedged, kill only processes you started.
-- `r97_gpu_tests` runs its tests from `main`, not from the at-exit runner the host and model tiers
-  use (`tests/gpu/main.cpp` says why: a device test `dlopen`s `libr97.so`, and a handler armed
-  during static initialisation would register the plugin's rows after the r97 registry they go
-  into is destroyed). `tests/gpu/adjoint_add.cpp` is the example of a device test.
+- `r97_gpu_tests` and `r97_host_tests` run their tests from `main`, not from the at-exit runner
+  `tests/support/test.h` arms from the first registration, which the model tier still uses
+  (`tests/gpu/main.cpp` says why: a device test `dlopen`s `libr97.so`, and a handler armed during
+  static initialisation would register the plugin's rows after the r97 registry they go into is
+  destroyed; the host tier hits the same wall, since a static initialiser in `tests/host/` builds
+  the fixture, whose strings and temp directory are gone by the time an armed handler runs).
+  `tests/gpu/adjoint_add.cpp` is the example of a device test.
