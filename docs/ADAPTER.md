@@ -347,6 +347,9 @@ GEMM, issued by radiance's `core/lora/declare.cpp`:
   A fused weight may need one per row part (for example `in_proj_qkv`'s three parts).
 - `lora_expand` multiplies by the slot's B factors and adds the result to the GEMM's output `y`.
 
-Both are present at every targeted site. `tests/host/live_adapter.cpp` checks the program of a
-bf16-fixture engine with a live slot and finds one `lora_shrink` and one `lora_expand` per entry
-in `Program::lora_sites`; the int8 trunk follows with patch `0210` and the same two ops.
+Both are present at every targeted site, and both are issued by a step that carries the adapter:
+`tests/host/live_adapter.cpp` fills the slot from memory, runs a prefill, and checks the step's
+tape (`Program::ops[i].issued`) for one issued `lora_shrink` and one issued `lora_expand` per
+entry in `Program::lora_sites`. A step that never names the slot leaves both unissued, so the
+check is what holds this section to a step rather than to the declaration alone. The int8 trunk
+follows with patch `0210` and the same two ops.

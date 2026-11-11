@@ -1,5 +1,6 @@
 // tests/host/live_adapter.cpp -- a delta's WireBuffers in radiance's LoRA slot on the bf16 fixture.
-// Label: host; needs the fixture's prefill (patch 0103).
+// Label: host; needs the fixture's prefill (patch 0103) and the live-slot entry point
+// (patch 0201).
 //
 // A test registered with R97_TEST runs from an atexit handler, after namespace-scope objects have
 // been destroyed, so this file keeps its targets in a function rather than in a static vector.
@@ -134,6 +135,16 @@ void same_logits(const std::vector<std::vector<float>>& got,
     }
 }
 
+// The two runs differ somewhere. Used where a later match only says something if the two
+// adapters it chooses between are not themselves the same run.
+bool any_logit_differs(const std::vector<std::vector<float>>& a,
+                       const std::vector<std::vector<float>>& b) {
+    if (a.size() != b.size()) return true;
+    for (size_t p = 0; p < a.size(); ++p)
+        if (a[p] != b[p]) return true;
+    return false;
+}
+
 void test_memory_equals_directory_and_base() {
     const r97::Fixture& f = r97::fixture();
     const std::vector<std::vector<int32_t>> sequences = { { 1, 7, 11, 19 }, { 2, 3 } };
@@ -184,6 +195,7 @@ void test_update_replaces_the_slot() {
     R97_CHECK(tiny::write_lora(b_dir, f.checkpoint, targets(), kRank, kAlpha, 32, 0.5f));
 
     std::string err;
+    const auto a_only = prefill_once(f, sequences, true, a_dir);
     std::vector<std::vector<float>> updated;
     {
         auto engine = start(f, sequences, true, "");
@@ -194,13 +206,21 @@ void test_update_replaces_the_slot() {
         updated = prefill(*engine);
     }
 
-    same_logits(updated, prefill_once(f, sequences, true, b_dir),
-                "updated adapter and the same adapter loaded fresh");
+    const auto b_only = prefill_once(f, sequences, true, b_dir);
+    same_logits(updated, b_only, "updated adapter and the same adapter loaded fresh");
+    // Matching b only shows the update was used because b's weights are not a's.
+    R97_CHECK(any_logit_differs(a_only, b_only));
 }
 
 void test_ops_and_refusal() {
     const r97::Fixture& f = r97::fixture();
     const std::vector<std::vector<int32_t>> sequences = { { 4, 6 } };
+
+    const std::string dir =
+        (std::filesystem::path(f.checkpoint).parent_path() / "live_adapter_ops").string();
+    std::filesystem::remove_all(dir);
+    R97_CHECK(tiny::write_lora(dir, f.checkpoint, targets(), kRank, kAlpha, 33, 0.25f));
+
     auto engine = start(f, sequences, true, "");
     std::string err;
     auto adapter = r97::LiveAdapter::open(*engine, live_config(), &err);
@@ -209,18 +229,31 @@ void test_ops_and_refusal() {
     R97_CHECK(adapter->rank() == kRank);
     R97_CHECK(adapter->alpha() == kAlpha);
     R97_CHECK(adapter->name() == kName);
+    R97_CHECK(adapter->update(wire_from(dir), &err) == 0);
+
+    // Run a step with the adapter in the slot (Config::prefill_lora names it, and open()
+    // published it under that name), so every sequence of it carries the adapter. The step's
+    // tape is Program::ops[i].issued: an op issued with no slot, or with the slot never named
+    // by the step, stays false.
+    prefill(*engine);
 
     const rad::Program& program = engine->program();
     R97_CHECK(!program.lora_sites.empty());
-    size_t shrink = 0, expand = 0;
+    size_t shrink = 0, expand = 0, shrink_issued = 0, expand_issued = 0;
     for (const rad::LoraIssueSite& site : program.lora_sites) {
         R97_CHECK(site.shrink < program.ops.size());
         R97_CHECK(site.expand < program.ops.size());
         if (program.ops[site.shrink].op == "lora_shrink") ++shrink;
         if (program.ops[site.expand].op == "lora_expand") ++expand;
+        R97_CHECK(program.ops[site.shrink].issued);
+        R97_CHECK(program.ops[site.expand].issued);
+        if (program.ops[site.shrink].issued) ++shrink_issued;
+        if (program.ops[site.expand].issued) ++expand_issued;
     }
     R97_CHECK(shrink == program.lora_sites.size());
     R97_CHECK(expand == program.lora_sites.size());
+    R97_CHECK(shrink_issued == program.lora_sites.size());
+    R97_CHECK(expand_issued == program.lora_sites.size());
 
     r97::WireBuffers wire;
     wire.extra.push_back(r97::Param{ "not-a-lora-weight", { 1 }, { 1.0f } });
