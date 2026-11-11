@@ -138,8 +138,8 @@ that leaves any of it behind (`live_bytes` back to zero).
 
 **Measured.** One call per shape by `tests/gpu/adjoint_linear.cpp`. With `--bench` the gpu tier's
 binary prints one line per shape in the form `docs/kernels/README.md` asks a kernel doc to carry --
-the adjoint's whole call, the forward twin, how they compare, the scratch peak -- and the card is selected
-with `R97_DEVICE`:
+the adjoint's whole call, the forward twin, how they compare, the scratch peak -- and the card is
+selected with `R97_DEVICE`:
 
 ```console
 $ cmake -B build -G Ninja && cmake --build build -j
@@ -151,8 +151,8 @@ conversion of `dy`, the weight and the scale grid, the uploads, the kernel and t
 The table splits it into its two measured halves, from the card run that this file carried before
 the plugin landed (the kernel and the staging are unchanged; the buffers now come from the plugin's
 scratch ledger instead of a private allocation). The forward column is the f64 host twin -- the op's
-own forward, one thread -- timed here on the host by the same `twin_find`/`TwinFn` path the bench
-uses, once per shape:
+own forward, one thread -- timed on the host by the same `twin_find`/`TwinFn` path the bench uses,
+in seconds:
 
 | shape | staging (host conversion + transfer) | kernel | whole call | forward twin (s) | TFLOP/s | scratch |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -174,7 +174,7 @@ called twice and the second call is the one reported, so the code object's first
 number; the bench warms up once and averages three calls instead. The scratch column is the peak the
 call actually asked the ledger for, and it matches the formula above.
 
-The card numbers are the last of three runs of this binary on a machine other contributors' builds
+The card numbers are the last of three runs of this kernel on a machine other contributors' builds
 share, and the columns move between them: the kernel column repeated within about 5% of itself for
 every shape but `attn_k/v` at 4096 rows, which the three runs put at 3.98, 1.68 and 1.06 ms, and the
 staging column, which is host work on a shared CPU, varied by up to three times (`ffn_gate_up` at
@@ -194,9 +194,9 @@ a scalar f64 loop -- the twin of a quantised linear is not even a bf16 GEMM -- a
 on this machine while it is quiet: 20.1 s at `attn_k/v`, 121.7 s at `attn_output` and 61.2 s at
 `attn_qg` 1024 are the three shapes that were timed then. Another session has since put the machine
 under a load of 91 on 48 cores, where the same loop measured 0.29-0.85 GMAC/s, so the other rows
-state their product at 1.06 GMAC/s rather than a time off a contended machine -- 20.3 s at
-`attn_k/v`, within 1% of the timed 20.1 s, at the smallest shape. At the widest shape a call is
-about eleven and a half minutes. The bench times the twin once per shape rather than `reps + 1`
+state the twin's product at 1.06 GMAC/s rather than a time off a contended machine. At the smallest
+shape that arithmetic gives 20.3 s against the 20.1 s timed, and at the widest one a call is about
+eleven and a half minutes. The bench times the twin once per shape rather than `reps + 1`
 times for the same reason: the whole column is three quarters of an hour of one core when the
 machine is quiet. A card's own forward, when an op has one, is what a kernel's `kernel` column
 should be held against; the twin beside the adjoint says how much of a backward is the staging.
