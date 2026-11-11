@@ -7,13 +7,17 @@ writes a weight gradient; each returns only the cotangent of its input. The rows
 | op | reads | writes | frozen |
 | --- | --- | --- | --- |
 | `gemm_nt` | `a`, `b` | `y` | `b` |
-| `gemm_nt_q` | `a`, `a_scale?`, `b`, `b_scale?` | `y` | `b` |
+| `gemm_nt_q` | `a`, `a_scale`, `b`, `b_scale` | `y` | `a_scale`, `b`, `b_scale` |
 | `logits_gemm` | `x`, `lm_head` | `logits` | `lm_head` |
 | `gather_rows` | `x`, `idx` | `y` | `idx` |
 | `embed_lookup` | `tokens`, `wte` | `x` | `tokens`, `wte` |
 
-Operands are named as the radiance schema names them. A `?` marks an optional read; `gemm_nt_q`'s
-optional `a_sum`/`b_ref` tails are not part of the int8 grid and are not read by these rows.
+Operands are named as the radiance schema names them. radiance marks `a_scale` optional and puts
+`a_sum`/`b_ref` after `y`; the int8 grid always supplies `a_scale`, and it has neither tail, so
+these rows read exactly the operands the table lists. The frozen positions travel with the row as
+schema positions, and the column names them: `b` for `gemm_nt`, `a_scale`, `b`, `b_scale` for
+`gemm_nt_q`, `lm_head` for `logits_gemm`, `idx` for `gather_rows`, and both operands of
+`embed_lookup`.
 
 ## `gemm_nt`
 
@@ -42,8 +46,9 @@ y[m,n] = sum_g s[m,n] * sa[m,g] * sb[n,g]
 ```
 
 The activation `a` is the dequantised, rotated activation of the forward: its code times
-`sa[m,g]`. Its scale belongs to the quantiser that produced it, not to this GEMM. The weight in the
-adjoint is the dequantised weight:
+`sa[m,g]`. Its scale belongs to the quantiser that produced it, not to this GEMM, so the row marks
+`a_scale` frozen beside `b` and `b_scale`: the walk asks for the cotangent of `a` alone. The weight
+in the adjoint is the dequantised weight:
 
 ```text
 W[n,k] = b_code[n,k] * sb[n,g]
@@ -109,4 +114,5 @@ them the tiny fixture's (hidden 128, MLP 256, vocabulary 320). Each adjoint is c
 finite differences of the twin to `1e-6` relative. For `gemm_nt_q` the finite-difference case holds
 the activation scale at one, because the adjoint describes the dequantised basis; a separate
 check perturbs the codes by `eps / sa` and confirms `dx_hat` against the dequantised directional
-derivative with a real scale.
+derivative with a real scale. One more check pins the frozen positions of every row against the
+table above, so this page and the registration cannot drift apart.

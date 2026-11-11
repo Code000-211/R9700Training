@@ -195,6 +195,31 @@ R97_TEST(adjoint_linear_gather_rows) {
     check(gather_rows_rec(37, 320, 384), 0x4003);
 }
 
+/* The frozen column of docs/adjoints/linear.md, operand for operand: the walk asks for exactly
+ * the cotangents the page says it does not, and the positions it registers are schema positions.
+ * A row that froze the wrong operand would still pass a finite-difference check whenever the
+ * check's own cotangent happens to be zero, so pin the positions here. */
+R97_TEST(adjoint_linear_frozen_positions_match_the_doc) {
+    const OpRecord gemm_nt = gemm_nt_rec(2, 3, 4);
+    const OpRecord gemm_nt_q = gemm_nt_q_rec(2, 3, 128);
+    const OpRecord logits_gemm = logits_gemm_rec(2, 16, 8);
+    const OpRecord gather_rows = gather_rows_rec(2, 5, 4);
+    const OpRecord embed_lookup = embed_lookup_rec(2, 16, 8);
+    const std::pair<const OpRecord*, std::vector<int>> rows[] = {
+        {&gemm_nt, {1}},              /* b */
+        {&gemm_nt_q, {1, 2, 3}},      /* a_scale, b, b_scale */
+        {&logits_gemm, {1}},          /* lm_head */
+        {&gather_rows, {1}},          /* idx */
+        {&embed_lookup, {0, 1}},      /* tokens, wte */
+    };
+    for (const auto& row : rows) {
+        const OpRecord& rec = *row.first;
+        const std::vector<int> frozen = adjoint_frozen(rec.op, Side::host, rec.params);
+        std::printf("%s: %zu frozen operands\n", rec.op.c_str(), frozen.size());
+        R97_CHECK(frozen == row.second);
+    }
+}
+
 R97_TEST(adjoint_linear_embed_lookup_is_a_stop) {
     const OpRecord rec = embed_lookup_rec(4, 320, 128);
     const Case c = make_case(rec, 0x5001);
