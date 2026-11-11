@@ -54,7 +54,8 @@ using device_check::numel;
 // One `gdn_chunk_scan` geometry. `k` and `v` are the per-head widths, `hk` and `hv` the head
 // counts, `chunk` the chunk length, and `scale` the record's scale parameter; `lens` is one length
 // per sequence in the batch. `slots` is the state cache's slot count (0 for one slot per sequence)
-// and `sidx` the per-sequence slot indices (empty for no `state_idx` read).
+// and `sidx` the per-sequence slot indices (empty for no `state_idx` read). `omit_scale` drops the
+// `scale` parameter, which is what the tape does: it carries integers and strings and no double.
 struct ScanShape {
     const char* name;
     int64_t k;
@@ -66,6 +67,7 @@ struct ScanShape {
     std::vector<int64_t> lens;
     int64_t slots = 0;
     std::vector<int64_t> sidx;
+    bool omit_scale = false;
 
     int64_t tokens() const {
         int64_t t = 0;
@@ -77,13 +79,16 @@ struct ScanShape {
 };
 
 // The tiny fixture's gdn geometry, and a state pool deeper than the batch: sequence 0 keeps slot 2
-// and sequence 1 slot 0, so a kernel that reads or writes the wrong slot is caught.
+// and sequence 1 slot 0, so a kernel that reads or writes the wrong slot is caught. The last case
+// carries no `scale`: the architecture issues 1/sqrt(head_k) = 0.25 there, not the 0.5 the others
+// state, so a kernel that fell back to 1.0 would miss it by the factor sqrt(head_k).
 std::vector<ScanShape> fixture_shapes() {
     return {
         {"tiny-fixture-short", 16, 16, 2, 4, 4, 0.5, {3}},
         {"ragged-chunks", 16, 16, 2, 4, 4, 0.5, {2, 4, 13}},
         {"state-pool", 16, 16, 2, 4, 4, 0.5, {5, 4}, 3, {2, 0}},
         {"state-pool-unsorted", 16, 16, 2, 4, 4, 0.5, {9, 1, 4}, 4, {3, 0, 2}},
+        {"off-tape-arch-scale", 16, 16, 2, 4, 4, 0.25, {3}, 0, {}, true},
     };
 }
 
@@ -131,11 +136,10 @@ OpRecord scan_rec(const ScanShape& s) {
     const int64_t slots = s.state_slots();
     OpRecord rec;
     rec.op = "gdn_chunk_scan";
-    rec.params = {{"M", t},
-                  {"head_k", s.k},
-                  {"head_v", s.v},
-                  {"chunk", s.chunk},
-                  {"scale", f64_text(s.scale)}};
+    rec.params = {{"M", t}, {"head_k", s.k}, {"head_v", s.v}, {"chunk", s.chunk}};
+    // A record off the tape carries no `scale`: the tape holds integers and strings, so the f64
+    // parameter cannot ride on it and the op falls back to the architecture's 1/sqrt(head_k).
+    if (!s.omit_scale) rec.params.push_back({"scale", f64_text(s.scale)});
     rec.n = t;
     // Schema positions 0 to 9; the optional state_idx is position 10, after the two writes.
     rec.operands = {
@@ -337,6 +341,21 @@ void gate_dropped(const AdjointCall& call) {
         call.dc->at(4).value.assign(call.dc->at(4).value.size(), 0.0);
 }
 
+// A wrong kernel: the `scale` a record off the tape does not carry is read as the kernel's own
+// default of 1.0 instead of the architecture's 1/sqrt(head_k). The record handed to the real row is
+// this test's, so the wrapper adds the parameter the record lacks.
+void scale_defaults_to_one(const AdjointCall& call) {
+    AdjointFn real = adjoint_find(call.rec.op, Side::device, call.rec.params, nullptr);
+    if (!real) return;
+    OpRecord rec = call.rec;
+    rec.params.erase(std::remove_if(rec.params.begin(), rec.params.end(),
+                                    [](const OpParam& p) { return p.first == "scale"; }),
+                     rec.params.end());
+    rec.params.push_back({"scale", f64_text(1.0)});
+    const std::vector<AdValue> fwd = gdn_scan_check::ordered_fwd(call);
+    real(AdjointCall{rec, fwd, call.cot, call.dc, call.grads, call.prefix});
+}
+
 // One case: the harness's comparison against the host row, then the deviation the doc quotes.
 void run_case(const ScanShape& s, uint64_t seed, bool measure) {
     const device_check::Case c = scan_case(s, s.name, seed);
@@ -372,6 +391,15 @@ void run_fixture() {
     R97_CHECK(!wrong.ok);
     R97_CHECK(wrong.first_slot == 4);
     std::printf("rejected the kernel that dropped the gate: %s\n", wrong.note.c_str());
+
+    // And a kernel that reads a missing `scale` as 1.0 rather than as 1/sqrt(head_k) is rejected on
+    // the case that carries no parameter. The case itself ran in the loop above, held to a host row
+    // that falls back the same way as the kernel must.
+    const device_check::Report one = gdn_scan_check::check(
+        scan_case(fixture_shapes().back(), "scale read as 1.0", 0x9d1c0ffeeull),
+        scale_defaults_to_one);
+    R97_CHECK(!one.ok);
+    std::printf("rejected the kernel that read a missing scale as 1.0: %s\n", one.note.c_str());
 }
 
 void run_real() {
