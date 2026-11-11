@@ -7,25 +7,27 @@
 // budget. The epoch's first bucket advances by one every epoch, so two consecutive epochs cannot
 // hand out the same order; inside a bucket the order is a shuffle as well, so the seed reaches
 // every plan and not only the order of the buckets. A dataset that fits one bucket has no bucket
-// order to shuffle, so that bucket's sequences are shuffled under the seed and rotated by the
-// epoch; either way the seed and the epoch reach the batches. Each step hands out `devices`
-// sub-batches with balanced token counts, one per device, and only the epoch's last tail hands out
-// fewer -- a sequence of no tokens can also leave one short, since it is a class of its own and a
-// step of one sub-batch has no spread to admit it under. The spread is a property of the step, not
-// of every add: a step on its way to filling every device with the same number of fixed-length
-// sequences passes through a spread of one maximal sequence and comes back inside it, so the
-// packer admits an add that lands on the bound while the rest of the run can still raise the
-// sub-batches below the longest, and refuses it -- starting the next step rather than splitting a
-// step off after the fact -- when it cannot. A run of one length class is packed as a whole (its
-// adjacent 32-sequence chunks are one run), and a dataset that is one length throughout has its
-// step sizes planned to spend the budget on the fewest balanced steps; a run that ends with fewer
-// sequences than devices carries them into the next bucket to fill the idle devices, which is how
-// a short tail fills a device a long sequence left idle; the buckets' classes never meet inside
-// one sub-batch. A step never hands out an empty sub-batch. The budget is per sub-batch, so a step
-// may spend up to `devices * token_budget` tokens. A sequence longer than the budget is reported
-// (in `skipped()`) and never batched. A sub-batch holds its sequences in the planned order, which
-// the seed and the epoch choose both through the bucket order and through the shuffle inside a
-// bucket.
+// order to shuffle, so the same two steps are taken inside it: the epoch starts on the sequence the
+// seed's hash plus the epoch names, and the rest is a fresh shuffle under the seed and the epoch,
+// so the plans do not cycle -- one shuffle rotated by the epoch hands out the first epoch's order
+// again after as many epochs as the bucket holds; either way the seed and the epoch reach the
+// batches. Each step hands out `devices` sub-batches with balanced token counts, one per device,
+// and only the epoch's last tail hands out fewer -- a sequence of no tokens can also leave one
+// short, since it is a class of its own and a step of one sub-batch has no spread to admit it
+// under. The spread is a property of the step, not of every add: a step on its way to filling
+// every device with the same number of fixed-length sequences passes through a spread of one
+// maximal sequence and comes back inside it, so the packer admits an add that lands on the bound
+// while the rest of the run can still raise the sub-batches below the longest, and refuses it --
+// starting the next step rather than splitting a step off after the fact -- when it cannot. A run
+// of one length class is packed as a whole (its adjacent 32-sequence chunks are one run), and a
+// dataset that is one length throughout has its step sizes planned to spend the budget on the
+// fewest balanced steps; a run that ends with fewer sequences than devices carries them into the
+// next bucket to fill the idle devices, which is how a short tail fills a device a long sequence
+// left idle; the buckets' classes never meet inside one sub-batch. A step never hands out an empty
+// sub-batch. The budget is per sub-batch, so a step may spend up to `devices * token_budget`
+// tokens. A sequence longer than the budget is reported (in `skipped()`) and never batched. A
+// sub-batch holds its sequences in the planned order, which the seed and the epoch choose both
+// through the bucket order and through the shuffle inside a bucket.
 //
 // Deterministic for a given seed: the same seed replays the same batches, each epoch is a new
 // shuffle -- two consecutive epochs never hand out the same plan -- and a position (epoch, step)

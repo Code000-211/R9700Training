@@ -28,18 +28,18 @@ uint64_t epoch_rng(uint64_t seed, int64_t epoch) {
     return state;
 }
 
-// The bucket an epoch starts on. The seed chooses where in the bucket cycle it starts and every
-// epoch moves that on by one, so two consecutive epochs start on different buckets; a bucket is
-// never empty, so that alone is a different order of the sequences, whatever the shuffle draws.
-// Rotating a fresh shuffle by an offset cannot promise the same: the shuffle and the offset are
-// drawn independently, so an epoch's order lands on the previous epoch's whenever the two shuffles
-// are rotations of each other. Nor may the offset be a linear function of the seed, as `3 * seed`
-// was -- it vanishes whenever the bucket count divides three times the seed, and two seeds then
-// hand out one order. The seed enters here as a hash.
-size_t starting_bucket(uint64_t seed, int64_t epoch, size_t buckets) {
+// The position an epoch starts on, out of `n` of them. The seed hashes to one and every epoch
+// moves that on by one, so two consecutive epochs start on different ones -- a bucket is never
+// empty and a sequence is never no sequence, so that alone is a different order of them, whatever
+// the shuffle draws. Rotating a fresh shuffle by an offset cannot promise the same: the shuffle
+// and the offset are drawn independently, so an epoch's order lands on the previous epoch's
+// whenever the two shuffles are rotations of each other. Nor may the offset be a linear function
+// of the seed, as `3 * seed` was -- it vanishes whenever the count divides three times the seed,
+// and two seeds then hand out one order. The seed enters here as a hash.
+size_t starting_position(uint64_t seed, int64_t epoch, size_t n) {
     uint64_t state = seed ^ 0xa0761d6478bd642full;
-    const size_t base = (size_t)(splitmix64(&state) % (uint64_t)buckets);
-    return (base + (size_t)((uint64_t)epoch % (uint64_t)buckets)) % buckets;
+    const size_t base = (size_t)(splitmix64(&state) % (uint64_t)n);
+    return (base + (size_t)((uint64_t)epoch % (uint64_t)n)) % n;
 }
 
 }  // namespace
@@ -106,7 +106,7 @@ std::vector<std::vector<size_t>> epoch_buckets(const std::vector<size_t>& kept, 
             size_t j = (size_t)(splitmix64(&rng) % (uint64_t)i);
             std::swap(positions[i - 1], positions[j]);
         }
-        const size_t first = starting_bucket(seed, epoch, n);
+        const size_t first = starting_position(seed, epoch, n);
         std::rotate(positions.begin(), std::find(positions.begin(), positions.end(), first),
                     positions.end());
         std::vector<std::vector<size_t>> shuffled;
@@ -115,21 +115,23 @@ std::vector<std::vector<size_t>> epoch_buckets(const std::vector<size_t>& kept, 
         buckets = std::move(shuffled);
     } else if (!buckets.empty()) {
         // One bucket is no bucket order to shuffle, so every epoch's order has to come from inside
-        // that one bucket. It is shuffled under the seed alone and then rotated by the epoch: two
-        // rotations of one permutation by different shifts are different orders, so consecutive
-        // epochs differ even when there are only two sequences. (Shuffling it again per epoch is
-        // no guarantee: two such shuffles can come out one rotation apart.)
+        // that one bucket: the same two steps as above, one level down. The epoch starts on the
+        // sequence the epoch names -- the bucket is sorted, so that is the same sequence for the
+        // same (seed, epoch) -- and the rest of the bucket is a fresh shuffle under (seed, epoch).
+        // The start is what keeps consecutive epochs apart even when the bucket holds two
+        // sequences only. The fresh shuffle is what keeps the epoch from cycling: rotating one
+        // seed-drawn shuffle by the epoch hands out the first epoch's order again after as many
+        // epochs as the bucket holds, which is a new order every epoch for a while and then none.
         auto& bucket = buckets.front();
-        uint64_t single = epoch_rng(seed, 0);
-        for (size_t i = bucket.size(); i > 1; --i) {
-            size_t j = (size_t)(splitmix64(&single) % i);
-            std::swap(bucket[i - 1], bucket[j]);
-        }
-        if (bucket.size() > 1) {
-            const size_t k = bucket.size();
-            const size_t shift = (size_t)((uint64_t)epoch % k);
-            std::rotate(bucket.begin(), bucket.begin() + static_cast<std::ptrdiff_t>(shift),
-                        bucket.end());
+        const size_t k = bucket.size();
+        if (k > 1) {
+            const size_t first = starting_position(seed, epoch, k);
+            std::swap(bucket[0], bucket[first]);
+            uint64_t rng = epoch_rng(seed, epoch);
+            for (size_t i = k - 1; i >= 2; --i) {
+                size_t j = 1 + (size_t)(splitmix64(&rng) % i);
+                std::swap(bucket[i], bucket[j]);
+            }
         }
     }
     return buckets;

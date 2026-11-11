@@ -32,9 +32,12 @@ An epoch is planned on demand from `(seed, epoch)` and cached (`Batcher::plan`):
    `n` buckets have `n!` orders and no more -- so two seeds would hand out the same batches one
    time in two or six on a dataset of two or three classes however the seed were hashed, and a
    fresh draw per epoch would repeat another epoch's order about as often. A dataset that fits one
-   bucket is the exception: there is no bucket order to shuffle, so that bucket's sequences are
-   shuffled under the seed and rotated by the epoch, which keeps consecutive epochs apart even
-   when the whole dataset is one length class and has only two sequences.
+   bucket is the exception: there is no bucket order to shuffle, so the same two steps are taken
+   one level down -- the epoch starts on the sequence the seed's hash plus the epoch names, and the
+   rest of the bucket is a fresh Fisher-Yates under `(seed, epoch)`. The start keeps consecutive
+   epochs apart even when the whole dataset is one length class and has only two sequences; the
+   fresh shuffle is what keeps the epoch from cycling, where rotating one seed-drawn shuffle by the
+   epoch hands out the first epoch's order again after as many epochs as the bucket holds.
 3. **Pack each sub-batch under the budget.** Adjacent buckets of one length class are merged
    into one run before packing: the 32-sequence chunks were the sort's unit, not the step's, so a
    step keeps filling across that seam instead of closing on an arbitrary chunk boundary. Walking
@@ -102,8 +105,11 @@ with both. A dataset whose buckets all hold a single sequence has only `n!` plan
 buckets, so two seeds must agree on some such datasets — two buckets leave two orders — and the
 seed is hashed into the choice so that it reaches every one of them; every bucket that holds more
 than one sequence multiplies the plans by its own orders. For a dataset that fits one bucket, the
-seed chooses a shuffle of it and the epoch rotates that shuffle, so consecutive epochs differ even
-when there are only two sequences. Two consecutive epochs never hand out the same plan.
+seed hashes to the sequence the epoch starts on and the epoch moves that start on by one, so
+consecutive epochs differ even when there are only two sequences, and the rest of the bucket is
+reshuffled every epoch, so the plans do not cycle: one shuffle rotated by the epoch is back where
+it started after `k` epochs and hands out `k` plans and no more. Two consecutive epochs never hand
+out the same plan.
 The same seed and epoch replay the same plan, so a saved position resumes identically.
 
 ## Tests
@@ -137,7 +143,13 @@ capacity of their steps — the old packer took 34 steps where this plan takes n
 where it takes seven. A dataset whose buckets each hold one sequence —
 two sequences in different length classes, and one per class across eight classes — does not come
 out identical across the seed runs or across three epochs; so does a dataset that fits one bucket
-(2, 3 and 20 sequences of one length), by shuffling and rotating that bucket. A dataset that fits
+(2, 3 and 20 sequences of one length), by shuffling that bucket and starting it on the sequence the
+epoch names. `batcher_single_bucket_does_not_cycle` looks past the neighbouring epoch, which is
+where the earlier rotation went wrong: a dataset that fits one bucket, run for three times its size
+in epochs, must not hand out the first epoch's plan again at epoch `k` (20 sequences of 50 tokens
+at budget 500 on two devices did, and 8 of 12 tokens at 36 did; 12 of 7 tokens at 30 and the same
+20 on one device are checked beside them) and must hand out more plans than it has sequences -- one
+plan per rotation and no more is exactly the cycle. A dataset that fits
 one step per bucket — 20 sequences of 17..74 tokens, 100 sequences of one length, 1000 sequences of
 50..80 tokens on two devices — still changes its whole shape (steps, sub-batches and the order
 inside them) with the seed and with the epoch, at the realistic budget of 4096 rather than a small
