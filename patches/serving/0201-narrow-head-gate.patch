@@ -1,0 +1,35 @@
+Concern: an int8 attention gate on a head narrower than the 128-column quantiser group
+Upstream: not-submitted
+diff --git a/arch/common/rad_block_attn_gated_fp8.h b/arch/common/rad_block_attn_gated_fp8.h
+index b93c49a..0fc8544 100644
+--- a/arch/common/rad_block_attn_gated_fp8.h
++++ b/arch/common/rad_block_attn_gated_fp8.h
+@@ -452,14 +452,17 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
+     } else {
+         /* Rotated int8 codes (ActFP8::q8_rot): gate_had_quant_i8g, had_quant_act_i8g's codes. */
+         const char* gq = w.attn.q8_rot ? "gate_had_quant_i8g" : "gate_quant_fp8";
+-        if (rad_op_declared(b, gq))
++        /* The fused producers write one scale per (token, head) row, which is the out
++         * projection's one scale per 128 columns only when a head is whole 128-column blocks;
++         * a narrower head takes the unfused pair below, whose quantiser is `q_dim` wide. */
++        if (g.head_dim % RAD_FP8_BLOCK == 0 && rad_op_declared(b, gq))
+             op_gq = rw(b, RAD_OP(b, gq,
+                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * g.n_head),
+                                       RAD_INT("n", g.head_dim), RAD_INT("group", RAD_FP8_BLOCK),
+                                       RAD_STR("dtype", g.dtype), RAD_STR("act", "sigmoid")),
+                            RAD_NOWEIGHTS),
+                        {w.qg, w.attn.x}, {w.attn.cq(), w.attn.cs(), w.attn.x});
+-        if (!op_gq && g.head_dim % RAD_FP8_BLOCK == 0) {
++        if (!op_gq && g.q_dim() % RAD_FP8_BLOCK == 0) {
+             RAD_ARCH_TRY(gate_pair(decl_b(b, nm.f("blk.%d.attn_gate", l), g.act_dtype,
+                                           {g.max_tok, q_dim})));
+             RAD_ARCH_TRY(q_gate.declare(b, g, w.attn, q_dim));
+@@ -473,7 +476,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
+      * pair). Declared only with a selection: the dense path also uses the prefill kernel, which
+      * has no merge. */
+     if (op_attn && qsa_sel && qsa_sequ && !g.w_bf16 && !w.attn.q8_rot &&
+-        rad_op_declared(b, "attn_paged_gate_quant")) {
++        g.head_dim % RAD_FP8_BLOCK == 0 && rad_op_declared(b, "attn_paged_gate_quant")) {
+         op_attn_gq = RAD_OP(b, "attn_paged_gate_quant",
+                             RAD_PARAMS(RAD_INT("q_len", 1), RAD_INT("head_dim", g.head_dim),
+                                        RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
