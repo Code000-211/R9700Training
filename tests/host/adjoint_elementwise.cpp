@@ -2,11 +2,13 @@
 // (src/adjoint/host/elementwise.cpp) through both checks of
 // tests/support/adjoint_check.h: each op's f64 twin against radiance's
 // reference kernel, and its host adjoint against finite differences of that
-// twin. Then the registry: every op of the family resolves to a twin and a host
-// adjoint, and the two weights the family carries are named as frozen.
+// twin. Then the refusals the op documents, which must stay refusals, and the
+// registry: every op of the family resolves to a twin and a host adjoint, and
+// the two weights the family carries are named as frozen.
 #include "support/adjoint_check.h"
 #include "support/test.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -217,18 +219,33 @@ void elementwise_test() {
     check_family("silu", silu);
 
     std::vector<Named> silu_mul;
-    std::vector<Named> act_silu;
-    std::vector<Named> act_sigmoid;
-    for (const Shape& s : kFeedShapes) {
+    for (const Shape& s : kFeedShapes)
         silu_mul.push_back({std::string(s.name) + ", bf16", silu_mul_rec(s, "bf16")});
-        act_silu.push_back({std::string(s.name) + ", bf16, act silu",
-                            act_mul_rec(s, "bf16", "silu")});
-        act_sigmoid.push_back({std::string(s.name) + ", bf16, act sigmoid",
-                               act_mul_rec(s, "bf16", "sigmoid")});
-    }
     check_family("silu_mul", silu_mul);
-    check_family("act_mul", act_silu);
-    check_family("act_mul", act_sigmoid);
+
+    /* Every smooth mode the schema enumerates, at the three shapes: `silu` and `sigmoid` are the
+     * two the Qwen3.5 plugins name on this path, and `quick_gelu`'s act is the sigmoid alone
+     * (the kernel leaves the x to `b`), so its row is the one that catches a twin folding the
+     * multiplier into the activation. */
+    static const char* const kSmoothActs[] = {"silu", "gelu", "gelu_tanh", "sigmoid",
+                                               "quick_gelu"};
+    for (const char* act : kSmoothActs) {
+        std::vector<Named> cases;
+        for (const Shape& s : kFeedShapes)
+            cases.push_back({std::string(s.name) + ", bf16, act " + act,
+                             act_mul_rec(s, "bf16", act)});
+        check_family("act_mul", cases);
+    }
+
+    /* relu's kink sits inside the samples' range, so a central difference near zero is
+     * meaningless; its case is checked against the kernel only. */
+    for (const Shape& s : kFeedShapes) {
+        const OpRecord rec = act_mul_rec(s, "bf16", "relu");
+        const Case v = make_case(rec, 0x5eed);
+        const KernelReport k = check_kernel(rec, v.in, v.out, bf16_tol);
+        std::printf("act_mul %s, bf16, act relu: kernel max err %.6g\n", s.name, k.max_err);
+        require(k);
+    }
 
     /* A cast only rounds, so every float pair the plugins issue is checked: the
      * identity row copy (from == to, rad_block_attn_fp8.h's q lift), and the
@@ -257,6 +274,115 @@ void elementwise_test() {
     rmsnorm.push_back({std::string(kShapes[2].name) + ", bf16 gain, wadd 0, mult 0.5",
                        rmsnorm_rec(kShapes[2], "bf16", "bf16", "0", "0.5")});
     check_family("rmsnorm", rmsnorm);
+}
+
+/* -- the refusals the doc names, pinned ------------------------------------ */
+
+/* A record the op cannot compute is refused on both sides: the twin writes no value and the
+ * adjoint adds nothing to any read operand's cotangent. A guard that stops refusing fails here
+ * instead of passing quietly. */
+void expect_refusal(const OpRecord& rec, const Case& v, const char* why) {
+    std::string err;
+    const TwinFn twin = twin_find(rec.op, rec.params, &err);
+    const AdjointFn adj = adjoint_find(rec.op, Side::host, rec.params, &err);
+    R97_CHECK(twin != nullptr);
+    R97_CHECK(adj != nullptr);
+    if (!twin || !adj) return;
+
+    std::vector<AdValue> produced;
+    twin(rec, v.in, &produced);
+
+    /* The call the walk would make had the twin run: the writes carry non-zero cotangents, the
+     * reads keep their values, and every read operand's dc starts at zero. */
+    uint64_t seed = 0xbadc0de;
+    std::vector<AdValue> fwd(rec.operands.size()), dc(rec.operands.size()), cot;
+    size_t r = 0, w = 0;
+    for (size_t i = 0; i < rec.operands.size(); ++i) {
+        if (rec.operands[i].written) {
+            fwd[i] = v.out[w++];
+            for (double& x : fwd[i].value) x = urand(&seed);
+        } else {
+            fwd[i] = v.in[r++];
+            dc[i] = fwd[i];
+            for (double& x : dc[i].value) x = 0.0;
+        }
+    }
+    for (const AdValue& o : v.out) {
+        cot.push_back(o);
+        for (double& x : cot.back().value) x = urand(&seed);
+    }
+    const AdjointCall call{rec, fwd, cot, &dc, nullptr, "test"};
+    adj(call);
+
+    double moved = 0.0;
+    for (size_t i = 0; i < rec.operands.size(); ++i)
+        if (!rec.operands[i].written)
+            for (double x : dc[i].value) moved += std::fabs(x);
+
+    std::printf("%s refuses %s: %zu of %zu values written, |dc| %g\n", rec.op.c_str(), why,
+                produced.size(), v.out.size(), moved);
+    R97_CHECK(produced.empty());
+    R97_CHECK(moved == 0.0);
+}
+
+/* The refusals the doc names -- `scale` with no factor, `act_mul` with no act or one the schema
+ * does not name, `rmsnorm` asking for `wadd` without a gain -- and the one rule `mul` refuses.
+ * Each writes no twin value, and the three the op's guard covers send no cotangent to a read
+ * operand either. */
+void refusals_test() {
+    const Shape s = kShapes[0];
+
+    {
+        const OpRecord rec = scale_rec(s, "bf16");
+        Case v = make_case(rec, 0x5eed);
+        v.in[1].value.clear();
+        expect_refusal(rec, v, "an empty s");
+    }
+    {
+        OpRecord rec = act_mul_rec(kFeedShapes[0], "bf16", "silu");
+        const Case v = make_case(rec, 0x5eed);
+        std::erase_if(rec.params, [](const OpParam& p) { return p.first == "act"; });
+        expect_refusal(rec, v, "no act");
+    }
+    {
+        const OpRecord rec = act_mul_rec(kFeedShapes[0], "bf16", "softmax");
+        expect_refusal(rec, make_case(rec, 0x5eed), "an act the schema does not name");
+    }
+    {
+        const OpRecord rec = rmsnorm_rec(s, "bf16", "f32", "1", "1");
+        Case v = make_case(rec, 0x5eed);
+        v.in[1].value.clear();
+        expect_refusal(rec, v, "wadd without a gain");
+    }
+
+    /* `mul`'s one broadcast rule refused, on the twin's side only: a `b` that is neither all of a
+     * nor one row of it writes nothing, so the walk never reaches the adjoint at all. */
+    {
+        const OpRecord rec = mul_rec(s, "bf16", true);
+        Case v = make_case(rec, 0x5eed);
+        v.in[1].shape = {7};
+        v.in[1].value.assign(7, 0.5);
+        std::vector<AdValue> produced;
+        const TwinFn twin = twin_find(rec.op, rec.params, nullptr);
+        R97_CHECK(twin != nullptr);
+        if (twin) twin(rec, v.in, &produced);
+        std::printf("mul refuses a b that is not one row of a: %zu of 1 values written\n",
+                    produced.size());
+        R97_CHECK(produced.empty());
+    }
+
+    /* The other side of `rmsnorm`'s guard: wadd 0 with no gain is the plain norm, not a refusal. */
+    {
+        const OpRecord rec = rmsnorm_rec(s, "bf16", "f32", "0", "1");
+        Case v = make_case(rec, 0x5eed);
+        v.in[1].value.clear();
+        std::vector<AdValue> produced;
+        const TwinFn twin = twin_find(rec.op, rec.params, nullptr);
+        R97_CHECK(twin != nullptr);
+        if (twin) twin(rec, v.in, &produced);
+        std::printf("rmsnorm wadd 0 with no gain: %zu of 1 values written\n", produced.size());
+        R97_CHECK(produced.size() == 1);
+    }
 }
 
 /* The family is what the tape and `r97train ops --registered` read: every op of
@@ -297,5 +423,6 @@ void registry_test() {
 
 R97_TEST(adjoint_elementwise) {
     elementwise_test();
+    refusals_test();
     registry_test();
 }

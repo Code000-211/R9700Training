@@ -123,7 +123,10 @@ double act_value(Act act, double x) {
             return 0.5 * x * (1.0 + std::tanh(k0 * (x + k1 * x * x * x)));
         }
         case kSigmoid: return sigmoid(x);
-        case kQuickGelu: return x * sigmoid(1.702 * x);
+        /* quick_gelu's act_mul mode is the sigmoid alone: the kernel leaves the x to the
+         * multiplier operand (its b is the same tensor, the unfused mul-then-act_mul pair), so
+         * act_mul(a, a) is x*sigmoid(1.702x) and act(a) here is sigmoid(1.702x). */
+        case kQuickGelu: return sigmoid(1.702 * x);
         case kRelu: return x > 0.0 ? x : 0.0;
     }
     return 0.0;
@@ -148,7 +151,7 @@ double act_slope(Act act, double x) {
         }
         case kQuickGelu: {
             const double s = sigmoid(1.702 * x);
-            return s + 1.702 * x * s * (1.0 - s);
+            return 1.702 * s * (1.0 - s);
         }
         case kRelu: return x > 0.0 ? 1.0 : 0.0;
     }

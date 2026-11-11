@@ -123,10 +123,18 @@ du[r, i] = dy[r, i] · silu(g[r, i])
 
 `y = act(a) · b` with both operands `[rows, n]`. The family implements all six modes the kernel's
 schema enumerates (`silu`, `gelu`, `gelu_tanh`, `sigmoid`, `quick_gelu`, `relu`) so that a record
-with any of them resolves, and the test checks the two the Qwen3.5 plugins name on this path:
-`"sigmoid"` for the gated attention's gate (`rad_block_attn_gated_fp8.h`, `rad_fp8.h`) and
-`"silu"` for a feed-forward's activation (`rad_fp8.h`). A record with no recognisable `act` gets
-no twin value and no cotangent.
+with any of them resolves. The two the Qwen3.5 plugins name on this path are `"sigmoid"` for the
+gated attention's gate (`rad_block_attn_gated_fp8.h`, `rad_fp8.h`) and `"silu"` for a
+feed-forward's activation (`rad_fp8.h`); the test checks those two and the other three smooth
+modes against the kernel and against finite differences, and `relu` against the kernel alone (its
+kink sits inside the samples' range, where a central difference is meaningless). A record with no
+recognisable `act` gets no twin value and no cotangent.
+
+`quick_gelu` is the sigmoid alone: `ref_act_mul` applies `σ(round(1.702 · a))` and leaves the
+`× x` to the multiplier operand, so a caller that wants `x · σ(1.702x)` passes the same tensor as
+`a` and `b` — the unfused `mul`-then-`act_mul` pair the kernel's comment says the mode replaces.
+The twin therefore keeps `act(x) = σ(1.702x)`; folding the `x` into the activation would put it a
+factor of `b` away from the kernel.
 
 ```
 y[r, i] = act(a[r, i]) · b[r, i]
@@ -140,8 +148,8 @@ act = gelu:      act(x) = ½x(1 + erf(x/√2))
 act = gelu_tanh: u = k₀(x + k₁x³), t = tanh(u), k₀ = √(2/π), k₁ = 0.044715
                  act(x) = ½x(1 + t)
                  act'(x) = ½(1 + t) + ½x(1 - t²)·k₀(1 + 3k₁x²)
-act = quick_gelu: act(x) = x·σ(1.702x)
-                 act'(x) = σ(1.702x) + 1.702x·σ(1.702x)·(1 - σ(1.702x))
+act = quick_gelu: act(x) = σ(1.702x)
+                 act'(x) = 1.702·σ(1.702x)·(1 - σ(1.702x))
 act = relu:      act(x) = max(x, 0)   act'(x) = 1 for x > 0, else 0
 ```
 
@@ -200,7 +208,7 @@ host kernel and the adjoint against finite differences of the twin.
 | `sigmoid`  | `[5,128]`, `[3,64]`, `[7,17]`         | bf16             |
 | `silu`     | `[5,128]`, `[3,64]`, `[7,17]`         | bf16             |
 | `silu_mul` | `[5,512]→[5,256]`, `[2,128]→[2,64]`, `[3,34]→[3,17]` | bf16 |
-| `act_mul`  | `[5,256]`, `[2,64]`, `[3,17]`         | bf16, `act` = `silu` and `sigmoid` |
+| `act_mul`  | `[5,256]`, `[2,64]`, `[3,17]`         | bf16, `act` = `silu`, `gelu`, `gelu_tanh`, `sigmoid`, `quick_gelu` (both checks) and `relu` (kernel only) |
 | `cast`     | `[5,128]`, `[3,64]`, `[7,17]`         | bf16→bf16, bf16→f32, f32→bf16, f32→f32; `[5,128]` bf16→f16 |
 | `rmsnorm`  | `[5,128]`, `[20,32]` (5 tokens × 4 heads), `[7,17]` | bf16 with an f32 gain at `wadd` 1 and `mult` 1; bf16 with a bf16 gain at `wadd` 0 and `mult` 0.5 |
 
@@ -221,6 +229,14 @@ take.
 
 A last check reads the registry: every op of the family resolves to a twin and a host adjoint, and
 `adjoint_frozen` names operand 1 for `rmsnorm` and `scale` and nothing for the rest.
+
+Beside the values, the test pins the refusals §1, §3 and §7 name, so a guard that stops refusing
+fails here instead of passing quietly. Each of the three is exercised on both sides — no twin value
+is written, and no cotangent reaches any read operand — and they are `scale` with an empty `s`,
+`act_mul` with the `act` parameter absent and with one the schema does not name, and `rmsnorm` with
+`wadd` and no gain (`wadd` 0 and no gain is the plain norm, and the test checks it is still
+computed). `mul`'s broadcast rule is pinned on the twin's side alone: a `b` that is neither all of
+`a` nor one row of it writes nothing, so the walk never reaches the adjoint.
 
 ## 11. What is not in this family
 
