@@ -23,8 +23,7 @@ this site (an op reads one record per targeted module, `include/r97/delta.h`); a
 outside `[0, S)` is a **base row** — a row of the batch no adapter touches — and neither op reads or
 writes it.
 
-`lora_shrink` reads `a`, optionally `a_scale`, `slot`, `lora_a [S, r, K]`, and writes
-`t [M, r]`:
+`lora_shrink` reads `a`, `a_scale`, `slot`, `lora_a [S, r, K]`, and writes `t [M, r]`:
 
     t[m, j] = sum_k x(m, k) * A[s, j, k]           s = slot[m],  0 <= m < M,  0 <= j < r
 
@@ -49,6 +48,12 @@ consistency statement radiance's row treats it as: if the count `ceil(K / group)
 stream's column count, the record is one the kernel would refuse with `RAD_E_SHAPE`, and the twin
 lays it out for no one.
 
+`a_scale` is an optional operand of the schema (`ref_registry.cpp`: `OPD_O("a_scale")`), so it
+keeps its place even when the call does not pass it: radiance issues `RAD_OPK_NONE` there
+(`issue.cpp`), and `Tape::record` names the position `none:1` with dtype `invalid`
+(`rad_dtype_name(RAD_DT_INVALID)`). The bf16 form's record is therefore five operands wide too,
+with its `a_scale` an absent position rather than a missing one.
+
 `lora_expand` reads `t [M, r]`, `slot`, `lora_b [S, N, r]`, `scale [S, N]`, and adds to
 `y [M, N]`:
 
@@ -65,7 +70,9 @@ this file.
 
 ## 2. The twin
 
-The twin of each op is its arithmetic in f64, over the read operands in schema order:
+The twin of each op is its arithmetic in f64, over the read operands in schema order. The shrink's
+reads are `a`, `a_scale` (real for a coded trunk, the absent position for a bf16 one), `slot` and
+`lora_a`; the expand's are `t`, `slot`, `lora_b` and `scale`.
 
 - `lora_shrink_twin` writes `t` as above, `x` at full precision (a code times its scale, one
   product in f64).
@@ -119,24 +126,22 @@ twice in one step sums both contributions:
 (`include/r97/delta.h`: `grad_prefix()`); `A` is stored `[r, K]` and `B` `[N, r]`, i.e. the layout
 the adapter file holds them in, so the optimiser's update is a flat `ParamSet` update.
 
-### 3.2 Frozen positions, and the two schema widths of the shrink
+### 3.2 Frozen positions
 
 `slot` is an index list and `lora_a`/`lora_b` are trainable weights: neither is something the walk
 asks a cotangent of, so both are frozen (`R97_REGISTER_ADJOINT_F`). The expand's `scale` is frozen
 too: `alpha / r` is a hyperparameter read from the adapter file, not a leaf. The shrink's `a_scale`
-is **not** frozen — the quantiser that produced the codes reads the cotangents of both of its
-outputs, so the adjoint writes `dc` for the codes and for the scales and the int8 chain stays
-complete.
+is **not** frozen when it is there: the quantiser that produced the codes reads the cotangents of
+both of its outputs, so the adjoint writes `dc` for the codes and for the scales and the int8 chain
+stays complete. A bf16 trunk leaves that position absent instead: it has no tensor, so no
+cotangent either, and position 1 is frozen with `slot` and `lora_a`.
 
-The shrink's record carries `a_scale` only beside a coded activation (`ref_shapes.cpp` skips the
-operand for a float `a`), so the schema is one of two widths and the frozen positions differ; two
-rows are registered, told apart by the record's `dtype`, which is also what says which layout the
-bytes are in:
+One row serves both forms, because the schema is one width (`ref_registry.cpp`):
 
 | activation | schema | frozen | row |
 |---|---|---|---|
-| `i8` | `a, a_scale, slot, lora_a, t` | 2, 3 | `R97_REGISTER_ADJOINT_IF_F(..., coded_params, 2, 3)` |
-| bf16 | `a, slot, lora_a, t` | 1, 2 | `R97_REGISTER_ADJOINT_IF_F(..., float_params, 1, 2)` |
+| `i8` | `a, a_scale, slot, lora_a, t` | 1, 2, 3 | `R97_REGISTER_ADJOINT_F("lora_shrink", host, ..., 1, 2, 3)` |
+| bf16 | `a, a_scale(absent), slot, lora_a, t` | 1, 2, 3 | the same row |
 
 ### 3.3 The `B = 0` start
 
@@ -177,14 +182,14 @@ twin, so a twin wrong about the group index agrees with its own differences.
 | check | what it proves | tolerance |
 |---|---|---|
 | `check_kernel` | the twin against radiance's host row (`lora_expand`, `lora_expand_mm`, and `lora_shrink` on a coded activation) | 0.02 relative, bf16's own width |
-| `float_shrink_kernel` (in the test) | the same for a bf16 activation, whose record has no `a_scale` | 0.02 relative |
+| `float_shrink_kernel` (in the test) | the same for a bf16 activation, whose `a_scale` is the absent position 1 | 0.02 relative |
 | `check_adjoint` | the adjoint against central differences of the twin, both forms of the shrink | 1e-6 relative |
 | `check_grad` (in the test) | `dA`/`dB` in the ParamSet against central differences of the twin, per entry and along a direction | 1e-5 of the block's largest entry |
 
 The bf16 trunk's kernel check is launched in the test rather than through `check_kernel`, because
-radiance's row wants `a_scale` in its place with no bytes (`abi/rad_plugin.h`) while `check_kernel`
-fills every position and refuses a dtype radiance does not know; the test's launch is the same
-recipe with position 1 absent (`RAD_DT_INVALID`, null data).
+radiance's row wants the absent `a_scale` in its place with no bytes (`abi/rad_plugin.h`) while
+`check_kernel` fills every position and refuses a dtype radiance does not know; the test's launch
+is the same recipe with position 1 absent (`RAD_DT_INVALID`, null data).
 
 The gradient difference is measured against the block's largest entry and not against the entry
 itself: a gradient in the `ParamSet` is f32 (`include/r97/params.h`), and an entry is a sum of f32
