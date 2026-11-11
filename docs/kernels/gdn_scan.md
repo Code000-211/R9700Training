@@ -72,10 +72,12 @@ row past it, and the `A` entries above the triangle are written as explicit zero
 The state and its cotangent are f32 in the card's scratch: the cotangent is carried over every
 chunk of the sequence, and at 4096 tokens that is 64 updates of a `[128, 128]` block per value
 head, so an f32 error introduced in the first chunk is still there in the last. Every reduction --
-`qk`, `vo`, `sk2`, the sums over `V` or `K` a stage needs -- accumulates in f32, and each gradient
-is rounded once, to its operand's dtype, on the way out: the gradients are bf16 on the card and a
-sum over many tokens accumulates in f32. The host row is f64 throughout, so the comparison below is
-exactly "the card's f32 carry against the host's f64 carry" on the same values.
+`qk`, `vo`, `sk2`, the sums over `V` or `K` a stage needs -- accumulates in f32, and `dv` and `dA`
+are rounded once, to bf16, their operand's dtype, on the way out: the gradients are bf16 on the card
+and a sum over many tokens accumulates in f32. `dg` and `dbeta` leave at f32 because the record
+holds `g` and `beta` at f32, and `dq` and `dk` at f32 for the reason given above, the shared key
+head's `atomicAdd`. The host row is f64 throughout, so the comparison below is exactly "the card's
+f32 carry against the host's f64 carry" on the same values.
 
 The one thing the kernel cannot fix by itself is a case whose data is not the delta rule's:
 `A` with random entries of order one, or keys that are not normalised, makes the state grow by tens
