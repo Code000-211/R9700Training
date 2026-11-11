@@ -218,19 +218,6 @@ if(R97_BUILD_TESTS)
     set_tests_properties(host_tests PROPERTIES LABELS host)
   endif()
 
-  # The tape test builds a radiance Program and runs one step, so it owns a main of its own. It
-  # keeps to the host backend with the card hidden; every other host test is still one binary.
-  file(GLOB R97_TAPE_TEST_SOURCES CONFIGURE_DEPENDS
-       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tape/*.cpp)
-  if(NOT R97_TAPE_TEST_SOURCES STREQUAL "")
-    add_executable(r97_tape_tests ${R97_TAPE_TEST_SOURCES})
-    target_link_libraries(r97_tape_tests PRIVATE r97)
-    add_test(NAME tape_tests COMMAND r97_tape_tests)
-    set_tests_properties(tape_tests PROPERTIES
-      LABELS host
-      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
-  endif()
-
   # The contract headers compile on their own: one translation unit per header, include and main.
   file(GLOB R97_HEADER_TEST_SOURCES CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_SOURCE_DIR}/tests/headers/*.cpp)

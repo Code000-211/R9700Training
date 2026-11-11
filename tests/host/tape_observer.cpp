@@ -1,18 +1,25 @@
-// tests/tape/tape.cpp -- the tape records what radiance issues, block by block.
+// tests/host/tape_observer.cpp -- the tape records what radiance issues, block by block.
 //
 // The program is built by hand, the way radiance's own runtime tests build one: a few buffers, one
 // weight, an op with the schema of a GEMM and a kernel that records its calls instead of computing.
 // The real runtime then runs one step, so the observer, the resolved operands and the block
 // brackets are all the production path; only the arithmetic is fake.
+//
+// The observer is a training patch on radiance (patches/training/0101-issue-observer.patch), and a
+// serving build applies none of the training set: there is no observer there, so no test to run.
 #include "r97/tape.h"
 
-#include "runtime/ctx.h"
+#if defined(RAD_ISSUE_OBSERVER)
 
-#include <cstdio>
+#include "runtime/ctx.h"
+#include "support/test.h"
+
+#include <cstdint>
 #include <cstdlib>
 #include <deque>
 #include <functional>
 #include <string>
+#include <variant>
 #include <vector>
 
 using rad::Ctx;
@@ -20,13 +27,14 @@ using rad::Program;
 
 namespace {
 
-void check_failed(const char* expr, const char* file, int line) {
-    std::fprintf(stderr, "%s:%d: check failed: %s\n", file, line, expr);
-    std::fflush(stderr);
-    std::abort();
-}
-
-#define CHECK(expr) ((expr) ? (void)0 : check_failed(#expr, __FILE__, __LINE__))
+// The host tier runs anywhere and must not take the shared card. radiance's device layer reads the
+// visible devices once, when something first brings it up, and then keeps that backend, so the card
+// is hidden while this translation unit registers -- before any test body can bring the device layer
+// up -- rather than by whichever test happens to need it.
+struct HideTheCard {
+    HideTheCard() { setenv("ROCR_VISIBLE_DEVICES", "99", 1); }
+};
+const HideTheCard g_hide_the_card;
 
 // ==================================================================== the recording kernel
 struct Call {
@@ -51,6 +59,11 @@ int k_gemm(const RadArgs* args, RadStream /*stream*/) {
 }
 
 std::function<void(Ctx&)> g_body;
+
+// The issues happen inside the architecture's step, called from radiance's C++ and across its
+// function pointers, so a throwing check there would unwind through frames that do not expect it:
+// the status of the last issue is kept and checked once the step has returned.
+int g_issue_status = RAD_OK;
 
 void arch_step(RadCtx* c, const RadBatch*) {
     if (g_body) g_body(*static_cast<Ctx*>(c));
@@ -179,6 +192,7 @@ struct Fixture {
         batch.step = 0;
         batch.n_tok = 1;
         batch.n_seq = 1;
+        g_issue_status = RAD_OK;
         g_body = body;
         const int status = ctx.run_step(&batch);
         g_body = nullptr;
@@ -186,18 +200,29 @@ struct Fixture {
     }
 };
 
-// A block of three issues: the first two in block 0, the third a narrowed row view in block 1.
+// The issues happen inside the architecture's step, called from radiance's C++ and across its
+// function pointers, so a throwing check there would unwind through frames that do not expect it:
+// the status of the last issue is kept and checked once the step has returned.
+int note(int status) {
+    if (status != RAD_OK) g_issue_status = status;
+    return status;
+}
+
+// A step of four issues: two in block 0, a narrowed row view in block 1, and one after the last
+// block has ended, which belongs to no block.
 void issue_a_step(Ctx& c, rad_buf x, rad_weight w, rad_buf y, rad_op op) {
     rad_block_begin(static_cast<RadCtx*>(&c), 0);
     RadOperand a[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
-    CHECK(c.issue(op, a, 3, 16) == RAD_OK);
-    CHECK(c.issue(op, a, 3, 16) == RAD_OK);
+    note(c.issue(op, a, 3, 16));
+    note(c.issue(op, a, 3, 16));
     rad_block_end(static_cast<RadCtx*>(&c), 0);
 
     rad_block_begin(static_cast<RadCtx*>(&c), 1);
     RadOperand narrowed[3] = { RAD_B_N(x, 8, 3), RAD_W(w), RAD_B(y) };
-    CHECK(c.issue(op, narrowed, 3, 4) == RAD_OK);
+    note(c.issue(op, narrowed, 3, 4));
     rad_block_end(static_cast<RadCtx*>(&c), 1);
+
+    note(c.issue(op, a, 3, 16));
 }
 
 bool same_tape(const std::vector<r97::OpRecord>& a, const std::vector<r97::OpRecord>& b) {
@@ -232,92 +257,125 @@ std::string str_param(const r97::OpRecord& rec, const std::string& key) {
 
 }  // namespace
 
-int main() {
+// The tape lists the issued ops in order with their parameters, operands and block grouping, and
+// with no observer the runtime runs the same kernels as before.
+R97_TEST(tape_observer_records_the_issue) {
     Fixture f;
-    CHECK(f.start() == RAD_OK);
+    R97_CHECK(f.start() == RAD_OK);
 
     // No observer: the step runs and the issue path is unchanged.
     g_calls.clear();
-    CHECK(f.step([&](Ctx& c) { issue_a_step(c, f.x, f.w, f.y, f.op); }) == RAD_OK);
-    CHECK(g_calls.size() == 3);
+    R97_CHECK(f.step([&](Ctx& c) { issue_a_step(c, f.x, f.w, f.y, f.op); }) == RAD_OK);
+    R97_CHECK(g_issue_status == RAD_OK);
+    R97_CHECK(g_calls.size() == 4);
     const std::vector<Call> baseline = g_calls;
 
     r97::Tape tape;
     tape.attach(static_cast<RadCtx*>(&f.ctx));
     g_calls.clear();
-    CHECK(f.step([&](Ctx& c) { issue_a_step(c, f.x, f.w, f.y, f.op); }) == RAD_OK);
+    R97_CHECK(f.step([&](Ctx& c) { issue_a_step(c, f.x, f.w, f.y, f.op); }) == RAD_OK);
+    R97_CHECK(g_issue_status == RAD_OK);
 
     // The observer saw the same kernels the runtime ran without one.
-    CHECK(g_calls.size() == baseline.size());
+    R97_CHECK(g_calls.size() == baseline.size());
     for (size_t i = 0; i < g_calls.size(); ++i) {
-        CHECK(g_calls[i].kernel == baseline[i].kernel);
-        CHECK(g_calls[i].M == baseline[i].M);
-        CHECK(g_calls[i].n_t == baseline[i].n_t);
-        CHECK(g_calls[i].a == baseline[i].a);
-        CHECK(g_calls[i].y == baseline[i].y);
+        R97_CHECK(g_calls[i].kernel == baseline[i].kernel);
+        R97_CHECK(g_calls[i].M == baseline[i].M);
+        R97_CHECK(g_calls[i].n_t == baseline[i].n_t);
+        R97_CHECK(g_calls[i].a == baseline[i].a);
+        R97_CHECK(g_calls[i].y == baseline[i].y);
     }
 
-    // Three ops, in order, grouped by the two blocks the architecture bracketed.
-    CHECK(tape.ops().size() == 3);
-    CHECK(tape.blocks().size() == 2);
-    CHECK(tape.blocks()[0].index == 0 && tape.blocks()[0].begin == 0 && tape.blocks()[0].end == 2);
-    CHECK(tape.blocks()[1].index == 1 && tape.blocks()[1].begin == 2 && tape.blocks()[1].end == 3);
-    CHECK(tape.ops()[0].position == 0 && tape.ops()[0].block == 0);
-    CHECK(tape.ops()[1].position == 1 && tape.ops()[1].block == 0);
-    CHECK(tape.ops()[2].position == 2 && tape.ops()[2].block == 1);
+    // Four ops, in order, grouped by the two blocks the architecture bracketed; the last one came
+    // after both blocks ended and belongs to none.
+    R97_CHECK(tape.ops().size() == 4);
+    R97_CHECK(tape.blocks().size() == 2);
+    R97_CHECK(tape.blocks()[0].index == 0 && tape.blocks()[0].begin == 0 &&
+              tape.blocks()[0].end == 2);
+    R97_CHECK(tape.blocks()[1].index == 1 && tape.blocks()[1].begin == 2 &&
+              tape.blocks()[1].end == 3);
+    R97_CHECK(tape.ops()[0].position == 0 && tape.ops()[0].block == 0);
+    R97_CHECK(tape.ops()[1].position == 1 && tape.ops()[1].block == 0);
+    R97_CHECK(tape.ops()[2].position == 2 && tape.ops()[2].block == 1);
+    R97_CHECK(tape.ops()[3].position == 3 && tape.ops()[3].block == -1);
 
     // Name, ranged count and resolved parameters.
     const r97::OpRecord& first = tape.ops()[0];
-    CHECK(first.op == "gemm_nt");
-    CHECK(first.n == 16);
-    CHECK(int_param(first, "M") == 8192);
-    CHECK(int_param(first, "N") == 8);
-    CHECK(int_param(first, "K") == 4);
-    CHECK(str_param(first, "dtype") == "f32");
+    R97_CHECK(first.op == "gemm_nt");
+    R97_CHECK(first.n == 16);
+    R97_CHECK(int_param(first, "M") == 8192);
+    R97_CHECK(int_param(first, "N") == 8);
+    R97_CHECK(int_param(first, "K") == 4);
+    R97_CHECK(str_param(first, "dtype") == "f32");
 
     // Operands: identity, dtype, full shape, row range and role, in schema order.
-    CHECK(first.operands.size() == 3);
-    CHECK(first.operands[0].buffer == "x" && first.operands[0].dtype == "f32");
-    CHECK(first.operands[0].shape == std::vector<int64_t>({64, 4}));
-    CHECK(first.operands[0].row_lo == 0 && first.operands[0].rows == 0);
-    CHECK(first.operands[0].written == false);
-    CHECK(first.operands[1].buffer == "blk.0.w" && first.operands[1].dtype == "f32");
-    CHECK(first.operands[1].shape == std::vector<int64_t>({8, 4}));
-    CHECK(first.operands[1].written == false);
-    CHECK(first.operands[2].buffer == "y" && first.operands[2].shape == std::vector<int64_t>({64, 8}));
-    CHECK(first.operands[2].written == true);
+    R97_CHECK(first.operands.size() == 3);
+    R97_CHECK(first.operands[0].buffer == "x" && first.operands[0].dtype == "f32");
+    R97_CHECK(first.operands[0].shape == std::vector<int64_t>({ 64, 4 }));
+    R97_CHECK(first.operands[0].row_lo == 0 && first.operands[0].rows == 0);
+    R97_CHECK(first.operands[0].written == false);
+    R97_CHECK(first.operands[1].buffer == "blk.0.w" && first.operands[1].dtype == "f32");
+    R97_CHECK(first.operands[1].shape == std::vector<int64_t>({ 8, 4 }));
+    R97_CHECK(first.operands[1].written == false);
+    R97_CHECK(first.operands[2].buffer == "y" &&
+              first.operands[2].shape == std::vector<int64_t>({ 64, 8 }));
+    R97_CHECK(first.operands[2].written == true);
 
     // A narrowed issue: first row 2, three rows, and the content is that slice.
     const r97::OpRecord& narrow = tape.ops()[2];
-    CHECK(narrow.n == 4);
-    CHECK(narrow.operands[0].shape == std::vector<int64_t>({64, 4}));
-    CHECK(narrow.operands[0].row_lo == 2);
-    CHECK(narrow.operands[0].rows == 3);
-    CHECK(tape.content(2, 0).data != nullptr);
-    CHECK(tape.content(2, 0).bytes == 3u * 4u * sizeof(float));
+    R97_CHECK(narrow.n == 4);
+    R97_CHECK(narrow.operands[0].shape == std::vector<int64_t>({ 64, 4 }));
+    R97_CHECK(narrow.operands[0].row_lo == 2);
+    R97_CHECK(narrow.operands[0].rows == 3);
+    R97_CHECK(tape.content(2, 0).data != nullptr);
+    R97_CHECK(tape.content(2, 0).bytes == 3u * 4u * sizeof(float));
 
     // Read access to the buffers the ops saw: the whole first operand of op 0, and the weight.
-    CHECK(tape.content(0, 0).data != nullptr);
-    CHECK(tape.content(0, 0).bytes == 64u * 4u * sizeof(float));
-    CHECK(tape.content(0, 1).data != nullptr);
-    CHECK(tape.content(0, 1).bytes == 8u * 4u * sizeof(float));
-    CHECK(tape.contents(0).size() == 3);
+    R97_CHECK(tape.content(0, 0).data != nullptr);
+    R97_CHECK(tape.content(0, 0).bytes == 64u * 4u * sizeof(float));
+    R97_CHECK(tape.content(0, 1).data != nullptr);
+    R97_CHECK(tape.content(0, 1).bytes == 8u * 4u * sizeof(float));
+    R97_CHECK(tape.contents(0).size() == 3);
+}
 
-    // Two runs record the same tape.
+// Two runs of the same step give the same tape.
+R97_TEST(tape_observer_gives_the_same_tape_twice) {
+    Fixture f;
+    R97_CHECK(f.start() == RAD_OK);
+
+    r97::Tape tape;
+    tape.attach(static_cast<RadCtx*>(&f.ctx));
+    R97_CHECK(f.step([&](Ctx& c) { issue_a_step(c, f.x, f.w, f.y, f.op); }) == RAD_OK);
     const std::vector<r97::OpRecord> first_run = tape.ops();
-    tape.clear();
-    CHECK(f.step([&](Ctx& c) { issue_a_step(c, f.x, f.w, f.y, f.op); }) == RAD_OK);
-    CHECK(same_tape(first_run, tape.ops()));
-    CHECK(tape.blocks().size() == 2);
 
-    // Detached, the tape stops recording and the runtime behaves as it did before.
+    tape.clear();
+    R97_CHECK(f.step([&](Ctx& c) { issue_a_step(c, f.x, f.w, f.y, f.op); }) == RAD_OK);
+    R97_CHECK(same_tape(first_run, tape.ops()));
+    R97_CHECK(tape.blocks().size() == 2);
+}
+
+// Detached, the tape stops recording and the runtime behaves as it did before.
+R97_TEST(tape_observer_detached_leaves_the_runtime_alone) {
+    Fixture f;
+    R97_CHECK(f.start() == RAD_OK);
+
+    r97::Tape tape;
+    tape.attach(static_cast<RadCtx*>(&f.ctx));
+    R97_CHECK(f.step([&](Ctx& c) { issue_a_step(c, f.x, f.w, f.y, f.op); }) == RAD_OK);
+    R97_CHECK(tape.ops().size() == 4);
+
     tape.detach();
     tape.clear();
     g_calls.clear();
-    CHECK(f.step([&](Ctx& c) { issue_a_step(c, f.x, f.w, f.y, f.op); }) == RAD_OK);
-    CHECK(tape.ops().empty());
-    CHECK(g_calls.size() == baseline.size());
-
-    std::puts("tape ok");
-    return 0;
+    R97_CHECK(f.step([&](Ctx& c) { issue_a_step(c, f.x, f.w, f.y, f.op); }) == RAD_OK);
+    R97_CHECK(g_issue_status == RAD_OK);
+    R97_CHECK(tape.ops().empty());
+    R97_CHECK(g_calls.size() == 4);
 }
+
+#else  // RAD_ISSUE_OBSERVER
+
+// A serving build applies none of patches/training/, so its radiance has no issue observer and
+// there is no tape to record: this file registers no test there.
+
+#endif  // RAD_ISSUE_OBSERVER
