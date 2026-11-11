@@ -233,6 +233,11 @@ void ForwardDriver::run_engine(const Batch& batch) {
     cfg.max_ctx = cfg_.max_ctx;
     cfg.max_seqs = cfg_.max_seqs;
     cfg.kv_cache_dtype = cfg_.kv_dtype;
+    // A prefill is cut into chunks of at most the linear-attention checkpoint interval, and a
+    // chunked prompt is a second step -- which this driver refuses (see max_tok above) because
+    // the step's block brackets and its rows are the batch's own. So the interval is at least the
+    // longest run the driver allows, and a sequence at max_ctx runs in one piece.
+    cfg.checkpoint_interval = std::max<int64_t>(cfg_.max_ctx, cfg_.max_tok);
     // Off for training: nothing is drafted, nothing is predicted ahead, the vision tower is not
     // built, and every sequence runs from position 0 in this one step.
     cfg.n_spec = 0;
