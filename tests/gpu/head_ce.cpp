@@ -4,9 +4,14 @@
 //   * the row's arithmetic (head_row.h) is the kernel's, so the f32 log-sum-exp, the loss and the
 //     gradient are pinned against ce_position without a card;
 //   * the chunk loop on the real vocabulary (248320 wide, the container's) agrees with ce_sum, for
-//     chunk sizes 1, 64 and 512: the summed loss and every gradient value;
+//     chunk sizes 1, 64 and 512: the summed loss and every gradient value, each gradient entry
+//     held relatively, with no absolute floor under it, because bf16 rounds relatively and an
+//     off-target entry of that width is 1.3e-6;
 //   * so does the tiny fixture's own recorded logits -- three sequences of 140, 73 and 31 tokens,
 //     unscored rows included, vocab 320 (docs/FIXTURES.md) -- against ce_loss and ce_grad;
+//   * the comparison has teeth: a deliberately wrong kernel, which writes the reference's loss and
+//     its target entry and zeros everywhere else, is the one a floor would have let through, and
+//     the comparison refuses it (the_comparison_has_teeth);
 //   * the Objective form (HeadCeObjective) is CeObjective's loss and cotangent on a tape, so the
 //     device loss can stand where the reference does;
 //   * logits near 1e30 stay finite, which is what the two-piece log-sum-exp is for.
@@ -56,6 +61,24 @@ void require_close(const std::string& what, int64_t index, double got, double wa
                       (long long)index, got, want, tol);
         throw std::runtime_error(buf);
     }
+}
+
+// A gradient entry is held to the tier's relative allowance and to nothing else. The card writes
+// bf16, which rounds relatively -- 2^-9 of an entry, whatever its size -- so a relative tolerance
+// is the one that fits it. device_check::kAbsTol (1e-3) is the floor of a sum that is nearly zero,
+// and an off-target entry of the logit gradient is `softmax * grad_scale`: 1.3e-6 across a
+// 248320-wide row, 1.2e-6 on a typical one of the fixture's, with 76,830 of the fixture's 76,879
+// under the floor. A comparison that lets 1e-3 past accepts a kernel that wrote zeros there;
+// the_comparison_has_teeth() below is that kernel, and this comparison has to refuse it.
+void require_grad_close(const std::string& what, int64_t index, double got, double want) {
+    require_close(what, index, got, want, device_check::kRelTol, 0.0);
+}
+
+// The summed loss is the reference's shape twice over: f32 per position, f64 across them, so it
+// agrees far inside this. 2% of 12 is a quarter of a nat, and a kernel that dropped a term would
+// sit well inside it.
+void require_loss_close(const std::string& what, double got, double want) {
+    require_close(what, 0, got, want, 1e-3, 0.0);
 }
 
 void require_copy(int rc, const char* what) {
@@ -177,6 +200,130 @@ Walk run_loop(const std::vector<float>& logits, const std::vector<int32_t>& ids,
     return out;
 }
 
+// One answer from the loop, held to the reference: the summed loss, then every gradient entry,
+// scored rows and unscored ones alike. Every device comparison in this file goes through here, so a
+// tolerance is decided once.
+void compare_walk(const std::string& where, const Walk& got, const CeSum& want_sum,
+                  const std::vector<float>& want, int64_t rows, int64_t vocab) {
+    R97_CHECK(got.scored == want_sum.scored);
+    require_loss_close(where + " loss", got.loss, want_sum.loss);
+    for (int64_t i = 0; i < rows * vocab; ++i)
+        require_grad_close(where + " grad", i, got.grad[size_t(i)], want[size_t(i)]);
+}
+
+// ------------------------------------------------------------------------ the harness's teeth
+
+// A deliberately wrong kernel: the reference's loss and the reference's target entry, zeros
+// everywhere else. It is the kernel an absolute floor lets through -- the great majority of the
+// entries it zeroes are orders of magnitude under a thousandth -- so the comparison has to refuse
+// it for its gradient check to mean anything. It reads its chunk back and walks the rows serially
+// because what it is wrong about is only which entries it fills.
+bool zero_off_target_chunk(const HeadChunk& c, const char** error) {
+    const auto stream = static_cast<RadStream>(c.stream);
+    const int64_t rows = c.positions;
+    const int64_t vocab = c.vocab;
+    std::vector<uint16_t> logits(size_t(rows * vocab));
+    std::vector<int32_t> ids(static_cast<size_t>(rows));
+    std::vector<float> loss(size_t(rows), 0.0f);  // the real kernel's value for an unscored row
+    std::vector<uint16_t> grad(size_t(rows * vocab), 0);
+
+    if (rad_memcpy_async(logits.data(), c.logits, int64_t(logits.size() * sizeof(uint16_t)),
+                         stream) != 0 ||
+        rad_memcpy_async(ids.data(), c.ids, int64_t(ids.size() * sizeof(int32_t)), stream) != 0 ||
+        rad_stream_sync(stream) != 0) {
+        if (error) *error = "the wrong kernel could not read its chunk back";
+        return false;
+    }
+
+    for (int64_t i = 0; i < rows; ++i) {
+        const int32_t target = ids[size_t(i)];
+        if (target < 0) continue;
+        const uint16_t* row = logits.data() + i * vocab;
+        HeadRowExp e;
+        e.max = head_row_max(row, vocab, 0, 1);
+        e.lse = logf(head_row_sumexp(row, vocab, e.max, 0, 1));
+        loss[size_t(i)] = head_row_loss(row, e, target);
+        grad[size_t(i * vocab + target)] =
+            head_bf16_from_f32(head_row_grad(row, e, target, target, c.grad_scale));
+    }
+
+    if (rad_memcpy_async(c.loss, loss.data(), int64_t(loss.size() * sizeof(float)), stream) != 0 ||
+        rad_memcpy_async(c.grad, grad.data(), int64_t(grad.size() * sizeof(uint16_t)), stream) != 0 ||
+        rad_stream_sync(stream) != 0) {
+        if (error) *error = "the wrong kernel could not write its chunk back";
+        return false;
+    }
+    return true;
+}
+
+// The comparison has teeth: the honest kernel passes it, and the kernel above -- which got the loss
+// and the target entry right and zeroed every other entry -- does not, though the floor the tier's
+// device_check carries would have accepted it on the fixture's logits. A comparison that took the
+// wrong kernel would accept anything.
+void the_comparison_has_teeth() {
+    const FixtureRows f = fixture_rows();
+    const CeSum want_sum = ce_loss(f.batch, f.logits, f.vocab);
+    R97_CHECK(want_sum.scored > 0);
+    const double scale = 1.0 / double(want_sum.scored);
+    std::vector<float> want(size_t(f.rows * f.vocab), 0.0f);
+    ce_grad(f.batch, f.logits.data(), f.vocab, scale, want.data());
+
+    // The honest kernel is accepted first: a refusal below is then the comparison's, not the data's.
+    const Walk honest = run_loop(f.logits, f.ids, f.rows, f.vocab, 64, scale);
+    compare_walk("teeth, the honest kernel", honest, want_sum, want, f.rows, f.vocab);
+
+    // The off-target entries the wrong kernel zeroes, and how many of them the floor under the
+    // tier's comparison would have let past as zeros. If none did, the wrong kernel would be caught
+    // by any comparison and this test would say nothing about the tolerance the others run under.
+    int64_t zeroed = 0;
+    int64_t swallowed = 0;
+    for (int64_t i = 0; i < f.rows; ++i) {
+        if (f.ids[size_t(i)] < 0) continue;
+        for (int64_t j = 0; j < f.vocab; ++j) {
+            if (j == f.ids[size_t(i)]) continue;
+            const double m = std::abs(double(want[size_t(i * f.vocab + j)]));
+            ++zeroed;
+            if (m <= device_check::kAbsTol + device_check::kRelTol * m) ++swallowed;
+        }
+    }
+    R97_CHECK(zeroed > 0);
+    R97_CHECK(swallowed * 2 >= zeroed);
+
+    const HeadCeKernel real = head_ce_find();
+    R97_CHECK(real != nullptr);
+    head_ce_register(&zero_off_target_chunk);
+    Walk wrong;
+    try {
+        wrong = run_loop(f.logits, f.ids, f.rows, f.vocab, 64, scale);
+    } catch (...) {
+        head_ce_register(real);
+        throw;
+    }
+    head_ce_register(real);
+
+    // Its loss and its target entries are the reference's: only the entries it zeroed are wrong.
+    require_loss_close("teeth, the wrong kernel's loss", wrong.loss, want_sum.loss);
+    for (int64_t i = 0; i < f.rows; ++i) {
+        if (f.ids[size_t(i)] < 0) continue;
+        const int64_t at = i * f.vocab + f.ids[size_t(i)];
+        require_grad_close("teeth, the wrong kernel's target", at, wrong.grad[size_t(at)],
+                           want[size_t(at)]);
+    }
+
+    bool refused = false;
+    std::string why;
+    try {
+        compare_walk("teeth, the wrong kernel", wrong, want_sum, want, f.rows, f.vocab);
+    } catch (const std::runtime_error& e) {
+        refused = true;
+        why = e.what();
+    }
+    R97_CHECK(refused);
+    std::printf("head_ce: the comparison refuses a kernel that zeroes %lld off-target entries, %lld "
+                "of them under the tier's %g floor: %s\n",
+                (long long)zeroed, (long long)swallowed, device_check::kAbsTol, why.c_str());
+}
+
 // ------------------------------------------------------------------------------- the row's maths
 
 // No card: the row arithmetic the kernel and its checks share, against the reference position.
@@ -208,10 +355,10 @@ void row_arithmetic() {
             const double want_loss = ce_position(wide.data(), shape.vocab, target, want.data(), scale);
 
             const std::string where = std::to_string(shape.vocab) + "-wide row " + std::to_string(row);
-            require_close(where + " loss", 0, head_row_loss(x, e, target), want_loss, 1e-3, 1e-3);
+            require_close(where + " loss", 0, head_row_loss(x, e, target), want_loss, 1e-3, 0.0);
             for (int64_t j = 0; j < shape.vocab; ++j)
                 require_close(where + " grad", j, head_row_grad(x, e, j, target, float(scale)),
-                              want[size_t(j)], 1e-3, 1e-4);
+                              want[size_t(j)], 1e-3, 0.0);
         }
 
         // The stable form, on logits a float holds but an exp of does not: the loss stays finite
@@ -230,11 +377,11 @@ void row_arithmetic() {
             const double want = ce_position(extreme_wide.data(), shape.vocab, target,
                                             extreme_want.data(), 1.0);
             require_close("1e30 row loss", target, head_row_loss(extreme.data(), e, target), want,
-                          1e-6, 1e6);
+                          1e-6, 0.0);
             for (int64_t j = 0; j < shape.vocab; ++j) {
                 const float g = head_row_grad(extreme.data(), e, j, target, 1.0f);
                 R97_CHECK(std::isfinite(g));
-                require_close("1e30 row grad", j, g, extreme_want[size_t(j)], 1e-6, 1e-6);
+                require_close("1e30 row grad", j, g, extreme_want[size_t(j)], 1e-6, 0.0);
             }
         }
     }
@@ -269,10 +416,7 @@ void chunks_on_the_real_vocabulary() {
     for (int64_t chunk : {int64_t(1), int64_t(64), int64_t(512)}) {
         const Walk got = run_loop(wide, ids, kRows, kVocab, chunk, scale);
         const std::string where = "248320-wide, chunk " + std::to_string(chunk);
-        R97_CHECK(got.scored == want_sum.scored);
-        require_close(where + " loss", 0, got.loss, want_sum.loss);
-        for (int64_t i = 0; i < kRows * kVocab; ++i)
-            require_close(where + " grad", i, got.grad[size_t(i)], want[size_t(i)]);
+        compare_walk(where, got, want_sum, want, kRows, kVocab);
         std::printf("head_ce: %s: loss %.6f, gradient agrees\n", where.c_str(), got.loss);
     }
 }
@@ -292,10 +436,7 @@ void chunks_on_the_fixture() {
     for (int64_t chunk : {int64_t(1), int64_t(64), int64_t(512)}) {
         const Walk got = run_loop(f.logits, f.ids, f.rows, f.vocab, chunk, 1.0 / double(want_sum.scored));
         const std::string where = "fixture, chunk " + std::to_string(chunk);
-        R97_CHECK(got.scored == want_sum.scored);
-        require_close(where + " loss", 0, got.loss, want_sum.loss);
-        for (int64_t i = 0; i < f.rows * f.vocab; ++i)
-            require_close(where + " grad", i, got.grad[size_t(i)], want[size_t(i)]);
+        compare_walk(where, got, want_sum, want, f.rows, f.vocab);
         std::printf("head_ce: %s: loss %.6f over %lld scored, gradient agrees\n", where.c_str(),
                     got.loss, (long long)got.scored);
     }
@@ -321,15 +462,15 @@ void objective_on_the_fixture() {
             const std::string where = "fixture window " + std::to_string(seq) + ", chunk "
                                       + std::to_string(chunk);
             R97_CHECK(have.scored == want.scored);
-            require_close(where + " loss", 0, have.loss, want.loss);
+            require_loss_close(where + " loss", have.loss, want.loss);
             R97_CHECK(have.seeds.size() == 1);
             R97_CHECK(have.seeds[0].buffer == "logits");
             R97_CHECK(have.seeds[0].row_lo == want.seeds[0].row_lo);
             R97_CHECK(have.seeds[0].row_hi == want.seeds[0].row_hi);
             R97_CHECK(have.seeds[0].cotangent.size() == want.seeds[0].cotangent.size());
             for (size_t i = 0; i < want.seeds[0].cotangent.size(); ++i)
-                require_close(where + " cotangent", int64_t(i), have.seeds[0].cotangent[i],
-                              want.seeds[0].cotangent[i]);
+                require_grad_close(where + " cotangent", int64_t(i), have.seeds[0].cotangent[i],
+                                   want.seeds[0].cotangent[i]);
         }
         std::printf("head_ce: fixture window %lld (%lld rows, total_scored 97): the Objective "
                     "matches CeObjective\n",
@@ -365,12 +506,9 @@ void very_large_logits_stay_finite() {
 
         const Walk got = run_loop(wide, ids, kRows, vocab, kRows, scale);
         R97_CHECK(std::isfinite(got.loss));
-        require_close(std::to_string(vocab) + "-wide large loss", 0, got.loss, want_sum.loss);
-        for (int64_t i = 0; i < kRows * vocab; ++i) {
+        for (int64_t i = 0; i < kRows * vocab; ++i)
             R97_CHECK(std::isfinite(got.grad[size_t(i)]));
-            require_close(std::to_string(vocab) + "-wide large grad", i, got.grad[size_t(i)],
-                          want[size_t(i)]);
-        }
+        compare_walk(std::to_string(vocab) + "-wide large", got, want_sum, want, kRows, vocab);
         std::printf("head_ce: %lld-wide logits at 1e30 and 3e38: loss %.6g, gradient finite\n",
                     (long long)vocab, got.loss);
     }
@@ -442,6 +580,7 @@ void run() {
     chunks_on_the_fixture();
     objective_on_the_fixture();
     very_large_logits_stay_finite();
+    the_comparison_has_teeth();
     if (r97test::bench()) bench_the_loop();
 }
 
