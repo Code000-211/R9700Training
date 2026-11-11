@@ -188,6 +188,28 @@ target_include_directories(r97
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(r97 PUBLIC rad_core)
 
+# Device adjoints: the kernel sources under src/adjoint/device/ register on Side::device from the
+# same registry as the host ones (r97/adjoint.h), so they compile into libr97 beside them and the
+# gpu tier reaches a device row through adjoint_find. The plugin issue owns this wiring; until it
+# lands the kernels are the library's own sources, and a build without HIP simply has no device
+# side -- every row the gpu tier looks for is then missing, which is what its tests report.
+if(NOT R97_WITH_HIP STREQUAL "OFF" AND R97_LIBHIP)
+  find_program(R97_HIPCC hipcc HINTS /opt/rocm/bin ENV ROCM_PATH)
+  if(R97_HIPCC)
+    set(CMAKE_HIP_ARCHITECTURES gfx1201 CACHE STRING "" FORCE)
+    set(CMAKE_HIP_STANDARD 20)
+    enable_language(HIP)
+    set_property(TARGET r97 PROPERTY HIP_ARCHITECTURES gfx1201)
+    file(GLOB R97_DEVICE_KERNEL_SOURCES CONFIGURE_DEPENDS
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/adjoint/device/*.hip)
+    if(R97_DEVICE_KERNEL_SOURCES)
+      target_sources(r97 PRIVATE ${R97_DEVICE_KERNEL_SOURCES})
+      set_source_files_properties(${R97_DEVICE_KERNEL_SOURCES} PROPERTIES LANGUAGE HIP)
+      target_link_libraries(r97 PUBLIC ${R97_LIBHIP})
+    endif()
+  endif()
+endif()
+
 # An op's twin and adjoint register themselves from a static object in the op's own file, so no
 # file lists the ops (r97/adjoint.h). An archive link drops the members nothing references, so
 # the binaries that ask the registry -- r97train and the host and gpu test tiers -- link r97
