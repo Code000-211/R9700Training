@@ -10,8 +10,9 @@
 // is for card machines. It also fails on a build whose radiance falls back to its host backend.
 //
 // Needs one R9700 (gfx1201, 32 GB) or similar; runs under the GPU test guard. The gpu tier's
-// binary has its main here -- tests/gpu/ holds no other source today.
+// binary has its main in main.cpp; this file registers its check like every other gpu source.
 #include "support/gpu_guard.h"
+#include "support/test.h"
 
 #include "rad_device.h"
 
@@ -118,12 +119,4 @@ void smoke() {
 
 }  // namespace
 
-int main() {
-    try {
-        smoke();
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "gpu_guard_smoke FAIL: %s\n", e.what());
-        return 1;
-    }
-    return 0;
-}
+R97_TEST(gpu_guard_smoke) { smoke(); }
