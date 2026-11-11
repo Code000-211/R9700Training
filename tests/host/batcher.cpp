@@ -233,19 +233,25 @@ void check_budget_coverage_and_resume() {
                 assert(resumed[k][d][i].ids == full[offset + k][d][i].ids);
     }
 
-    // N sub-batches of a step differ by less than one maximal sequence in tokens.
+    // A step's sub-batches differ by less than one maximal sequence in tokens. Only a final odd
+    // tail can hand out fewer than `devices`, and it has no pair to differ.
     for (const auto& stp : run) {
-        assert((int64_t)stp.size() == devices);
-        std::vector<int64_t> loads(devices, 0);
+        assert(!stp.empty());
+        assert((int)stp.size() <= devices);
+        std::vector<int64_t> loads(stp.size(), 0);
         int64_t max_seq = 0;
-        for (size_t d = 0; d < stp.size(); ++d)
+        for (size_t d = 0; d < stp.size(); ++d) {
+            assert(!stp[d].empty());
             for (const TokenSeq& s : stp[d]) {
                 loads[d] += tokens(s);
                 max_seq = std::max(max_seq, tokens(s));
             }
-        int64_t spread = *std::max_element(loads.begin(), loads.end()) -
-                         *std::min_element(loads.begin(), loads.end());
-        assert(spread < max_seq);
+        }
+        if (stp.size() >= 2) {
+            int64_t spread = *std::max_element(loads.begin(), loads.end()) -
+                             *std::min_element(loads.begin(), loads.end());
+            assert(spread < max_seq);
+        }
     }
 }
 
@@ -333,17 +339,27 @@ void check_shuffle_reaches_the_batches() {
         for (int64_t e = 0; e < 3; ++e) {
             b.seek({e, 0});
             auto one = run_epoch(b);
-            // Every sequence once an epoch, and every sub-batch under the budget.
+            // Every sequence once an epoch, every sub-batch under the budget, and every step
+            // with two sub-batches under the strict token spread.
             size_t seen = 0;
             for (const auto& step : one) {
-                assert((int64_t)step.size() == c.devices);
-                for (const Batch& sub : step) {
-                    int64_t total = 0;
-                    for (const TokenSeq& s : sub) {
-                        total += tokens(s);
+                assert(!step.empty());
+                assert((int)step.size() <= c.devices);
+                std::vector<int64_t> loads(step.size(), 0);
+                int64_t max_seq = 0;
+                for (size_t d = 0; d < step.size(); ++d) {
+                    assert(!step[d].empty());
+                    for (const TokenSeq& s : step[d]) {
+                        loads[d] += tokens(s);
+                        max_seq = std::max(max_seq, tokens(s));
                         ++seen;
                     }
-                    assert(total <= c.budget);
+                    assert(loads[d] <= c.budget);
+                }
+                if (step.size() >= 2) {
+                    int64_t spread = *std::max_element(loads.begin(), loads.end()) -
+                                     *std::min_element(loads.begin(), loads.end());
+                    assert(spread < max_seq);
                 }
             }
             assert(seen == c.lens.size());
@@ -517,12 +533,91 @@ void check_reset_and_config_errors() {
             assert(step[d][i].ids == again[0][d][i].ids);
 }
 
+// A short tail of a length bucket -- fewer sequences than devices -- must not be handed out as
+// an empty sub-batch. It carries into the next bucket to fill the idle devices; the last tail of
+// an epoch, with nothing left to carry into, hands out fewer sub-batches rather than an empty
+// one. Every step that still has two or more sub-batches keeps the strict balance: the token
+// spread is less than the step's longest sequence. The cases below are the ones a per-bucket
+// greedy gets wrong: a long bucket tail beside a short bucket, a final odd sequence, and an odd
+// residue that greedy would hand to one device while leaving the other behind.
+void check_short_tail_balance() {
+    struct Case {
+        const char* what;
+        std::vector<int64_t> lens;
+        int64_t budget;
+        int devices;
+        bool every_step_full;  // the carry must fill every step of this one
+    };
+    std::vector<Case> cases;
+    {
+        Case c{"33 longs of 500 beside 32 shorts of 12, two devices", {}, 1000, 2, true};
+        c.lens.assign(33, 500);
+        c.lens.insert(c.lens.end(), 32, 12);
+        cases.push_back(std::move(c));
+    }
+    {
+        Case c{"5 sequences of 500, budget 1200, two devices", {}, 1200, 2, false};
+        c.lens.assign(5, 500);
+        cases.push_back(std::move(c));
+    }
+    {
+        Case c{"3 sequences of 500, budget 1200, two devices", {}, 1200, 2, false};
+        c.lens.assign(3, 500);
+        cases.push_back(std::move(c));
+    }
+    {
+        Case c{"3 unit sequences, two devices", {}, 100, 2, false};
+        c.lens.assign(3, 1);
+        cases.push_back(std::move(c));
+    }
+
+    for (const Case& c : cases) {
+        (void)c.what;
+        auto seqs = make_sequences(c.lens);
+        r97::BatcherConfig cfg;
+        cfg.token_budget = c.budget;
+        cfg.devices = c.devices;
+        cfg.seed = 23;
+        Batcher b(seqs, cfg);
+
+        auto run = run_epoch(b);
+        assert(!run.empty());
+        size_t seen = 0;
+        bool saw_short = false;
+        for (const auto& step : run) {
+            assert(!step.empty());
+            assert((int)step.size() <= c.devices);
+            if ((int)step.size() < c.devices) saw_short = true;
+            std::vector<int64_t> loads(step.size(), 0);
+            int64_t max_seq = 0;
+            for (size_t d = 0; d < step.size(); ++d) {
+                assert(!step[d].empty());  // never an empty sub-batch for a device
+                for (const TokenSeq& s : step[d]) {
+                    loads[d] += tokens(s);
+                    max_seq = std::max(max_seq, tokens(s));
+                    ++seen;
+                }
+                assert(loads[d] <= c.budget);
+            }
+            if (step.size() >= 2) {
+                int64_t spread = *std::max_element(loads.begin(), loads.end()) -
+                                 *std::min_element(loads.begin(), loads.end());
+                assert(spread < max_seq);
+            }
+        }
+        assert(seen == c.lens.size());
+        if (c.every_step_full) assert(!saw_short);
+        else assert(saw_short);  // an epoch's final tail has nothing to fill with
+    }
+}
+
 void run_checks() {
     check_budget_coverage_and_resume();
     check_budget_is_per_batch();
     check_shuffle_reaches_the_batches();
     check_similar_lengths_are_grouped();
     check_single_step_split();
+    check_short_tail_balance();
     check_reset_and_config_errors();
     std::puts("batcher ok");
 }

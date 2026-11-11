@@ -22,19 +22,31 @@ An epoch is planned on demand from `(seed, epoch)` and cached (`Batcher::plan`):
 3. **Pack each sub-batch under the budget.** Walking one bucket's shuffled order, each sequence
    goes to the least-loaded of the `devices` sub-batches that still has room for it
    (`load + length <= token_budget`), ties to the lowest device. When no sub-batch can take the
-   next sequence the step closes, and it also closes at the bucket's end, so a step never draws
-   from two buckets and all of a step's sequences are of similar length. The budget is per
-   sub-batch, not per step: every `Batch` stays under `token_budget`, so a step may spend up to
-   `devices * token_budget` tokens. A sub-batch keeps its sequences in the order the shuffle put
-   them in; the packing does not re-sort them. A re-sort (longest first, say) would erase the
-   epoch's shuffle wherever the packing's outcome is fixed by the data — a bucket that fits one
-   step, sequences all of one length — leaving every seed and every epoch with byte-identical
-   batches.
+   next sequence the step closes. At a bucket's end the step normally closes too, so its
+   sub-batches hold one length class only. The exception is a bucket that ends with fewer
+   sequences than devices: those sequences carry into the next bucket to fill its idle devices
+   instead of being handed out with an empty sub-batch. The occupied devices are sealed for the
+   carry, so the next bucket's shorter sequences cannot join an occupied sub-batch and mix
+   classes inside one `Batch`; each sub-batch still holds sequences of one length class. Because
+   the sort runs longest first, the carry crosses from the short end of one class to the long end
+   of the next, so the two classes that meet at one carry are within a factor of two, and a carry
+   repeats only when a class is too small to fill the remaining devices. The budget
+   is per sub-batch, not per step: every `Batch` stays under `token_budget`, so a step may spend
+   up to `devices * token_budget` tokens. A sub-batch keeps its sequences in the order the
+   shuffle put them in; the packing does not re-sort them. A re-sort (longest first, say) would
+   erase the epoch's shuffle wherever the packing's outcome is fixed by the data — a bucket that
+   fits one step, sequences all of one length — leaving every seed and every epoch with
+   byte-identical batches.
 4. **Balance devices.** Least-loaded-first assignment keeps the token spread between the fullest
-   and emptiest sub-batch of a step at most one maximal sequence of that step. When a step ends
-   with fewer sequences than devices — a bucket edge can leave one — a sub-batch is necessarily
-   empty and the spread is exactly one maximal sequence; no packing can fill it. The tests assert
-   the strict bound on their varied data.
+   and emptiest sub-batch of a step under one maximal sequence of that step. If a closed step
+   still reaches that bound — an odd residue of equal-length sequences, say — the fullest
+   sub-batch's last sequences spill into a step of their own until the remainder is strictly
+   under the bound. What spills is one sub-batch's worth, so it is still under the budget, and a
+   spill step has a single sub-batch and no spread to bound. So a step hands out fewer than
+   `devices` sub-batches in two cases: it is a spill split off to keep another step's strict
+   spread, or it is the epoch's last tail, which has no next bucket to carry into. Neither is
+   handed out with an empty sub-batch: a single final sequence has no step to balance against, so
+   its step has one sub-batch rather than an empty second one.
 
 ## Skip, position, resume
 
@@ -67,13 +79,19 @@ fills both devices of every step; every step's lengths are within a factor of tw
 sequence appears exactly once an epoch and the skipped one in no batch; the same seed replays and
 another seed does not; a seek to a saved `(epoch, step)` continues identically; `reset()` returns
 to `(0, 0)` and replays the first epoch, even after a traversal has run out; a non-positive budget
-and fewer than one device are rejected; on the varied data a step's sub-batches differ by less
-than one maximal sequence; a dataset that fits one step per bucket — 20 sequences of 17..74
-tokens, 100 sequences of one length, 1000 sequences of 50..80 tokens on two devices — still
-changes its whole shape (steps, sub-batches and the order inside them) with the seed and with the
-epoch, at the realistic budget of 4096 rather than a small one that forces the packing to end a
-step early; and a dataset of two length classes 40x apart, 32 long ones beside 32 shorts and
-then 33 long ones beside 32 shorts, comes out in steps that hold one class only, the long ones
+and fewer than one device are rejected; on the varied data a step with two sub-batches keeps the
+strict spread, less than one maximal sequence; a short bucket tail — 33 sequences of 500 beside
+32 of 12 on two devices — fills the idle device from the next bucket, so no step has an empty
+sub-batch and the carried steps keep the strict bound; an epoch's last odd tail — 5 sequences of
+500 at budget 1200 on two devices — has no next bucket, so its last step has one sub-batch rather
+than an empty one, again keeping the strict bound on every step that has two; and the same holds
+for the smaller odd residues (3 sequences of 500, 3 unit sequences) that a greedy hand-out would
+leave unbalanced; a dataset that fits one step per bucket — 20 sequences of 17..74 tokens, 100
+sequences of one length, 1000 sequences of 50..80 tokens on two devices — still changes its whole
+shape (steps, sub-batches and the order inside them) with the seed and with the epoch, at the
+realistic budget of 4096 rather than a small one that forces the packing to end a step early; and
+a dataset of two length classes 40x apart, 32 long ones beside 32 shorts and then 33 long ones
+beside 32 shorts with one device, comes out in steps that hold one class only, the long ones
 first. The 32 case is exactly two buckets; the 33 case leaves a bucket that would hold one long
 and the shorts after it in the sorted order, so it is the case that mixes classes unless the
 bucket is cut at the length class and a step stops at the bucket edge — the grouping that a plain

@@ -3,11 +3,16 @@
 // Given the training data (one `TokenSeq` per example) the Batcher plans the epoch: it groups
 // similar lengths (sorted into buckets, each bucket shuffled under the seed) so a batch never
 // mixes one long sequence with many short ones, and packs each sub-batch's total token count
-// under the budget. Each step hands out `devices` sub-batches with balanced token counts, one per
-// device; the budget is per sub-batch, so a step may spend up to `devices * token_budget` tokens.
-// A sequence longer than the budget is reported (in `skipped()`) and never batched. A sub-batch
-// holds its sequences in the order the epoch's shuffle gave them, so the seed and the epoch reach
-// the batches even where the packing's outcome is fixed.
+// under the budget. Each step hands out up to `devices` sub-batches with balanced token counts,
+// one per device: every step with two or more sub-batches keeps the token spread under the step's
+// longest sequence. A length bucket that ends with fewer sequences than devices carries them into
+// the next bucket to fill the idle devices. A step that has to split off one sub-batch's worth to
+// keep the strict spread, and the epoch's last tail (which has no next bucket to carry into),
+// hand out only the sub-batches they have, never an empty one. The budget is per sub-batch, so
+// a step may spend up to `devices * token_budget` tokens. A sequence longer than the budget is
+// reported (in `skipped()`) and never batched. A sub-batch holds its sequences in the order the
+// epoch's shuffle gave them, so the seed and the epoch reach the batches even where the packing's
+// outcome is fixed.
 //
 // Deterministic for a given seed: the same seed replays the same batches, each epoch is a new
 // shuffle, and a position (epoch, step) saved and restored resumes with the same batches.
