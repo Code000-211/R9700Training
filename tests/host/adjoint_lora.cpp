@@ -6,13 +6,13 @@
 // Six shapes, one of them the tiny fixture's (tests/support/fixture.h: hidden 128, ffn 256), at
 // ranks 16 and 4: a q_proj 6x128 -> 128, an mlp.gate_proj 5x128 -> 256 (the fixture's ffn width),
 // an mlp.down_proj 4x256 -> 128, and three of them again on the int8 trunk, its codes with a
-// 128-wide group scale. Both forms radiance issues are here: the bf16 activation with no scale
-// operand at all, and the code stream with one. The code sites are three widths on purpose: the
-// q_proj's K of 128 leaves one scale group per row, so every k reads a_scale[m, 0] whatever index
-// the twin computes; the down_proj's K of 256 puts two groups in a row and a wrong group index on
-// most of its k's; and the up_proj's K of 300 puts three groups in a row, the last one partial
-// (128, 128 and 44 wide), so a width taken as ceil(K / groups) -- 100 here -- misreads 100..127
-// and 200..255, and check_kernel says so.
+// 128-wide group scale. Both forms radiance issues are here: the bf16 activation, whose `a_scale`
+// is the absent position 1 its schema keeps, and the code stream with a real one. The code sites
+// are three widths on purpose: the q_proj's K of 128 leaves one scale group per row, so every k
+// reads a_scale[m, 0] whatever index the twin computes; the down_proj's K of 256 puts two groups
+// in a row and a wrong group index on most of its k's; and the up_proj's K of 300 puts three groups
+// in a row, the last one partial (128, 128 and 44 wide), so a width taken as ceil(K / groups) --
+// 100 here -- misreads 100..127 and 200..255, and check_kernel says so.
 #include "support/adjoint_check.h"
 #include "support/test.h"
 
@@ -77,8 +77,12 @@ int32_t slot_of(const Site& s, int64_t m) {
 
 /* ------------------------------------------------------------------ records */
 
-/* `lora_shrink` as the schema states it: a, [a_scale], slot, lora_a, then the write t. The scale
- * operand exists only beside a coded activation, so a float record is one operand shorter. */
+/* `lora_shrink` as radiance's schema states it: a, a_scale, slot, lora_a, then the write t. The
+ * schema is five operands wide in both forms (`ref_registry.cpp`: `OPD_O("a_scale")`), and a bf16
+ * call passes no scale, so its position 1 is the absent operand: the tape names it `none:1` and
+ * gives it dtype `invalid` (tape.cpp, rad_dtype_name(RAD_DT_INVALID)). */
+const char* absent_dtype = "invalid";
+
 OpRecord shrink_rec(const Site& s, bool coded) {
     OpRecord rec;
     rec.op = "lora_shrink";
@@ -92,6 +96,8 @@ OpRecord shrink_rec(const Site& s, bool coded) {
     if (coded)
         rec.operands.push_back(
             {"a_scale", "f32", {s.M, (s.K + s.group - 1) / s.group}, 0, s.M, false});
+    else
+        rec.operands.push_back({"a_scale", absent_dtype, {}, 0, 0, false});
     rec.operands.push_back({"slot", "i32", {s.M}, 0, s.M, false});
     rec.operands.push_back({"lora_a", "bf16", {s.S, s.R, s.K}, 0, s.S, false});
     rec.operands.push_back({"t", "f32", {s.M, s.R}, 0, s.M, true});
@@ -131,6 +137,12 @@ Case make_case(const Site& s, const OpRecord& rec, bool b_zero, uint64_t seed) {
         v.shape = o.shape;
         int64_t n = 1;
         for (int64_t d : o.shape) n *= d;
+        /* The absent position of an optional operand holds no tensor, so no value: the checkers
+         * carry it empty and the twin must not read it. */
+        if (o.dtype == absent_dtype) {
+            (o.written ? c.out : c.in).push_back(std::move(v));
+            continue;
+        }
         v.value.assign((size_t)n, 0.0);
         if (o.buffer == "slot") {
             for (int64_t i = 0; i < n; ++i) v.value[(size_t)i] = slot_of(s, i);
@@ -202,8 +214,9 @@ void require(const std::string& what, const FdReport& r) {
 /* radiance's row for `lora_shrink` wants all five schema positions, an absent `a_scale` staying in
  * its place as a tensor with no data (abi/rad_plugin.h: "an optional operand a call does not pass
  * is a RadTensor whose data is null"). tests/support/adjoint_check.h fills every position with
- * bytes and refuses a dtype radiance does not know, and a float record carries no scale operand at
- * all -- so its kernel run is launched here, by the same recipe the shared check uses. */
+ * bytes and refuses a dtype radiance does not know, and a bf16 record carries its scale position
+ * absent (dtype `invalid`, no data) -- so its kernel run is launched here, by the same recipe the
+ * shared check uses. */
 KernelReport float_shrink_kernel(const OpRecord& rec, const std::vector<AdValue>& in,
                                  const AdValue& out_spec) {
     KernelReport rep;
@@ -232,8 +245,8 @@ KernelReport float_shrink_kernel(const OpRecord& rec, const std::vector<AdValue>
     };
     fill(&t[0], in[0]);
     t[1].dtype = RAD_DT_INVALID;  // a_scale: present, no bytes
-    fill(&t[2], in[1]);
-    fill(&t[3], in[2]);
+    fill(&t[2], in[2]);
+    fill(&t[3], in[3]);
     fill(&t[4], out_spec);
     for (int64_t e = 0; e < rad_tensor_numel(&t[4]); ++e) rad_store_f32(t[4].data, t[4].dtype, e, 0.0f);
 
@@ -400,11 +413,78 @@ void check_grad(const std::string& what, const OpRecord& rec, const Call& c,
     }
 }
 
+/* ------------------------------------------------------------------ the schema the tape records */
+
+/* The schema a radiance plugin declares for an op: the runtime issues one operand per position and
+ * the tape records them in that order, absent optional ones included, so a record the twin is
+ * checked against has to be this one. libref exports the same table the checks use for kernels. */
+const RadOpSchema* find_schema(const char* op) {
+    Plugin& p = libref();
+    if (!p.so) return nullptr;
+    auto count = (int (*)())dlsym(p.so, "rad_kernel_schema_count");
+    auto at = (const RadOpSchema* (*)(int))dlsym(p.so, "rad_kernel_schema_at");
+    if (!count || !at) return nullptr;
+    for (int i = 0; i < count(); ++i) {
+        const RadOpSchema* s = at(i);
+        if (s && s->op && std::string(s->op) == op) return s;
+    }
+    return nullptr;
+}
+
+void require_schema(const OpRecord& rec) {
+    const RadOpSchema* s = find_schema(rec.op.c_str());
+    R97_CHECK(s != nullptr);
+    R97_CHECK(s->n_operands == (int)rec.operands.size());
+    for (int i = 0; i < s->n_operands; ++i) {
+        const RadOperandSpec& spec = s->operands[i];
+        const Operand& o = rec.operands[i];
+        R97_CHECK(spec.name != nullptr && std::string(spec.name) == o.buffer);
+        const bool written = spec.role == RAD_OPD_OUT || spec.role == RAD_OPD_INOUT;
+        R97_CHECK(written == o.written);
+    }
+}
+
+/* The records above are the schema radiance issues, operand for operand, and the shrink's is five
+ * wide in both forms: `a_scale` is the schema's optional operand at position 1, and a bf16 call
+ * leaves that place absent (`none:1`, dtype `invalid`) rather than dropping it. This is the test
+ * the family first lacked: a four-operand bf16 record is refused, whether it drops the position or
+ * fills it with a scale its `dtype` says is not there. */
+R97_TEST(records_are_the_schema_radiance_issues) {
+    for (const Site& s : sites) {
+        require_schema(shrink_rec(s, false));
+        if (coded_site(s)) require_schema(shrink_rec(s, true));
+        require_schema(expand_rec(s));
+        require_schema(expand_rec(s, "lora_expand_mm"));
+    }
+
+    const RadOpSchema* sh = find_schema("lora_shrink");
+    R97_CHECK(sh && sh->n_operands == 5 && sh->operands[1].name != nullptr);
+    R97_CHECK(std::string(sh->operands[1].name) == "a_scale" && sh->operands[1].optional == 1);
+
+    const Site& s = sites[0];  // tiny_q_proj, the bf16 trunk
+    const OpRecord f = shrink_rec(s, false);
+    R97_CHECK(f.operands.size() == 5 && f.operands[1].dtype == absent_dtype);
+
+    OpRecord dropped = f;  // the four-operand record this family first believed
+    dropped.operands.erase(dropped.operands.begin() + 1);
+    Case cd = make_case(s, dropped, false, seed_of(s));
+    std::vector<AdValue> od;
+    twin_find("lora_shrink", dropped.params, nullptr)(dropped, cd.in, &od);
+    R97_CHECK(od.empty());
+
+    OpRecord lying = f;  // a float record with a real scale in the absent position
+    lying.operands[1] = {"a_scale", "f32", {s.M, 1}, 0, s.M, false};
+    Case cl = make_case(s, lying, false, seed_of(s));
+    std::vector<AdValue> ol;
+    twin_find("lora_shrink", lying.params, nullptr)(lying, cl.in, &ol);
+    R97_CHECK(ol.empty());
+}
+
 /* ------------------------------------------------------------------ the tests */
 
-/* The shrink's twin against radiance's host row: the float activation through the launch above (a
- * record with no scale operand at all), the code stream with its group scale through the shared
- * check (all five positions filled). */
+/* The shrink's twin against radiance's host row: the bf16 activation through the launch above
+ * (position 1 absent), the code stream with its group scale through the shared check (all five
+ * positions filled). */
 R97_TEST(lora_shrink_twin_matches_the_kernel) {
     for (const Site& s : sites) {
         const bool coded = coded_site(s);
@@ -472,7 +552,7 @@ R97_TEST(lora_gradients_are_named_leaves) {
         const Case sc = make_case(s, srec, false, seed);
         const uint64_t cot_seed = 0x9e37u + (uint64_t)s.K;
         const Call cs = run_adjoint(srec, sc.in, sc.out, s.module, cot_seed);
-        check_grad(label(s, "lora_shrink"), srec, cs, sc.in, coded ? 3 : 2,
+        check_grad(label(s, "lora_shrink"), srec, cs, sc.in, 3,
                    std::string(s.module) + ".lora_A", {s.R, s.K}, &seed);
         /* A block that stayed zero would pass a shape check and fail the point. */
         const Param* pa = find_grad(cs.grads, std::string(s.module) + ".lora_A");
@@ -544,9 +624,48 @@ R97_TEST(lora_path_with_b_zero) {
         for (float v : pa->value) R97_CHECK(v == 0.0f);
         for (const AdValue& v : cs.dc)
             for (double e : v.value) R97_CHECK(e == 0.0);
-        check_grad(label(s, "B = 0 lora_shrink"), srec, cs, sc.in, coded ? 3 : 2,
+        check_grad(label(s, "B = 0 lora_shrink"), srec, cs, sc.in, 3,
                    std::string(s.module) + ".lora_A", {s.R, s.K}, &seed);
     }
+}
+
+/* One row serves both forms, and it freezes the absent a_scale position with slot and lora_a: a
+ * bf16 trunk's record asks no cotangent of any of the three. */
+R97_TEST(shrink_frozen_positions_cover_the_absent_scale) {
+    for (const Site& s : sites) {
+        for (bool coded : {false, true}) {
+            if (coded != coded_site(s)) continue;
+            const OpRecord rec = shrink_rec(s, coded);
+            R97_CHECK(adjoint_frozen(rec.op, Side::host, rec.params) ==
+                      std::vector<int>({1, 2, 3}));
+        }
+    }
+}
+
+/* The bf16 form adds both things the issue asks of it: dA in the ParamSet under the module's name,
+ * and the contribution to dx. This is the form that first added neither -- its record was read as
+ * three operands and refused -- so the test states the two additions directly, not through the FD
+ * check's sum over the operands. */
+R97_TEST(lora_shrink_bf16_adds_da_and_dx) {
+    const Site& s = sites[0];  // tiny_q_proj: the tiny fixture's q_proj, K 128, rank 16
+    const OpRecord rec = shrink_rec(s, false);
+    const Case c = make_case(s, rec, false, seed_of(s));
+    const Call a = run_adjoint(rec, c.in, c.out, s.module, seed_of(s));
+
+    const Param* pa = find_grad(a.grads, std::string(s.module) + ".lora_A");
+    R97_CHECK(pa != nullptr);
+    R97_CHECK(pa->shape == std::vector<int64_t>({s.R, s.K}));
+    double da = 0.0;
+    for (float v : pa->value) da += std::fabs((double)v);
+    R97_CHECK(da > 0.0);
+
+    R97_CHECK(a.dc[0].value.size() == (size_t)(s.M * s.K));
+    double dx = 0.0;
+    for (double v : a.dc[0].value) dx += std::fabs(v);
+    R97_CHECK(dx > 0.0);
+
+    /* The absent position stays empty: it is not a tensor, so there is no cotangent to add. */
+    R97_CHECK(a.dc[1].value.empty());
 }
 
 }  // namespace

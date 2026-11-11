@@ -14,14 +14,17 @@
 // under `<prefix>.lora_B` [N, r], f32, added to and never overwritten, so a step that reaches one
 // module through two ops sums them the way a ParamSet wants.
 //
-// The shrink's record carries `a_scale` only when the activation is coded (radiance's shape row
-// skips the operand for a float `a`), so the schema is one of two widths and the frozen positions
-// are not the same for both: two rows, told apart by the record's `dtype`, which is what says which
-// layout the bytes are in. In both, `slot` is an index list and `lora_a` a trainable weight, so
-// neither has a cotangent the walk asks for; `a_scale` has one, and the adjoint gives it: the
-// quantiser that made the codes reads both of its outputs' cotangents back. The expand's only
-// cotangent is t's: `scale` is the adapter's alpha/r, a hyperparameter from the adapter file, and
-// `lora_b` is a leaf whose gradient goes to the ParamSet.
+// The shrink's schema is five operands in both forms -- a, a_scale, slot, lora_a, t
+// (ref_registry.cpp: OPD("a"), OPD_O("a_scale"), OPD("slot"), OPD("lora_a"), OUT("t")). A float
+// trunk's `a_scale` is an optional operand the call does not pass, and an absent operand keeps its
+// place: radiance issues RAD_OPK_NONE there (issue.cpp), and Tape::record names the position
+// `none:<i>` with dtype `invalid` (tape.cpp, rad_dtype_name(RAD_DT_INVALID)). So a bf16 record is
+// five wide too, and the frozen positions are the same for both forms -- `slot` at 2 and `lora_a`
+// at 3. A float trunk's absent `a_scale` at 1 is frozen as well: it has no tensor and so no
+// cotangent. In the coded form `a_scale` does have one, and the adjoint gives it: the quantiser
+// that made the codes reads both of its outputs' cotangents back. The expand's only cotangent is
+// t's: `scale` is the adapter's alpha/r, a hyperparameter from the adapter file, and `lora_b` is a
+// leaf whose gradient goes to the ParamSet.
 //
 // `lora_expand_mm` is the same op with t rounded to bf16 before the sum. Rounding has no
 // derivative of its own, so its adjoint is this one's; its twin rounds, which is the only
@@ -83,9 +86,6 @@ bool coded_act(const std::vector<OpParam>& params) {
     return false;
 }
 
-bool coded_params(const std::vector<OpParam>& params) { return coded_act(params); }
-bool float_params(const std::vector<OpParam>& params) { return !coded_act(params); }
-
 /* The dtype the op writes, which the twin's output carries: the record is the only place it says. */
 std::string write_dtype(const OpRecord& rec, const char* fallback) {
     for (const Operand& o : rec.operands)
@@ -124,10 +124,11 @@ double rounded_bf16(double v) {
 
 // ------------------------------------------------------------------ lora_shrink
 
-/* The record's operands, in the schema's order: a, [a_scale], slot, lora_a, t. A twin is handed the
- * reads and an adjoint the whole schema, one longer. A record whose operands do not meet the op's
- * contract lays out nothing: the twin pushes no output and the adjoint adds nothing, which the
- * checkers report against what they expected. */
+/* The record's operands, in the schema's order: a, a_scale, slot, lora_a, t. A float activation
+ * leaves `a_scale` absent, in place; a twin is handed the four reads and an adjoint the whole
+ * schema, five wide. A record whose operands do not meet the op's contract lays out nothing: the
+ * twin pushes no output and the adjoint adds nothing, which the checkers report against what they
+ * expected. */
 struct Shrink {
     const AdValue* a = nullptr;
     const AdValue* as = nullptr;  // null: a float activation, read as it stands
@@ -139,39 +140,42 @@ struct Shrink {
 
 bool shrink_layout(const OpRecord& rec, const AdValue* v, size_t n, Shrink* sh) {
     const bool coded = coded_act(rec.params);
-    const size_t reads = coded ? 4u : 3u;
-    if (n != reads && n != reads + 1) return false;
+    if (n != 4u && n != 5u) return false;
     const AdValue& a = v[0];
-    const AdValue* as = coded ? &v[1] : nullptr;
-    const AdValue& slot = v[coded ? 2 : 1];
-    const AdValue& la = v[coded ? 3 : 2];
+    const AdValue& held = v[1];  // a_scale, or the place an absent one keeps
+    const AdValue& slot = v[2];
+    const AdValue& la = v[3];
     if (a.shape.size() != 2 || slot.shape.size() != 1 || la.shape.size() != 3) return false;
+    /* The record's `dtype` and its operand 1 have to agree: a coded trunk passes a_scale, a float
+     * trunk's position is the absent one the runtime left (radiance names it `invalid`). */
+    const bool absent = held.dtype == "invalid";
+    if (coded == absent) return false;
     const int64_t M = a.shape[0], K = a.shape[1], S = la.shape[0], R = la.shape[1];
     if (M <= 0 || K <= 0 || R <= 0 || S <= 0) return false;
     if (la.shape[2] != K || slot.shape[0] != M) return false;
     if ((int64_t)a.value.size() != M * K || (int64_t)slot.value.size() != M ||
         (int64_t)la.value.size() != S * R * K)
         return false;
-    if (as) {
-        if (as->shape.size() != 2 || as->shape[0] != M || as->shape[1] <= 0) return false;
-        if ((int64_t)as->value.size() != M * as->shape[1]) return false;
+    if (coded) {
+        if (held.shape.size() != 2 || held.shape[0] != M || held.shape[1] <= 0) return false;
+        if ((int64_t)held.value.size() != M * held.shape[1]) return false;
     }
     sh->a = &a;
-    sh->as = as;
+    sh->as = coded ? &held : nullptr;
     sh->slot = &slot;
     sh->la = &la;
     sh->M = M;
     sh->K = K;
     sh->R = R;
     sh->S = S;
-    sh->groups = as ? as->shape[1] : 0;
-    sh->group = as ? group_width(K, sh->groups) : 0;
+    sh->groups = coded ? held.shape[1] : 0;
+    sh->group = coded ? group_width(K, sh->groups) : 0;
     /* The record's `group` is a consistency statement, not the width the kernel reads with: the
      * stream's column grid is what make_scales turns back into a width, and radiance's row refuses
      * a record whose `group` divides K into a different number of groups (ref_registry.cpp: K=300
      * with a `group` of 128 needs three columns, not two or four). So a record this twin lays out
      * is one the kernel would run, and it reads a partial last group the way the kernel does. */
-    const int64_t stated = as ? param_int(rec.params, "group") : 0;
+    const int64_t stated = coded ? param_int(rec.params, "group") : 0;
     if (stated > 0 && (K + stated - 1) / stated != (K + sh->group - 1) / sh->group) return false;
     return true;
 }
@@ -398,10 +402,9 @@ R97_REGISTER_TWIN("lora_shrink", lora_shrink_twin)
 R97_REGISTER_TWIN("lora_expand", lora_expand_twin)
 R97_REGISTER_TWIN("lora_expand_mm", lora_expand_twin)
 
-/* A coded activation's record has five operands, a float one's four: slot and lora_a are frozen in
- * both, and the positions shift by the a_scale a coded trunk carries. */
-R97_REGISTER_ADJOINT_IF_F("lora_shrink", host, lora_shrink_host_adjoint, coded_params, 2, 3)
-R97_REGISTER_ADJOINT_IF_F("lora_shrink", host, lora_shrink_host_adjoint, float_params, 1, 2)
+/* slot and lora_a are frozen in both forms, and so is the a_scale position: a float trunk leaves
+ * it absent there, with no tensor and so no cotangent. */
+R97_REGISTER_ADJOINT_F("lora_shrink", host, lora_shrink_host_adjoint, 1, 2, 3)
 
 R97_REGISTER_ADJOINT_F("lora_expand", host, lora_expand_host_adjoint, 1, 2, 3)
 R97_REGISTER_ADJOINT_F("lora_expand_mm", host, lora_expand_host_adjoint, 1, 2, 3)
