@@ -188,32 +188,6 @@ target_include_directories(r97
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(r97 PUBLIC rad_core)
 
-# Device adjoints: the kernel sources under src/adjoint/device/ register on Side::device from the
-# same registry as the host ones (r97/adjoint.h), so they compile into libr97 beside them and the
-# gpu tier reaches a device row through adjoint_find. The plugin issue owns this wiring; until it
-# lands the kernels are the library's own sources, and a build without HIP simply has no device
-# side -- every row the gpu tier looks for is then missing, which is what its tests report.
-if(NOT R97_WITH_HIP STREQUAL "OFF" AND R97_LIBHIP)
-  find_program(R97_HIPCC hipcc HINTS /opt/rocm/bin ENV ROCM_PATH)
-  if(R97_HIPCC)
-    # gfx1201 is the R9700 the gpu tier runs on; another card passes its own architecture. The
-    # target's property is set as well because r97 exists before the language is enabled, and a
-    # target's HIP_ARCHITECTURES is initialised when it is created.
-    set(R97_HIP_ARCHS "gfx1201" CACHE STRING "HIP architectures the device adjoints build for")
-    set(CMAKE_HIP_ARCHITECTURES ${R97_HIP_ARCHS} CACHE STRING "HIP architectures")
-    set(CMAKE_HIP_STANDARD 20)
-    enable_language(HIP)
-    set_property(TARGET r97 PROPERTY HIP_ARCHITECTURES ${R97_HIP_ARCHS})
-    file(GLOB R97_DEVICE_KERNEL_SOURCES CONFIGURE_DEPENDS
-         ${CMAKE_CURRENT_SOURCE_DIR}/src/adjoint/device/*.hip)
-    if(R97_DEVICE_KERNEL_SOURCES)
-      target_sources(r97 PRIVATE ${R97_DEVICE_KERNEL_SOURCES})
-      set_source_files_properties(${R97_DEVICE_KERNEL_SOURCES} PROPERTIES LANGUAGE HIP)
-      target_link_libraries(r97 PUBLIC ${R97_LIBHIP})
-    endif()
-  endif()
-endif()
-
 # An op's twin and adjoint register themselves from a static object in the op's own file, so no
 # file lists the ops (r97/adjoint.h). An archive link drops the members nothing references, so
 # the binaries that ask the registry -- r97train and the host and gpu test tiers -- link r97
@@ -232,6 +206,9 @@ else()
   target_include_directories(r97train PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools
                                               ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(r97train PRIVATE ${R97_LINK_WHOLE})
+  # A subcommand that loads the device kernel plugin registers its adjoints into r97's registry,
+  # so r97's symbols must be in the binary's dynamic table.
+  set_target_properties(r97train PROPERTIES ENABLE_EXPORTS TRUE)
 
   # The oracle's checkpoint writer: the tests' own tiny fixture, written to a directory the
   # Python generator loads. It sits in its own subdirectory so it is not one of r97train's
@@ -243,6 +220,58 @@ else()
     ${CMAKE_CURRENT_SOURCE_DIR}/tests
     ${R97_RADIANCE_COPY}/tests)
   target_link_libraries(r97_write_fixture PRIVATE r97)
+endif()
+
+# ---------------------------------------------------- device kernel plugin
+# libr97 is where the device kernels live: a radiance kernel plugin built the out-of-tree way
+# radiance's tests/oot_plugins.sh shows (cmake/RadAddPlugin.cmake), against the radiance copy's
+# ABI and with no link to r97 -- like libr4d, it calls back into the process that loads it. Its
+# sources are collected by glob from src/adjoint/device/, and its file lands in the radiance home
+# next to libr4d. A host-only configuration has no device kernels and builds no plugin.
+if(NOT R97_WITH_HIP STREQUAL "OFF")
+  find_program(R97_HIPCC NAMES hipcc HINTS /opt/rocm/bin ENV ROCM_PATH PATH_SUFFIXES bin)
+  if(NOT R97_HIPCC)
+    message(STATUS "r97: hipcc not found; no libr97 device kernel plugin")
+  else()
+    set(CMAKE_HIP_ARCHITECTURES "${RAD_GPU_TARGETS}")
+    enable_language(HIP)
+    include(${R97_RADIANCE_COPY}/cmake/RadAddPlugin.cmake)
+
+    # What find_package(radiance) hands an out-of-tree plugin: the abi headers, no engine.
+    add_library(radiance_abi INTERFACE)
+    add_library(radiance::abi ALIAS radiance_abi)
+    target_include_directories(radiance_abi INTERFACE ${R97_RADIANCE_COPY}/abi)
+    target_compile_definitions(radiance_abi INTERFACE __HIP_PLATFORM_AMD__=1)
+
+    find_library(R97_HIP_RUNTIME amdhip64 HINTS /opt/rocm/lib ENV ROCM_PATH PATH_SUFFIXES lib)
+    if(NOT R97_HIP_RUNTIME)
+      message(FATAL_ERROR "r97: hipcc is present but amdhip64 was not found; set ROCM_PATH")
+    endif()
+    set(RAD_HIP_RUNTIME "${R97_HIP_RUNTIME}")
+    set(RAD_HIP_FOUND ON)
+    set(RAD_PLUGIN_OUT "${CMAKE_BINARY_DIR}/radiance-build/radiance_home")
+    set(RAD_PLUGIN_INSTALL OFF)   # the build tree is the home here; nothing is installed
+
+    file(GLOB R97_DEVICE_KERNEL_SOURCES CONFIGURE_DEPENDS
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/adjoint/device/*.hip)
+    # The plugin table is not a kernel: it goes in SOURCES below and would otherwise be compiled
+    # twice.
+    list(REMOVE_ITEM R97_DEVICE_KERNEL_SOURCES
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/adjoint/device/plugin.hip)
+    if(R97_DEVICE_KERNEL_SOURCES STREQUAL "")
+      message(FATAL_ERROR "r97: src/adjoint/device/ holds no kernels; libr97 needs add.hip")
+    endif()
+    rad_add_plugin(libr97 kernels
+      SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/src/adjoint/device/plugin.hip
+      HIP_SOURCES ${R97_DEVICE_KERNEL_SOURCES}
+      GPU_TARGETS ${RAD_GPU_TARGETS}
+      INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    set_target_properties(libr97 PROPERTIES
+      HIP_STANDARD 20
+      HIP_STANDARD_REQUIRED ON)
+    target_compile_definitions(libr97 PRIVATE
+      "R97_DEVICE_BUILD_TARGET=\"${RAD_GPU_TARGETS}\"")
+  endif()
 endif()
 
 # ------------------------------------------------------------------ tests
@@ -277,14 +306,24 @@ if(R97_BUILD_TESTS)
       R97_FIXTURE_W8A8_RECIPE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/w8a8_fwht128.recipe")
   endif()
 
-  # gpu tests: need the card, run serially. Same shape as the host binary; empty until the device
-  # issues add sources.
+  # gpu tests: need the card, run serially. One binary, its main in tests/gpu/main.cpp; every
+  # source brings its checks as R97_TEST.
   file(GLOB R97_GPU_TEST_SOURCES CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu/*.cpp)
   if(NOT R97_GPU_TEST_SOURCES STREQUAL "")
     add_executable(r97_gpu_tests ${R97_GPU_TEST_SOURCES})
+    # The device plugin is dlopen()ed: it registers its adjoints into r97's registry and takes
+    # its scratch from radiance's device layer, so those symbols must be in the dynamic table.
+    set_target_properties(r97_gpu_tests PROPERTIES ENABLE_EXPORTS TRUE)
     target_link_libraries(r97_gpu_tests PRIVATE ${R97_LINK_WHOLE})
-    target_include_directories(r97_gpu_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_include_directories(r97_gpu_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests
+      ${CMAKE_CURRENT_SOURCE_DIR}/src)   # the device harness reads the scratch ledger
+    if(TARGET libr97)
+      add_dependencies(r97_gpu_tests libr97)
+      target_compile_definitions(r97_gpu_tests PRIVATE
+        "R97_DEVICE_PLUGIN=\"$<TARGET_FILE:libr97>\"")
+    endif()
   endif()
 
   file(GLOB R97_MODEL_TEST_SOURCES CONFIGURE_DEPENDS

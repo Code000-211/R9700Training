@@ -33,15 +33,7 @@ struct Reg {
     Reg(const char* name, void (*fn)());
 };
 
-// Runs every test once. A binary whose main runs them itself -- the gpu tier does, because a
-// device launch cannot wait until exit (see tests/gpu/gpu_guard_smoke.cpp) -- gets the same result
-// from the exit-time runner instead of a second run.
 inline int run_all() {
-    static bool ran = false;
-    static int result = 0;
-    if (ran) return result;
-    ran = true;
-
     int failed = 0;
     for (const Test& t : tests()) {
         try {
@@ -55,8 +47,7 @@ inline int run_all() {
         }
     }
     std::printf("%zu tests, %d failed\n", tests().size(), failed);
-    result = failed ? 1 : 0;
-    return result;
+    return failed ? 1 : 0;
 }
 
 inline void run_at_exit() {

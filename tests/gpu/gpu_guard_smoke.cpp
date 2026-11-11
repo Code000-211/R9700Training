@@ -10,7 +10,7 @@
 // is for card machines. It also fails on a build whose radiance falls back to its host backend.
 //
 // Needs one R9700 (gfx1201, 32 GB) or similar; runs under the GPU test guard. The gpu tier's
-// binary has its main here: the smoke test first, then every test under tests/gpu/ with it.
+// binary has its main in main.cpp; this file registers its check like every other gpu source.
 #include "support/gpu_guard.h"
 #include "support/test.h"
 
@@ -119,17 +119,4 @@ void smoke() {
 
 }  // namespace
 
-int main() {
-    try {
-        smoke();
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "gpu_guard_smoke FAIL: %s\n", e.what());
-        return 1;
-    }
-    // The tier's tests run here rather than from the exit-time runner the other tiers use, because
-    // a device launch cannot wait until exit: once radiance's device layer has been initialised in
-    // this process, launching the same kernel from the exit hook faults inside hipLaunchKernel,
-    // while the same call from main runs. run_all() runs the tests once, so the exit hook that the
-    // registrations arm only reports this result instead of running them again.
-    return r97test::run_all();
-}
+R97_TEST(gpu_guard_smoke) { smoke(); }

@@ -31,18 +31,18 @@
 // columns -- so the staged tile is read with the eight scalar reads of a transposed fragment
 // instead of the two of a contiguous one. Staging it transposed in shared memory instead would cost
 // four times as many scattered LDS stores as those reads.
-#include "device.h"
 #include "r97/adjoint.h"
+
+#include "rad_device.h"
+
+#include "scratch.h"
 
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -266,12 +266,6 @@ static int linear_dx_launch(bool quant, const void* dy, const void* w, const voi
 namespace r97 {
 namespace {
 
-void hip_ok(hipError_t e, const char* what) {
-    if (e != hipSuccess)
-        throw std::runtime_error(std::string("device adjoint linear: ") + what + ": " +
-                                 hipGetErrorString(e));
-}
-
 // f64 -> bf16, one rounding to nearest. The hardware's own conversion rounds a tie to even and this
 // rounds it away from zero, so the two can differ by one bf16 ulp; staging adds no more than that.
 unsigned short to_bf16(double x) {
@@ -290,13 +284,13 @@ double of_bf16(unsigned short h) {
 }
 
 // An int8 code carried as f64: a weight the IQR decode wrote is exact, and one that is not would
-// quantise silently, so say so instead.
-int8_t to_code(double x, int64_t n) {
+// quantise silently. A value outside the grid is a shape this row was not written for, so the call
+// declines it rather than inventing a code.
+bool to_code(double x, int8_t* out) {
     const double r = std::round(x);
-    if (std::fabs(x - r) > 1e-3 || r < -128.0 || r > 127.0)
-        throw std::runtime_error("device adjoint linear: weight code " + std::to_string(n) +
-                                 " is not an int8 value");
-    return static_cast<int8_t>(r);
+    if (std::fabs(x - r) > 1e-3 || r < -128.0 || r > 127.0) return false;
+    *out = static_cast<int8_t>(r);
+    return true;
 }
 
 const OpParam* find_param(const std::vector<OpParam>& params, const char* name) {
@@ -345,13 +339,22 @@ double scale_at(const AdValue* scale, int64_t row, int64_t group, int64_t rows, 
     return scale->value[static_cast<std::size_t>(at)];
 }
 
-double millis(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
-    return std::chrono::duration<double, std::milli>(b - a).count();
+// One stream for every device adjoint call in this process, as add.hip keeps one: the call's
+// upload, launch and download are one queue's worth of work. The stream belongs to the device
+// rad_dev_set() chose; a test or a trainer selects one device before the first adjoint runs.
+RadStream adjoint_stream() {
+    static RadStream s = [] {
+        RadStream created = nullptr;
+        if (rad_stream_create(&created, 0) != 0) return (RadStream) nullptr;
+        return created;
+    }();
+    return s;
 }
 
 // dx[m,k] = sum_n dy[m,n] * W[n,k], with W the int8 codes and their per-block scale (`quant`) or
 // the bf16 weight as it stands.
 void linear_dx_adjoint(const AdjointCall& call, bool quant) {
+    if (!call.dc) return;
     const int ia = operand_pos(call.rec, "a");
     const int ib = operand_pos(call.rec, "b");
     const int ibs = operand_pos(call.rec, "b_scale");
@@ -359,6 +362,8 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
 
     const AdValue& a = call.fwd[static_cast<std::size_t>(ia)];
     const AdValue& b = call.fwd[static_cast<std::size_t>(ib)];
+    if (static_cast<std::size_t>(ia) >= call.dc->size()) return;
+    AdValue& dx = (*call.dc)[static_cast<std::size_t>(ia)];
     const AdValue* bs = ibs >= 0 ? &call.fwd[static_cast<std::size_t>(ibs)] : nullptr;
     const AdValue& dy = call.cot[0];
 
@@ -368,16 +373,17 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
     const int64_t group = int_param(call.rec.params, "group", K > 0 ? K : 1);
     const int64_t groups = group > 0 ? (K + group - 1) / group : 1;
     if (M <= 0 || N <= 0 || K <= 0) return;
-    if (M * N != static_cast<int64_t>(dy.value.size()) || M * K != static_cast<int64_t>(a.value.size()) ||
-        N * K != static_cast<int64_t>(b.value.size()))
-        throw std::runtime_error("device adjoint linear: operand extents do not match M, N, K");
+    /* The operand extents, the write's shape and the record's M, N, K have to agree; a record that
+     * does not is one this row was not written for, and an adjoint must not throw. */
+    if (M * N != static_cast<int64_t>(dy.value.size()) ||
+        M * K != static_cast<int64_t>(a.value.size()) ||
+        N * K != static_cast<int64_t>(b.value.size()) ||
+        static_cast<int64_t>(dx.value.size()) != M * K)
+        return;
     /* Only the int8 grid has a scale grid, and the kernel's block of K is one of its 128-wide
      * blocks; a bf16 weight carries none, and `group` falls back to K there. */
-    if (quant && group != LD_BK)
-        throw std::runtime_error("device adjoint linear: the kernel serves the 128-wide scale grid, "
-                                 "the record carries group " + std::to_string(group));
-    if (K < 8 || K % 8 != 0)
-        throw std::runtime_error("device adjoint linear: K must be a positive multiple of 8");
+    if (quant && group != LD_BK) return;
+    if (K < 8 || K % 8 != 0) return;
     /* The reduction tile is 16 output channels wide, so a narrow projection -- the fixture's eight-
      * and twelve-channel ones -- gets zero rows of weight and zero dy columns out to 16. They add
      * nothing to the sum and every fragment read stays inside its buffer. */
@@ -387,17 +393,18 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
      * elements, so anything near the limit is a shape this kernel was not written for. */
     if (static_cast<double>(M) * static_cast<double>(N) >= 2147483648.0 ||
         static_cast<double>(M) * static_cast<double>(K) >= 2147483648.0)
-        throw std::runtime_error("device adjoint linear: M x N or M x K does not fit a 32-bit offset");
+        return;
 
-    const int dev = device_adjoint_device();
-    if (dev >= 0) hip_ok(hipSetDevice(dev), "hipSetDevice");
+    RadStream stream = adjoint_stream();
+    if (!stream) return;
 
     const std::size_t dy_n = static_cast<std::size_t>(M * Np);
     const std::size_t w_n = static_cast<std::size_t>(Np * K);
     const std::size_t dx_n = static_cast<std::size_t>(M * K);
     const std::size_t sc_n = static_cast<std::size_t>(Np * groups);
 
-    const auto t0 = std::chrono::steady_clock::now();
+    /* Staging: the tape's dy and weight are f64, the kernel's are bf16 (the weight's codes int8),
+     * so this call converts them on the way in and the answer on the way out. */
     std::vector<unsigned short> host_dy(dy_n, 0);
     for (int64_t m = 0; m < M; ++m) {
         const double* src = dy.value.data() + static_cast<std::size_t>(m * N);
@@ -409,67 +416,46 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
     for (int64_t n = 0; n < N; ++n)
         for (int64_t k = 0; k < K; ++k) {
             const std::size_t i = static_cast<std::size_t>(n * K + k);
-            if (quant) host_code[i] = to_code(b.value[i], static_cast<int64_t>(i));
-            else host_w[i] = to_bf16(b.value[i]);
+            if (quant) {
+                if (!to_code(b.value[i], &host_code[i])) return;
+            } else {
+                host_w[i] = to_bf16(b.value[i]);
+            }
         }
     std::vector<unsigned short> host_sc(quant ? sc_n : 0, to_bf16(1.0));
     if (quant)
         for (int64_t n = 0; n < N; ++n)
             for (int64_t g = 0; g < groups; ++g)
-                host_sc[static_cast<std::size_t>(n * groups + g)] = to_bf16(scale_at(bs, n, g, N, groups));
+                host_sc[static_cast<std::size_t>(n * groups + g)] =
+                    to_bf16(scale_at(bs, n, g, N, groups));
     std::vector<unsigned short> host_dx(dx_n);
-    const auto t1 = std::chrono::steady_clock::now();
 
-    void* dev_dy = nullptr;
-    void* dev_w = nullptr;
-    void* dev_sc = nullptr;
-    void* dev_dx = nullptr;
-    int64_t scratch = 0;
-    const auto alloc = [&](void** p, std::size_t bytes) {
-        hip_ok(hipMalloc(p, bytes), "hipMalloc");
-        scratch += static_cast<int64_t>(bytes);
-    };
-    alloc(&dev_dy, dy_n * 2);
-    alloc(&dev_w, quant ? w_n : w_n * 2);
-    if (quant) alloc(&dev_sc, sc_n * 2);
-    alloc(&dev_dx, dx_n * 2);
-    hip_ok(hipMemcpy(dev_dy, host_dy.data(), dy_n * 2, hipMemcpyHostToDevice), "hipMemcpy dy");
-    hip_ok(hipMemcpy(dev_w, quant ? static_cast<const void*>(host_code.data())
-                                  : static_cast<const void*>(host_w.data()),
-                     quant ? w_n : w_n * 2, hipMemcpyHostToDevice),
-           "hipMemcpy w");
-    if (quant) hip_ok(hipMemcpy(dev_sc, host_sc.data(), sc_n * 2, hipMemcpyHostToDevice), "hipMemcpy scale");
-    const auto t2 = std::chrono::steady_clock::now();
+    device::ScratchBlock dev_dy(static_cast<int64_t>(dy_n * 2));
+    device::ScratchBlock dev_w(static_cast<int64_t>(quant ? w_n : w_n * 2));
+    device::ScratchBlock dev_sc(static_cast<int64_t>(quant ? sc_n * 2 : 0));
+    device::ScratchBlock dev_dx(static_cast<int64_t>(dx_n * 2));
+    if (!dev_dy || !dev_w || (quant && !dev_sc) || !dev_dx) return;
 
-    const int rc = linear_dx_launch(quant, dev_dy, dev_w, dev_sc, dev_dx, static_cast<int>(M),
-                                    static_cast<int>(Np), static_cast<int>(K),
-                                    static_cast<int>(groups), nullptr);
-    if (rc != 0) {
-        (void)hipFree(dev_dy);
-        (void)hipFree(dev_w);
-        if (quant) (void)hipFree(dev_sc);
-        (void)hipFree(dev_dx);
-        throw std::runtime_error(std::string("device adjoint linear: launch: ") +
-                                 hipGetErrorString(static_cast<hipError_t>(rc)));
-    }
-    hip_ok(hipDeviceSynchronize(), "hipDeviceSynchronize");
-    const auto t3 = std::chrono::steady_clock::now();
-    hip_ok(hipMemcpy(host_dx.data(), dev_dx, dx_n * 2, hipMemcpyDeviceToHost), "hipMemcpy dx");
-    (void)hipFree(dev_dy);
-    (void)hipFree(dev_w);
-    if (quant) (void)hipFree(dev_sc);
-    (void)hipFree(dev_dx);
+    if (rad_memcpy_async(dev_dy.p, host_dy.data(), static_cast<int64_t>(dy_n * 2), stream) != 0)
+        return;
+    if (rad_memcpy_async(dev_w.p, quant ? static_cast<const void*>(host_code.data())
+                                       : static_cast<const void*>(host_w.data()),
+                         static_cast<int64_t>(quant ? w_n : w_n * 2), stream) != 0)
+        return;
+    if (quant && rad_memcpy_async(dev_sc.p, host_sc.data(), static_cast<int64_t>(sc_n * 2), stream) != 0)
+        return;
 
-    AdValue& dx = (*call.dc)[static_cast<std::size_t>(ia)];
-    if (dx.value.size() != dx_n)
-        throw std::runtime_error("device adjoint linear: the write operand is not M x K");
+    const int rc = linear_dx_launch(quant, dev_dy.p, dev_w.p, quant ? dev_sc.p : nullptr, dev_dx.p,
+                                    static_cast<int>(M), static_cast<int>(Np), static_cast<int>(K),
+                                    static_cast<int>(groups), static_cast<hipStream_t>(stream));
+    if (rc != 0) return;  // a failed launch leaves dc as the host row's would if it declined
+
+    if (rad_stream_sync(stream) != 0) return;
+    if (rad_memcpy_async(host_dx.data(), dev_dx.p, static_cast<int64_t>(dx_n * 2), stream) != 0)
+        return;
+    if (rad_stream_sync(stream) != 0) return;
+
     for (std::size_t i = 0; i < dx_n; ++i) dx.value[i] += of_bf16(host_dx[i]);
-
-    DeviceAdjointStats stats;
-    stats.staging_ms = millis(t0, t2);
-    stats.kernel_ms = millis(t2, t3);
-    stats.scratch_bytes = scratch;
-    device_adjoint_note(stats);
 }
 
 void gemm_nt_q_device(const AdjointCall& call) { linear_dx_adjoint(call, true); }

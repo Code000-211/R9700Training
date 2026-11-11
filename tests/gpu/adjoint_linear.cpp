@@ -4,14 +4,16 @@
 // asks two questions of them.
 //
 //   agrees: the device row and the host row, handed the same record and the same values, write the
-//   same dx within bf16_tol. At the fixture's shapes that is the whole of dx. At the model's it is
-//   a spread sample of (m,k) probes against the same f64 sum the host adjoint forms, because the
-//   full comparison there is hundreds of GMAC of f64 on one thread per call -- the doc says which
-//   shapes carry which check.
+//   same dx within the harness's bf16 tolerance (tests/support/device_check.h). At the fixture's
+//   shapes, and at the real model's hidden width with few rows, that is the whole of dx, compared
+//   element by element. At the model's real shapes -- 1024 and 4096 tokens, and a packed batch of
+//   unequal lengths -- it is a spread sample of (m,k) probes against the same f64 sum the host
+//   adjoint forms: the full comparison there is hundreds of GMAC of f64 on one thread per call.
 //
-//   measures: every real shape runs twice and the call's staging and kernel milliseconds and the
-//   card memory it held are printed (src/adjoint/device/device.h). docs/kernels/linear.md carries
-//   the numbers; no speed target is set, the measurement is the deliverable.
+//   measures: every real shape prints one line of adjoint milliseconds, forward-twin milliseconds
+//   and scratch, as docs/kernels/README.md asks. The forward twin is called once per shape rather
+//   than reps+1 times, because at the widest linear the f64 twin is tens of minutes a call; the
+//   adjoint is warmed up and averaged. docs/kernels/linear.md carries the numbers.
 //
 // The values follow tests/host/adjoint_linear.cpp -- integer codes, bf16-exact bf16 operands,
 // power-of-two scales -- so that the two sides start from what the host test's kernel check starts
@@ -19,8 +21,7 @@
 // the bf16 rounding of the gradient, not exactness.
 //
 // Label: gpu. The kernels launch on the card the guard reserved (R97_DEVICE selects it).
-#include "../../src/adjoint/device/device.h"  // which card, and what the last call cost
-#include "support/gpu_guard.h"
+#include "support/device_check.h"
 #include "support/test.h"
 
 #include "r97/adjoint.h"
@@ -30,7 +31,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
@@ -39,59 +39,26 @@ using namespace r97;
 
 namespace {
 
-const double bf16_tol = 1e-2;
+const double bf16_tol = 1e-2;  // whole-tensor relative L2 over the probe sample
 
-uint64_t mix(uint64_t* s) {
-    uint64_t x = (*s += 0x9e3779b97f4a7c15ull);
-    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
-    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
-    return x ^ (x >> 31);
-}
+uint64_t mix(uint64_t* s) { return device_check::splitmix64(s); }
 
-double unit(uint64_t* s) { return static_cast<double>(mix(s) >> 11) * (1.0 / 9007199254740992.0); }
+double unit(uint64_t* s) { return device_check::urand(s); }
 
 bool has(const std::string& s, const char* needle) { return s.find(needle) != std::string::npos; }
+
+int64_t numel(const std::vector<int64_t>& shape) {
+    int64_t n = 1;
+    for (int64_t d : shape) n *= d;
+    return n;
+}
 
 AdValue value_of(const Operand& o) {
     AdValue v;
     v.dtype = o.dtype;
     v.shape = o.shape;
-    int64_t n = 1;
-    for (int64_t d : o.shape) n *= d;
-    v.value.assign(static_cast<std::size_t>(n), 0.0);
+    v.value.assign(static_cast<std::size_t>(numel(o.shape)), 0.0);
     return v;
-}
-
-struct Case {
-    std::vector<AdValue> fwd;  // the full schema; the written operands are zero
-    std::vector<AdValue> cot;  // one per written operand, in schema order
-};
-
-Case make_case(const OpRecord& rec, uint64_t seed) {
-    Case c;
-    for (const Operand& o : rec.operands) {
-        AdValue v = value_of(o);
-        if (o.written) {
-            AdValue d = v;
-            for (double& x : d.value) x = 2.0 * unit(&seed) - 1.0;
-            c.cot.push_back(std::move(d));
-        } else {
-            for (double& x : v.value) {
-                const uint64_t r = mix(&seed);
-                if (o.dtype == "i8" || o.dtype == "u8") {
-                    x = static_cast<double>(static_cast<int>(r % 9) - 4);
-                } else if (has(o.buffer, "scale")) {
-                    x = (static_cast<double>((r >> 16) % 16) + 1.0) / 256.0;  // power of two: exact
-                } else if (o.dtype == "bf16") {
-                    x = (static_cast<double>(static_cast<int>(r % 257) - 128)) / 128.0;
-                } else {
-                    x = 2.0 * unit(&seed) - 1.0;
-                }
-            }
-        }
-        c.fwd.push_back(std::move(v));
-    }
-    return c;
 }
 
 OpRecord gemm_nt_q_rec(int64_t M, int64_t N, int64_t K) {
@@ -126,27 +93,63 @@ int operand_pos(const OpRecord& rec, const char* name) {
     return -1;
 }
 
-AdjointFn side_of(Side side, const OpRecord& rec) {
-    std::string why;
-    AdjointFn fn = adjoint_find(rec.op, side, rec.params, &why);
-    if (fn == nullptr)
-        throw std::runtime_error((side == Side::device ? "device" : "host") + std::string(" adjoint of ")
-                                 + rec.op + ": " + why);
-    return fn;
+// A case the kernel was written for: int8 codes as integers, bf16 values exact in bf16, scales
+// powers of two, and a uniform cotangent at the linear's output.
+device_check::Case linear_case(const OpRecord& rec, uint64_t seed, std::string label) {
+    device_check::Case c;
+    c.rec = rec;
+    c.label = std::move(label);
+    for (const Operand& o : rec.operands) {
+        if (o.written) continue;
+        AdValue v = value_of(o);
+        for (double& x : v.value) {
+            const uint64_t r = mix(&seed);
+            if (o.dtype == "i8") {
+                x = static_cast<double>(static_cast<int>(r % 9) - 4);
+            } else if (o.dtype == "bf16") {
+                x = static_cast<double>(static_cast<int>(r % 257) - 128) / 128.0;  // exact in bf16
+            } else if (has(o.buffer, "scale")) {
+                x = (static_cast<double>((r >> 16) % 16) + 1.0) / 256.0;  // power of two: exact
+            } else {
+                x = 2.0 * unit(&seed) - 1.0;
+            }
+        }
+        c.in.push_back(std::move(v));
+    }
+    for (const Operand& o : rec.operands) {
+        if (!o.written) continue;
+        AdValue d = value_of(o);
+        for (double& x : d.value) x = 2.0 * unit(&seed) - 1.0;
+        c.cot.push_back(std::move(d));
+    }
+    return c;
 }
 
-// One adjoint call. `fwd` and `dc` span the full schema -- the writes' slots of dc stay empty, the
-// read operands' zeroed -- as the host checker hands them over.
-std::vector<AdValue> run(AdjointFn fn, const OpRecord& rec, const Case& c) {
-    std::vector<AdValue> dc(rec.operands.size());
-    for (std::size_t i = 0; i < rec.operands.size(); ++i) {
-        if (rec.operands[i].written) continue;
-        dc[i] = c.fwd[i];
-        dc[i].value.assign(dc[i].value.size(), 0.0);
+// One call over a case without the forward twin: the reads come from the case, the writes are
+// zeroed slots at the schema positions the kernel expects. The model's shapes cannot afford the
+// twin, whose f64 GEMM is the better part of an hour at the widest linear.
+AdjointCall build_call(const device_check::Case& c, std::vector<AdValue>* fwd, std::vector<AdValue>* dc) {
+    fwd->clear();
+    std::size_t read = 0;
+    for (const Operand& o : c.rec.operands) {
+        if (o.written) {
+            fwd->push_back(value_of(o));
+        } else {
+            fwd->push_back(c.in.at(read++));
+        }
     }
-    AdjointCall call{rec, c.fwd, c.cot, &dc, nullptr, ""};
-    fn(call);
-    return dc;
+    dc->clear();
+    for (const Operand& o : c.rec.operands) dc->push_back(value_of(o));
+    return AdjointCall{c.rec, *fwd, c.cot, dc, nullptr, ""};
+}
+
+AdjointFn device_row(const OpRecord& rec) {
+    std::string why;
+    AdjointFn fn = adjoint_find(rec.op, Side::device, rec.params, &why);
+    if (fn == nullptr)
+        throw std::runtime_error("device adjoint of " + rec.op + ": " + why +
+                                 " (is the plugin loaded?)");
+    return fn;
 }
 
 double rel_l2(const std::vector<double>& dev, const std::vector<double>& ref) {
@@ -159,43 +162,38 @@ double rel_l2(const std::vector<double>& dev, const std::vector<double>& ref) {
     return std::sqrt(num / den);
 }
 
-// dx[m,k] = sum_n dy[m,n] * b[n,k] * s[n, k/128], the f64 sum the host adjoint forms.
-double probe_ref(const OpRecord& rec, const Case& c, int64_t m, int64_t k) {
-    const int ia = operand_pos(rec, "a");
-    const int ib = operand_pos(rec, "b");
-    const int ibs = operand_pos(rec, "b_scale");
-    const int64_t K = c.fwd[static_cast<std::size_t>(ia)].shape[1];
-    const int64_t N = c.fwd[static_cast<std::size_t>(ib)].shape[0];
-    const std::vector<double>& dy = c.cot.front().value;
-    const std::vector<double>& b = c.fwd[static_cast<std::size_t>(ib)].value;
-    const std::vector<double>* s = ibs >= 0 ? &c.fwd[static_cast<std::size_t>(ibs)].value : nullptr;
-    const int64_t groups = K / 128;
+// dx[m,k] = sum_n dy[m,n] * W[n,k], W the codes times their per-block scale (`gemm_nt_q`) or the
+// bf16 weight as it stands: the f64 sum the host adjoint forms, for one element.
+double probe_ref(const AdjointCall& call, int64_t m, int64_t k) {
+    const int ia = operand_pos(call.rec, "a");
+    const int ib = operand_pos(call.rec, "b");
+    const int ibs = operand_pos(call.rec, "b_scale");
+    const int64_t K = call.fwd[static_cast<std::size_t>(ia)].shape[1];
+    const int64_t N = call.fwd[static_cast<std::size_t>(ib)].shape[0];
+    const int64_t group = K / 128 > 0 ? 128 : K;
+    const int64_t groups = (K + group - 1) / group;
+    const std::vector<double>& dy = call.cot.front().value;
+    const std::vector<double>& b = call.fwd[static_cast<std::size_t>(ib)].value;
+    const std::vector<double>* s =
+        ibs >= 0 ? &call.fwd[static_cast<std::size_t>(ibs)].value : nullptr;
+    const int64_t g = group > 0 ? k / group : 0;
     double acc = 0.0;
     for (int64_t n = 0; n < N; ++n)
-        acc += dy[static_cast<std::size_t>(m * N + n)] * b[static_cast<std::size_t>(n * K + k)] *
-               (s != nullptr ? (*s)[static_cast<std::size_t>(n * groups + k / 128)] : 1.0);
+        acc += dy[static_cast<std::size_t>(m * N + n)] *
+               b[static_cast<std::size_t>(n * K + k)] *
+               (s != nullptr ? (*s)[static_cast<std::size_t>(n * groups + g)] : 1.0);
     return acc;
 }
 
-// The device row and the host row on one record: the whole of dx, and the frozen positions.
-double agree_fully(const OpRecord& rec, uint64_t seed) {
-    const Case c = make_case(rec, seed);
-    const int ia = operand_pos(rec, "a");
-    const std::vector<AdValue> dev = run(side_of(Side::device, rec), rec, c);
-    const std::vector<AdValue> host = run(side_of(Side::host, rec), rec, c);
-    R97_CHECK(adjoint_frozen(rec.op, Side::device, rec.params) ==
-              adjoint_frozen(rec.op, Side::host, rec.params));
-    return rel_l2(dev[static_cast<std::size_t>(ia)].value, host[static_cast<std::size_t>(ia)].value);
-}
-
-// The same question over a spread sample of (m,k) instead of every column.
-double agree_on_probes(const OpRecord& rec, uint64_t seed, int probes) {
-    const Case c = make_case(rec, seed);
-    const int ia = operand_pos(rec, "a");
-    const std::vector<AdValue> dev = run(side_of(Side::device, rec), rec, c);
-    const std::vector<double>& dx = dev[static_cast<std::size_t>(ia)].value;
-    const int64_t K = c.fwd[static_cast<std::size_t>(ia)].shape[1];
-    const int64_t M = c.fwd[static_cast<std::size_t>(ia)].shape[0];
+// The device row on a spread sample of (m,k) against probe_ref.
+double agree_on_probes(const device_check::Case& c, uint64_t seed, int probes) {
+    std::vector<AdValue> fwd, dc;
+    AdjointCall call = build_call(c, &fwd, &dc);
+    device_row(c.rec)(call);
+    const int ia = operand_pos(c.rec, "a");
+    const std::vector<double>& dx = dc[static_cast<std::size_t>(ia)].value;
+    const int64_t K = c.in[static_cast<std::size_t>(ia)].shape[1];
+    const int64_t M = c.in[static_cast<std::size_t>(ia)].shape[0];
     std::vector<double> got, want;
     got.reserve(static_cast<std::size_t>(probes));
     want.reserve(static_cast<std::size_t>(probes));
@@ -204,7 +202,7 @@ double agree_on_probes(const OpRecord& rec, uint64_t seed, int probes) {
         const int64_t m = static_cast<int64_t>(r % static_cast<uint64_t>(M));
         const int64_t k = static_cast<int64_t>((r >> 32) % static_cast<uint64_t>(K));
         got.push_back(dx[static_cast<std::size_t>(m * K + k)]);
-        want.push_back(probe_ref(rec, c, m, k));
+        want.push_back(probe_ref(call, m, k));
     }
     return rel_l2(got, want);
 }
@@ -218,46 +216,78 @@ void report(const char* what, const OpRecord& rec, double rel) {
     std::fflush(stdout);
 }
 
-// One measured call: prints the staging and kernel milliseconds and the scratch the call held.
-void measure(const char* what, const OpRecord& rec, uint64_t seed) {
-    const Case c = make_case(rec, seed);
-    const AdjointFn fn = side_of(Side::device, rec);
-    run(fn, rec, c);  // the first launch loads the code object; measure the second
-    const std::vector<AdValue> dc = run(fn, rec, c);
-    const DeviceAdjointStats s = device_adjoint_stats();
-    const int ia = operand_pos(rec, "a");
-    const int64_t M = c.fwd[static_cast<std::size_t>(ia)].shape[0];
-    const int64_t N = c.cot.front().shape[1];
-    const int64_t K = c.fwd[static_cast<std::size_t>(ia)].shape[1];
-    const double flops = 2.0 * static_cast<double>(M) * static_cast<double>(N) * static_cast<double>(K);
-    const double tflops = s.kernel_ms > 0.0 ? flops / (s.kernel_ms * 1e9) : 0.0;
-    std::printf("%-22s %-10s M=%5lld N=%6lld K=%6lld  staging %8.3f ms  kernel %8.3f ms  %6.1f "
-                "TFLOP/s  scratch %4lld MiB\n",
-                what, rec.op.c_str(), static_cast<long long>(M), static_cast<long long>(N),
-                static_cast<long long>(K), s.staging_ms, s.kernel_ms, tflops,
-                static_cast<long long>(s.scratch_bytes >> 20));
+// The whole of dx and every frozen position against the host row, through the harness.
+void agree_whole(const device_check::Case& c) {
+    const device_check::Report r = device_check::check(c);
+    device_check::require(r);
+    R97_CHECK(r.scratch_peak > 0);
+    std::printf("%-34s device == host whole, scratch peak %lld KiB\n", c.label.c_str(),
+                static_cast<long long>(r.scratch_peak / 1024));
     std::fflush(stdout);
-    R97_CHECK(!dc[static_cast<std::size_t>(ia)].value.empty());
+    if (r97test::bench()) device_check::print_bench(c, 20);
 }
 
-// The guard: the card from R97_DEVICE, locked for the test's lifetime, with the VRAM the largest
-// call below holds at once (dy and the codes staged, dx, and a little room).
-r97test::GuardOptions guard_options() {
-    r97test::GuardOptions o;
-    const char* env = std::getenv("R97_DEVICE");
-    o.device = r97test::parse_device(env != nullptr ? env : "0");
-    o.bdf = r97test::hip_bdf(o.device);
-    o.need_vram = int64_t(2) << 30;
-    return o;
+struct Timing {
+    double adjoint_ms = 0.0;
+    double forward_ms = 0.0;
+    int64_t scratch_peak = 0;
+};
+
+// The harness's measurement, with the forward twin called once instead of reps+1 times: at the
+// widest real shape one f64 twin call is over twenty minutes, and the twin is a scalar loop whose
+// rate does not depend on a warm cache.
+Timing time_call(const device_check::Case& c, int reps) {
+    const AdjointFn row = device_row(c.rec);
+    const TwinFn twin = twin_find(c.rec.op, c.rec.params, nullptr);
+    if (!twin) throw std::runtime_error("no twin for op '" + c.rec.op + "'");
+
+    std::vector<AdValue> fwd, dc;
+    AdjointCall call = build_call(c, &fwd, &dc);
+    device::scratch_reset();
+    row(call);  // warm-up: the first launch is where the kernel's module is finalized
+    auto zero_dc = [&dc] {
+        for (AdValue& v : dc) std::fill(v.value.begin(), v.value.end(), 0.0);
+    };
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < reps; ++i) {
+        zero_dc();
+        row(call);
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+
+    Timing t;
+    t.adjoint_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / reps;
+    t.scratch_peak = device::scratch_stats().peak_bytes;
+
+    std::vector<AdValue> out;
+    const auto t2 = std::chrono::steady_clock::now();
+    twin(c.rec, c.in, &out);
+    const auto t3 = std::chrono::steady_clock::now();
+    t.forward_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+    return t;
 }
+
+void measure(const device_check::Case& c, int reps) {
+    const Timing t = time_call(c, reps);
+    const double ratio = t.forward_ms > 0.0 ? t.adjoint_ms / t.forward_ms : 0.0;
+    std::printf("%-28s %8.3f ms adjoint  %8.3f ms forward twin  %6.2fx forward  "
+                "scratch peak %lld KiB\n",
+                (c.rec.op + " " + c.label).c_str(), t.adjoint_ms, t.forward_ms, ratio,
+                static_cast<long long>(t.scratch_peak / 1024));
+    std::fflush(stdout);
+    R97_CHECK(t.adjoint_ms > 0.0);
+}
+
+// The card from R97_DEVICE, locked for the test's lifetime, with the VRAM the largest call below
+// holds at once (dy and the codes staged, dx, and room for the code object).
+r97test::GuardOptions guard_options() { return device_check::guard_options(int64_t(2) << 30); }
 
 }  // namespace
 
 R97_TEST(adjoint_linear_device_rows) {
-    // What the family registers, reachable without a card: the two ops on Side::device, the same
-    // frozen positions as their host rows, and the int8 predicate that keeps the kernel to the
-    // 128-wide scale grid it serves. A missing row is the failure the loader would see; the card is
-    // a separate question, asked below.
+    // What the family registers: the two ops on Side::device, the same frozen positions as their
+    // host rows, and the int8 predicate that keeps the kernel to the 128-wide scale grid it serves.
+    (void)device_check::load_plugin();
     for (const OpRecord& rec : {gemm_nt_q_rec(4, 256, 128), gemm_nt_rec(4, 256, 128)}) {
         const std::vector<int> dev = adjoint_frozen(rec.op, Side::device, rec.params);
         const std::vector<int> host = adjoint_frozen(rec.op, Side::host, rec.params);
@@ -276,20 +306,29 @@ R97_TEST(adjoint_linear_device_rows) {
 R97_TEST(adjoint_linear_device_agrees) {
     const r97test::GuardOptions o = guard_options();
     const r97test::DeviceGuard guard(o);
-    r97::device_adjoint_set_device(o.device);
+    (void)device_check::load_plugin();
+    device_check::require_device(o.device);
     std::printf("adjoint_linear: card %s\n", guard.card().c_str());
 
-    // The tiny fixture's shapes, whole: the MLP and vocabulary widths of tests/host/adjoint_linear.cpp,
-    // the fixture's eight-channel delta-net projection (padded to sixteen on the card) and its
-    // ssm_out width.
+    // The tiny fixture's shapes, whole: the fixture's MLP and vocabulary widths, its eight-channel
+    // delta-net projection (padded to sixteen on the card) and its ssm_out width.
     for (const OpRecord& rec : {gemm_nt_q_rec(4, 256, 128), gemm_nt_q_rec(1, 128, 256),
                                 gemm_nt_q_rec(7, 320, 384), gemm_nt_q_rec(3, 8, 128),
                                 gemm_nt_rec(4, 256, 128), gemm_nt_rec(1, 128, 256),
                                 gemm_nt_rec(7, 320, 384), gemm_nt_rec(3, 8, 128),
                                 gemm_nt_rec(2, 128, 64)}) {
-        const double rel = agree_fully(rec, 0x2000 + rec.operands.size());
-        report("agrees (whole)", rec, rel);
-        R97_CHECK(rel <= bf16_tol);
+        const int64_t M = *std::get_if<int64_t>(&rec.params[0].second);
+        const int64_t N = *std::get_if<int64_t>(&rec.params[1].second);
+        const int64_t K = *std::get_if<int64_t>(&rec.params[2].second);
+        agree_whole(linear_case(rec, 0x2000 + static_cast<uint64_t>(N), rec.op + " fixture " +
+                                                                         std::to_string(M) + "x" +
+                                                                         std::to_string(N) + "x" +
+                                                                         std::to_string(K)));
+    }
+
+    // The real model's hidden width with few rows, whole: five scale blocks of K, both ops.
+    for (const OpRecord& rec : {gemm_nt_q_rec(16, 5120, 5120), gemm_nt_rec(16, 5120, 5120)}) {
+        agree_whole(linear_case(rec, 0x2100, rec.op + " hidden width 16x5120x5120 whole"));
     }
 
     // The real model's linears at one sequence's worth of tokens, on probes: the hidden width, the
@@ -313,30 +352,60 @@ R97_TEST(adjoint_linear_device_agrees) {
         {"attn_k/v batch", gemm_nt_q_rec(4023, 1024, 5120)},
     };
     for (const Real& r : real) {
-        const double rel = agree_on_probes(r.rec, 0x3000, 512);
+        const double rel = agree_on_probes(linear_case(r.rec, 0x3000, r.name), 0x3001, 512);
         report(r.name, r.rec, rel);
         R97_CHECK(rel <= bf16_tol);
     }
 }
 
+R97_TEST(adjoint_linear_device_teeth) {
+    // The comparison has teeth: a device kernel that leaves the weight's contribution out of one
+    // row of dx is a kernel this harness has to reject.
+    const r97test::GuardOptions o = guard_options();
+    const r97test::DeviceGuard guard(o);
+    (void)device_check::load_plugin();
+    device_check::require_device(o.device);
+
+    const device_check::Case c = linear_case(gemm_nt_q_rec(4, 256, 128), 0x5000, "fixture, one row dropped");
+    const device_check::Report wrong = device_check::check(c, [](const AdjointCall& call) {
+        const AdjointFn right = device_row(call.rec);
+        right(call);
+        AdValue& dx = call.dc->at(static_cast<std::size_t>(operand_pos(call.rec, "a")));
+        std::fill(dx.value.begin(), dx.value.begin() + static_cast<std::ptrdiff_t>(dx.shape[1]), 0.0);
+    });
+    R97_CHECK(!wrong.ok);
+    R97_CHECK(wrong.first_slot == operand_pos(c.rec, "a"));
+    std::printf("rejected the kernel that dropped one row: %s\n", wrong.note.c_str());
+    std::fflush(stdout);
+}
+
 R97_TEST(adjoint_linear_device_measures) {
     const r97test::GuardOptions o = guard_options();
     const r97test::DeviceGuard guard(o);
-    r97::device_adjoint_set_device(o.device);
-    std::printf("adjoint_linear: card %s, one call per shape, staging (conversion and transfer) and "
-                "kernel separately\n", guard.card().c_str());
+    (void)device_check::load_plugin();
+    device_check::require_device(o.device);
+    if (!r97test::bench()) {
+        std::printf("adjoint_linear: measurement skipped without --bench (the forward twin is "
+                    "minutes a call at these shapes)\n");
+        return;
+    }
+    std::printf("adjoint_linear: card %s, one call per shape, the whole call (upload, kernel, "
+                "download)\n", guard.card().c_str());
 
     // Every linear of one transformer block at 1024 and at 4096 tokens, plus a packed batch of
     // three sequences of unequal length (317 + 1009 + 2697 = 4023 rows), which is what a step's
-    // token count looks like.
-    measure("attn_k/v", gemm_nt_q_rec(4096, 1024, 5120), 0x4001);
-    measure("attn_output", gemm_nt_q_rec(4096, 5120, 6144), 0x4002);
-    measure("attn_qg", gemm_nt_q_rec(1024, 12288, 5120), 0x4003);
-    measure("attn_qg", gemm_nt_q_rec(4096, 12288, 5120), 0x4004);
-    measure("ssm_inz", gemm_nt_q_rec(4096, 16384, 5120), 0x4005);
-    measure("ffn_down", gemm_nt_q_rec(4096, 5120, 17408), 0x4006);
-    measure("ffn_gate_up", gemm_nt_q_rec(1024, 34816, 5120), 0x4007);
-    measure("ffn_gate_up", gemm_nt_q_rec(4096, 34816, 5120), 0x4008);
-    measure("ffn_gate_up batch", gemm_nt_q_rec(4023, 34816, 5120), 0x4009);
-    measure("ssm_out bf16", gemm_nt_rec(4096, 5120, 6144), 0x400a);
+    // token count looks like. The attention linear runs at 1024 rows for its 12288-wide form
+    // (where the projection's own width dominates) and at 4096 for the others.
+    measure(linear_case(gemm_nt_q_rec(1024, 1024, 5120), 0x4001, "1024 tok, k/v"), 3);
+    measure(linear_case(gemm_nt_q_rec(4096, 1024, 5120), 0x4002, "4096 tok, k/v"), 3);
+    measure(linear_case(gemm_nt_q_rec(4096, 5120, 6144), 0x4003, "4096 tok, attn output"), 3);
+    measure(linear_case(gemm_nt_q_rec(1024, 12288, 5120), 0x4004, "1024 tok, q/g"), 3);
+    measure(linear_case(gemm_nt_q_rec(4096, 12288, 5120), 0x4005, "4096 tok, q/g"), 3);
+    measure(linear_case(gemm_nt_q_rec(4096, 16384, 5120), 0x4006, "4096 tok, ssm in/z"), 3);
+    measure(linear_case(gemm_nt_q_rec(4096, 5120, 17408), 0x4007, "4096 tok, ffn down"), 3);
+    measure(linear_case(gemm_nt_q_rec(1024, 34816, 5120), 0x4008, "1024 tok, ffn gate/up"), 3);
+    measure(linear_case(gemm_nt_q_rec(4096, 34816, 5120), 0x4009, "4096 tok, ffn gate/up"), 3);
+    measure(linear_case(gemm_nt_q_rec(4023, 34816, 5120), 0x400a, "batch 317+1009+2697, ffn gate/up"),
+            3);
+    measure(linear_case(gemm_nt_rec(4096, 5120, 6144), 0x400b, "4096 tok, ssm out bf16"), 3);
 }
