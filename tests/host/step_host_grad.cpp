@@ -20,13 +20,20 @@
 // agreement as the rounded forward can show, and the figures printed per module and per direction
 // say how much that is. `docs/STEPS-HOST.md` records them.
 //
-// The oracle comparison lives in step_host_oracle.cpp; this file does not read the reference.
+// The last case separates the gradient from the difference that measures it: beside the join it
+// runs the f64 reference step -- `make_reference_step`, the twins over the same recorded graph --
+// on the same Model, adapter and batch, so that the issue's 1e-3 is asked of a forward that can
+// answer it and the secant the bf16 trunk leaves behind is measured at the same step sizes instead
+// of assumed.
+//
+// The oracle comparison lives in step_host_oracle.cpp; this file does not read the reference file.
 #include "r97/adapter_io.h"
 #include "r97/batch.h"
 #include "r97/config.h"
 #include "r97/forward.h"
 #include "r97/live_adapter.h"
 #include "r97/model.h"
+#include "r97/reference_step.h"
 #include "r97/step_host.h"
 #include "support/fixture.h"
 #include "support/late_fixture.h"
@@ -71,6 +78,12 @@ constexpr int kStepCoarse = 32;         // 32 * 2^-11, the coarse one the pair e
 // the part a pair of steps cannot see (the secants' own truncation).
 constexpr double kSigmas = 3.0;
 constexpr double kSlack = 0.05;
+// How far the join's gradient may sit from the exact step's. The only thing between the two is the
+// fixture's bf16 trunk: the oracle case measures that forward's own agreement per boundary and its
+// worst cotangent is 0.58 of itself (cosine 0.812), so a direction that mixes fifty tensors is held
+// to 0.75 -- wide enough for the forward, and far too narrow for a gradient that is wrong in the
+// join rather than in the forward (a factor of two is 1.0).
+constexpr double kBf16Gradient = 0.75;
 
 r97::Batch batch_of(const std::vector<std::vector<int32_t>>& sequences) {
     r97::Batch batch;
@@ -169,6 +182,16 @@ double dot(const Direction& dir, const r97::ParamSet& params, const r97::ParamSe
 
 r97::ParamSet perturb(const r97::ParamSet& params, const Direction& dir, int units) {
     const double h = std::ldexp(1.0, -kGridShift) * double(units);
+    r97::ParamSet out = params;
+    for (size_t i = 0; i < out.size(); ++i)
+        for (size_t j = 0; j < out[i].value.size(); ++j)
+            out[i].value[j] = float(double(params[i].value[j]) + h * double(dir[i][j]));
+    return out;
+}
+
+// The same step with a free size, for the reference step: its arithmetic is f64 and its parameters
+// are f32, so h = 2^-17 is an exact point below the bf16 grid the driver's steps have to use.
+r97::ParamSet shift(const r97::ParamSet& params, const Direction& dir, double h) {
     r97::ParamSet out = params;
     for (size_t i = 0; i < out.size(); ++i)
         for (size_t j = 0; j < out[i].value.size(); ++j)
@@ -631,6 +654,138 @@ R97_TEST(host_step_memory_does_not_grow_with_layers) {
     // The one part that does grow with the number of layers, and exactly so.
     R97_CHECK(report.residual_store_bytes ==
               (report.layers + 1) * report.tokens * report.hidden * 2);
+}
+
+// The issue's finite-difference acceptance, asked of the forward that can answer it, and the
+// secant the bf16 trunk leaves, measured at the same step sizes.
+//
+// The ten-direction case above differences the driver's own loss, and that loss is rounded: a step
+// small enough to be a derivative is a step the rounded loss cannot see. This case runs the f64
+// reference step beside the join on the same Model, adapter and batch, so that three numbers
+// separate the join's gradient from the instrument that measures it:
+//
+//   * the exact step's gradient against its own central difference at h = 2^-17: below the bf16
+//     grid's ulp at every adapter value and far above f32's, with a truncation below 1e-8 of the
+//     difference. The issue's 1e-3, held.
+//   * both steps' central differences at h = 16 * 2^-11 and 32 * 2^-11, the steps the ten-direction
+//     case takes: the secant's own bias on this fixture, measured rather than assumed.
+//   * the join's gradient against the exact step's: the bf16 forward's rounding is the whole of
+//     what may move that, and it is the only part of the difference this join answers for.
+//
+// The direction seeds are the ten-direction case's, so trial 6 here is trial 6 there.
+// `docs/STEPS-HOST.md` records the figures and what they settle.
+R97_TEST(host_step_gradient_against_the_exact_step_at_the_same_steps) {
+#if !R97_FIXTURE_PREFILL
+    return;  // the reference step traces the graph live, which the training patch provides
+#else
+    const std::string container = r97test::late_container();
+    const r97::Batch batch = batch_of({prompt(21, 20), prompt(13, 12)});
+    const r97::Config cfg = lora_config(container);
+    const r97::Model model = r97::make_model(cfg);
+    const r97::ModelMeta meta = r97::read_model_meta(container);
+    r97::ParamSet params = model.delta->init(meta, cfg.delta, 4321);
+    pin_to_grid(&params, 0x9e3779b97f4a7c15ULL);
+
+    std::unique_ptr<r97::ForwardDriver> driver = open_forward(container);
+    r97::HostStepReport report;
+    const r97::StepFn step = r97::host_step(*driver, model, {}, &report);
+    r97::ParamSet grads;
+    const double scored = double(step(batch, params, &grads).scored);
+
+    // The same Model, the same adapter, the same batch, and no card: the f64 twins over the op
+    // graph the driver records.
+    r97::ReferenceStepOptions opts;
+    opts.container = container;
+    opts.radiance_home = r97test::late_paths().home;
+    opts.kernels = {"libavx", "libref"};
+    const r97::StepFn exact = r97::make_reference_step(model, opts);
+    r97::ParamSet exact_grads;
+    const double exact_scored = double(exact(batch, params, &exact_grads).scored);
+    // One batch, so one count for the seed both gradients belong to.
+    R97_CHECK(exact_scored == scored);
+
+    const auto secant = [&](const r97::StepFn& fn, const Direction& dir, double h) {
+        const double plus = fn(batch, shift(params, dir, h), nullptr).loss;
+        const double minus = fn(batch, shift(params, dir, -h), nullptr).loss;
+        return (plus - minus) / (2.0 * h * scored);
+    };
+    const auto grid = [](int units) { return std::ldexp(1.0, -kGridShift) * double(units); };
+    const double tiny = std::ldexp(1.0, -17);
+    const double fine_h = grid(kStepFine);
+    const double coarse_h = grid(kStepCoarse);
+
+    std::printf("  host exact: exact step's own difference at h = 2^-17 (%.6g); both steps' at"
+                " %d*2^-11 (%.6g) and %d*2^-11 (%.6g); %d scored tokens\n",
+                tiny, kStepFine, fine_h, kStepCoarse, coarse_h, int(scored));
+    double exact_worst = 0.0;
+    double join_worst = 0.0;
+    double sum_exact_g = 0.0, sum_exact_fd = 0.0, sum_join_g = 0.0, sum_join_fd = 0.0;
+    for (int trial = 0; trial < 10; ++trial) {
+        uint64_t st = 0x2545f4914f6cdd1dULL + 0x9e3779b97f4a7c15ULL * uint64_t(trial);
+        const Direction dir = whole_adapter_direction(params, &st);
+
+        const double g_exact = dot(dir, params, exact_grads);
+        const double g_join = dot(dir, params, grads);
+        const double exact_tiny = secant(exact, dir, tiny);
+        const double exact_fine = secant(exact, dir, fine_h);
+        const double exact_coarse = secant(exact, dir, coarse_h);
+        const double join_tiny = secant(step, dir, tiny);
+        const double join_fine = secant(step, dir, fine_h);
+        const double join_coarse = secant(step, dir, coarse_h);
+
+        // Relative to the gradient the exact step reports, so that a direction whose derivative is
+        // near zero cannot turn an absolute difference into an unbounded relative one.
+        const double scale = std::fabs(g_exact) + 1e-9;
+        const double exact_error = std::fabs(exact_tiny - g_exact) / scale;
+        const double exact_bias = std::fabs(exact_fine - g_exact) / scale;
+        const double join_gap = std::fabs(g_join - g_exact) / scale;
+        std::printf("  host exact: %2d exact g %11.6g fd(2^-17) %11.6g fd16 %11.6g fd32 %11.6g"
+                    " | join g %11.6g fd16 %11.6g fd32 %11.6g fd(2^-17) %11.6g | secant bias"
+                    " %7.3g gap %7.3g\n",
+                    trial, g_exact, exact_tiny, exact_fine, exact_coarse, g_join, join_fine,
+                    join_coarse, join_tiny, exact_bias, join_gap);
+
+        // The issue's acceptance, held on the step whose arithmetic is f64 and at a step that is a
+        // derivative there.
+        if (!(exact_error <= 1e-3))
+            throw std::runtime_error(
+                "host exact: direction " + std::to_string(trial) +
+                "'s exact gradient differs from the exact step's own central difference at"
+                " h = 2^-17 by " + std::to_string(exact_error) +
+                " relative, which the issue's 1e-3 forbids");
+        // The join against the exact step: the bf16 forward is the whole of what may move it.
+        if (!(join_gap <= kBf16Gradient))
+            throw std::runtime_error(
+                "host exact: direction " + std::to_string(trial) +
+                "'s gradient differs from the exact step's by " + std::to_string(join_gap) +
+                " relative, more than the " + std::to_string(kBf16Gradient) +
+                " the fixture's bf16 forward accounts for");
+        // Below one bf16 quantum of the adapter the trunk's loss does not move at all: this is the
+        // floor every difference of the driver's loss has to climb over, and it is why the step
+        // the ten-direction case takes is a secant and not a derivative.
+        if (!(std::fabs(join_tiny) <= 0.25 * std::fabs(g_join)))
+            throw std::runtime_error(
+                "host exact: direction " + std::to_string(trial) + "'s loss moves by " +
+                std::to_string(join_tiny) +
+                " under a step of 2^-17, so the adapter is not reaching the trunk on the bf16 grid"
+                " this file's steps assume");
+
+        exact_worst = std::max(exact_worst, exact_error);
+        join_worst = std::max(join_worst, join_gap);
+        sum_exact_g += g_exact;
+        sum_exact_fd += exact_fine;
+        sum_join_g += g_join;
+        sum_join_fd += join_fine;
+    }
+    R97_CHECK(exact_worst <= 1e-3);
+    R97_CHECK(join_worst <= kBf16Gradient);
+    // The ten directions' sum, which averages the per-direction noise both steps carry.
+    std::printf("  host exact: ten directions: exact gradient %11.6g, the same step's secant at"
+                " %g %11.6g; join gradient %11.6g, its secant at the same h %11.6g; worst exact"
+                " error %.3g, worst join gap %.3g\n",
+                sum_exact_g, fine_h, sum_exact_fd, sum_join_g, sum_join_fd, exact_worst,
+                join_worst);
+#endif
 }
 
 #endif  // R97_FORWARD
