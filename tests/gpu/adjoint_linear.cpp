@@ -39,16 +39,6 @@ using namespace r97;
 
 namespace {
 
-// The registry's table is a function-local static, so whichever translation unit touches it first
-// constructs it, and its destructor is registered at that moment -- which has to be before the
-// exit-time test runner arms, or the table is gone by the time a test reads it. A test file that
-// carries its own registrations gets that for free (tests/host/adjoint_registry.cpp); this one only
-// reads rows the library registers, and the library's objects initialise after the test objects on
-// the link line, so it asks for the table itself, here, before its first R97_TEST below.
-struct Ask_for_the_table {
-    Ask_for_the_table() { (void)ops_registered(); }
-} ask_for_the_table;
-
 const double bf16_tol = 1e-2;
 
 uint64_t mix(uint64_t* s) {
