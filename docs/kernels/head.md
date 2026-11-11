@@ -97,15 +97,14 @@ are about 1.99 GB of traffic and 497 million `exp` evaluations, two per element.
 `card2`), `./build/r97_gpu_tests --bench`:
 
 ```
-head ce: 96.575 ms per 1000 positions, the best of 7 passes of 256 rows of 248320 at chunk 64,
-  one upload a pass (the slowest read 106.094); loss 3215.06; one chunk's scratch peak 62080 KiB
+head ce: 96.575 ms per 1000 positions, the best of 7 passes of 256 rows of 248320 at chunk 64, one upload a pass (the slowest read 106.094); loss 3215.06; one chunk's scratch peak 62080 KiB
 ```
 
 The bench walks 256 positions of the real width through the loop -- four chunks of 64 -- with one
 upload of the chunk's logits a pass and the pass that warms the scratch not counted, so the line
 is this side of the join: the kernel and the losses coming back, and not the head product. The
 machine is shared, and the seven passes are one card's own state: 96.6 to 106.1 ms. With another
-run on this card at the same time the same passes read 280 to 340 ms, which is why the bench takes
+run on this card at the same time the same passes read 132 to 340 ms, which is why the bench takes
 the best of them.
 
 96.6 ms per 1000 positions is 21 GB/s of the 1.99 GB above, where this card streams 514 to 562 GB/s
