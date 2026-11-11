@@ -43,8 +43,11 @@ prefill of one sequence is 48 -- and two passes over that block's chunks.
 1. **Replay.** The block re-runs the forward's state carry from `h0`, one chunk at a time, and
    writes each chunk's *entering* state into its own f32 scratch at `[chunk, K, V]`. The reverse
    pass reads those instead of recomputing a state per chunk, and the caller's forward saves
-   nothing: no interior state crosses the op's boundary. The replay also keeps each chunk's `W`
-   and `V'` in scratch, the two intermediates stages 3 and 4 differentiate.
+   nothing: no interior state crosses the op's boundary. The states are all the replay keeps: the
+   chunk's `W` and `V'`, the two intermediates stages 3 and 4 differentiate, are built in the
+   block's single pair of planes and dropped with the chunk, and the reverse walk rebuilds them as
+   it reaches each chunk. One pair per chunk would be 4 MiB a head -- the replay's own size again,
+   192 MiB more over the 48 heads.
 2. **The reverse walk.** For each chunk from the last to the first the block runs the host's four
    stages -- from the state cotangent (stage 1), from `o`'s cotangent (stage 2), from `V' = A W`
    (stage 3), from `W` (stage 4) -- and carries the state cotangent into the previous chunk.
@@ -93,8 +96,17 @@ At `T = 4096`, `chunk = 64` (64 chunks), `Hg = 16`, `H = 48`, `K = V = 128`, one
 | what | per value head | over the 48 heads |
 |------|----------------|-------------------|
 | the replay's entering states (`[64, 128, 128]` f32) | 4,194,304 B (4 MiB) | 201,326,592 B (192 MiB) |
-| the block's working set (`St1`, `dS0`, `W`, `V'`, the `[L, L]` triangles) | 576,000 B (562.5 KiB) | 27,648,000 B (26.4 MiB) |
+| the state cotangent's pair, `st1` and `ds0` (`[K, V]` each) | 131,072 B (128 KiB) | 6,291,456 B (6 MiB) |
+| seven `[L, V]` planes: `W`, `Vp`, `dVp`, `dW`, `vc`, `oc`, `dvc` | 229,376 B (224 KiB) | 11,010,048 B (10.5 MiB) |
+| four `[L, K]` planes: `qc`, `kc`, `dqc`, `dkc` | 131,072 B (128 KiB) | 6,291,456 B (6 MiB) |
+| five `[L, L]` triangles: `Ac`, `dAc`, `qkb`, `vo`, `phi` | 81,920 B (80 KiB) | 3,932,160 B (3.75 MiB) |
+| the `[L]` vectors `gc`, `bc`, `dgc`, `dbc`, `gs`, `eg` and the `[V]`/`[K]` pair `sk2`, `s0oi` | 2,560 B (2.5 KiB) | 122,880 B (120 KiB) |
+| the block's working set, the rows above but the states | 576,000 B (562.5 KiB) | 27,648,000 B (26.4 MiB) |
 | **scratch in all** | **4,770,304 B (4.55 MiB)** | **228,974,592 B (218.4 MiB)** |
+
+The five component rows above the working set add to its 576,000 B, `4,770,304 - 4,194,304`, and
+the whole to the 4,770,304 B the pool allocates: 1,192,576 floats a block, where `gdn_scan.hip`'s
+`pool_floats` lays them out.
 
 The host issue's figures for the same sequence (`docs/adjoints/gdn_scan.md`) are: 8,388,608 bytes
 (8 MiB) per head for the 64 entering states in f64, held for one head at a time and released
@@ -119,8 +131,9 @@ reference to compose -- within `1e-3 + 0.02 * |host|`, the bf16 tolerance
 
 - the tiny fixture's gdn geometry (`docs/FIXTURES.md`): two key heads and four value heads of 16,
   4-token chunks, one short sequence, a batch of three ragged ones (2, 4 and 13 tokens, the last
-  a chunk of one), and two state pools deeper than their batches with `state_idx` naming slots out
-  of order -- 3 slots for 2 sequences (slots 2 and 0) and 4 slots for 3 (slots 3, 0 and 2);
+  a chunk of one), two state pools deeper than their batches with `state_idx` naming slots out of
+  order -- 3 slots for 2 sequences (slots 2 and 0) and 4 slots for 3 (slots 3, 0 and 2) -- and one
+  record that carries no `scale` at all;
 - the real model's (`docs/DESIGN.md`, hidden 5120): `K = V = 128`, 16 key heads, 48 value heads,
   64-token chunks, at 1024 tokens in one sequence, at 1024 tokens in a batch of three ragged
   sequences (448, 322 and 254, so one ends on a chunk boundary and two end short), and at 4096
@@ -129,6 +142,13 @@ reference to compose -- within `1e-3 + 0.02 * |host|`, the bf16 tolerance
 It also checks the frozen set, that the kernel leaves no scratch live, and that the comparison has
 teeth: a device row that drops the gate's cotangent -- the term of the reverse pass a kernel is
 most likely to leave out -- must be rejected in `dc[4]`.
+
+A record off the tape carries no `scale` -- the tape holds integers and strings and drops the f64
+parameter -- so the fallback to `1/sqrt(head_k)` is a branch of this kernel like any other, and it
+is pinned like one. The fixture case without the parameter is held to a host row that falls back
+the same way, which a kernel that kept the `1.0` of its own default would miss by the factor
+`sqrt(head_k)`; and the test also runs the kernel with the missing parameter read as `1.0`, the
+fallback a careless one would take, and requires the comparison to reject it.
 
 The harness (`tests/support/device_check.h`) builds a case's forward values as its reads in schema
 order followed by the twin's writes in theirs, which is the record's order only while the writes
