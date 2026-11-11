@@ -109,10 +109,12 @@ registered only to end the walk.
 
 ## Checks
 
-Each op's twin is compared with radiance's host kernel at bf16 tolerance on three shapes, one of
-them the tiny fixture's (hidden 128, MLP 256, vocabulary 320). Each adjoint is compared with central
-finite differences of the twin to `1e-6` relative. For `gemm_nt_q` the finite-difference case holds
-the activation scale at one, because the adjoint describes the dequantised basis; a separate
-check perturbs the codes by `eps / sa` and confirms `dx_hat` against the dequantised directional
-derivative with a real scale. One more check pins the frozen positions of every row against the
-table above, so this page and the registration cannot drift apart.
+Each op's twin, `embed_lookup`'s included, is compared with radiance's host kernel at bf16
+tolerance on three shapes, one of them the tiny fixture's (hidden 128, MLP 256, vocabulary 320).
+Each adjoint that answers is compared with central finite differences of the twin to `1e-6`
+relative; `embed_lookup`'s stop is checked to add nothing to either of its operands. For
+`gemm_nt_q` the finite-difference case holds the activation scale at one, because the adjoint
+describes the dequantised basis; a separate check perturbs the codes by `eps / sa` and confirms
+`dx_hat` against the dequantised directional derivative with a real scale. One more check pins the
+frozen positions of every row against the table above, so this page and the registration cannot
+drift apart.

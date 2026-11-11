@@ -220,6 +220,12 @@ R97_TEST(adjoint_linear_frozen_positions_match_the_doc) {
     }
 }
 
+R97_TEST(adjoint_linear_embed_lookup) {
+    check(embed_lookup_rec(4, 320, 128), 0x5001);  // the tiny fixture's vocabulary
+    check(embed_lookup_rec(1, 128, 256), 0x5002);
+    check(embed_lookup_rec(9, 320, 384), 0x5003);
+}
+
 R97_TEST(adjoint_linear_embed_lookup_is_a_stop) {
     const OpRecord rec = embed_lookup_rec(4, 320, 128);
     const Case c = make_case(rec, 0x5001);
