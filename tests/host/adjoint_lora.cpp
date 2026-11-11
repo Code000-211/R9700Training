@@ -3,11 +3,14 @@
 // not: the gradients of A and B in the ParamSet against central differences of the twin, and the
 // pair a fresh adapter starts with, B = 0. docs/adjoints/lora.md carries every formula.
 //
-// Four shapes, one of them the tiny fixture's (tests/support/fixture.h: hidden 128, ffn 256), at
+// Five shapes, one of them the tiny fixture's (tests/support/fixture.h: hidden 128, ffn 256), at
 // ranks 16 and 4: a q_proj 6x128 -> 128, an mlp.gate_proj 5x128 -> 256 (the fixture's ffn width),
-// an mlp.down_proj 4x256 -> 128, and the same q_proj on the int8 trunk, its codes with a 128-wide
-// group scale. Both forms radiance issues are here: the bf16 activation with no scale operand at
-// all, and the code stream with one.
+// an mlp.down_proj 4x256 -> 128, and two of them again on the int8 trunk, its codes with a
+// 128-wide group scale. Both forms radiance issues are here: the bf16 activation with no scale
+// operand at all, and the code stream with one. The code sites are two widths on purpose: the
+// q_proj's K of 128 leaves one scale group per row, so every k reads a_scale[m, 0] whatever index
+// the twin computes, while the down_proj's K of 256 puts two groups in a row and a wrong group
+// index on most of its k's.
 #include "support/adjoint_check.h"
 #include "support/test.h"
 
@@ -56,6 +59,7 @@ const Site sites[] = {
     {"tiny_gate_proj", 5, 128, 256, 16, 1, 0, "model.layers.0.mlp.gate_proj"},
     {"tiny_down_proj", 4, 256, 128, 4, 1, 0, "model.layers.0.mlp.down_proj"},
     {"coded_q_proj", 3, 128, 128, 4, 2, 128, "model.layers.1.self_attn.q_proj"},
+    {"coded_down_proj", 4, 256, 128, 4, 1, 128, "model.layers.1.mlp.down_proj"},
 };
 
 bool coded_site(const Site& s) { return s.group > 0; }

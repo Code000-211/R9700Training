@@ -139,7 +139,7 @@ against the twin.
 
 ## 4. What the tests cover
 
-Four sites, one of them the tiny fixture's (`tests/support/fixture.h`: hidden 128, ffn 256), at
+Five sites, one of them the tiny fixture's (`tests/support/fixture.h`: hidden 128, ffn 256), at
 ranks 16 and 4:
 
 | site | M | K | N | r | S | trunk |
@@ -148,9 +148,18 @@ ranks 16 and 4:
 | `tiny_gate_proj` | 5 | 128 | 256 | 16 | 1 | bf16 |
 | `tiny_down_proj` | 4 | 256 | 128 | 4 | 1 | bf16 |
 | `coded_q_proj` | 3 | 128 | 128 | 4 | 2 | int8, group 128 |
+| `coded_down_proj` | 4 | 256 | 128 | 4 | 1 | int8, group 128 |
 
 Every site has a base row spelled `-1` and one spelled past the pool (`S`), the two spellings a
 record uses.
+
+The two coded sites are widths apart on purpose. At `K = 128` a row has one scale group, so
+every `k` reads `a_scale[m, 0]` and any group index at all agrees; at `K = 256` a row has two
+groups of 128, so an index that is wrong — `k % groups`, say, or a group width derived from
+something other than the stream's grid — reads a different scale over half the row and
+`check_kernel` fails on radiance's `lora_shrink`. That is the check that has to catch it: the
+adjoint and gradient checks read the same twin, so a twin wrong about the group index agrees with
+its own differences.
 
 | check | what it proves | tolerance |
 |---|---|---|
