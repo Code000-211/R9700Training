@@ -28,6 +28,20 @@ uint64_t epoch_rng(uint64_t seed, int64_t epoch) {
     return state;
 }
 
+// The bucket an epoch starts on. The seed chooses where in the bucket cycle it starts and every
+// epoch moves that on by one, so two consecutive epochs start on different buckets; a bucket is
+// never empty, so that alone is a different order of the sequences, whatever the shuffle draws.
+// Rotating a fresh shuffle by an offset cannot promise the same: the shuffle and the offset are
+// drawn independently, so an epoch's order lands on the previous epoch's whenever the two shuffles
+// are rotations of each other. Nor may the offset be a linear function of the seed, as `3 * seed`
+// was -- it vanishes whenever the bucket count divides three times the seed, and two seeds then
+// hand out one order. The seed enters here as a hash.
+size_t starting_bucket(uint64_t seed, int64_t epoch, size_t buckets) {
+    uint64_t state = seed ^ 0xa0761d6478bd642full;
+    const size_t base = (size_t)(splitmix64(&state) % (uint64_t)buckets);
+    return (base + (size_t)((uint64_t)epoch % (uint64_t)buckets)) % buckets;
+}
+
 }  // namespace
 
 namespace {
@@ -64,29 +78,47 @@ std::vector<std::vector<size_t>> epoch_buckets(const std::vector<size_t>& kept, 
                              order.begin() + static_cast<std::ptrdiff_t>(hi));
         lo = hi;
     }
-    // Shuffle the bucket order, not the sequences inside: the sort within a bucket is what keeps
-    // similar lengths together, and the bucket is the unit the epoch varies. This is also what a
-    // bucket of one needs -- there is nothing inside it to reorder.
-    uint64_t rng = epoch_rng(seed, epoch);
-    for (size_t i = buckets.size(); i > 1; --i) {
-        size_t j = (size_t)(splitmix64(&rng) % i);
-        std::swap(buckets[i - 1], buckets[j]);
-    }
-    // Fisher-Yates can hand out the same order for nearby seeds when there are only a couple of
-    // buckets, and can repeat a consecutive epoch's order by chance. Rotate the shuffled order by
-    // an offset that the seed shifts and each epoch advances: a bucket of one still moves with
-    // (seed, epoch), and the common short-bucket collisions are broken. 3 is odd, so for two
-    // buckets the seed still flips the order.
+    // Inside a bucket the order is a shuffle too, drawn from a stream for (seed, epoch, bucket).
+    // The sort did its work when it formed the buckets -- inside one, every length is in one
+    // power-of-two class -- so shuffling them costs the grouping nothing, and it is what gives the
+    // seed and the epoch room to differ: the bucket order alone is n! orders for n buckets, so two
+    // seeds on a dataset of two or three classes would hand out the same batches one time in two
+    // or six, however the seed were hashed into the choice.
     if (buckets.size() > 1) {
+        for (size_t b = 0; b < buckets.size(); ++b) {
+            uint64_t rng =
+                epoch_rng(seed ^ (0x2545f4914f6cdd1dull * (uint64_t)(b + 1)), epoch);
+            for (size_t i = buckets[b].size(); i > 1; --i) {
+                size_t j = (size_t)(splitmix64(&rng) % (uint64_t)i);
+                std::swap(buckets[b][i - 1], buckets[b][j]);
+            }
+        }
+        // Shuffle the buckets' positions, then start the order on the bucket the epoch names. The
+        // start is what makes each epoch a new shuffle rather than a fresh draw that may land on
+        // the previous one: consecutive epochs start on different buckets, so no two of them can
+        // hand out the same order. The rest of the order is the shuffled one, so the seed and the
+        // epoch still reach every bucket, and a dataset of singletons still moves.
         const size_t n = buckets.size();
-        const size_t shift = (size_t)(((uint64_t)epoch + 3 * seed) % n);
-        std::rotate(buckets.begin(), buckets.begin() + static_cast<std::ptrdiff_t>(shift),
-                    buckets.end());
+        std::vector<size_t> positions(n);
+        for (size_t i = 0; i < n; ++i) positions[i] = i;
+        uint64_t rng = epoch_rng(seed, epoch);
+        for (size_t i = n; i > 1; --i) {
+            size_t j = (size_t)(splitmix64(&rng) % (uint64_t)i);
+            std::swap(positions[i - 1], positions[j]);
+        }
+        const size_t first = starting_bucket(seed, epoch, n);
+        std::rotate(positions.begin(), std::find(positions.begin(), positions.end(), first),
+                    positions.end());
+        std::vector<std::vector<size_t>> shuffled;
+        shuffled.reserve(n);
+        for (size_t i : positions) shuffled.push_back(std::move(buckets[i]));
+        buckets = std::move(shuffled);
     } else if (!buckets.empty()) {
-        // One bucket is no bucket order to shuffle. Sorting it by length would leave the seed and
-        // the epoch with nothing to change on a dataset that fits one bucket, so shuffle its
-        // sequences under the seed and then rotate by the epoch. The rotation makes every epoch's
-        // order a new one even when there are only two sequences.
+        // One bucket is no bucket order to shuffle, so every epoch's order has to come from inside
+        // that one bucket. It is shuffled under the seed alone and then rotated by the epoch: two
+        // rotations of one permutation by different shifts are different orders, so consecutive
+        // epochs differ even when there are only two sequences. (Shuffling it again per epoch is
+        // no guarantee: two such shuffles can come out one rotation apart.)
         auto& bucket = buckets.front();
         uint64_t single = epoch_rng(seed, 0);
         for (size_t i = bucket.size(); i > 1; --i) {
