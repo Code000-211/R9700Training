@@ -125,10 +125,12 @@ cmake -B build -G Ninja            # finds the card's target (default gfx1201)
 cmake --build build                # builds libr97.so into the radiance home
 ctest --test-dir build -L gpu      # the card, serially, under the GPU test guard
 ./build/r97_gpu_tests --bench      # the same checks plus the timing lines
+./build/r97_gpu_tests --bench --model  # ... and the model cases, when the container is there
 ```
 
 - `R97_DEVICE` selects the card; the guard is in `tests/support/gpu_guard.h` and its rules are in
-  `docs/TESTING.md`.
+  `docs/TESTING.md`. A kernel test that reads the real container is a model test
+  (`R97_MODEL_TEST`, `tests/gpu/iqr_decode.cpp`) and only runs under `--model` or `ctest -L model`.
 - `R97_DEVICE_SO` overrides the plugin path. The build normally passes the file it built as
   `R97_DEVICE_PLUGIN`, and `RADIANCE_HOME/kernels/libr97.so` is the fallback the engine uses.
 - `-DR97_WITH_HIP=OFF` (or a machine without `hipcc`) builds the host-only configuration: `r97`,
