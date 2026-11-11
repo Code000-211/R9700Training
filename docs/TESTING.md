@@ -120,6 +120,7 @@ without the exit, for a caller that reports the absence itself.
 |---|---|
 | `R97_DEVICE` | the card ordinal the tests use; default `0` |
 | `R97_LOCK_DIR` | where the guard keeps the per-card locks; default `/tmp` (set it when `/tmp` is not writable) |
+| `R97_TEST_ONLY` | a comma-separated list of registered test names; when set, the test runner runs only those. The reference check uses it to take its program-mode step in a child where no other test has run |
 | `R97_MODEL_DIR` | where the model tests find the container: a `.rad` file, or a directory that holds one (the first `*.rad` inside; the `qwen3.8-27b-iq4r-s-v4.rad` name wins if present) |
 | `R97_MODEL_RAD` | the same thing, resolved by the build at configure time; `R97_MODEL_DIR`, when set, wins over it |
 
@@ -148,8 +149,10 @@ hf download StillDeadcode/qwen3.8-27b-iqr-v4 qwen3.8-27b-iq4r-s-v4.rad
   registered twins and host adjoints (`src/reference_step.cpp`); the live trace runs the plugin's
   host chain (`libref`) only to hand them its `OpRecord`s and never touches `libr4d`. Over the
   batch `tests/fixtures/programs/oracle.json` records, `--program` reads the op list from that
-  file instead and runs no `rad_issue` at all, so the process loads neither kernel library (a step
-  refuses a batch the recorded one does not match, and `tests/host/reference_step.cpp` drives it
-  with the fixed test batch). This proves the loop, the checkpoint, the batcher and the resume on
-  the real graph shape, and it proves the adjoints compose; it does **not** prove the int8 path,
-  the GPU kernels or the device library, which it deliberately never loads.
+  file instead and runs no `rad_issue` at all, so the process loads neither kernel library
+  (`tests/host/reference_step.cpp` takes that step in a child run with `R97_TEST_ONLY`, which
+  starts with neither library loaded and checks its own maps before and after the step; a step
+  refuses a batch the recorded one does not match). This proves the loop, the checkpoint, the
+  batcher and the resume on the real graph shape, and it proves the adjoints compose; it does
+  **not** prove the int8 path, the GPU kernels or the device library, which it deliberately never
+  loads.
