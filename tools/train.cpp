@@ -17,12 +17,29 @@
 #include "r97/trainer.h"
 
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <vector>
 
 namespace r97tool {
 namespace {
+
+// The plugin home: RADIANCE_HOME, else the one the build keeps beside this binary, as the `loss`
+// subcommand finds it.
+std::string radiance_home() {
+    if (const char* env = std::getenv("RADIANCE_HOME"); env && *env) return env;
+
+    std::error_code ec;
+    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (ec) return {};
+    const std::filesystem::path beside = exe.parent_path();
+    for (const std::filesystem::path& p :
+         {beside / "radiance-build" / "radiance_home", beside / "radiance_home"}) {
+        if (std::filesystem::exists(p / "architectures", ec)) return p.string();
+    }
+    return {};
+}
 
 int train_main(int argc, char** argv) {
     std::string config_path;
@@ -84,7 +101,7 @@ int train_main(int argc, char** argv) {
         if (reference) {
             r97::ReferenceStepOptions opts;
             opts.container = cfg.model;
-            if (const char* home = std::getenv("RADIANCE_HOME")) opts.radiance_home = home;
+            opts.radiance_home = radiance_home();
             opts.kernels = {"libavx", "libref"};
             opts.program = program;
             step = r97::make_reference_step(model, opts);
