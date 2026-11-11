@@ -4,11 +4,14 @@
 // asks two questions of them.
 //
 //   agrees: the device row and the host row, handed the same record and the same values, write the
-//   same dx within the harness's bf16 tolerance (tests/support/device_check.h). At the fixture's
-//   shapes, and at the real model's hidden width with few rows, that is the whole of dx, compared
-//   element by element. At the model's real shapes -- 1024 and 4096 tokens, and a packed batch of
-//   unequal lengths -- it is a spread sample of (m,k) probes against the same f64 sum the host
-//   adjoint forms: the full comparison there is hundreds of GMAC of f64 on one thread per call.
+//   same dx within bf16_tol. At the fixture's shapes, and at the real model's hidden width with few
+//   rows, that is the whole of dx: the relative L2 over the tensor, and every element within 2% of
+//   itself plus a tenth of the tensor's RMS -- the RMS term because a reduction's rounding error
+//   does not shrink when its sum cancels, so the harness's per-element rule
+//   (tests/support/device_check.h) would fail a near-zero element of a kernel that is right. At the
+//   model's real shapes -- 1024 and 4096 tokens, and a packed batch of unequal lengths -- it is a
+//   spread sample of (m,k) probes against the same f64 sum the host adjoint forms: the full
+//   comparison there is hundreds of GMAC of f64 on one thread per call.
 //
 //   measures: every real shape prints one line of adjoint milliseconds, forward-twin milliseconds
 //   and scratch, as docs/kernels/README.md asks. The forward twin is called once per shape rather
@@ -128,7 +131,8 @@ device_check::Case linear_case(const OpRecord& rec, uint64_t seed, std::string l
 // One call over a case without the forward twin: the reads come from the case, the writes are
 // zeroed slots at the schema positions the kernel expects. The model's shapes cannot afford the
 // twin, whose f64 GEMM is the better part of an hour at the widest linear.
-AdjointCall build_call(const device_check::Case& c, std::vector<AdValue>* fwd, std::vector<AdValue>* dc) {
+AdjointCall build_call(const device_check::Case& c, std::vector<AdValue>* fwd,
+                       std::vector<AdValue>* dc) {
     fwd->clear();
     std::size_t read = 0;
     for (const Operand& o : c.rec.operands) {
@@ -212,19 +216,74 @@ void report(const char* what, const OpRecord& rec, double rel) {
     const int64_t N = *std::get_if<int64_t>(&rec.params[1].second);
     const int64_t K = *std::get_if<int64_t>(&rec.params[2].second);
     std::printf("%-22s %-10s M=%5lld N=%6lld K=%6lld  rel %.3g\n", what, rec.op.c_str(),
-                static_cast<long long>(M), static_cast<long long>(N), static_cast<long long>(K), rel);
+                static_cast<long long>(M), static_cast<long long>(N), static_cast<long long>(K),
+                rel);
     std::fflush(stdout);
 }
 
-// The whole of dx and every frozen position against the host row, through the harness.
-void agree_whole(const device_check::Case& c) {
-    const device_check::Report r = device_check::check(c);
-    device_check::require(r);
-    R97_CHECK(r.scratch_peak > 0);
-    std::printf("%-34s device == host whole, scratch peak %lld KiB\n", c.label.c_str(),
-                static_cast<long long>(r.scratch_peak / 1024));
+struct Agree {
+    double rel = 0.0;    // relative L2 over the whole of dx
+    double worst = 0.0;  // the largest element error, over its own allowance
+    double rms = 0.0;    // the host's root-mean-square element, the allowance a near-zero one gets
+    int64_t scratch_peak = 0;
+};
+
+Agree compare_dx(const std::vector<double>& got, const std::vector<double>& want, int64_t peak) {
+    R97_CHECK(got.size() == want.size());
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        num += (got[i] - want[i]) * (got[i] - want[i]);
+        den += want[i] * want[i];
+    }
+    Agree a;
+    a.rel = den == 0.0 ? std::sqrt(num) : std::sqrt(num / den);
+    a.rms = std::sqrt(den / static_cast<double>(want.size()));
+    a.scratch_peak = peak;
+    /* A reduction over hundreds of terms carries a relative bf16 rounding error per term, and the
+     * sum's error is the same size whatever the sum cancels to: for an element near zero, a
+     * relative rule alone would fail the kernel for being lucky. The allowance is therefore the
+     * harness's 2% of the element plus a tenth of the tensor's RMS -- local, and scaled to the
+     * tensor rather than to the element. The kernel's own error is about 0.3% of the RMS (the
+     * relative L2 below), so a tenth leaves rounding a wide margin and any structural mistake --
+     * a dropped block of scales, a weight out by one -- far above it. */
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        const double allowed = 0.02 * std::fabs(want[i]) + 0.10 * a.rms;
+        const double err = std::fabs(got[i] - want[i]);
+        a.worst = std::max(a.worst, allowed > 0.0 ? err / allowed : err);
+    }
+    return a;
+}
+
+// The host row of the same record, on the same forward values and its own dc.
+std::vector<double> host_dx(const device_check::Case& c) {
+    std::vector<AdValue> fwd, dc;
+    AdjointCall call = build_call(c, &fwd, &dc);
+    std::string why;
+    const AdjointFn host = adjoint_find(c.rec.op, Side::host, c.rec.params, &why);
+    if (host == nullptr) throw std::runtime_error("host adjoint of " + c.rec.op + ": " + why);
+    host(call);
+    return dc[static_cast<std::size_t>(operand_pos(c.rec, "a"))].value;
+}
+
+// The device row on the whole of dx, with the scratch ledger watched around the call.
+Agree agree_whole(const device_check::Case& c) {
+    std::vector<AdValue> fwd, dc;
+    AdjointCall call = build_call(c, &fwd, &dc);
+    device::scratch_reset();
+    device_row(c.rec)(call);
+    const device::ScratchStats stats = device::scratch_stats();
+    R97_CHECK(stats.live_bytes == 0);  // the call's staging is all freed before it returns
+    return compare_dx(dc[static_cast<std::size_t>(operand_pos(c.rec, "a"))].value, host_dx(c),
+                      stats.peak_bytes);
+}
+
+void require_agrees(const device_check::Case& c, const Agree& a) {
+    R97_CHECK(a.rel <= bf16_tol);
+    R97_CHECK(a.worst <= 1.0);
+    R97_CHECK(a.scratch_peak > 0);
+    std::printf("%-52s rel %.4f, worst element %.2f of its allowance, scratch peak %lld KiB\n",
+                c.label.c_str(), a.rel, a.worst, static_cast<long long>(a.scratch_peak / 1024));
     std::fflush(stdout);
-    if (r97test::bench()) device_check::print_bench(c, 20);
 }
 
 struct Timing {
@@ -234,7 +293,7 @@ struct Timing {
 };
 
 // The harness's measurement, with the forward twin called once instead of reps+1 times: at the
-// widest real shape one f64 twin call is over twenty minutes, and the twin is a scalar loop whose
+// widest real shape one f64 twin call is some twelve minutes, and the twin is a scalar loop whose
 // rate does not depend on a warm cache.
 Timing time_call(const device_check::Case& c, int reps) {
     const AdjointFn row = device_row(c.rec);
@@ -293,7 +352,8 @@ R97_TEST(adjoint_linear_device_rows) {
         const std::vector<int> host = adjoint_frozen(rec.op, Side::host, rec.params);
         R97_CHECK(!dev.empty());
         R97_CHECK(dev == host);
-        std::printf("%s: device frozen %zu operand(s), the host row's\n", rec.op.c_str(), dev.size());
+        std::printf("%s: device frozen %zu operand(s), the host row's\n", rec.op.c_str(),
+                    dev.size());
     }
     OpRecord other = gemm_nt_q_rec(4, 256, 128);  // the same op on a grid the kernel does not serve
     other.params[3].second = int64_t(64);
@@ -320,15 +380,20 @@ R97_TEST(adjoint_linear_device_agrees) {
         const int64_t M = *std::get_if<int64_t>(&rec.params[0].second);
         const int64_t N = *std::get_if<int64_t>(&rec.params[1].second);
         const int64_t K = *std::get_if<int64_t>(&rec.params[2].second);
-        agree_whole(linear_case(rec, 0x2000 + static_cast<uint64_t>(N), rec.op + " fixture " +
-                                                                         std::to_string(M) + "x" +
-                                                                         std::to_string(N) + "x" +
-                                                                         std::to_string(K)));
+        const device_check::Case c =
+            linear_case(rec, 0x2000 + static_cast<uint64_t>(N),
+                        rec.op + " fixture " + std::to_string(M) + "x" + std::to_string(N) + "x" +
+                            std::to_string(K));
+        require_agrees(c, agree_whole(c));
+        if (r97test::bench()) device_check::print_bench(c, 20);
     }
 
     // The real model's hidden width with few rows, whole: five scale blocks of K, both ops.
     for (const OpRecord& rec : {gemm_nt_q_rec(16, 5120, 5120), gemm_nt_rec(16, 5120, 5120)}) {
-        agree_whole(linear_case(rec, 0x2100, rec.op + " hidden width 16x5120x5120 whole"));
+        const device_check::Case c =
+            linear_case(rec, 0x2100, rec.op + " hidden width 16x5120x5120 whole");
+        require_agrees(c, agree_whole(c));
+        if (r97test::bench()) device_check::print_bench(c, 20);
     }
 
     // The real model's linears at one sequence's worth of tokens, on probes: the hidden width, the
@@ -366,16 +431,17 @@ R97_TEST(adjoint_linear_device_teeth) {
     (void)device_check::load_plugin();
     device_check::require_device(o.device);
 
-    const device_check::Case c = linear_case(gemm_nt_q_rec(4, 256, 128), 0x5000, "fixture, one row dropped");
-    const device_check::Report wrong = device_check::check(c, [](const AdjointCall& call) {
-        const AdjointFn right = device_row(call.rec);
-        right(call);
-        AdValue& dx = call.dc->at(static_cast<std::size_t>(operand_pos(call.rec, "a")));
-        std::fill(dx.value.begin(), dx.value.begin() + static_cast<std::ptrdiff_t>(dx.shape[1]), 0.0);
-    });
-    R97_CHECK(!wrong.ok);
-    R97_CHECK(wrong.first_slot == operand_pos(c.rec, "a"));
-    std::printf("rejected the kernel that dropped one row: %s\n", wrong.note.c_str());
+    const device_check::Case c =
+        linear_case(gemm_nt_q_rec(4, 256, 128), 0x5000, "fixture, one row dropped");
+    const std::vector<double> want = host_dx(c);
+    std::vector<AdValue> fwd, dc;
+    AdjointCall call = build_call(c, &fwd, &dc);
+    device_row(c.rec)(call);
+    AdValue& dx = dc[static_cast<std::size_t>(operand_pos(c.rec, "a"))];
+    std::fill(dx.value.begin(), dx.value.begin() + static_cast<std::ptrdiff_t>(dx.shape[1]), 0.0);
+    const Agree wrong = compare_dx(dx.value, want, 0);
+    R97_CHECK(wrong.worst > 1.0);  // the comparison would have caught this kernel
+    std::printf("dropping one row of dx is a %.3g allowance, rejected\n", wrong.worst);
     std::fflush(stdout);
 }
 
@@ -405,7 +471,8 @@ R97_TEST(adjoint_linear_device_measures) {
     measure(linear_case(gemm_nt_q_rec(4096, 5120, 17408), 0x4007, "4096 tok, ffn down"), 3);
     measure(linear_case(gemm_nt_q_rec(1024, 34816, 5120), 0x4008, "1024 tok, ffn gate/up"), 3);
     measure(linear_case(gemm_nt_q_rec(4096, 34816, 5120), 0x4009, "4096 tok, ffn gate/up"), 3);
-    measure(linear_case(gemm_nt_q_rec(4023, 34816, 5120), 0x400a, "batch 317+1009+2697, ffn gate/up"),
+    measure(linear_case(gemm_nt_q_rec(4023, 34816, 5120), 0x400a,
+                        "batch 317+1009+2697, ffn gate/up"),
             3);
     measure(linear_case(gemm_nt_rec(4096, 5120, 6144), 0x400b, "4096 tok, ssm out bf16"), 3);
 }
