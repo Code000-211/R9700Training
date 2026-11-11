@@ -196,10 +196,14 @@ target_link_libraries(r97 PUBLIC rad_core)
 if(NOT R97_WITH_HIP STREQUAL "OFF" AND R97_LIBHIP)
   find_program(R97_HIPCC hipcc HINTS /opt/rocm/bin ENV ROCM_PATH)
   if(R97_HIPCC)
-    set(CMAKE_HIP_ARCHITECTURES gfx1201 CACHE STRING "" FORCE)
+    # gfx1201 is the R9700 the gpu tier runs on; another card passes its own architecture. The
+    # target's property is set as well because r97 exists before the language is enabled, and a
+    # target's HIP_ARCHITECTURES is initialised when it is created.
+    set(R97_HIP_ARCHS "gfx1201" CACHE STRING "HIP architectures the device adjoints build for")
+    set(CMAKE_HIP_ARCHITECTURES ${R97_HIP_ARCHS} CACHE STRING "HIP architectures")
     set(CMAKE_HIP_STANDARD 20)
     enable_language(HIP)
-    set_property(TARGET r97 PROPERTY HIP_ARCHITECTURES gfx1201)
+    set_property(TARGET r97 PROPERTY HIP_ARCHITECTURES ${R97_HIP_ARCHS})
     file(GLOB R97_DEVICE_KERNEL_SOURCES CONFIGURE_DEPENDS
          ${CMAKE_CURRENT_SOURCE_DIR}/src/adjoint/device/*.hip)
     if(R97_DEVICE_KERNEL_SOURCES)
