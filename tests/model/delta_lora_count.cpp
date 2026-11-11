@@ -40,6 +40,10 @@ void delta_lora_parameter_count() {
     CHECK(meta.layers == 64);
     CHECK(meta.hidden == 5120);
     CHECK(meta.targetable.size() == 16 * 7 + 48 * 6);
+    // IQR-V4 rotates every trunk linear by fwht128, and every targeted weight says so, so the
+    // adapter written from this meta records the basis radiance's site filter needs
+    // (docs/ADAPTER.md, section 4). The bf16 fixture is the natural-basis case, tested on the host.
+    CHECK(meta.input_basis == "fwht128");
 
     r97::Config config;
     config.delta.kind = "lora";
