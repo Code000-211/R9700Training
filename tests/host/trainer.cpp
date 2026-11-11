@@ -382,6 +382,34 @@ R97_TEST(trainer_config_rejects_a_value_out_of_range_naming_the_key) {
     R97_CHECK(refused(config, "delta.rank"));
     config.delta.rank = 8;
 
+    config.delta.alpha = 0.0;
+    R97_CHECK(refused(config, "delta.alpha"));
+    config.delta.alpha = 16.0;
+
+    config.delta.kind.clear();
+    R97_CHECK(refused(config, "delta.kind"));
+    config.delta.kind = "lora";
+
+    config.delta.targets = {"q_proj", ""};
+    R97_CHECK(refused(config, "delta.targets"));
+    config.delta.targets.clear();
+
+    config.weight_decay = -1.0;
+    R97_CHECK(refused(config, "weight_decay"));
+    config.weight_decay = 0.0;
+
+    config.warmup_steps = -1;
+    R97_CHECK(refused(config, "warmup_steps"));
+    config.warmup_steps = 0;
+
+    config.seed = -1;
+    R97_CHECK(refused(config, "seed"));
+    config.seed = 7;
+
+    config.eval_every = -1;
+    R97_CHECK(refused(config, "eval_every"));
+    config.eval_every = 0;
+
     config.accumulation = 0;
     R97_CHECK(refused(config, "accumulation"));
     config.accumulation = 1;
@@ -401,6 +429,12 @@ R97_TEST(trainer_config_rejects_a_value_out_of_range_naming_the_key) {
     config.steps = 0;
     R97_CHECK(refused(config, "steps"));
     config.steps = 4;
+
+    config.steps = 0;
+    config.epochs = -1;
+    R97_CHECK(refused(config, "epochs"));
+    config.steps = 4;
+    config.epochs = 0;
 
     config.epochs = 2;
     R97_CHECK(refused(config, "steps"));  // set exactly one of steps/epochs

@@ -376,6 +376,8 @@ void validate_config(const Config& config) {
             "must be > 0 (got " + std::to_string(config.delta.rank) + ")");
     require(std::isfinite(config.delta.alpha) && config.delta.alpha > 0.0, "delta.alpha",
             "must be a finite value > 0 (got " + number(config.delta.alpha) + ")");
+    for (const std::string& target : config.delta.targets)
+        require(!trim(target).empty(), "delta.targets", "has an empty target");
     require(std::isfinite(config.lr) && config.lr > 0.0, "lr",
             "must be a finite value > 0 (got " + number(config.lr) + ")");
     require(std::isfinite(config.weight_decay) && config.weight_decay >= 0.0, "weight_decay",
