@@ -140,7 +140,8 @@ The single cases are one sequence of length 23; the batch cases are three sequen
 17, 11 and 6, padded to 17 with an attention mask. Each case has a fixed random output cotangent and
 the input cotangent autograd returns for it, so a test can differentiate a block on its own, without
 a whole model. The masks travel with the case; the padding is at the end, so it cannot change an
-earlier position.
+earlier position's *output*. It does change an earlier position's *cotangent*, for the reason in
+"What a batch case's padded rows do to its input cotangent".
 
 The adapter is also written as a PEFT directory, `adapter/`, with `adapter_config.json` and
 `adapter_model.safetensors`. `A` and `B` are both non-zero (PEFT's default `B` is zero, which would
@@ -240,6 +241,50 @@ Because the cases' random inputs now come from the seeded generator before the a
 `B`, the regenerated files hold a different adapter, loss, residual cotangents and adapter
 gradients than the first version did. The token ids and the logits without the adapter are
 unchanged, so the table above still applies.
+
+## What a batch case's padded rows do to its input cotangent
+
+A valid query row never reads a padded one, so no valid row's output depends on the padding, and a
+test may run the case's packed valid rows and compare them with the reference's output. The
+cotangent is not so clean, on the attention case.
+
+A padded query row is masked out entirely, and its input row is zero. So that such a row does not
+leave the attention with nothing to normalise, transformers' attention lets a fully masked row read
+every key the padding leaves visible: a padded row reads all of the sequence's valid keys. Its
+query is zero — its input row is, and so is everything the norm and both query projections make of
+it — so the weights are uniform, `1 / length`, and the row's output is
+`o_proj(sigmoid(0.5) · mean of the sequence's values)`. That again touches no valid row's output.
+But the row's stored cotangent is random like every other row's, and differentiating through it
+adds to the valid rows' value gradient the term
+`(1 / length) · (sum of the padded rows' cotangents)`, carried back through the output projection,
+the value projection, the key norm and their linears.
+
+A block masked the way radiance masks it has no such term: a padded row reads nothing, so nothing
+comes back from it. That is the whole of the difference between the reference's
+`attention_sublayer.batch.input_cotangent` and the packed block's composed adjoint. Measured on the
+checked-in file, per sequence:
+
+| sequence | length | padded rows | relative difference |
+|---|---|---|---|
+| 0 | 17 | 0 | 3.1e-16 |
+| 1 | 11 | 6 | 5.9e-2 |
+| 2 | 6 | 11 | 1.65e-1 |
+
+The sequence that fills the batch, with no padded row, is exact; the two shorter ones are off by an
+amount that grows with how many padded rows they have. The term was confirmed rather than argued: a
+pure-Python reproduction of the block that lets a padded row read every visible key reproduces the
+reference's stored `input_cotangent` on probed entries to 5e-9 (finite differences of the same
+forward), and the same reproduction without that term misses by up to 0.11.
+
+The MLP case has no such term at any length — its block is per row throughout — and its batch
+`input_cotangent` matches to 5.6e-16.
+
+So `tests/host/block_attention_mlp.cpp` compares the attention batch case's adjoint per sequence:
+the sequence that fills the batch at 1e-8, and the padded ones at `kPaddedRowTolerance = 0.2`, twice
+the measured worst. The forward is compared at 1e-8 for all three and the finite-difference check of
+the whole batch's composed adjoint runs at 1e-6, so the adjoint itself is still checked exactly;
+what is loosened is one comparison against the reference, and only for the sequences whose padded
+rows read the valid ones. `docs/BLOCKS.md` has the rest of the block check.
 
 ## What this reference does not cover
 
