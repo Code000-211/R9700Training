@@ -136,12 +136,20 @@ both of its outputs, so the adjoint writes `dc` for the codes and for the scales
 stays complete. A bf16 trunk leaves that position absent instead: it has no tensor, so no
 cotangent either, and position 1 is frozen with `slot` and `lora_a`.
 
-One row serves both forms, because the schema is one width (`ref_registry.cpp`):
+So two rows serve the op, and the coded one is registered first: the registry applies the first row
+whose predicate accepts the record, and a coded record and a float one share the op name and the
+schema width — only the `dtype` parameter tells them apart (`ref_registry.cpp`):
 
 | activation | schema | frozen | row |
 |---|---|---|---|
-| `i8` | `a, a_scale, slot, lora_a, t` | 1, 2, 3 | `R97_REGISTER_ADJOINT_F("lora_shrink", host, ..., 1, 2, 3)` |
-| bf16 | `a, a_scale(absent), slot, lora_a, t` | 1, 2, 3 | the same row |
+| `i8` | `a, a_scale, slot, lora_a, t` | 2, 3 | `R97_REGISTER_ADJOINT_IF_F("lora_shrink", host, ..., coded_act, 2, 3)` |
+| bf16 | `a, a_scale(absent), slot, lora_a, t` | 1, 2, 3 | `R97_REGISTER_ADJOINT_F("lora_shrink", host, ..., 1, 2, 3)` |
+
+The `_IF_F` form is the one that takes a predicate, and the float row's null predicate accepts
+every record, which is why it comes second: a single row freezing 1 as well would declare the
+scale's cotangent away for the coded form, and the adjoint's write of it would be dead. The tests
+state the coded route on its own (`lora_shrink_coded_scale_gets_a_cotangent`): the shared FD check
+skips frozen operands, so it cannot notice a position frozen by mistake.
 
 ### 3.3 The `B = 0` start
 
@@ -183,7 +191,8 @@ twin, so a twin wrong about the group index agrees with its own differences.
 |---|---|---|
 | `check_kernel` | the twin against radiance's host row (`lora_expand`, `lora_expand_mm`, and `lora_shrink` on a coded activation) | 0.02 relative, bf16's own width |
 | `float_shrink_kernel` (in the test) | the same for a bf16 activation, whose `a_scale` is the absent position 1 | 0.02 relative |
-| `check_adjoint` | the adjoint against central differences of the twin, both forms of the shrink | 1e-6 relative |
+| `check_adjoint` | the adjoint against central differences of the twin, both forms of the shrink; for the coded form the scale stream is among the perturbed operands, because position 1 is not frozen | 1e-6 relative |
+| `lora_shrink_coded_scale_gets_a_cotangent` (in the test) | the coded shrink's `a_scale` cotangent against the formula and against a derivative of the twin along a direction in the scale stream, without consulting the frozen list | 1e-12 of the block's largest for the formula, 1e-6 relative for the derivative |
 | `check_grad` (in the test) | `dA`/`dB` in the ParamSet against central differences of the twin, per entry and along a direction | 1e-5 of the block's largest entry |
 
 The bf16 trunk's kernel check is launched in the test rather than through `check_kernel`, because

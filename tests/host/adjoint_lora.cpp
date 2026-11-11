@@ -12,7 +12,10 @@
 // reads a_scale[m, 0] whatever index the twin computes; the down_proj's K of 256 puts two groups
 // in a row and a wrong group index on most of its k's; and the up_proj's K of 300 puts three groups
 // in a row, the last one partial (128, 128 and 44 wide), so a width taken as ceil(K / groups) --
-// 100 here -- misreads 100..127 and 200..255, and check_kernel says so.
+// 100 here -- misreads 100..127 and 200..255, and check_kernel says so. The coded shrink's scale
+// is a route of its own: its cotangent is part of the int8 chain, stated against the formula and as
+// a derivative of the twin without the frozen list, and the frozen list itself is stated per form --
+// the two together show if the registration froze the position or the write went missing.
 #include "support/adjoint_check.h"
 #include "support/test.h"
 
@@ -513,7 +516,10 @@ R97_TEST(lora_expand_twin_matches_the_kernel) {
 
 /* The shrink's adjoint against central differences of its twin, on both forms. For the code stream
  * the difference is taken over the codes and over the scales, so the dequantisation's own factor is
- * part of what is checked: the value-space cotangent split the way the quantiser will read it. */
+ * part of what is checked: the value-space cotangent split the way the quantiser will read it. That
+ * holds only while position 1 is not frozen -- the shared check skips frozen operands -- which
+ * `shrink_frozen_positions_follow_the_form` states and `lora_shrink_coded_scale_gets_a_cotangent`
+ * states without the frozen list. */
 R97_TEST(lora_shrink_adjoint_matches_finite_differences) {
     for (const Site& s : sites) {
         for (bool coded : {false, true}) {
@@ -629,16 +635,87 @@ R97_TEST(lora_path_with_b_zero) {
     }
 }
 
-/* One row serves both forms, and it freezes the absent a_scale position with slot and lora_a: a
- * bf16 trunk's record asks no cotangent of any of the three. */
-R97_TEST(shrink_frozen_positions_cover_the_absent_scale) {
+/* The frozen positions follow the form. `slot` (2) is an index list and `lora_a` (3) a weight:
+ * neither is something the walk asks a cotangent of, so both are frozen in both forms. The
+ * `a_scale` position (1) is frozen only on a bf16 trunk, where it is the absent operand; a coded
+ * trunk passes a real scale whose cotangent the adjoint gives, so position 1 is the walk's there.
+ * Two rows serve the op -- `R97_REGISTER_ADJOINT_IF_F` for the codes, `_F` for the float -- and the
+ * coded one is registered first, because the registry applies the first row whose predicate accepts
+ * the record. */
+R97_TEST(shrink_frozen_positions_follow_the_form) {
+    int coded_sites_seen = 0;
     for (const Site& s : sites) {
-        for (bool coded : {false, true}) {
-            if (coded != coded_site(s)) continue;
-            const OpRecord rec = shrink_rec(s, coded);
-            R97_CHECK(adjoint_frozen(rec.op, Side::host, rec.params) ==
-                      std::vector<int>({1, 2, 3}));
+        const OpRecord bf16 = shrink_rec(s, false);
+        R97_CHECK(adjoint_frozen(bf16.op, Side::host, bf16.params) == std::vector<int>({1, 2, 3}));
+        if (!coded_site(s)) continue;
+        ++coded_sites_seen;
+        const OpRecord i8 = shrink_rec(s, true);
+        R97_CHECK(adjoint_frozen(i8.op, Side::host, i8.params) == std::vector<int>({2, 3}));
+    }
+    R97_CHECK(coded_sites_seen == 3);
+}
+
+/* The coded shrink's chain through `a_scale`: dL/dscale[m, e] = sum_{k in group e} g[m, k] *
+ * code[m, k] with g[m, k] = sum_j cot t[m, j] * A[s, j, k]. The registration formerly froze position 1
+ * for both forms, which told the walk never to ask for this cotangent and made the adjoint's write
+ * of it dead; nothing caught that, because the shared FD check skips frozen operands. So this test
+ * states the route twice without consulting the frozen list: the formula, read out of the operands
+ * entry by entry, and the derivative of <twin, cot t> along a direction in the scale stream. */
+R97_TEST(lora_shrink_coded_scale_gets_a_cotangent) {
+    for (const Site& s : sites) {
+        if (!coded_site(s)) continue;
+        const OpRecord rec = shrink_rec(s, true);
+        const Case c = make_case(s, rec, false, seed_of(s));
+        const Call a = run_adjoint(rec, c.in, c.out, s.module, seed_of(s) ^ 0x5ca1eu);
+
+        const int64_t groups = (s.K + s.group - 1) / s.group;
+        R97_CHECK(rec.operands[1].shape[1] == groups);
+        R97_CHECK(a.dc[1].value.size() == (size_t)(s.M * groups));
+
+        std::vector<double> want((size_t)(s.M * groups), 0.0);
+        for (int64_t m = 0; m < s.M; ++m) {
+            const int64_t slot = slot_of(s, m);
+            if (slot < 0 || slot >= s.S) continue;  // a base row, or a slot past the pool
+            for (int64_t e = 0; e < groups; ++e) {
+                const int64_t lo = e * s.group;
+                const int64_t hi = std::min(s.K, lo + s.group);
+                double sum = 0.0;
+                for (int64_t k = lo; k < hi; ++k) {
+                    double g = 0.0;
+                    for (int64_t j = 0; j < s.R; ++j)
+                        g += a.cot[0].value[(size_t)(m * s.R + j)] *
+                             c.in[3].value[(size_t)((slot * s.R + j) * s.K + k)];
+                    sum += g * c.in[0].value[(size_t)(m * s.K + k)];
+                }
+                want[(size_t)(m * groups + e)] = sum;
+            }
         }
+        double biggest = 0.0, worst = 0.0;
+        for (size_t e = 0; e < want.size(); ++e) {
+            biggest = std::max(biggest, std::fabs(want[e]));
+            worst = std::max(worst, std::fabs(a.dc[1].value[e] - want[e]));
+        }
+        R97_CHECK(biggest > 0.0);
+        std::printf("  %s coded a_scale: formula worst %.1g of the block's largest\n", s.name,
+                    worst / biggest);
+        R97_CHECK(worst <= 1e-12 * biggest);
+
+        /* The same claim as a derivative of the twin over a direction in the scale stream. The
+         * frozen list plays no part: a row that skipped position 1 would leave the adjoint's side
+         * at zero while the twin's difference is not. */
+        std::vector<double> dir((size_t)c.in[1].value.size());
+        uint64_t seed = seed_of(s) ^ 0x71e5u;
+        for (double& v : dir) v = urand(&seed);
+        const double eps = 1e-6;
+        const double numeric = (loss_along(rec, c.in, 1, dir, eps, a.cot[0].value) -
+                                loss_along(rec, c.in, 1, dir, -eps, a.cot[0].value)) /
+                               (2.0 * eps);
+        double analytic = 0.0;
+        for (size_t e = 0; e < dir.size(); ++e) analytic += a.dc[1].value[e] * dir[e];
+        R97_CHECK(std::fabs(analytic) > 0.0);
+        std::printf("  %s coded a_scale: direction %+.6g vs finite differences %+.6g\n", s.name,
+                    analytic, numeric);
+        R97_CHECK(std::fabs(analytic - numeric) <= fd_tol * std::fabs(analytic));
     }
 }
 

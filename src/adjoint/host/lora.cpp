@@ -19,10 +19,14 @@
 // trunk's `a_scale` is an optional operand the call does not pass, and an absent operand keeps its
 // place: radiance issues RAD_OPK_NONE there (issue.cpp), and Tape::record names the position
 // `none:<i>` with dtype `invalid` (tape.cpp, rad_dtype_name(RAD_DT_INVALID)). So a bf16 record is
-// five wide too, and the frozen positions are the same for both forms -- `slot` at 2 and `lora_a`
-// at 3. A float trunk's absent `a_scale` at 1 is frozen as well: it has no tensor and so no
-// cotangent. In the coded form `a_scale` does have one, and the adjoint gives it: the quantiser
-// that made the codes reads both of its outputs' cotangents back. The expand's only cotangent is
+// five wide too, and `slot` at 2 and `lora_a` at 3 are frozen in both forms. The `a_scale` position
+// at 1 is the one that differs: a float trunk leaves it absent, with no tensor and so no cotangent,
+// and the row that serves a float record freezes it; a coded trunk passes a real scale, whose
+// cotangent the adjoint gives, because the quantiser that made the codes reads both of its outputs'
+// cotangents back. So the shrink registers two rows -- `R97_REGISTER_ADJOINT_IF_F` for the coded
+// form with 2 and 3 frozen, `_F` for the float one with 1, 2 and 3 -- and the coded row comes
+// first, because lookup applies the first row whose predicate accepts the record and the float row
+// accepts every record. The expand's only cotangent is
 // t's: `scale` is the adapter's alpha/r, a hyperparameter from the adapter file, and `lora_b` is a
 // leaf whose gradient goes to the ParamSet.
 //
@@ -402,8 +406,12 @@ R97_REGISTER_TWIN("lora_shrink", lora_shrink_twin)
 R97_REGISTER_TWIN("lora_expand", lora_expand_twin)
 R97_REGISTER_TWIN("lora_expand_mm", lora_expand_twin)
 
-/* slot and lora_a are frozen in both forms, and so is the a_scale position: a float trunk leaves
- * it absent there, with no tensor and so no cotangent. */
+/* Two rows, because the a_scale position means different things in the two forms: a coded trunk
+ * passes a real scale, and its cotangent is part of the int8 chain, so only slot (2) and lora_a (3)
+ * are frozen there; a float trunk leaves the position absent -- no tensor, no cotangent -- so 1 is
+ * frozen with them. The coded row goes first: the registry applies the first row whose predicate
+ * accepts the record, and the float row's predicate is null, which accepts everything. */
+R97_REGISTER_ADJOINT_IF_F("lora_shrink", host, lora_shrink_host_adjoint, coded_act, 2, 3)
 R97_REGISTER_ADJOINT_F("lora_shrink", host, lora_shrink_host_adjoint, 1, 2, 3)
 
 R97_REGISTER_ADJOINT_F("lora_expand", host, lora_expand_host_adjoint, 1, 2, 3)
