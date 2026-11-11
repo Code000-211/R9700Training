@@ -516,54 +516,64 @@ void very_large_logits_stay_finite() {
 
 // ------------------------------------------------------------------------------------ the cost
 
-// What docs/kernels/head.md quotes: 1000 positions through the loop, and one chunk's memory. The
-// upload is counted once, so the line is the head product's side of the join -- the kernel, the
-// losses coming back and nothing else.
+// What docs/kernels/head.md quotes: 1000 positions through the loop, and one chunk's memory. A
+// pass is 256 rows of the real width in the loop's own chunks, with one upload of the chunk's
+// logits, so the line is the head product's side of the join -- the kernel, the losses coming back
+// and nothing else. The first pass warms the chunk's scratch and is not counted; the best of the
+// passes after it is the number, because a shared card gives a run some room.
 void bench_the_loop() {
     constexpr int64_t kRows = 256;   // four chunks of the real width, a fifth of 1000 positions
     constexpr int64_t kChunk = kHeadChunkRows;
     constexpr int64_t kVocab = 248320;
+    constexpr int kPasses = 8;       // one to warm the scratch, seven counted
 
     uint64_t seed = 0x4ce00003ull;
-    const int64_t chunk_bytes = kChunk * kVocab;
-    std::vector<uint16_t> logits(size_t(chunk_bytes), 0);
+    std::vector<uint16_t> logits(size_t(kChunk * kVocab), 0);
     for (uint16_t& x : logits) x = head_bf16_from_f32(float(device_check::urand(&seed) * 2.0 - 1.0));
     std::vector<int32_t> ids(size_t(kChunk), 0);
 
-    double loss = 0.0;
-    int64_t rows_done = 0;
-    bool uploaded = false;
     device::scratch_reset();
+    double best = 0.0;
+    double worst = 0.0;
+    double loss = 0.0;
+    for (int pass = 0; pass < kPasses; ++pass) {
+        int64_t rows_done = 0;
+        bool uploaded = false;
+        const HeadCeWindow window{kRows, kVocab, kChunk, 1.0 / double(kRows)};
+        const HeadChunkFill fill = [&](HeadChunk& c) {
+            HeadChunkRows answer;
+            const int64_t n = std::min(c.positions, kRows - rows_done);
+            if (n <= 0) return answer;
+            if (!uploaded) {  // one upload a pass: the kernel and the losses coming back are the cost
+                require_copy(rad_memcpy_async(c.logits, logits.data(),
+                                              n * kVocab * int64_t(sizeof(uint16_t)),
+                                              static_cast<RadStream>(c.stream)),
+                             "uploading the bench's rows");
+                uploaded = true;
+            }
+            answer.rows = n;
+            answer.ids.assign(ids.begin(), ids.begin() + n);
+            return answer;
+        };
+        const HeadGradSink sink = [](const HeadChunk&) {};
 
-    const HeadCeWindow window{kRows, kVocab, kChunk, 1.0 / double(kRows)};
-    const HeadChunkFill fill = [&](HeadChunk& c) {
-        HeadChunkRows answer;
-        const int64_t n = std::min(c.positions, kRows - rows_done);
-        if (n <= 0) return answer;
-        if (!uploaded) {  // one upload: what the loop costs is the kernel and the losses coming back
-            require_copy(rad_memcpy_async(c.logits, logits.data(), n * kVocab * int64_t(sizeof(uint16_t)),
-                                          static_cast<RadStream>(c.stream)),
-                         "uploading the bench's rows");
-            uploaded = true;
-        }
-        answer.rows = n;
-        answer.ids.assign(ids.begin(), ids.begin() + n);
-        return answer;
-    };
-    const HeadGradSink sink = [](const HeadChunk&) {};
+        const auto t0 = std::chrono::steady_clock::now();
+        const HeadCeSum sum = head_ce_loop(window, fill, sink);
+        const auto t1 = std::chrono::steady_clock::now();
+        loss = sum.loss;
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        if (pass == 0) continue;
+        if (best == 0.0 || ms < best) best = ms;
+        if (ms > worst) worst = ms;
+    }
 
-    const auto t0 = std::chrono::steady_clock::now();
-    const HeadCeSum sum = head_ce_loop(window, fill, sink);
-    const auto t1 = std::chrono::steady_clock::now();
-    loss = sum.loss;
-
-    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     const int64_t peak = device::scratch_stats().peak_bytes;
     device::scratch_reset();
-    std::printf("head ce: %.3f ms per 1000 positions (%lld rows of %lld, chunk %lld, one upload); "
-                "loss %.6g; one chunk's scratch peak %lld KiB\n",
-                ms * 1000.0 / double(kRows), (long long)kRows, (long long)kVocab, (long long)kChunk,
-                loss, (long long)(peak / 1024));
+    std::printf("head ce: %.3f ms per 1000 positions, the best of %d passes of %lld rows of %lld at "
+                "chunk %lld, one upload a pass (the slowest read %.3f); loss %.6g; one chunk's "
+                "scratch peak %lld KiB\n",
+                best * 1000.0 / double(kRows), kPasses - 1, (long long)kRows, (long long)kVocab,
+                (long long)kChunk, worst * 1000.0 / double(kRows), loss, (long long)(peak / 1024));
 }
 
 void run() {
