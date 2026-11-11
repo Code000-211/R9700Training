@@ -316,6 +316,11 @@ R97_TEST(adjoint_linear_device_agrees) {
         {"ffn_down", gemm_nt_q_rec(1024, 5120, 17408)},
         {"ffn_gate_up", gemm_nt_q_rec(1024, 34816, 5120)},
         {"ssm_out bf16", gemm_nt_rec(1024, 5120, 6144)},
+        // Four thousand and ninety-six tokens of the widest linear, and a batch of unequal lengths
+        // whose 4023 tokens leave both the 256-row band and the sixteen rows of one wave's tile a
+        // partial tail.
+        {"ffn_gate_up 4096", gemm_nt_q_rec(4096, 34816, 5120)},
+        {"attn_k/v batch", gemm_nt_q_rec(4023, 1024, 5120)},
     };
     for (const Real& r : real) {
         const double rel = agree_on_probes(r.rec, 0x3000, 512);
