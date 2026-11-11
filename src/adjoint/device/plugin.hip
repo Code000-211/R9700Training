@@ -16,6 +16,7 @@
 
 #include "r97/adjoint.h"
 
+#include "grad_stage.h"
 #include "scratch.h"
 
 // The build passes the architecture list it is building for; a standalone compile of this file
@@ -58,6 +59,7 @@ namespace device {
 
 void* scratch_alloc(int64_t) { return nullptr; }
 void scratch_free(void*) {}
+float* grad_stage_slot(const std::string&, const std::vector<int64_t>&) { return nullptr; }
 
 }  // namespace device
 }  // namespace r97

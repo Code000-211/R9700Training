@@ -11,6 +11,11 @@
 //     harness compares: this file runs both rows with a ParamSet and holds dA and dB to the same
 //     tolerance, measured against the block's largest entry because a gradient entry is a sum that
 //     cancels and an f32 sum's error follows the terms it summed, not the entry it lands in;
+//   * a gradient is the step's, not the call's (src/adjoint/device/grad_stage.h): the row adds a
+//     call's sum into an f32 accumulator on the card and touches no leaf, the accumulator is the
+//     same f32 buffer for every token of every call of the step, and it is rounded to bf16 once --
+//     at the step's end, when the walk copies it into the ParamSet. A step whose tokens arrive in
+//     two calls is held to the host row over the sum of the two calls;
 //   * the shapes the standard names: ranks 4 and 16 on the real widths, 1024 and 4096 tokens, one
 //     sequence and a batch of unequal lengths (the adapter sees a batch of unequal lengths as its
 //     total token count, so 448 + 320 + 256 is the 1024-token row at the ffn's widths);
@@ -20,6 +25,8 @@
 // Needs one R9700 (gfx1201, 32 GB) or similar; runs under the GPU test guard. No container is
 // read: the real widths are numbers from the design, so this test carries the `gpu` label only.
 #include "r97/adjoint.h"
+
+#include "adjoint/device/grad_stage.h"
 
 #include "support/bench.h"
 #include "support/device_check.h"
@@ -43,11 +50,15 @@ using namespace r97;
 using device_check::Case;
 using device_check::Report;
 
-// The device side rounds a gradient to bf16 once, after the f32 sum over the tokens went out: an
-// entry carries about 2^-9 of relative rounding, and the sum's f32 noise follows the terms, not the
-// entry. Both are measured against the block's largest entry, so the tolerance is the harness's
-// bf16 relative bound on that scale.
+// The device side rounds a gradient to bf16 once, at the step's end, after the f32 sum over all of
+// the step's tokens: an entry carries about 2^-9 of relative rounding, and the sum's f32 noise
+// follows the terms, not the entry. Both are measured against the block's largest entry, so the
+// tolerance is the harness's bf16 relative bound on that scale.
 constexpr double kGradScale = device_check::kRelTol;
+
+// One step of bf16 rounding: what a claim that differs only in which side of a rounding tie a term
+// fell on may be off by.
+constexpr double kOneBf16 = 1.0 / 256.0;
 
 /* ------------------------------------------------------------------ the sites */
 
@@ -275,6 +286,24 @@ GradReport check_grads(const Case& c, const char* prefix, bool zero_a) {
     device_call.prefix = prefix;
     device(device_call);
 
+    // The call leaves the step's total on the card: the walk's ParamSet is untouched until the step
+    // ends, and what the step is holding is the f32 accumulator, not a bf16 leaf.
+    if (!device_grads.empty()) {
+        g.ok = false;
+        g.note = c.label + ": the call copied gradients into the ParamSet before the step ended";
+        return g;
+    }
+    if (!device::grad_stage_flush(&device_grads)) {
+        g.ok = false;
+        g.note = c.label + ": the step's staged gradients did not copy out";
+        return g;
+    }
+    if (device::grad_stage_bytes() != 0) {
+        g.ok = false;
+        g.note = c.label + ": the step's staging was not freed when it ended";
+        return g;
+    }
+
     // The reference sees the same forward values and the same cotangent as the device did, at zero
     // dc and at an empty ParamSet.
     std::vector<AdValue> host_dc = device_dc;
@@ -347,9 +376,9 @@ void require(const GradReport& g) {
 
 /* ------------------------------------------------------------------ timing */
 
-/* The time of the whole call with the gradients in it: upload, the kernels, the f32 sum over the
- * tokens, the one rounding to bf16 and the copy back into the ParamSet. The harness's own bench
- * times the call the contract states (no ParamSet), which the doc quotes beside this. */
+/* The time of the whole call with the gradients in it: upload, the kernels and the f32 sum over
+ * the tokens into the step's accumulator on the card. The harness's own bench times the call the
+ * contract states (no ParamSet), which the doc quotes beside this. */
 double time_with_grads_ms(const Case& c, int reps) {
     AdjointFn device = adjoint_find(c.rec.op, Side::device, c.rec.params, nullptr);
     if (!device) throw std::runtime_error("no device adjoint for '" + c.rec.op + "'");
@@ -357,11 +386,8 @@ double time_with_grads_ms(const Case& c, int reps) {
     AdjointCall call = device_check::make_call(c, &fwd, &dc);
     ParamSet grads;
     call.grads = &grads;
-    device(call);  // warm-up: the kernel's module is finalized and the leaves exist
-    auto zero = [&dc, &grads] {
-        for (AdValue& v : dc) std::fill(v.value.begin(), v.value.end(), 0.0);
-        for (Param& p : grads) std::fill(p.value.begin(), p.value.end(), 0.0f);
-    };
+    device(call);  // warm-up: the kernel's module is finalized and the step's accumulator is made
+    auto zero = [&dc] { for (AdValue& v : dc) std::fill(v.value.begin(), v.value.end(), 0.0); };
     zero();
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < reps; ++i) {
@@ -369,7 +395,32 @@ double time_with_grads_ms(const Case& c, int reps) {
         device(call);
     }
     const auto t1 = std::chrono::steady_clock::now();
+    device::grad_stage_discard();  // the timing does not want the step's gradients
     return std::chrono::duration<double, std::milli>(t1 - t0).count() / std::max(reps, 1);
+}
+
+/* The step's end, as the walk pays for it: one call has put the step's f32 total on the card, and
+ * grad_stage_flush rounds it once and copies it into the ParamSet. The copy is what the walk does
+ * once per step, so the number is the whole of the step's gradient traffic besides the calls. */
+double time_flush_ms(const Case& c, int reps) {
+    AdjointFn device = adjoint_find(c.rec.op, Side::device, c.rec.params, nullptr);
+    if (!device) throw std::runtime_error("no device adjoint for '" + c.rec.op + "'");
+    std::vector<AdValue> fwd, dc;
+    AdjointCall call = device_check::make_call(c, &fwd, &dc);
+    ParamSet grads;
+    call.grads = &grads;
+    device(call);  // warm-up, and the leaf the flush will add to
+    device::grad_stage_flush(&grads);
+    double total = 0.0;
+    for (int i = 0; i < reps; ++i) {
+        for (AdValue& v : dc) std::fill(v.value.begin(), v.value.end(), 0.0);
+        device(call);  // one call's tokens, staged on the card
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!device::grad_stage_flush(&grads)) throw std::runtime_error("the flush failed");
+        const auto t1 = std::chrono::steady_clock::now();
+        total += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+    return total / std::max(reps, 1);
 }
 
 /* Deliberately wrong: the value-space cotangent without the group scale, which a coded record's
@@ -421,6 +472,8 @@ void check_site(const Site& s, int reps) {
             device_check::print_bench(c, reps);
             std::printf("%-44s %8.3f ms adjoint with dA/dB\n", c.label.c_str(),
                         time_with_grads_ms(c, reps));
+            std::printf("%-44s %8.3f ms step's flush into the ParamSet\n", c.label.c_str(),
+                        time_flush_ms(c, reps));
             std::fflush(stdout);
         }
     }
@@ -479,7 +532,12 @@ void run_fixture() {
         ParamSet grads;
         call.grads = &grads;
         call.prefix = "model.layers.0.self_attn.q_proj";
-        adjoint_find("lora_shrink", Side::device, c.rec.params, nullptr)(call);
+        AdjointFn device = adjoint_find("lora_shrink", Side::device, c.rec.params, nullptr);
+        device(call);
+        R97_CHECK(grads.empty());
+        R97_CHECK(device::grad_stage_bytes() == int64_t(tiny_r16.R) * tiny_r16.K * 4);
+        R97_CHECK(device::grad_stage_flush(&grads));
+        R97_CHECK(device::grad_stage_bytes() == 0);
         R97_CHECK(grads.size() == 1);
         R97_CHECK(grads[0].name == "model.layers.0.self_attn.q_proj.lora_A");
         R97_CHECK(grads[0].shape == std::vector<int64_t>({tiny_r16.R, tiny_r16.K}));
@@ -487,18 +545,32 @@ void run_fixture() {
         std::printf("dA is named %s and is [%lld, %lld]\n", grads[0].name.c_str(),
                     (long long)grads[0].shape[0], (long long)grads[0].shape[1]);
 
-        // A second call adds to the same leaf, as a step's tokens arriving in two chunks do.
-        adjoint_find("lora_shrink", Side::device, c.rec.params, nullptr)(call);
-        R97_CHECK(grads.size() == 1);
+        // A step's tokens in two calls: the second call adds into the accumulator the first one made
+        // -- the same buffer, not a second one -- and nothing reaches the leaf until the walk ends
+        // the step, which rounds the total once. So a step of two identical calls is twice the step
+        // of one, to within that one rounding (the sum's order puts a term on either side of a
+        // rounding tie).
         std::vector<AdValue> fwd2, dc2;
         AdjointCall again = device_check::make_call(c, &fwd2, &dc2);
         ParamSet doubled;
+        call.grads = &doubled;
         again.grads = &doubled;
-        again.prefix = "model.layers.0.self_attn.q_proj";
-        adjoint_find("lora_shrink", Side::device, c.rec.params, nullptr)(again);
-        for (size_t i = 0; i < grads[0].value.size(); ++i)
-            R97_CHECK(grads[0].value[i] == 2.0f * doubled[0].value[i]);
-        std::printf("a second call adds to the same leaf\n");
+        again.prefix = call.prefix;
+        const std::vector<float> one_call = grads[0].value;
+        device(call);
+        R97_CHECK(doubled.empty());                     // the step's first call copies nothing out
+        R97_CHECK(grads[0].value == one_call);          // and the leaf the step before left is its own
+        device(again);
+        R97_CHECK(doubled.empty());                     // the second call copies nothing out either
+        R97_CHECK(grads[0].value == one_call);
+        R97_CHECK(device::grad_stage_bytes() == int64_t(tiny_r16.R) * tiny_r16.K * 4);
+        R97_CHECK(device::grad_stage_flush(&doubled));
+        R97_CHECK(doubled.size() == 1);
+        for (size_t i = 0; i < grads[0].value.size(); ++i) {
+            const double twice = 2.0 * grads[0].value[i];
+            R97_CHECK(std::fabs(doubled[0].value[i] - twice) <= kOneBf16 * std::fabs(twice));
+        }
+        std::printf("a step of two calls sums them in f32 on the card and rounds the total once\n");
     }
 
     // The harness rejects a reference that drops the coded record's scale.
@@ -523,6 +595,7 @@ void run_fixture() {
         call.grads = &grads;
         call.prefix = tiny_r16.module;
         adjoint_find("lora_expand", Side::device, expand.rec.params, nullptr)(call);
+        R97_CHECK(device::grad_stage_flush(&grads));
         R97_CHECK(grads.size() == 1);
         size_t dt_nonzero = 0;
         for (double v : dc[0].value) dt_nonzero += v != 0.0 ? 1 : 0;

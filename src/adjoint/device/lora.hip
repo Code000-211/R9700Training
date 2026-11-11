@@ -26,9 +26,10 @@
 //
 // A base row -- a slot below 0, or one past the pool -- takes no cotangent and gives no gradient,
 // as on the host. The gradients are leaves of the walk's ParamSet, not operands of the record: this
-// kernel accumulates dA and dB over every token of the call in f32 on the card, rounds each entry
-// to bf16 once on the way out (the dtype a gradient has on the card) and adds it to the gradient
-// ParamSet, so the accumulation never leaves the card before the call ends.
+// kernel adds dA and dB into the step's f32 accumulators on the card (grad_stage.h), over every
+// token of every call of the step, and touches no leaf of the ParamSet. The step's total leaves the
+// card when the walk ends it, rounded once to bf16 -- the dtype a gradient has on the card -- by
+// grad_stage_flush.
 //
 // What the caller hands each call (the record's operand order, reads first):
 //
@@ -53,6 +54,7 @@
 
 #include "r97/adjoint.h"
 
+#include "grad_stage.h"
 #include "scratch.h"
 
 #include "rad_device.h"
@@ -60,9 +62,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
-#include <cstring>
 #include <string>
-#include <utility>
 #include <variant>
 #include <vector>
 
@@ -73,22 +73,6 @@ constexpr int kBlock = 256;            // threads in a block; one column each wh
 constexpr int kMaxJ = 32;              // dA rows a thread accumulates in registers at once
 constexpr int64_t kRowsChunk = 64;     // token rows one dA block sums before adding its partials
 constexpr int64_t kMaxRShared = 1024;  // pool columns a token row can hold in shared memory
-
-// bf16 storage on the card, as radiance's kernels spell it: unsigned short, round half to even.
-__host__ __device__ inline unsigned short f32_to_bf16(float f) {
-    uint32_t u = 0;
-    std::memcpy(&u, &f, sizeof u);
-    u += 0x7fffu + ((u >> 16) & 1u);
-    u &= 0xffff0000u;
-    return (unsigned short)(u >> 16);
-}
-
-__host__ __device__ inline float bf16_to_f32(unsigned short h) {
-    const uint32_t u = (uint32_t)h << 16;
-    float f = 0.0f;
-    std::memcpy(&f, &u, sizeof f);
-    return f;
-}
 
 int64_t param_int(const std::vector<OpParam>& params, const char* name) {
     for (const OpParam& p : params) {
@@ -120,18 +104,6 @@ int64_t group_width(int64_t k, int64_t groups) {
     int64_t b = 1;
     while (b < lo) b <<= 1;
     return (k + b - 1) / b == groups ? b : lo;
-}
-
-// A cotangent of a trainable leaf, under the name the walk's prefix gives it.
-Param& grad_entry(ParamSet* grads, const std::string& name, const std::vector<int64_t>& shape) {
-    for (Param& p : *grads)
-        if (p.name == name) return p;
-    Param p;
-    p.name = name;
-    p.shape = shape;
-    p.value.assign((size_t)(shape[0] * shape[1]), 0.0f);
-    grads->push_back(std::move(p));
-    return grads->back();
 }
 
 std::string grad_name(const char* prefix, const char* leaf) {
@@ -363,14 +335,7 @@ __global__ void expand_db_kernel(const float* __restrict__ cy, const float* __re
         if (s < 0) continue;
         acc += cy[m * N + n] * sc[s * N + n] * t[m * R + j];
     }
-    db[i] = acc;
-}
-
-// The f32 sum over the step's tokens, rounded once to the dtype a gradient has on the card.
-__global__ void to_bf16_kernel(const float* __restrict__ src, unsigned short* __restrict__ dst,
-                               int64_t n) {
-    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = f32_to_bf16(src[i]);
+    db[i] += acc;  // the step's accumulator: this call's sum adds to the calls before it
 }
 
 // -- the plumbing ------------------------------------------------------------
@@ -383,19 +348,6 @@ bool upload_f32(const AdValue& v, void* dst, int64_t n, std::vector<float>* stag
 
 bool upload_slots(const std::vector<int>& slots, void* dst, RadStream stream) {
     return rad_memcpy_async(dst, slots.data(), (int64_t)(slots.size() * sizeof(int)), stream) == 0;
-}
-
-// Adds a bf16 buffer the kernel filled to the leaf's f32 values in the gradient ParamSet.
-bool download_add_bf16(Param* leaf, void* src, std::vector<unsigned short>* stage,
-                       RadStream stream) {
-    if (!leaf) return true;
-    const int64_t n = (int64_t)leaf->value.size();
-    stage->resize((size_t)n);
-    if (rad_memcpy_async(stage->data(), src, n * (int64_t)sizeof(unsigned short), stream) != 0)
-        return false;
-    if (rad_stream_sync(stream) != 0) return false;
-    for (int64_t i = 0; i < n; ++i) leaf->value[(size_t)i] += bf16_to_f32((*stage)[(size_t)i]);
-    return true;
 }
 
 // Adds an f32 buffer the kernel filled to a slot of the cotangent, in the value space the host row
@@ -426,8 +378,11 @@ void lora_shrink_device_adjoint(const AdjointCall& call) {
     RadStream stream = adjoint_stream();
     if (!stream) return;
 
-    Param* dA = nullptr;
-    if (call.grads) dA = &grad_entry(call.grads, grad_name(call.prefix, "lora_A"), {sh.R, sh.K});
+    // dA belongs to the step, not to the call: this row adds the call's sum into the f32
+    // accumulator the step is holding on the card, and the walk copies the step's total out when
+    // the step ends (grad_stage.h). Nothing of the leaf is touched here.
+    float* d_da = nullptr;
+    if (call.grads) d_da = device::grad_stage_slot(grad_name(call.prefix, "lora_A"), {sh.R, sh.K});
 
     device::ScratchBlock d_a(f32_bytes(sh.M * sh.K));
     device::ScratchBlock d_as(f32_bytes(sh.M * sh.groups));
@@ -436,10 +391,8 @@ void lora_shrink_device_adjoint(const AdjointCall& call) {
     device::ScratchBlock d_slot((int64_t)(sh.M * (int64_t)sizeof(int)));
     device::ScratchBlock d_dx(f32_bytes(sh.M * sh.K));
     device::ScratchBlock d_sct(f32_bytes(sh.M * sh.groups));
-    device::ScratchBlock d_da(dA ? f32_bytes(sh.R * sh.K) : 0);
-    device::ScratchBlock d_dab(dA ? sh.R * sh.K * (int64_t)sizeof(unsigned short) : 0);
     if (!d_a || !d_as || !d_ct || !d_la || !d_slot || !d_dx || !d_sct) return;
-    if (dA && (!d_da || !d_dab)) return;
+    if (call.grads && !d_da) return;
 
     std::vector<int> slots;
     fill_slots(*sh.slot, sh.S, &slots);
@@ -452,11 +405,6 @@ void lora_shrink_device_adjoint(const AdjointCall& call) {
     if (!upload_slots(slots, d_slot.p, stream)) return;
     if (rad_memset_async(d_dx.p, 0, f32_bytes(sh.M * sh.K), stream) != 0) return;
     if (rad_memset_async(d_sct.p, 0, f32_bytes(sh.M * sh.groups), stream) != 0) return;
-    if (dA) {
-        if (rad_memset_async(d_da.p, 0, f32_bytes(sh.R * sh.K), stream) != 0) return;
-        if (rad_memset_async(d_dab.p, 0, sh.R * sh.K * (int64_t)sizeof(unsigned short), stream) != 0)
-            return;
-    }
 
     const int64_t row_in_shared = sh.R <= kMaxRShared ? 1 : 0;
     const int64_t shared = row_in_shared ? sh.R * (int64_t)sizeof(float) : 0;
@@ -465,28 +413,18 @@ void lora_shrink_device_adjoint(const AdjointCall& call) {
                        (const float*)d_as.p, (const float*)d_ct.p, (const float*)d_la.p,
                        (const int*)d_slot.p, (float*)d_dx.p, (float*)d_sct.p, sh.M, sh.K, sh.R,
                        sh.groups, sh.group, row_in_shared);
-    if (dA) {
+    if (d_da) {
         const int64_t chunks = (sh.M + kRowsChunk - 1) / kRowsChunk;
         hipLaunchKernelGGL(shrink_da_kernel, dim3((unsigned int)blocks(sh.K), (unsigned int)chunks),
                            dim3(kBlock), 0, (hipStream_t)stream, (const float*)d_a.p,
                            (const float*)d_as.p, (const float*)d_ct.p, (const int*)d_slot.p,
-                           (float*)d_da.p, sh.M, sh.K, sh.R, sh.groups, sh.group, kRowsChunk);
+                           d_da, sh.M, sh.K, sh.R, sh.groups, sh.group, kRowsChunk);
     }
     if (rad_stream_sync(stream) != 0) return;
 
     std::vector<float> h_dx, h_sct;
     if (!download_add_f32(&a_cot, d_dx.p, &h_dx, stream)) return;
     if (!download_add_f32(&s_cot, d_sct.p, &h_sct, stream)) return;
-    if (dA) {
-        // The gradient stays in f32 on the card until the call ends; it goes out rounded once, as
-        // bf16, which is what a gradient is on the card.
-        hipLaunchKernelGGL(to_bf16_kernel, dim3((unsigned int)blocks(sh.R * sh.K)), dim3(kBlock), 0,
-                           (hipStream_t)stream, (const float*)d_da.p, (unsigned short*)d_dab.p,
-                           sh.R * sh.K);
-        if (rad_stream_sync(stream) != 0) return;
-        std::vector<unsigned short> h_dab;
-        (void)download_add_bf16(dA, d_dab.p, &h_dab, stream);
-    }
 }
 
 // The expand's adjoint: the cotangent of t over the projection's columns, and dB over the tokens.
@@ -502,8 +440,8 @@ void lora_expand_device_adjoint(const AdjointCall& call) {
     RadStream stream = adjoint_stream();
     if (!stream) return;
 
-    Param* dB = nullptr;
-    if (call.grads) dB = &grad_entry(call.grads, grad_name(call.prefix, "lora_B"), {ex.N, ex.R});
+    float* d_db = nullptr;
+    if (call.grads) d_db = device::grad_stage_slot(grad_name(call.prefix, "lora_B"), {ex.N, ex.R});
 
     device::ScratchBlock d_cy(f32_bytes(ex.M * ex.N));
     device::ScratchBlock d_t(f32_bytes(ex.M * ex.R));
@@ -511,10 +449,8 @@ void lora_expand_device_adjoint(const AdjointCall& call) {
     device::ScratchBlock d_sc(f32_bytes(ex.S * ex.N));
     device::ScratchBlock d_slot((int64_t)(ex.M * (int64_t)sizeof(int)));
     device::ScratchBlock d_dt(f32_bytes(ex.M * ex.R));
-    device::ScratchBlock d_db(dB ? f32_bytes(ex.N * ex.R) : 0);
-    device::ScratchBlock d_dbb(dB ? ex.N * ex.R * (int64_t)sizeof(unsigned short) : 0);
     if (!d_cy || !d_t || !d_lb || !d_sc || !d_slot || !d_dt) return;
-    if (dB && (!d_db || !d_dbb)) return;
+    if (call.grads && !d_db) return;
 
     std::vector<int> slots;
     fill_slots(*ex.slot, ex.S, &slots);
@@ -526,34 +462,20 @@ void lora_expand_device_adjoint(const AdjointCall& call) {
     if (!upload_f32(*ex.sc, d_sc.p, ex.S * ex.N, &h_sc, stream)) return;
     if (!upload_slots(slots, d_slot.p, stream)) return;
     if (rad_memset_async(d_dt.p, 0, f32_bytes(ex.M * ex.R), stream) != 0) return;
-    if (dB) {
-        if (rad_memset_async(d_db.p, 0, f32_bytes(ex.N * ex.R), stream) != 0) return;
-        if (rad_memset_async(d_dbb.p, 0,
-                             ex.N * ex.R * (int64_t)sizeof(unsigned short), stream) != 0)
-            return;
-    }
 
     hipLaunchKernelGGL(expand_dt_kernel, dim3((unsigned int)blocks(ex.M * ex.R)),
                        dim3(kBlock), 0, (hipStream_t)stream, (const float*)d_cy.p,
                        (const float*)d_lb.p, (const float*)d_sc.p, (const int*)d_slot.p,
                        (float*)d_dt.p, ex.M, ex.N, ex.R);
-    if (dB)
+    if (d_db)
         hipLaunchKernelGGL(expand_db_kernel, dim3((unsigned int)blocks(ex.N * ex.R)),
                            dim3(kBlock), 0, (hipStream_t)stream, (const float*)d_cy.p,
-                           (const float*)d_t.p, (const float*)d_sc.p, (const int*)d_slot.p,
-                           (float*)d_db.p, ex.M, ex.N, ex.R);
+                           (const float*)d_t.p, (const float*)d_sc.p, (const int*)d_slot.p, d_db,
+                           ex.M, ex.N, ex.R);
     if (rad_stream_sync(stream) != 0) return;
 
     std::vector<float> h_dt;
     if (!download_add_f32(&t_cot, d_dt.p, &h_dt, stream)) return;
-    if (dB) {
-        hipLaunchKernelGGL(to_bf16_kernel, dim3((unsigned int)blocks(ex.N * ex.R)), dim3(kBlock), 0,
-                           (hipStream_t)stream, (const float*)d_db.p, (unsigned short*)d_dbb.p,
-                           ex.N * ex.R);
-        if (rad_stream_sync(stream) != 0) return;
-        std::vector<unsigned short> h_dbb;
-        (void)download_add_bf16(dB, d_dbb.p, &h_dbb, stream);
-    }
 }
 
 }  // namespace
