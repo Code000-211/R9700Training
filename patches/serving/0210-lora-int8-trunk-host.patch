@@ -4,7 +4,7 @@ diff --git a/core/engine_lora.cpp b/core/engine_lora.cpp
 index 353a637..4623465 100644
 --- a/core/engine_lora.cpp
 +++ b/core/engine_lora.cpp
-@@ -59,6 +59,27 @@
+@@ -59,6 +59,27 @@ int read_targets(const std::string& dir, std::set<std::string>* out, std::string
      return RAD_OK;
  }
  
@@ -32,7 +32,7 @@ index 353a637..4623465 100644
  /* A generator's adapter name: a file stem under --lora-dir, possibly in a subdirectory, never
   * leaving it. */
  bool valid_name(const std::string& n) {
-@@ -103,6 +124,41 @@
+@@ -103,6 +124,41 @@ int Engine::lora_targets() {
          }
          if (cfg_.lora.adapters.empty()) lora_targets_.insert("*");
      }
@@ -78,7 +78,7 @@ diff --git a/core/lora/config.h b/core/lora/config.h
 index bf08120..2680a35 100644
 --- a/core/lora/config.h
 +++ b/core/lora/config.h
-@@ -35,6 +35,11 @@
+@@ -35,6 +35,11 @@ struct LoraConfig {
      /* HF module leaf names (q_proj, gate_proj, in_proj_qkv, ...) the sites are built for, sorted
       * and unique. Empty: the union of the startup adapters' target_modules. */
      std::vector<std::string> targets;
@@ -94,7 +94,7 @@ diff --git a/core/lora/declare.cpp b/core/lora/declare.cpp
 index ad04866..1dc9afc 100644
 --- a/core/lora/declare.cpp
 +++ b/core/lora/declare.cpp
-@@ -109,10 +109,29 @@
+@@ -109,10 +109,29 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
          return RAD_E_INVAL;
      }
  
@@ -125,7 +125,7 @@ index ad04866..1dc9afc 100644
      if (s < 0) return s;
      if (!bad.empty()) {
          for (const lora::UnsupportedUse& u : bad)
-@@ -126,7 +145,7 @@
+@@ -126,7 +145,7 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
      std::vector<lora::Site>  sites;
      std::vector<std::string> pool_weights;
      std::string              err;
@@ -134,7 +134,7 @@ index ad04866..1dc9afc 100644
      if (s < 0) {
          RAD_ERR("lora: %s", err.c_str());
          return s;
-@@ -226,6 +245,8 @@
+@@ -226,6 +245,8 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
          const OpInfo&  g = P.ops[gh];
          const std::string gop = g.op;
          const std::string rkey = g.ranged_key;
@@ -143,7 +143,7 @@ index ad04866..1dc9afc 100644
          const int64_t  lo = g.range_lo, hi = g.range_hi;
          long long gk = 0, gn = 0;
          const bool     has_k = g.base.get_i("K", &gk), has_n = g.base.get_i("N", &gn);
-@@ -267,7 +288,7 @@
+@@ -267,7 +288,7 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
              continue;
          }
  
@@ -152,7 +152,7 @@ index ad04866..1dc9afc 100644
          int n_sp = 0;
          sp[n_sp++] = RAD_RANGE("M", lo, hi);
          sp[n_sp++] = RAD_INT("K", x.K_r);
-@@ -275,6 +296,10 @@
+@@ -275,6 +296,10 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
          sp[n_sp++] = RAD_INT("S", S);
          if (coded) sp[n_sp++] = RAD_INT("group", a_grid);
          sp[n_sp++] = RAD_STR("dtype", rad_dtype_name(a_dt));
@@ -163,7 +163,7 @@ index ad04866..1dc9afc 100644
          const rad_op hs = b.decl_op("lora_shrink", sp, n_sp, nullptr, 0);
  
          RadParam ep[5] = { RAD_RANGE("M", lo, hi), RAD_INT("N", x.N_r), RAD_INT("R", x.R),
-@@ -300,7 +325,7 @@
+@@ -300,7 +325,7 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
              for (int v = 0; v < 2; ++v) {
                  const int64_t rv = ((x.R >> (v + 1)) + 15) / 16 * 16;
                  if (rv < 16 || rv >= prev) break;
@@ -173,10 +173,10 @@ index ad04866..1dc9afc 100644
                  vs[2] = RAD_INT("R", rv);
                  ep[2] = RAD_INT("R", rv);
 diff --git a/core/lora/lora.cpp b/core/lora/lora.cpp
-index 708784a..cd7623c 100644
+index 708784a..7f5f514 100644
 --- a/core/lora/lora.cpp
 +++ b/core/lora/lora.cpp
-@@ -566,6 +566,27 @@
+@@ -566,6 +566,27 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
  
  }  /* namespace */
  
@@ -204,7 +204,7 @@ index 708784a..cd7623c 100644
  /* ================================================================== predicates */
  bool weight_targeted(const Program& prog, rad_weight w, const TargetSet& targets) {
      if (targets.empty() || w == 0 || w >= prog.weights.size()) return false;
-@@ -578,7 +599,8 @@
+@@ -578,7 +599,8 @@ bool weight_targeted(const Program& prog, rad_weight w, const TargetSet& targets
      return targeted_core(prog, wi, maps, targets);
  }
  
@@ -214,7 +214,7 @@ index 708784a..cd7623c 100644
      auto no = [&](const std::string& m) { if (why) *why = m; return false; };
      if (b_out) *b_out = 0;
      const bool g = op.op == "gemm_nt", gb = op.op == "gemm_nt_bias", gq = op.op == "gemm_nt_q",
-@@ -602,10 +624,13 @@
+@@ -602,10 +624,13 @@ bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::s
      }
      if (gq || gqb) {
          /* At w4a8, w8a8 and w2a8 `a` is quant_act_i8's codes in the int8 WMMA's step order (the
@@ -231,7 +231,7 @@ index 708784a..cd7623c 100644
              return no(fmt("%s at %s reads quant_act_i8's codes in the int8 WMMA's step order, not "
                            "in the activation's column order", op.op.c_str(), dt));
      }
-@@ -616,14 +641,31 @@
+@@ -616,14 +641,31 @@ bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::s
              return no(fmt("%s reads K=%lld against a weight of %lld columns (a widened, rotated "
                            "input)", op.op.c_str(), k, (long long)w.decl.shape[1]));
      }
@@ -267,7 +267,7 @@ index 708784a..cd7623c 100644
      if (out) out->clear();
      if (targets.empty() || gen_scope(prog)) return 0;
      const MapIndex mi(prog);
-@@ -633,7 +675,7 @@
+@@ -633,7 +675,7 @@ int find_unsupported_uses(const Program& prog, const TargetSet& targets,
          if (op.weights.empty() || !op_live(op)) continue;
          rad_weight b = 0;
          std::string why;
@@ -276,7 +276,7 @@ index 708784a..cd7623c 100644
          for (rad_weight h : op.weights) {
              if (!targeted_idx(prog, mi, h, targets)) continue;
              /* Every view of a targeted weight read by a site over the same logical weight is the
-@@ -662,7 +704,8 @@
+@@ -662,7 +704,8 @@ int find_unsupported_uses(const Program& prog, const TargetSet& targets,
  }
  
  int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
@@ -286,7 +286,7 @@ index 708784a..cd7623c 100644
      if (!out) return fail(err, RAD_E_INVAL, "build_sites: null output");
      out->clear();
      if (pool_weights) pool_weights->clear();
-@@ -677,7 +720,7 @@
+@@ -677,7 +720,7 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
              const OpInfo& op = prog.ops[i];
              if (op.weights.empty() || !op_live(op)) continue;
              rad_weight b = 0;
@@ -295,7 +295,7 @@ index 708784a..cd7623c 100644
              for (rad_weight h : op.weights)
                  if (h && h < prog.weights.size() &&
                      (!site || !b || prog.weights[b].source != prog.weights[h].source))
-@@ -687,7 +730,7 @@
+@@ -687,7 +730,7 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
      std::vector<size_t> first_site;
      for (size_t i = 1; i < prog.ops.size(); ++i) {
          rad_weight b = 0;
@@ -304,7 +304,7 @@ index 708784a..cd7623c 100644
          if (!targeted_idx(prog, mi, b, targets)) continue;
          if (other_reader.count(prog.weights[b].source)) continue;
          if (gen_scope(prog)) {
-@@ -731,7 +774,8 @@
+@@ -731,7 +774,8 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
      return RAD_OK;
  }
  
@@ -314,7 +314,7 @@ index 708784a..cd7623c 100644
      const std::string want[3] = {
          module,
          module.starts_with("model.") && !module.starts_with("model.language_model.")
-@@ -773,7 +817,7 @@
+@@ -773,7 +817,7 @@ std::string explain_module(const Program& prog, const TargetSet& targets, const
                  if (!uses) continue;
                  rad_weight b = 0;
                  std::string no;
@@ -323,7 +323,7 @@ index 708784a..cd7623c 100644
                  reads += fmt("%sop %zu %s (%s)", reads.empty() ? "" : "; ", i, op.op.c_str(), no.c_str());
              }
              if (!reads.empty()) why = std::string("'") + m.declared + "' is read by " + reads;
-@@ -865,6 +909,14 @@
+@@ -865,6 +909,14 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
                     cfg["use_rslora"].get<bool>();
      if (cfg.contains("base_model_name_or_path") && cfg["base_model_name_or_path"].is_string())
          info->base_model = cfg["base_model_name_or_path"].get<std::string>();
@@ -338,12 +338,29 @@ index 708784a..cd7623c 100644
      if (cfg.contains("target_modules")) {
          const ojson& t = cfg["target_modules"];
          if (t.is_string()) info->target_modules.push_back(t.get<std::string>());
-@@ -1234,13 +1286,15 @@
+@@ -1234,13 +1286,32 @@ int pack_modules(const std::vector<Site>& sites, int max_rank,
  int check_placed(const std::vector<AdapterInfo>& per_rank, std::string* err, const Program* prog,
                   const TargetSet* targets) {
      if (per_rank.empty()) return RAD_OK;
 +    InputBasis basis = kInputNatural;
 +    if (parse_input_basis(per_rank[0].input_basis, &basis, nullptr) < 0) basis = kInputNatural;
++    /* The basis is the adapter's, so the site check runs again for one loaded after startup
++     * (Engine::lora_load, lora_set_weights): the sites were built from the startup adapters'
++     * basis, and an adapter stored in another would multiply the wrong activation. Nothing else
++     * can differ -- the Program and the targets are the ones declare checked. */
++    if (prog && targets) {
++        std::vector<UnsupportedUse> bad;
++        const int s = find_unsupported_uses(*prog, *targets, &bad, basis);
++        if (s < 0) return s;
++        if (!bad.empty()) {
++            const UnsupportedUse& u = bad[0];
++            return fail(err, RAD_E_UNSUPPORTED,
++                        fmt("weight '%s' (%s) is read by op %u '%s', which cannot carry an "
++                            "adapter: %s",
++                            u.weight.c_str(), u.module.c_str(), u.op_index, u.op.c_str(),
++                            u.why.c_str()));
++        }
++    }
      for (const AdapterInfo::Module& m : per_rank[0].modules) {
          bool anywhere = false;
          for (const AdapterInfo& a : per_rank)
@@ -359,7 +376,7 @@ diff --git a/core/lora/lora.h b/core/lora/lora.h
 index 11156ce..ed5929b 100644
 --- a/core/lora/lora.h
 +++ b/core/lora/lora.h
-@@ -101,6 +101,7 @@
+@@ -101,6 +101,7 @@ struct AdapterInfo {
      std::string dir;
      std::string base_model;        /* base_model_name_or_path */
      std::string peft_type;         /* "LORA" */
@@ -367,7 +384,7 @@ index 11156ce..ed5929b 100644
      int64_t     r = 0;             /* config r */
      double      alpha = 0.0;       /* config lora_alpha */
      bool        rslora = false;
-@@ -138,21 +139,40 @@
+@@ -138,21 +139,40 @@ struct UnsupportedUse {
   * A routed expert IS targeted when its leaf is (so its moe op is reported, never skipped). */
  bool weight_targeted(const Program& prog, rad_weight w, const TargetSet& targets);
  
@@ -412,7 +429,7 @@ index 11156ce..ed5929b 100644
  
  /* One adapter for one rank: `packed` gets one PackedSite per pool (index = Site::pool), in the
   * slot layout of the pool's sites. Refusals return a negative code and name module, expected and
-@@ -187,7 +207,8 @@
+@@ -187,7 +207,8 @@ int check_placed(const std::vector<AdapterInfo>& per_rank, std::string* err,
                   const Program* prog = nullptr, const TargetSet* targets = nullptr);
  
  /* Why a module path is not a site on this Program, in one sentence ("" when it is one). */
@@ -423,10 +440,10 @@ index 11156ce..ed5929b 100644
  }  /* namespace lora */
  }  /* namespace rad */
 diff --git a/docs/OPS.md b/docs/OPS.md
-index 57d9412..9ec3762 100644
+index 57d9412..e796bfd 100644
 --- a/docs/OPS.md
 +++ b/docs/OPS.md
-@@ -880,7 +880,7 @@
+@@ -880,7 +880,7 @@ butterfly), so every tile is byte-identical (`tests/r4d_emu/test_f32.cpp`).
  
  | op | params | operands |
  |---|---|---|
@@ -435,15 +452,17 @@ index 57d9412..9ec3762 100644
  | `lora_expand` | `M`(range) `N` `R` `S` `dtype` | `t`, `slot`, `lora_b`, `scale`, `y`:inout |
  | `lora_expand_mm` | `M`(range) `N` `R` `S` `dtype` | `t`, `slot`, `lora_b`, `scale`, `y`:inout |
  
-@@ -903,6 +903,11 @@
+@@ -903,6 +903,13 @@ GEMM's rows need not be the pass's token rows.
    `group` is a cross-check on the stream's grid -- `ceil(K / group)` groups along K -- and 0 means
    none; `dtype` is `a`'s tensor dtype name
    (`rad_dtype_name`: `bf16`, `f16`, `f32`, `fp8_e4m3`, `i8`, ...), not a combined quant string.
 +  `gemm_dtype` is the encoding of the GEMM whose activation `a` is (`i8a8h`, `w8a8`, ...), which
 +  says how that GEMM reads the codes: at `w4a8`/`w8a8`/`w2a8` `quant_act_i8` writes them in the
-+  int8 WMMA's step order and `lora_shrink` reads them exchanged back, as `gemm_nt_q` does, while
-+  the rotated producers write column order. The core declares it from the GEMM's `dtype`; it is
-+  absent when the GEMM has none (a `bf16` `gemm_nt`).
++  int8 WMMA's step order, while the rotated producers write column order. The core declares it from
++  the GEMM's `dtype`; it is absent when the GEMM has none (a `bf16` `gemm_nt`). libref's and
++  libavx's rows read either order, exchanging the step order back as `gemm_nt_q` does; libr4d's and
++  libhalo's rows read a row's codes by column only, so they refuse a step-order `gemm_dtype` with
++  an `i8` `a` (`RAD_E_UNSUPPORTED`) rather than fold the codes of the wrong columns.
    `lora_a` is `[S, R, K]` bf16, `t` is `[M, R]` f32.
  - `lora_expand`: `y[m, n] = y[m, n] + scale[s, n] · Σ_j t[m, j] · lora_b[s, n, j]`, f32
    accumulate, one rounding to `y`'s dtype (`bf16`/`f16`/`f32`, named by `dtype`). `lora_b` is
@@ -460,7 +479,7 @@ index fbf6c51..65884c2 100644
  using namespace avx;
  
  namespace {
-@@ -116,6 +118,31 @@
+@@ -116,6 +118,31 @@ AVX_KERNEL(lora_shrink) {
      const int64_t gp = p_int(a, "group", 0);
      if (gp > 0 && SA.p && (K + gp - 1) / gp != (K + SA.group - 1) / SA.group) return RAD_E_SHAPE;
  
@@ -496,7 +515,7 @@ diff --git a/libavx/avx_registry.cpp b/libavx/avx_registry.cpp
 index 1dbd2e5..d7c9938 100644
 --- a/libavx/avx_registry.cpp
 +++ b/libavx/avx_registry.cpp
-@@ -314,7 +314,8 @@
+@@ -314,7 +314,8 @@ static const RadOperandSpec oGemmQBias[]  = { OPD("a"), OPD("a_scale"), WGT("b")
                                                WGT("bias"), OUT("y") };
  /* Runtime LoRA, libref's schemas slot for slot (libref/ref_registry.cpp says what they mean). */
  static const RadParamSpec pLoraShrink[]   = { P_INT("M"), P_INT("K"), P_INT("R"), P_INT("S"),
@@ -506,11 +525,111 @@ index 1dbd2e5..d7c9938 100644
  static const RadOperandSpec oLoraShrink[] = { OPD("a"), OPD_O("a_scale"), OPD("slot"),
                                                OPD("lora_a"), OUT("t") };
  static const RadParamSpec pLoraExpand[]   = { P_INT("M"), P_INT("N"), P_INT("R"), P_INT("S"),
+diff --git a/libhalo/halo_lora_bf16.hip b/libhalo/halo_lora_bf16.hip
+index 459e7d5..74e8904 100644
+--- a/libhalo/halo_lora_bf16.hip
++++ b/libhalo/halo_lora_bf16.hip
+@@ -52,6 +52,7 @@
+ #include <hip/hip_runtime.h>
+ 
+ #include <cstdint>
++#include <cstring>
+ #include <map>
+ #include <mutex>
+ #include <utility>
+@@ -295,6 +296,17 @@ static bool dtype_agrees(const RadArgs* a, uint32_t dt) {
+     return !d || rad_dtype_parse(d) == dt;
+ }
+ 
++/* The GEMM's encoding and the order of its activation's codes: at the dtypes this names,
++ * quant_act_i8 wrote a row in the int8 WMMA's step order (libref/ref_common.h, i8_step_pos) and
++ * the rows below read a row by column. libref's shrink unexchanges the steps (ref_lora.cpp); no
++ * row here does, so a step-order reading is refused rather than folded over the wrong columns. */
++static bool i8_steps_dtype(const char* dt) {
++    static const char* const kDtypes[] = { "w4a8", "w4a8_asym", "w8a8", "w2a8" };
++    for (const char* d : kDtypes)
++        if (dt && std::strcmp(dt, d) == 0) return true;
++    return false;
++}
++
+ /* The scalar rows' launches, one per dtype instantiation: M blocks for shrink and M strips of 256
+  * columns for expand, 256 threads each, whatever the slots hold. */
+ template <int ADT>
+@@ -335,6 +347,7 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
+     }
+     if (!dtype_agrees(a, X->dtype)) return RAD_E_DTYPE;
+     if (adt >= kE4M3 && !XS) return RAD_E_INVAL;     /* a code without its scale has no value */
++    if (adt == kI8 && i8_steps_dtype(rad_args_gets(a, "gemm_dtype"))) return RAD_E_UNSUPPORTED;
+     if (LA->dtype != RAD_BF16 || T->dtype != RAD_F32 || SL->dtype != RAD_I32) return RAD_E_DTYPE;
+ 
+     int64_t M = 0, t_rs = 0, t_cs = 0, xr = 0, x_rs = 0, x_cs = 0, sr = 0, sl_st = 0;
+diff --git a/libhalo/halo_rows.cpp b/libhalo/halo_rows.cpp
+index af041c8..5f1c3a1 100644
+--- a/libhalo/halo_rows.cpp
++++ b/libhalo/halo_rows.cpp
+@@ -2450,6 +2450,7 @@ static const RadParamSpec pLoraShrink[] = {
+     P_INT("S"),
+     P_INTO("group"),
+     P_STR("dtype"),
++    P_STRO("gemm_dtype"),
+ };
+ static const RadOperandSpec oLoraShrink[] = {
+     { "a",       RAD_OPD_IN,  0 },
+diff --git a/libr4d/r4d_lora_bf16.hip b/libr4d/r4d_lora_bf16.hip
+index 0eb48ba..68576d1 100644
+--- a/libr4d/r4d_lora_bf16.hip
++++ b/libr4d/r4d_lora_bf16.hip
+@@ -50,6 +50,7 @@
+ #include <hip/hip_runtime.h>
+ 
+ #include <cstdint>
++#include <cstring>
+ #include <map>
+ #include <mutex>
+ #include <utility>
+@@ -768,6 +769,17 @@ static bool dtype_agrees(const RadArgs* a, uint32_t dt) {
+     return !d || rad_dtype_parse(d) == dt;
+ }
+ 
++/* The GEMM's encoding and the order of its activation's codes: at the dtypes this names,
++ * quant_act_i8 wrote a row in the int8 WMMA's step order (libref/ref_common.h, i8_step_pos) and
++ * the rows below read a row by column. libref's shrink unexchanges the steps (ref_lora.cpp); no
++ * row here does, so a step-order reading is refused rather than folded over the wrong columns. */
++static bool i8_steps_dtype(const char* dt) {
++    static const char* const kDtypes[] = { "w4a8", "w4a8_asym", "w8a8", "w2a8" };
++    for (const char* d : kDtypes)
++        if (dt && std::strcmp(dt, d) == 0) return true;
++    return false;
++}
++
+ /* The scalar rows' launches, one per dtype instantiation: M blocks for shrink and M strips of 256
+  * columns for expand, 256 threads each, whatever the slots hold. */
+ template <int ADT>
+@@ -808,6 +820,7 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
+     }
+     if (!dtype_agrees(a, X->dtype)) return RAD_E_DTYPE;
+     if (adt >= kE4M3 && !XS) return RAD_E_INVAL;     /* a code without its scale has no value */
++    if (adt == kI8 && i8_steps_dtype(rad_args_gets(a, "gemm_dtype"))) return RAD_E_UNSUPPORTED;
+     if (LA->dtype != RAD_BF16 || T->dtype != RAD_F32 || SL->dtype != RAD_I32) return RAD_E_DTYPE;
+ 
+     int64_t M = 0, t_rs = 0, t_cs = 0, xr = 0, x_rs = 0, x_cs = 0, sr = 0, sl_st = 0;
+diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
+index fdd53f8..058d4a2 100644
+--- a/libr4d/r4d_rows.cpp
++++ b/libr4d/r4d_rows.cpp
+@@ -2662,6 +2662,7 @@ static const RadParamSpec pLoraShrink[] = {
+     P_INT("S"),
+     P_INTO("group"),
+     P_STR("dtype"),
++    P_STRO("gemm_dtype"),
+ };
+ static const RadOperandSpec oLoraShrink[] = {
+     { "a",       RAD_OPD_IN,  0 },
 diff --git a/libref/ref_lora.cpp b/libref/ref_lora.cpp
 index 54ec504..8246823 100644
 --- a/libref/ref_lora.cpp
 +++ b/libref/ref_lora.cpp
-@@ -79,6 +79,25 @@
+@@ -79,6 +79,25 @@ int ref_lora_shrink(const RadArgs* a, RadStream) {
      const int64_t gp = p_int(a, "group", 0);
      if (gp > 0 && SA.p && (K + gp - 1) / gp != (K + SA.group - 1) / SA.group) return RAD_E_SHAPE;
  
@@ -540,7 +659,7 @@ diff --git a/libref/ref_registry.cpp b/libref/ref_registry.cpp
 index e7a05c2..3d1e548 100644
 --- a/libref/ref_registry.cpp
 +++ b/libref/ref_registry.cpp
-@@ -401,9 +401,11 @@
+@@ -401,9 +401,11 @@ static const RadOperandSpec oGemmQBias[] = { OPD("a"), OPD("a_scale"), WGT("b"),
   * (`lora_a` [S, R, K], `lora_b` [S, N, R], `scale` [S, N]) are inputs, not weights: the engine owns
   * them as program buffers and copies an adapter into a slot between steps. `group` is optional, 0
   * meaning no scale stream; `dtype` is the tensor dtype name (rad_dtype_name) of `a` for shrink and
@@ -554,27 +673,3 @@ index e7a05c2..3d1e548 100644
  static const RadOperandSpec oLoraShrink[] = { OPD("a"), OPD_O("a_scale"), OPD("slot"),
                                                OPD("lora_a"), OUT("t") };
  static const RadParamSpec pLoraExpand[] = { P_INT("M"), P_INT("N"), P_INT("R"), P_INT("S"),
-diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
-index fdd53f8..058d4a2 100644
---- a/libr4d/r4d_rows.cpp
-+++ b/libr4d/r4d_rows.cpp
-@@ -2662,6 +2662,7 @@
-     P_INT("S"),
-     P_INTO("group"),
-     P_STR("dtype"),
-+    P_STRO("gemm_dtype"),
- };
- static const RadOperandSpec oLoraShrink[] = {
-     { "a",       RAD_OPD_IN,  0 },
-diff --git a/libhalo/halo_rows.cpp b/libhalo/halo_rows.cpp
-index af041c8..5f1c3a1 100644
---- a/libhalo/halo_rows.cpp
-+++ b/libhalo/halo_rows.cpp
-@@ -2450,6 +2450,7 @@
-     P_INT("S"),
-     P_INTO("group"),
-     P_STR("dtype"),
-+    P_STRO("gemm_dtype"),
- };
- static const RadOperandSpec oLoraShrink[] = {
-     { "a",       RAD_OPD_IN,  0 },

@@ -18,9 +18,10 @@
 //                   from the tape's own operands (the int8 codes with their scales, the bf16
 //                   factors, the f32 scale stream) -- not from the container's weights
 //   B = 0           the logits are the base model's, bit for bit
-//   the refusals    an adapter with no key is turned away with the message it got before, and
-//                   two that stay: the vocabulary weight is not a site, and a weight the recipe
-//                   left unrotated cannot be ridden in the rotated basis
+//   the refusals    an adapter with no key is turned away with the message it got before, at
+//                   startup and again when it is loaded at runtime, and two that stay: the
+//                   vocabulary weight is not a site, and a weight the recipe left unrotated
+//                   cannot be ridden in the rotated basis
 //   the encoding    every declared shrink carries the encoding of the GEMM whose activation it
 //                   reads (`gemm_dtype`), the only thing that says how its codes are stored
 //
@@ -239,6 +240,36 @@ R97_TEST(lora_w8a8_refuses_an_adapter_without_the_key) {
     // This fixture has no step-order site, so the missing key reaches the basis refusal first.
     R97_CHECK(!r.mentions("step order"));
     std::printf("  lora_w8a8: an adapter with no key is refused with today's message ok\n");
+}
+
+// The basis is the adapter's, so a load at runtime is checked against the same sites with that
+// adapter's own: the sites were built from the startup adapter's "fwht128", and a keyless one
+// loaded later would be placed on the rotated trunk and multiply a transformed activation with
+// factors in the natural basis, silently. It is refused with the message startup gives, and an
+// adapter in the trunk's basis still loads.
+R97_TEST(lora_w8a8_refuses_a_runtime_load_without_the_key) {
+    const r97::Fixture& f       = r97::w8a8_fixture();
+    const std::string   rotated = r97::lora_w8a8::write_adapter(temp_dir("lora_w8a8_runtime"));
+    r97::lora_w8a8::Spec keyless_spec;
+    keyless_spec.key = false;
+    const std::string keyless =
+        r97::lora_w8a8::write_adapter(temp_dir("lora_w8a8_runtime_no_key"), keyless_spec);
+
+    rad::Config cfg = r97::lora_w8a8::config(f, { prompt() }, rotated, 4);
+    cfg.lora.max_loras = 3;  // the startup adapter takes one; two loads at runtime need two more
+    rad::Engine engine(cfg);
+    R97_CHECK(engine.start() >= 0);
+
+    // The same adapter again, under a name of its own: it is in the trunk's basis and is taken.
+    std::string err;
+    R97_CHECK(engine.lora_load("second", rotated, &err) >= 0);
+
+    err.clear();
+    const int loaded = engine.lora_load("keyless", keyless, &err);
+    R97_CHECK(loaded < 0);
+    R97_CHECK(err.find("is stored in the 'fwht128' transform basis") != std::string::npos);
+    R97_CHECK(err.find("is fed a transformed activation") != std::string::npos);
+    std::printf("  lora_w8a8: a keyless adapter is refused again when it is loaded at runtime ok\n");
 }
 
 // The refusals that stay. The vocabulary weight is not a site, at any basis. And a targeted weight
