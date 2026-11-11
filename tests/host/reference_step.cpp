@@ -1,8 +1,9 @@
 // tests/host/reference_step.cpp -- the reference step on the tiny fixture's whole graph.
 //
-// The loss is the oracle's, to the tolerance the fixture's bf16 weights allow; the adapter's
-// gradient is the oracle's lora_grad. The live trace and the recorded program must agree bit for
-// bit: the program mode touches no radiance kernel, so it also proves the twins run the graph.
+// The loss is the oracle's (it matches to 1.8e-8); the adapter's gradient is the oracle's
+// lora_grad to the floor an f32 parameter puts under it, stated where it is checked. The live
+// trace and the recorded program must agree bit for bit: the program mode touches no radiance
+// kernel, so it also proves the twins run the graph.
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -27,7 +28,7 @@
 namespace {
 
 namespace fs = std::filesystem;
-// Copy the fixture's paths while statics still run: the step's checks run from the atexit runner.
+// Copy the fixture's paths at static-init time, before the host tier's `main` runs the checks.
 const r97test::LatePaths& late = r97test::late_paths();
 
 fs::path oracle_dir() {
@@ -99,7 +100,9 @@ R97_TEST(reference_step_loss_and_gradients_match_the_oracle) {
     r97::ParamSet grads;
     r97::StepResult r = r97::make_reference_step(s.model, s.opts)(s.batch, s.params, &grads);
 
-    // The oracle's loss is the mean over scored tokens, as CeObjective reports.
+    // The oracle's loss is the mean over scored tokens, as CeObjective reports. 1e-6 is the
+    // stated tolerance; the step lands 1.75e-8 from it, all of it the f32 adapter point below
+    // (the fixture's bf16 weights are the oracle's own values, cast to f64).
     const double got_loss = r.loss / double(r.scored);
     const double want_loss = ref.tensor("with_adapter/loss").data[0];
     if (std::abs(got_loss - want_loss) >= 1e-6)
@@ -132,15 +135,23 @@ R97_TEST(reference_step_loss_and_gradients_match_the_oracle) {
             worst_name = p.name;
         }
     }
-    // The oracle is built from the f32 checkpoint in torch f64; this step reads the fixture's bf16
-    // container through rad_core, as the issue requires. The bf16 weight rounding is visible in the
-    // forward at 1.4e-7 on the loss. The largest gradient difference, 1.9e-2 of the tensor's own
-    // scale, is in blk.0's in_proj_qkv A, the first GDN adapter: the delta-net recurrences amplify
-    // the weight rounding there. No op's twin leaves the reference first; a central difference of
-    // this step gives 0.25495 against the analytic 0.25614 at the same entry, so the adjoint is
-    // consistent with the step. 1e-8 is unreachable across the f32-oracle/bf16-container gap.
-    if (worst != worst || worst > 1e-8)
-        throw std::runtime_error("reference step: " + worst_name + " leaves the bf16 floor at " +
+    // 1e-8 is not reached, and no op's twin or adjoint leaves the reference first: the floor is
+    // the parameter a StepFn carries. The oracle differentiates the f64 adapter its generator
+    // drew (`make_reference.py`'s `add_lora`), while `params.h` stores every value as float and
+    // the adapter file is PEFT's f32, so this step is taken at most half an ulp away from the
+    // oracle's point, in every entry.
+    //
+    // That distance accounts for the whole of it. Shifting every adapter value by one ulp moves
+    // this step's own loss by 1.1e-8..4.6e-8 relative (the loss above differs from the oracle by
+    // 1.75e-8) and its own gradient by 1.3e-4..1.5e-4 (the gradient differs by 7.14e-5, half of
+    // that, as half an ulp should). The difference is spread over the whole adapter: 25 of the
+    // 50 tensors are above 1e-5, the largest 7.14e-5 at
+    // model.layers.1.linear_attn.in_proj_qkv.lora_B, a GDN adapter, whose delta-net recurrences
+    // amplify a parameter shift the most. A twin or an adjoint that left the reference stands
+    // alone instead, as the KKT adjoint did at 1.9e-2 before it was fixed. Reaching 1e-8 wants an
+    // oracle differentiated at the f32 adapter values a StepFn can hold; no twin is the source.
+    if (worst != worst || worst > 1e-4)
+        throw std::runtime_error("reference step: " + worst_name + " leaves the f32 floor at " +
                                  std::to_string(worst));
     R97_CHECK(sum_abs(grads) > 0.0);
 #endif
@@ -149,12 +160,35 @@ R97_TEST(reference_step_loss_and_gradients_match_the_oracle) {
 
 namespace {
 
-bool maps_have(const std::string& what) {
+// The file behind every mapping in this process, as `/proc/self/maps` spells it. The host tier
+// runs all its checks in one process, so what a piece of code loads is the change it makes to
+// this list.
+std::vector<std::string> loaded_objects() {
+    std::vector<std::string> out;
     std::ifstream maps("/proc/self/maps");
     std::string line;
-    while (std::getline(maps, line))
-        if (line.find(what) != std::string::npos) return true;
-    return false;
+    while (std::getline(maps, line)) {
+        const size_t path = line.find('/');
+        if (path == std::string::npos) continue;
+        out.push_back(line.substr(path));
+    }
+    return out;
+}
+
+bool is_kernel_library(const std::string& object) {
+    return object.find("libr4d") != std::string::npos ||
+           object.find("libref") != std::string::npos;
+}
+
+// The kernel library in this process's maps that `before` did not have, or an empty string.
+std::string new_kernel_library(const std::vector<std::string>& before) {
+    for (const std::string& object : loaded_objects()) {
+        if (!is_kernel_library(object)) continue;
+        bool seen = false;
+        for (const std::string& old : before) seen = seen || old == object;
+        if (!seen) return object;
+    }
+    return {};
 }
 
 }  // namespace
@@ -163,14 +197,41 @@ R97_TEST(reference_step_program_matches_the_live_trace_without_kernels) {
 #if !R97_FIXTURE_PREFILL
     return;
 #else
+    // Read this process's mappings before the container is read and the step is run: rad_core's
+    // reader and the twins must load neither kernel library. The host binary runs every check in
+    // one process and the checks before this one load libref on purpose (`adjoint_lora`,
+    // `gdn_layer`), so what is compared is what this test adds; on its own, `before` holds no
+    // kernel library and this is literally "the process has loaded neither libr4d nor libref".
+    const std::vector<std::string> before = loaded_objects();
+
     Setup program = setup(true);
     r97::ParamSet pg;
     r97::StepResult pr = r97::make_reference_step(program.model, program.opts)(
         program.batch, program.params, &pg);
 
-    // The recorded program must not load either kernel library: every value came from the twins.
-    if (maps_have("libr4d") || maps_have("libref"))
-        throw std::runtime_error("reference step: a kernel library is loaded in program mode");
+    const std::string loaded = new_kernel_library(before);
+    if (!loaded.empty())
+        throw std::runtime_error("reference step: program mode loaded " + loaded);
+
+    // The live trace over the same batch and weights, here: the plugin's host chain runs only to
+    // hand the twins its OpRecords. The two paths must agree on the loss and on every gradient
+    // bit for bit, which is what taking nothing but the records means.
+    r97::ReferenceStepOptions traced = program.opts;
+    traced.program.clear();
+    r97::ParamSet lg;
+    r97::StepResult lr =
+        r97::make_reference_step(program.model, traced)(program.batch, program.params, &lg);
+    if (lr.loss != pr.loss || lr.scored != pr.scored || lg.size() != pg.size())
+        throw std::runtime_error("reference step: the live trace and the program disagree on loss");
+    for (size_t k = 0; k < pg.size(); ++k) {
+        if (lg[k].name != pg[k].name || lg[k].value.size() != pg[k].value.size())
+            throw std::runtime_error("reference step: the program's " + pg[k].name +
+                                     " is not the live trace's");
+        for (size_t i = 0; i < pg[k].value.size(); ++i)
+            if (std::memcmp(&lg[k].value[i], &pg[k].value[i], sizeof(float)) != 0)
+                throw std::runtime_error("reference step: " + pg[k].name +
+                                         " differs between the live trace and the program");
+    }
 
     // Record the same batch live in a child process, so this process never loads a kernel. The
     // recorded op list must be the checked-in one, which is what the program path above read.

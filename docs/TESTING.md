@@ -144,9 +144,12 @@ hf download StillDeadcode/qwen3.8-27b-iqr-v4 qwen3.8-27b-iq4r-s-v4.rad
   register the plugin's rows after the r97 registry they go into is destroyed).
   `tests/gpu/adjoint_add.cpp` is the example of a device test.
 - `reference`: `r97train train --reference --model <tiny.rad> --out <dir>` runs a full training
-  step with neither a card nor a device library. The forward and backward are the fixture's op
-  graph in f64, from the registered twins and host adjoints (`src/reference_step.cpp`); with
-  `--program tests/fixtures/programs/oracle.json` the op list is read from the recorded batch and
-  no `rad_issue` runs at all. This proves the loop, the checkpoint, the batcher and the resume on
+  step with no card. The forward and backward are the fixture's op graph in f64, from the
+  registered twins and host adjoints (`src/reference_step.cpp`); the live trace runs the plugin's
+  host chain (`libref`) only to hand them its `OpRecord`s and never touches `libr4d`. Over the
+  batch `tests/fixtures/programs/oracle.json` records, `--program` reads the op list from that
+  file instead and runs no `rad_issue` at all, so the process loads neither kernel library (a step
+  refuses a batch the recorded one does not match, and `tests/host/reference_step.cpp` drives it
+  with the fixed test batch). This proves the loop, the checkpoint, the batcher and the resume on
   the real graph shape, and it proves the adjoints compose; it does **not** prove the int8 path,
   the GPU kernels or the device library, which it deliberately never loads.
