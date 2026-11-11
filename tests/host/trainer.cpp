@@ -616,6 +616,35 @@ R97_TEST(trainer_resume_is_bit_identical) {
     R97_CHECK(read_lines(resumed_in_place / "train.jsonl").size() == 2 * n);
 }
 
+R97_TEST(trainer_resume_keeps_a_pending_accumulation) {
+    TempDir straight;
+    TempDir split;
+    const int64_t n = 5;  // odd: two updates are applied and one micro-step is pending
+
+    Config straight_config = base_config(straight.path, 2 * n);
+    straight_config.accumulation = 2;
+    straight_config.checkpoint_every = 0;
+    Config split_config = base_config(split.path, 2 * n);
+    split_config.accumulation = 2;
+    split_config.checkpoint_every = 0;
+
+    Harness one(straight_config, toy_step, {}, {});
+    Harness two(split_config, toy_step, {}, {});
+    R97_CHECK(one.trainer.run() == 2 * n);
+
+    R97_CHECK(two.trainer.run_steps(n) == n);
+    R97_CHECK(two.optimiser.updates_done() == 2);
+    R97_CHECK(two.optimiser.pending() == 1);
+    const std::string checkpoint = checkpoint_dir(split.path, n);
+    R97_CHECK(fs::exists(checkpoint));
+
+    two.trainer.resume(checkpoint);
+    R97_CHECK(two.optimiser.updates_done() == 2);
+    R97_CHECK(two.optimiser.pending() == 1);
+    R97_CHECK(two.trainer.run_steps(n) == n);
+    R97_CHECK(same_bits(one.params, two.params));
+}
+
 R97_TEST(trainer_resume_refuses_a_different_base_id) {
     TempDir dir;
     Config first = base_config(dir.path, 5);
