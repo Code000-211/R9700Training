@@ -102,7 +102,7 @@ The rope positions are the packed row's index, not the position in its sequence:
 reference's block case hands the block (`make_reference.py`'s `arange` over the packed rows), and it
 is what both sides are compared on.
 
-## Two things the records make sharp
+## Three things the records make sharp
 
 `attn_paged`'s operands keep their schema positions: `block_table`, `seqused`, `k_descale`,
 `v_descale`, `cu_seqlens`. A record that writes `cu_seqlens` but leaves the two descales out has the
@@ -111,6 +111,14 @@ scores come out flat: the forward then differs by 0.18 relative, which is how th
 The descales are in the record at one, before the `cu_seqlens`. Nothing is wrong with the family,
 which documents the positions as fixed; but a record that means to pass a ragged batch has to carry
 them.
+
+`rope`'s angle base is the schema's `theta`, and it is the only name `libref` reads
+(`ref_attn.cpp`'s `p_f32(a, "theta", 10000.0f)`). A record that spells it `rope` still runs: an
+unknown parameter is simply not found, and the kernel falls back to its own 10000. The fixture's
+theta is 10000 too, so the fallback and the intended value agree and the block comparison passes
+either way — the typo costs nothing here and would cost a lot on a fixture with another theta. The
+record below carries `theta`, and the twin's table is built from the same constant, so the two
+chains are compared with the fixture's angle base on both sides.
 
 `rope` and `kv_store` have no twin and no adjoint row in the registry (`src/adjoint/host/qk.cpp`
 registers neither; it exports `rope_forward_f64`, `rope_adjoint_f64`, `kv_store_forward_f64` and

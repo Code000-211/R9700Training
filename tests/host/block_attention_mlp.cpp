@@ -398,13 +398,18 @@ OpRecord attn_rec(const Batch& b) {
 }
 
 // rope's and kv_store's records: the kernel chain runs them as the fixture issues them, the twin
-// chain calls the qk family's f64 functions.
+// chain calls the qk family's f64 functions. rope's schema names its angle base "theta"; a record
+// that spells it "rope" reaches the kernel with that parameter missing and the kernel falls back
+// to its own 10000, which this fixture's theta happens to equal, so the chain would agree by
+// accident and pin no parameter. The twin and the kernel are compared on the record below, and the
+// theta the table is built from is the same constant.
 OpRecord rope_rec(int64_t T, int64_t heads, int64_t n_head_kv) {
     OpRecord r;
     r.op = "rope";
     r.params = {num("M", T), num("head_dim", kHeadDim), num("n_head", heads),
-                num("n_head_kv", n_head_kv), num("rotary_dim", kRotary), real("rope", kRopeTheta),
-                real("scale", 1.0), text("mode", "neox"), text("dtype", kDtype)};
+                num("n_head_kv", n_head_kv), num("rotary_dim", kRotary),
+                real("theta", kRopeTheta), real("scale", 1.0), text("mode", "neox"),
+                text("dtype", kDtype)};
     r.n = T;
     r.operands = {{"qkv", kDtype, {T, heads, kHeadDim}, 0, T, true},
                   {"positions", "i32", {T}, 0, T, false}};
