@@ -54,6 +54,10 @@ namespace r97 {
 
 void adjoint_register(const char*, Side, AdjointFn, const std::vector<int>&, ParamPred) {}
 
+// The fused producers' adjoint (quant.hip) rebuilds the value the quantiser rotated through the
+// parts' twin. A process with no registry has no twin, and no device adjoint runs there either.
+TwinFn twin_find(const std::string&, const std::vector<OpParam>&, std::string*) { return nullptr; }
+
 namespace device {
 
 void* scratch_alloc(int64_t) { return nullptr; }
