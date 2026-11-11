@@ -87,11 +87,9 @@ message(STATUS "r97: radiance at ${R97_RADIANCE_COPY}, commit ${R97_RADIANCE_COM
 
 # Build rad_core out of tree: the subproject is configured (Ninja, like us) and built for rad_core,
 # the two host kernel libraries, the qwen35_bf16 architecture plugin and rad-convert, which turns a
-# checkpoint into a container -- what a host test loads and runs. A test build also builds libref,
-# the reference plugin the adjoint checks compare against (tests/support/adjoint_check.h dlopens
-# it the way rad-kbench does) and nothing else opens. The radiance server and the other tools are
-# not this build's business. An IMPORTED target hands the archive to this project's consumers,
-# with the include directories and link libraries rad_core itself publishes (see
+# checkpoint into a container -- what a host test loads and runs. The radiance server and the other
+# tools are not this build's business. An IMPORTED target hands the archive to this project's
+# consumers, with the include directories and link libraries rad_core itself publishes (see
 # third_party/core/CMakeLists.txt).
 include(ExternalProject)
 find_package(Threads REQUIRED)
@@ -124,15 +122,6 @@ else()
 endif()
 set(RAD_GPU_TARGETS "gfx1201" CACHE STRING "AMDGPU architectures radiance's HIP kernels target")
 
-set(R97_RAD_BUILD_TARGETS rad_core libavx rad-convert qwen35_bf16)
-set(R97_RAD_BYPRODUCTS ${CMAKE_BINARY_DIR}/radiance-build/core/librad_core.a
-                       ${CMAKE_BINARY_DIR}/radiance-build/vendor/librad_vendor_llama.a
-                       ${CMAKE_BINARY_DIR}/radiance-build/vendor/librad_vendor_httplib.a)
-if(R97_BUILD_TESTS)
-  list(APPEND R97_RAD_BUILD_TARGETS libref)
-  list(APPEND R97_RAD_BYPRODUCTS ${CMAKE_BINARY_DIR}/radiance-build/radiance_home/kernels/libref.so)
-endif()
-
 ExternalProject_Add(radiance_core
   PREFIX  ${CMAKE_BINARY_DIR}/radiance-ext
   SOURCE_DIR ${R97_RADIANCE_COPY}
@@ -147,11 +136,13 @@ ExternalProject_Add(radiance_core
     -DRAD_WITH_HIP=${RAD_WITH_HIP}
     -DRAD_GPU_TARGETS=${RAD_GPU_TARGETS}
     -DR97_PATCH_STAMP=${R97_PATCH_STAMP}
-  BUILD_COMMAND ${CMAKE_COMMAND} --build . --target ${R97_RAD_BUILD_TARGETS}
+  BUILD_COMMAND ${CMAKE_COMMAND} --build . --target rad_core libref libavx rad-convert qwen35_bf16
   INSTALL_COMMAND ""
   BUILD_ALWAYS FALSE
   USES_TERMINAL_BUILD TRUE
-  BUILD_BYPRODUCTS ${R97_RAD_BYPRODUCTS})
+  BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/radiance-build/core/librad_core.a
+                   ${CMAKE_BINARY_DIR}/radiance-build/vendor/librad_vendor_llama.a
+                   ${CMAKE_BINARY_DIR}/radiance-build/vendor/librad_vendor_httplib.a)
 
 set(R97_RADIANCE_LIB ${CMAKE_BINARY_DIR}/radiance-build/core/librad_core.a)
 # rad_core links the vendored llama (the tokeniser, the chat templates) and cpp-httplib, so a
