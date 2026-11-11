@@ -4,12 +4,12 @@
 // `"radiance_input_basis": "fwht128"` (the key docs/ADAPTER.md defines), both refusals in
 // core/lora/lora.cpp: the weight "stored in the 'fwht128' transform basis" one and the step-order
 // dtype one (w4a8/w8a8/w2a8), because the host lora_shrink form now unexchanges quant_act_i8's
-// codes before it reads them. The trunk applies the 128-wide Hadamard before quantising, so the
-// codes had_quant_act_i8g writes are already in the activation's column order and need no
-// unexchange; no site of this trunk has a step-order dtype. What is left to prove is the
-// arithmetic: the trunk's int8 GEMM already multiplies the rotated activation, so an adapter
-// whose A factors are in that basis adds its delta to the same product, and the sum has to be the
-// model's output at that site.
+// codes before it reads them -- the declaration hands it its GEMM's encoding as `gemm_dtype`.
+// The trunk applies the 128-wide Hadamard before quantising, so the codes had_quant_act_i8g
+// writes are already in the activation's column order and need no unexchange; no site of this
+// trunk has a step-order dtype. What is left to prove is the arithmetic: the trunk's int8 GEMM
+// already multiplies the rotated activation, so an adapter whose A factors are in that basis adds
+// its delta to the same product, and the sum has to be the model's output at that site.
 //
 // These tests run the engine's prefill on the int8 fixture with an adapter over every module it
 // can ride, and read the step's tape:
@@ -21,6 +21,8 @@
 //   the refusals    an adapter with no key is turned away with the message it got before, and
 //                   two that stay: the vocabulary weight is not a site, and a weight the recipe
 //                   left unrotated cannot be ridden in the rotated basis
+//   the encoding    every declared shrink carries the encoding of the GEMM whose activation it
+//                   reads (`gemm_dtype`), the only thing that says how its codes are stored
 //
 // The prefill, the observer and the tape are patches/training/'s; a serving build applies none of
 // that set, so this file registers no test there. The include sits above the guard, the way
@@ -110,6 +112,36 @@ R97_TEST(lora_w8a8_accepts_the_adapter_at_every_site) {
     R97_CHECK(moved > 1.0);
     std::printf("  lora_w8a8: %zu sites carry the adapter, the logits move by %.3f ok\n",
                 found.size(), moved);
+}
+
+// The shrink is told the encoding of the GEMM whose activation it reads, not the activation's
+// element dtype: `gemm_dtype` is the GEMM's own `dtype` string. At a step-order site the two
+// differ, and only the first says whether the codes need unexchanging, so the declaration must
+// carry it -- `dtype` alone reads "i8" at every coded site and cannot.
+R97_TEST(lora_w8a8_hands_the_shrink_the_site_encoding) {
+    const r97::Fixture& f = r97::w8a8_fixture();
+    const std::string   dir = r97::lora_w8a8::write_adapter(temp_dir("lora_w8a8_encoding"));
+
+    Tape tape;
+    R97_CHECK(!r97::lora_w8a8::run(f, prompt(), dir, &tape).logits.empty());
+
+    const std::vector<r97::lora_w8a8::Site> found = r97::lora_w8a8::sites(tape);
+    R97_CHECK(!found.empty());
+    bool coded = false;
+    for (const r97::lora_w8a8::Site& s : found) {
+        const r97::OpRecord& gemm   = tape.ops()[s.gemm];
+        const r97::OpRecord& shrink = tape.ops()[s.shrink];
+        const std::string    site   = r97::lora_w8a8::str_param(gemm, "dtype");
+        R97_CHECK(!site.empty());
+        coded = coded || site == "i8a8h";
+        // The element dtype stays what it was: these are int8 codes.
+        R97_CHECK(r97::lora_w8a8::str_param(shrink, "dtype") == "i8");
+        // And the site's encoding rides along, equal to the GEMM's own, on every site.
+        R97_CHECK(r97::lora_w8a8::str_param(shrink, "gemm_dtype") == site);
+    }
+    R97_CHECK(coded);  // the fixture's sites are the rotated int8 ones this patch is about
+    std::printf("  lora_w8a8: every shrink carries its GEMM's encoding (%zu sites, coded)\n",
+                found.size());
 }
 
 // Each site computed the trunk's own GEMM plus (alpha / r) * B * A * x. The tape's operands are

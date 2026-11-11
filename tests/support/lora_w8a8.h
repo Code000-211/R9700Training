@@ -252,6 +252,13 @@ inline int64_t int_param(const OpRecord& rec, const char* key) {
     return -1;
 }
 
+// A string parameter, or "" when the op does not carry it.
+inline std::string str_param(const OpRecord& rec, const char* key) {
+    for (const auto& [k, v] : rec.params)
+        if (k == key && std::holds_alternative<std::string>(v)) return std::get<std::string>(v);
+    return std::string();
+}
+
 // One operand as numbers: `cols` is the stride to read it with, which for a pool of [slots, rows,
 // cols] or a scale of [1, n] is not shape[1].
 struct Matrix {
