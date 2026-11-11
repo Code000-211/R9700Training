@@ -15,11 +15,13 @@
 //     The learning-rate schedule is the run's horizon, so the N-step checkpoint has to come out of
 //     a 2N-step run (`--checkpoint_every N`): a run told `--steps N` is not the first half of a
 //     run told `--steps 2N`;
-//   - no device library is loaded. LD_DEBUG names every object the loader initialised, so a
-//     process that had loaded libr4d could not pass; libavx/libref appearing in the same list is
-//     the control that the log is not simply empty (the live trace does run the host chain).
-//     On a build without libr4d.so this half proves nothing on its own, which is why the control
-//     is checked too.
+//   - no device library is selected. The run's own report says which kernel libraries it left out
+//     and which kernels it selected, and that report is the evidence. The loader's log
+//     (LD_DEBUG=libs) alone is not: radiance opens every library in the home to read its identity
+//     before it registers anything (core/plugin/loader.cpp), so a device library on the search path
+//     is mapped and unmapped by that probe whether or not the run ever selects it. What the log
+//     does prove is that something was loaded: libavx/libref appearing in it is the control that it
+//     is not simply empty (the live trace does run the host chain).
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
@@ -165,19 +167,59 @@ std::vector<std::string> mapped_objects(const std::string& loader_log) {
     return objects;
 }
 
-void check_loads_no_device_library(const std::string& loader_log) {
-    const std::vector<std::string> objects = mapped_objects(loader_log);
-    bool host_kernel = false;
-    for (const std::string& path : objects) {
-        if (path.find("libr4d") != std::string::npos)
-            throw std::runtime_error("train --reference loaded the device library: " + path);
+// A build without the device library (no HIP) leaves nothing for the negative half to catch.
+bool device_library_ships() {
+    std::error_code ec;
+    const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (ec) return false;
+    return fs::exists(exe.parent_path() / "radiance-build" / "radiance_home" / "kernels" /
+                          "libr4d.so",
+                      ec);
+}
+
+// What the run loaded: its own report of the kernel libraries it left out and the kernels it
+// selected, over the stderr that also carries the loader's log. Every line is read, so a selection
+// that named the device library cannot hide behind a second one.
+void check_loads_no_device_library(const std::string& run_log) {
+    // The loader's log is the control: it names a host kernel library, so it is not an empty log
+    // being read as proof of nothing.
+    const std::vector<std::string> objects = mapped_objects(run_log);
+    bool host_mapped = false;
+    for (const std::string& path : objects)
         if (path.find("libavx") != std::string::npos || path.find("libref") != std::string::npos)
-            host_kernel = true;
-    }
-    if (!host_kernel)
+            host_mapped = true;
+    if (!host_mapped)
         throw std::runtime_error(
             "train --reference: the loader's log names no host kernel library, so it cannot be "
             "read as evidence about what the run loaded");
+
+    bool host_selected = false;
+    bool device_left_out = false;
+    for (std::size_t at = 0; at < run_log.size();) {
+        std::size_t end = run_log.find('\n', at);
+        if (end == std::string::npos) end = run_log.size();
+        const std::string line = run_log.substr(at, end - at);
+        at = end + 1;
+
+        const std::size_t selection = line.find("kernel selection");
+        if (selection != std::string::npos) {
+            if (line.find("libr4d", selection) != std::string::npos)
+                throw std::runtime_error("train --reference selected the device library: " + line);
+            if (line.find("libavx", selection) != std::string::npos ||
+                line.find("libref", selection) != std::string::npos)
+                host_selected = true;
+        }
+        const std::size_t left_out = line.find("and so not loaded: ");
+        if (left_out != std::string::npos &&
+            line.find("libr4d", left_out + 18) != std::string::npos)
+            device_left_out = true;
+    }
+    if (!host_selected)
+        throw std::runtime_error(
+            "train --reference: the run's report names no host kernel selection");
+    if (device_library_ships() && !device_left_out)
+        throw std::runtime_error(
+            "train --reference: the run does not report the device library as left out");
 }
 
 // Two checkpoint directories, file for file and byte for byte.

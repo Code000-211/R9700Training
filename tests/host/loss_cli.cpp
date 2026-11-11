@@ -4,11 +4,7 @@
 // rows the trainer scores. The second case runs the same comparison through an adapter directory
 // the fixture ships, so `--lora` is checked against radiance loading the same directory itself.
 #include "../support/fixture.h"
-
-// radiance's tests/rad_test.h, which the fixture header brings in, defines CHECK for its own
-// TEST() registry; this file checks through R97_CHECK, so drop the alias before self_check.h.
-#undef CHECK
-#include "../support/self_check.h"
+#include "../support/test.h"
 
 #include <algorithm>
 #include <cmath>
@@ -193,49 +189,40 @@ Corpus write_corpus(const r97::Fixture& f, const std::string& name) {
     return c;
 }
 
-// The fixture and the corpus, built before main.
+// The fixture and the corpus the cases share, built the first time a case asks for them.
 //
-// ChatData compiles the container's chat template and tokenises, and by the time the checks below
-// run from their exit handler (see the arming block at the end of this file) radiance's tokeniser
-// tables -- process-wide statics that the chat-data checks build at static-initialisation time --
-// have been destroyed: ChatData cannot open a container there, and an engine's corpus load dies
-// inside the tokeniser. The corpus is therefore built here, at static-initialiser time, where
-// ChatData does work (the chat-data checks use it there). The engine is the reverse: it allocates
-// through radiance's device ledger, whose constructor runs later in the binary's static
-// initialisation, so an engine starts only from the exit handler. One test, two moments; nothing
-// about the comparison changes.
-//
-// The prepared state is leaked on purpose: it has to outlive the exit handler, and a static of
-// its own would be destroyed before the handler runs.
+// ChatData compiles the container's chat template and tokenises, and the comparison starts an
+// engine, which allocates through radiance's device ledger: both need the binary's statics alive,
+// which they are for a test the tier's main runs, so nothing has to be built from a static
+// initialiser. The fixture is the tier's own (support/fixture.h); r97::detail::make() would delete
+// and rewrite the directory another file's fixture may already hold.
 struct Prepared {
     bool ok = false;
     std::string error;
     r97::Fixture fixture;
     Corpus corpus;
-    std::string radiance_home;  // build_dir() and radiance_home() read statics that are gone at exit
-    std::string cli_path;       // <build>/r97train
+    std::string radiance_home;
+    std::string cli_path;  // <build>/r97train
 };
 
 Prepared& prepared() {
-    static Prepared* const p = [] {
-        Prepared* q = new Prepared();
+    static Prepared p = [] {
+        Prepared q;
         try {
-            q->fixture = r97::detail::make();
-            q->corpus = write_corpus(q->fixture, "loss_cli");
-            q->radiance_home = r97::detail::radiance_home();
-            q->cli_path = (fs::path(r97::detail::build_dir()) / "r97train").string();
-            if (q->radiance_home.empty())
+            q.fixture = r97::fixture();
+            q.corpus = write_corpus(q.fixture, "loss_cli");
+            q.radiance_home = r97::detail::radiance_home();
+            q.cli_path = (fs::path(r97::detail::build_dir()) / "r97train").string();
+            if (q.radiance_home.empty())
                 throw std::runtime_error("no radiance home beside the build");
-            q->ok = true;
+            q.ok = true;
         } catch (const std::exception& e) {
-            q->error = e.what();
+            q.error = e.what();
         }
         return q;
     }();
-    return *p;
+    return p;
 }
-
-[[maybe_unused]] const bool prepared_before_main = (prepared(), true);
 
 // Record the corpus's loss with radiance itself -- through `lora`, when one is named -- run
 // `r97train loss` over the same chat file, and check they agree.
@@ -297,13 +284,13 @@ void check_against_record(const Prepared& p, const std::string& name, const std:
 }
 
 // Two cases: the base model, and the fixture's adapter through --lora.
-void test_loss_cli_matches_radiance_kld() {
+R97_TEST(loss_cli_matches_radiance_kld) {
     const Prepared& p = prepared();
     if (!p.ok) throw std::runtime_error(p.error);
     check_against_record(p, "base", "");
 }
 
-void test_loss_cli_lora_matches_radiance_kld() {
+R97_TEST(loss_cli_lora_matches_radiance_kld) {
     const Prepared& p = prepared();
     if (!p.ok) throw std::runtime_error(p.error);
     check_against_record(p, "lora", adapter_path());
@@ -312,7 +299,7 @@ void test_loss_cli_lora_matches_radiance_kld() {
 // A directory radiance cannot load must end the run with a message and a non-zero status, not take
 // the process down: the driver reports a failed engine start by throwing, and loss_main must catch
 // it. Radiance logs the reason the loader refused the directory.
-void test_loss_cli_reports_an_unloadable_lora() {
+R97_TEST(loss_cli_reports_an_unloadable_lora) {
     const Prepared& p = prepared();
     if (!p.ok) throw std::runtime_error(p.error);
     const r97::Fixture& f = p.fixture;
@@ -332,33 +319,6 @@ void test_loss_cli_reports_an_unloadable_lora() {
     if (cli.output.find("adapter_config.json") == std::string::npos)
         throw std::runtime_error("the run did not report radiance's loader error:\n" + cli.output);
 }
-
-// The tier's own runner (tests/support/test.h) runs an R97_TEST from the atexit handler armed by
-// the first test file to register one -- adjoint_add.cpp, the first in link order. The chat-data
-// checks tokenise at static-initialisation time, so radiance's tokeniser tables are built then and
-// their destructors are registered after that runner's handler: the runner runs after the tables
-// are gone, and an engine started from any of its tests fails inside the tokeniser. (The fixture
-// and forward tests hit the same wall.)
-//
-// This file arms its own handler from its static initialiser instead. The linker reaches that
-// initialiser after the chat-data file's and before radiance's tables are torn down, so the
-// handler runs while they are alive; r97test::run prints each check and aborts on a failure, which
-// is what makes ctest see it. When the tier's runner runs before the static destructors, these
-// become plain R97_TESTs and this block goes away.
-void run_loss_cli_checks() {
-    ::r97test::run("loss_cli_matches_radiance_kld", test_loss_cli_matches_radiance_kld);
-    ::r97test::run("loss_cli_lora_matches_radiance_kld", test_loss_cli_lora_matches_radiance_kld);
-    ::r97test::run("loss_cli_reports_an_unloadable_lora", test_loss_cli_reports_an_unloadable_lora);
-}
-
-struct ArmLossCliChecks {
-    ArmLossCliChecks() {
-        if (std::atexit(&run_loss_cli_checks) != 0)
-            std::fprintf(stderr, "loss_cli: could not register the exit handler\n");
-    }
-};
-
-const ArmLossCliChecks arm_loss_cli_checks;
 
 }  // namespace
 

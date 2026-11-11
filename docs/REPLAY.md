@@ -78,15 +78,7 @@ must be the stored next boundary, and the final residual buffer must hold the ne
 bytes.
 
 `ReplayStep` writes its own fixture and finds the plugin home and `rad-convert` beside the
-executable instead of calling `r97::fixture()`, because that cache and `radtest::tmpdir()` are
-function-local statics destroyed before the exit-time `R97_TEST` runner (docs/BLOCKS.md records
-that defect). For the same reason this test registers its own `atexit` handler: it is registered
-after those statics' own, so it runs before them and before the shared runner, while the engine's
-globals are alive. The handler prints the same `[host]` lines and aborts on a failed check.
-
-The shared host binary currently aborts in `test_loss_ce_objective_loss` during static
-initialisation (docs/BLOCKS.md), before any handler runs; that failure predates this test. Run the
-binary with that one self-check skipped, or run this test alone: build the same compile and link
-the shared host target uses, with a trivial `int main() { return 0; }` in place of the test
-binary's own main, and let the test's handler do the work. `R97_RAD_CONVERT` and `RADIANCE_HOME`
-may name the converter and the plugin home, or the test finds them under `<build>/radiance-build/`.
+executable, rather than calling `r97::fixture()`: a step that keeps its engine and its tape alive
+owns its directory and removes it with the step. The two checks are plain `R97_TEST`s, which
+`tests/host/main.cpp` runs with every static alive. `R97_RAD_CONVERT` and `RADIANCE_HOME` may name
+the converter and the plugin home, or the test finds them under `<build>/radiance-build/`.

@@ -8,14 +8,11 @@
 // block kinds, the on-path mark and the adjoint families are checked for shape too, so a
 // classifier that quietly collapses stops the test rather than the doc.
 //
-// The step is recorded in a child process, by `r97train ops`. The host binary runs its registered
-// tests from the at-exit runner (support/test.h), and by then the statics a recorded step needs
-// are gone: the fixture's own (support/fixture.h) and radiance's, whose device layer reads state
-// destructed with them, so a step recorded in this process dies instead of running. Each
-// fixture's container path is therefore copied into a POD while the fixtures are built at
-// startup -- no destructor, so it is still readable at exit -- and the step runs in the child,
-// which is what the subcommand this issue adds does for a person. A serving build has no prefill
-// mode, and this file compiles to nothing there.
+// The step is recorded in a child process, by `r97train ops`. The child is pinned to the host
+// backend (`HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES` hide every card) and names the host
+// kernel hierarchy: the tiny fixture's shapes (4 heads of 32, a 128-wide head) fit no device
+// kernel, so an engine that sees a card refuses the model rather than recording a step. This is
+// what the fixture's own conversion does (`support/fixture.h`), and it keeps the tier card-free.
 #include "support/fixture.h"
 #include "support/fixture_w8a8.h"
 #include "support/test.h"
@@ -32,28 +29,27 @@
 
 namespace {
 
-// Filled while the fixtures are alive, read after teardown: no std::string, nothing destroys it.
-struct Containers {
-    char bf16[4096];
-    char w8a8[4096];
-    char failure[1024];
+// The fixture containers, and what went wrong if one could not be built: read when a check runs,
+// from the tier's main, where the fixtures' own statics are alive.
+struct Fixtures {
+    std::string bf16;
+    std::string w8a8;
+    std::string error;
 };
-Containers g_containers;
 
-void remember(char* to, size_t size, const std::string& from) {
-    std::snprintf(to, size, "%s", from.c_str());
-}
-
-struct CaptureFixtures {
-    CaptureFixtures() {
+const Fixtures& fixtures() {
+    static const Fixtures built = [] {
+        Fixtures q;
         try {
-            remember(g_containers.bf16, sizeof g_containers.bf16, r97::fixture().container);
-            remember(g_containers.w8a8, sizeof g_containers.w8a8, r97::w8a8_fixture().container);
+            q.bf16 = r97::fixture().container;
+            q.w8a8 = r97::w8a8_fixture().container;
         } catch (const std::exception& e) {
-            remember(g_containers.failure, sizeof g_containers.failure, e.what());
+            q.error = e.what();
         }
-    }
-} g_capture_fixtures;
+        return q;
+    }();
+    return built;
+}
 
 std::string shell_quote(const std::string& s) {
     std::string q = "'";
@@ -64,20 +60,14 @@ std::string shell_quote(const std::string& s) {
     return q + "'";
 }
 
-// The directory this binary sits in, asked for on every call: a lookup kept in a static would
-// already have been destroyed by the time this test runs.
-std::string build_dir() {
-    std::error_code ec;
-    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
-    return ec ? std::string() : exe.parent_path().string();
-}
-
-// One run of the subcommand, as it prints for a person. The engine's own log lines go to stderr
-// and are dropped: this reads the inventory, and a run that failed says so in its exit status.
+// One run of the subcommand, as it prints for a person, pinned to the host backend. The engine's
+// own log lines go to stderr and are dropped: this reads the inventory, and a run that failed says
+// so in its exit status.
 std::string inventory_text(const std::string& container) {
-    const std::string build = build_dir();
+    const std::string build = r97::detail::build_dir();
     const std::string tool = build.empty() ? std::string("r97train") : build + "/r97train";
-    std::string cmd = shell_quote(tool) + " ops " + shell_quote(container);
+    std::string cmd = "HIP_VISIBLE_DEVICES= ROCR_VISIBLE_DEVICES=99 " + shell_quote(tool) +
+                      " ops " + shell_quote(container) + " --kernels libavx,libref";
     std::error_code ec;
     if (!build.empty()) {
         const std::filesystem::path home =
@@ -170,11 +160,11 @@ bool forbidden(const std::string& op) {
     return false;
 }
 
-void check_one(const char* container, const char* which) {
-    const std::string what = std::string(which) + ": ";
-    if (g_containers.failure[0] != '\0')
-        throw std::runtime_error(what + "the fixture was not built: " + g_containers.failure);
-    if (container[0] == '\0') throw std::runtime_error(what + "no container path was captured");
+void check_one(const std::string& container, const std::string& which) {
+    const std::string what = which + ": ";
+    if (!fixtures().error.empty())
+        throw std::runtime_error(what + "the fixture was not built: " + fixtures().error);
+    if (container.empty()) throw std::runtime_error(what + "the fixture names no container");
 
     const std::string once = inventory_text(container);
     long long issues = 0, forms = 0;
@@ -230,13 +220,13 @@ void check_one(const char* container, const char* which) {
         throw std::runtime_error(what + "a block kind is missing from the inventory");
 
     std::printf("  %s: %lld ops in %zu forms, one logits seed, no drafter/vision/sampler op ok\n",
-                which, issues, rows.size());
+                which.c_str(), issues, rows.size());
     std::printf("\n%s\n", once.c_str());
 }
 
-R97_TEST(ops_inventory_bf16_fixture) { check_one(g_containers.bf16, "bf16 fixture"); }
+R97_TEST(ops_inventory_bf16_fixture) { check_one(fixtures().bf16, "bf16 fixture"); }
 
-R97_TEST(ops_inventory_w8a8_fixture) { check_one(g_containers.w8a8, "w8a8 fixture"); }
+R97_TEST(ops_inventory_w8a8_fixture) { check_one(fixtures().w8a8, "w8a8 fixture"); }
 
 }  // namespace
 

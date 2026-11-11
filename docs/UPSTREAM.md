@@ -68,3 +68,4 @@ what it removed from each patch, is in `docs/reports/2026-11-11-patch-audit.md`.
 - `0201` is serving: radiance's service API loads an adapter from a directory, so a slot from
   factors already in memory needs an entry point. It reuses the slot and the swap the engine
   already has.
+| `patches/training/0106-preload-adapter.patch` | training | 72 | 0 | 80 | not-submitted | a run with no command line names the adapter its prefill steps load, before any engine exists |

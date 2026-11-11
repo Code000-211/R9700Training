@@ -1,7 +1,7 @@
 // tests/host/loss_ce.cpp -- the reference cross-entropy loss: hand-computed cases, the gradient
 // against finite differences, a row of very large logits stays finite, and the chunked call
 // equals the whole call. Label: host.
-#include "support/self_check.h"
+#include "support/test.h"
 
 #include "r97/loss.h"
 
@@ -31,15 +31,15 @@ static void hand_computed() {
     {
         const float row[2] = {0.0f, 0.0f};
         const r97::CeSum s = r97::ce_loss(b, row, 2);
-        CHECK(s.scored == 1);
-        CHECK(near(s.loss, std::log(2.0), 1e-15));
+        R97_CHECK(s.scored == 1);
+        R97_CHECK(near(s.loss, std::log(2.0), 1e-15));
     }
     // Row {ln 2, 0}, the scored token is ids[1] = 1, so target 1 with logit 0: p = 1/3 and the
     // loss is ln 3 -- the row's larger logit is at the token that is not the target.
     {
         const float row[2] = {std::log(2.0f), 0.0f};
         const r97::CeSum s = r97::ce_loss(b, row, 2);
-        CHECK(near(s.loss, std::log(3.0), 1e-6));
+        R97_CHECK(near(s.loss, std::log(3.0), 1e-6));
     }
     // Two sequences concatenated: rows 0..2 predict tokens 1..3 of the first, rows 3..4 tokens
     // 1..2 of the second. The scored token 7 of the second sequence hangs off row 4.
@@ -63,8 +63,8 @@ static void hand_computed() {
         want += ce_direct(rows5[0], 3, 1);  // seq 1, token ids[1] = 1 (scored)
         want += ce_direct(rows5[2], 3, 1);  // seq 1, token ids[3] = 1 (scored)
         want += ce_direct(rows5[4], 3, 0);  // seq 2, token ids[2] = 0 (scored)
-        CHECK(s.scored == 3);
-        CHECK(near(s.loss, want, 1e-12));
+        R97_CHECK(s.scored == 3);
+        R97_CHECK(near(s.loss, want, 1e-12));
     }
     std::puts("loss_ce: hand-computed ok");
 }
@@ -99,11 +99,11 @@ static void grad_finite_differences() {
             xm[size_t(row * vocab + col)] -= float(h);
             const double fd = (mean_loss(xp) - mean_loss(xm)) / (2.0 * h);
             const double g = grad[size_t(row * vocab + col)];
-            CHECK(near(g, fd, 1e-4));
+            R97_CHECK(near(g, fd, 1e-4));
         }
     // Unscored rows are exactly zero.
-    CHECK(grad[1 * vocab + 1] == 0.0f);  // row 1 predicts token 2, score 0
-    CHECK(grad[5 * vocab + 2] == 0.0f);  // row 5 predicts nothing scored
+    R97_CHECK(grad[1 * vocab + 1] == 0.0f);  // row 1 predicts token 2, score 0
+    R97_CHECK(grad[5 * vocab + 2] == 0.0f);  // row 5 predicts nothing scored
     std::puts("loss_ce: gradient vs finite differences ok");
 }
 
@@ -115,10 +115,10 @@ static void large_logits() {
     const float row[3] = {1e30f, 1e30f, 5.0f};
     float grad[3] = {0, 0, 0};
     const double loss = r97::ce_position(row, 3, 0, grad);
-    CHECK(std::isfinite(loss) && near(loss, std::log(2.0), 1e-6));
-    CHECK(near(grad[0], -0.5, 1e-6) && near(grad[1], 0.5, 1e-6) && near(grad[2], 0.0, 1e-6));
+    R97_CHECK(std::isfinite(loss) && near(loss, std::log(2.0), 1e-6));
+    R97_CHECK(near(grad[0], -0.5, 1e-6) && near(grad[1], 0.5, 1e-6) && near(grad[2], 0.0, 1e-6));
     const r97::CeSum s = r97::ce_loss(b, row, 3);
-    CHECK(std::isfinite(s.loss));
+    R97_CHECK(std::isfinite(s.loss));
     std::puts("loss_ce: large logits ok");
 }
 
@@ -144,8 +144,8 @@ static void chunked_equals_whole() {
                                          1.0 / double(whole.scored));
         loss_sum += s.loss;
     }
-    CHECK(near(loss_sum, whole.loss, 1e-12 * std::max(1.0, std::fabs(whole.loss))));
-    for (size_t i = 0; i < gw.size(); ++i) CHECK(gw[i] == gc[i]);  // rows are independent
+    R97_CHECK(near(loss_sum, whole.loss, 1e-12 * std::max(1.0, std::fabs(whole.loss))));
+    for (size_t i = 0; i < gw.size(); ++i) R97_CHECK(gw[i] == gc[i]);  // rows are independent
     std::puts("loss_ce: chunked equals whole ok");
 }
 
@@ -158,11 +158,11 @@ static void bf16_matches_f32() {
     const uint16_t bf[2] = {0x3e80, 0xbf80};
     const r97::CeSum sf = r97::ce_loss(b, row, 2);
     const r97::CeSum sb = r97::ce_loss(b, std::vector<uint16_t>(bf, bf + 2), 2);
-    CHECK(sf.loss == sb.loss && sb.scored == 1);
+    R97_CHECK(sf.loss == sb.loss && sb.scored == 1);
     std::puts("loss_ce: bf16 input ok");
 }
 
-static void test_loss_ce() {
+R97_TEST(test_loss_ce) {
     hand_computed();
     grad_finite_differences();
     large_logits();
@@ -170,5 +170,3 @@ static void test_loss_ce() {
     bf16_matches_f32();
     std::puts("loss_ce ok");
 }
-
-R97_SELF_CHECK(test_loss_ce)
