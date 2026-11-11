@@ -35,34 +35,47 @@ An epoch is planned on demand from `(seed, epoch)` and cached (`Batcher::plan`):
    bucket is the exception: there is no bucket order to shuffle, so that bucket's sequences are
    shuffled under the seed and rotated by the epoch, which keeps consecutive epochs apart even
    when the whole dataset is one length class and has only two sequences.
-3. **Pack each sub-batch under the budget.** Walking the buckets in their shuffled order, each
-   sequence goes to the least-loaded of the `devices` sub-batches that can still take it: it has
-   room under the budget (`load + length <= token_budget`) and adding it keeps the step's spread
-   inside its bound (point 4). Ties go to the lowest device. When no sub-batch can take the next
-   sequence the step closes and the next sequence starts a new one. A bucket that ends with
-   fewer sequences than devices carries them into the next bucket to fill its idle devices
-   instead of being handed out with an empty sub-batch. If the next bucket is another chunk of
-   the same length class, it just continues filling the step. At a class edge the occupied
-   devices are sealed for the carry, so the next class cannot join an occupied sub-batch and mix
-   classes inside one `Batch`; every sub-batch still holds sequences of one length class, while a
-   step may hold two classes in different sub-batches. The budget is per sub-batch, not per step:
-   every `Batch` stays under `token_budget`, so a step may spend up to `devices * token_budget`
-   tokens. The packing keeps each sub-batch in the planned order; it does not re-sort it
-   afterwards.
-4. **Balance devices.** The spread is part of what a device is asked for, not a repair after the
-   packing: a sub-batch is only a candidate for a sequence while the step it is in still hands
-   out sub-batches within one maximal sequence of each other in tokens, and the bound is read
-   against the longest sequence in the step, which is what `keeps_spread` in the packer checks.
-   An add that would break it is no candidate, so a step closes with every device carrying a
-   sub-batch — the sequences it could not take are the first of the next step, and nothing is
-   split off after the fact to keep the bound. Every step but an epoch's last tail therefore
-   hands out `devices` sub-batches, and the tail hands out the one to `devices` it has. Neither
-   is handed out with an empty sub-batch: a single final sequence has no step to balance against,
-   so its step has one sub-batch rather than an empty second one. A sequence of no tokens is the
-   case neither rule covers and the packing does not special-case: it is its own length class, so
-   it cannot join a sub-batch that already holds one, and a step of one sub-batch has no bound
-   that admits a second, so a zero-token sequence can leave a step short in the middle of an
-   epoch. A tokenised sequence is never empty, and such a sequence has nothing to train on.
+3. **Pack each sub-batch under the budget.** Adjacent buckets of one length class are merged
+   into one run before packing: the 32-sequence chunks were the sort's unit, not the step's, so a
+   step keeps filling across that seam instead of closing on an arbitrary chunk boundary. Walking
+   the runs in their shuffled order, each sequence goes to the least-loaded of the `devices`
+   sub-batches that can still take it: it has room under the budget (`load + length <=
+   token_budget`) and adding it keeps the step's spread inside its bound (point 4). Ties go to the
+   lowest device. When no sub-batch can take the next sequence the step closes and the next
+   sequence starts a new one. When the kept data is a single run of one length -- fixed-length or
+   packed data, the case the budget exists for -- the step sizes are planned exactly instead:
+   every step before the tail is a multiple of `devices` sequences (so every device gets the same
+   count and the spread is zero), and the tail is split into equal sub-batches that each fit the
+   budget. That spends the budget on the fewest steps the rules allow; filling greedily can leave
+   a tail (five sequences at four per device on three devices) that needs an extra step to hand
+   out balanced. A run that ends with fewer sequences than devices carries them into
+   the next run to fill its idle devices instead of being handed out with an empty sub-batch. At a
+   class edge the occupied devices are sealed for the carry, so the next class cannot join an
+   occupied sub-batch and mix classes inside one `Batch`; every sub-batch still holds sequences of
+   one length class, while a step may hold two classes in different sub-batches. The budget is per
+   sub-batch, not per step: every `Batch` stays under `token_budget`, so a step may spend up to
+   `devices * token_budget` tokens. The packing keeps each sub-batch in the planned order; it does
+   not re-sort it afterwards.
+4. **Balance devices.** The spread is a property of the step the reader receives, not of every
+   intermediate add. Walking a fixed-length run from one sequence per device to four of the same
+   length passes through a spread of exactly one maximal sequence; a packer that bounds every add
+   stops there and hands out a fraction of the budget the batcher exists to spend. So
+   `keeps_spread` admits an add that lands exactly on the bound while the rest of the run can
+   still raise the sub-batches at the bottom: it simulates the next sequences, at most `devices`
+   of them, raising the least-loaded device, and allows the add only if they bring the spread
+   strictly inside the bound. If the run ends first, or those sequences do not fit, the add is
+   refused and the step closes on the state before it, which is still inside the bound. Thus a
+   step closes with every device carrying a sub-batch -- the sequences it could not take are the
+   first of the next step, and nothing is split off after the fact to keep the bound. A carried
+   class edge is never admitted at the bound, because its sealed sub-batches at the bottom cannot
+   be raised. Every step but an epoch's last tail therefore hands out `devices` sub-batches, and
+   the tail hands out the one to `devices` it has. Neither is handed out with an empty sub-batch: a
+   single final sequence has no step to balance against, so its step has one sub-batch rather than
+   an empty second one. A sequence of no tokens is the case neither rule covers and the packing
+   does not special-case: it is its own length class, so it cannot join a sub-batch that already
+   holds one, and a step of one sub-batch has no bound that admits a second, so a zero-token
+   sequence can leave a step short in the middle of an epoch. A tokenised sequence is never empty,
+   and such a sequence has nothing to train on.
 
 ## Skip, position, resume
 
@@ -115,8 +128,13 @@ unit sequences) that a greedy hand-out would leave unbalanced. Every step but th
 all of its devices — on three longs beside three shorts on two devices, the case where one long is
 left for the next step and the three shorts then fill the device it left idle, and on 800 varied
 lengths at two, three and four devices, over three seeds and three epochs each, and on 101 sequences
-of one length at three devices; before the spread became part of the pick, each of those handed out
-a step of one sub-batch in the middle of the epoch. A dataset whose buckets each hold one sequence —
+of one length at three devices; a packer that bounds every add hands out one sequence per device
+there, a step of one sub-batch in the middle of the epoch.
+`batcher_fills_the_budget_on_fixed_lengths` pins what a token-budget batcher spends on fixed-length
+data: 101 of 500 at budget 2000 on three devices, 100 of 100 at 1000 on two, and 1000 of 100 and 800
+of 128 at 4096 on four each stay within their step counts and spend at least three quarters of the
+capacity of their steps — the old packer took 34 steps where this plan takes nine, and 250 and 512
+where it takes seven. A dataset whose buckets each hold one sequence —
 two sequences in different length classes, and one per class across eight classes — does not come
 out identical across the seed runs or across three epochs; so does a dataset that fits one bucket
 (2, 3 and 20 sequences of one length), by shuffling and rotating that bucket. A dataset that fits

@@ -11,16 +11,21 @@
 // epoch; either way the seed and the epoch reach the batches. Each step hands out `devices`
 // sub-batches with balanced token counts, one per device, and only the epoch's last tail hands out
 // fewer -- a sequence of no tokens can also leave one short, since it is a class of its own and a
-// step of one sub-batch has no spread to admit it under. A sub-batch is not a candidate for a
-// sequence that would push the step's token spread to the step's longest sequence, so what a step
-// cannot take starts the next step rather than being split off into a step of its own. A length
-// bucket that ends with fewer sequences than devices carries them into the next bucket to fill the
-// idle devices, which is how a short tail fills a device a long sequence left idle; the buckets'
-// classes never meet inside one sub-batch. A step never hands out an empty sub-batch. The budget
-// is per sub-batch, so a step may spend up to `devices * token_budget` tokens. A sequence longer
-// than the budget is reported (in `skipped()`) and never batched. A sub-batch holds its sequences
-// in the planned order, which the seed and the epoch choose both through the bucket order and
-// through the shuffle inside a bucket.
+// step of one sub-batch has no spread to admit it under. The spread is a property of the step, not
+// of every add: a step on its way to filling every device with the same number of fixed-length
+// sequences passes through a spread of one maximal sequence and comes back inside it, so the
+// packer admits an add that lands on the bound while the rest of the run can still raise the
+// sub-batches below the longest, and refuses it -- starting the next step rather than splitting a
+// step off after the fact -- when it cannot. A run of one length class is packed as a whole (its
+// adjacent 32-sequence chunks are one run), and a dataset that is one length throughout has its
+// step sizes planned to spend the budget on the fewest balanced steps; a run that ends with fewer
+// sequences than devices carries them into the next bucket to fill the idle devices, which is how
+// a short tail fills a device a long sequence left idle; the buckets' classes never meet inside
+// one sub-batch. A step never hands out an empty sub-batch. The budget is per sub-batch, so a step
+// may spend up to `devices * token_budget` tokens. A sequence longer than the budget is reported
+// (in `skipped()`) and never batched. A sub-batch holds its sequences in the planned order, which
+// the seed and the epoch choose both through the bucket order and through the shuffle inside a
+// bucket.
 //
 // Deterministic for a given seed: the same seed replays the same batches, each epoch is a new
 // shuffle -- two consecutive epochs never hand out the same plan -- and a position (epoch, step)

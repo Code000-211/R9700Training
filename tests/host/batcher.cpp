@@ -890,6 +890,65 @@ R97_TEST(batcher_short_tail_balance) {
     }
 }
 
+// Fixed-length or packed data is the ordinary case for a token-budget batcher: every sequence is
+// the same length, so the only thing that can keep a sub-batch from filling is the budget. The
+// spread is a property of the step, not of every intermediate packing state -- a step that is on
+// its way from one sequence per device to a full four per device passes through the bound and
+// comes back to it -- so a batcher that checks the spread at every add hands out one sequence per
+// device and spends a fraction of the budget it exists to spend. These are the cases the last
+// round measured: 101 sequences of 500 at budget 2000 on three devices took 34 steps, 1000 of 100
+// at 4096 on four took 250, and 800 of 128 at 4096 on four spent 512 of the 16384 tokens a step
+// can hold. The step counts below are the fewest those shapes allow, and the utilisation says how
+// much of the step's capacity the plan actually spends.
+R97_TEST(batcher_fills_the_budget_on_fixed_lengths) {
+    struct Case {
+        const char* what;
+        std::vector<int64_t> lens;
+        int64_t budget;
+        int devices;
+        size_t max_steps;
+    };
+    std::vector<Case> cases;
+    cases.push_back(Case{"101 sequences of 500, budget 2000, three devices",
+                         std::vector<int64_t>(101, 500), 2000, 3, 9});
+    cases.push_back(Case{"100 sequences of 100, budget 1000, two devices",
+                         std::vector<int64_t>(100, 100), 1000, 2, 5});
+    cases.push_back(Case{"1000 sequences of 100, budget 4096, four devices",
+                         std::vector<int64_t>(1000, 100), 4096, 4, 7});
+    cases.push_back(Case{"800 sequences of 128, budget 4096, four devices",
+                         std::vector<int64_t>(800, 128), 4096, 4, 7});
+
+    for (const Case& c : cases) {
+        (void)c.what;
+        auto seqs = make_sequences(c.lens);
+        r97::BatcherConfig cfg;
+        cfg.token_budget = c.budget;
+        cfg.devices = c.devices;
+        cfg.seed = 1;
+        Batcher b(seqs, cfg);
+
+        auto run = run_epoch(b);
+        R97_CHECK(!run.empty());
+        R97_CHECK(run.size() <= c.max_steps);
+        R97_CHECK(coverage(run, c.lens).size() == c.lens.size());
+
+        int64_t tokens_in_run = 0;
+        for (const auto& step : run) {
+            check_step(step, c.budget, c.devices);
+            for (const Batch& sub : step)
+                for (const TokenSeq& s : sub) tokens_in_run += tokens(s);
+        }
+        // Every step but the last fills every device, so only that tail can be short of capacity.
+        for (size_t i = 0; i + 1 < run.size(); ++i)
+            R97_CHECK((int)run[i].size() == c.devices);
+
+        // At least three quarters of what the plan's steps could hold: one sequence per device
+        // (a tenth of the 100-of-100 case) is exactly the waste this test exists to catch.
+        const int64_t capacity = (int64_t)run.size() * c.devices * c.budget;
+        R97_CHECK(tokens_in_run * 4 >= capacity * 3);
+    }
+}
+
 // A saved Position is plain data, and seek() promises no validity beyond what a previous
 // position() returned. A stepped-back or corrupted epoch/step must not index a plan out of bounds:
 // seek() clamps it into the valid range, so a negative step resumes at the first step, a negative
