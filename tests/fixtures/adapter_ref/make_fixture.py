@@ -3,7 +3,7 @@
 
 The point of the fixture is to be independent of `src/adapter_io.cpp`: the bytes here are laid out
 from the safetensors specification and PEFT's naming rule, not by calling the writer under test, so
-tests/host/adapter_io.cpp comparing the writer's output to this directory says the writer follows
+tests/host/late_adapter_io.cpp comparing the writer's output to this directory says the writer follows
 the document and not only itself.
 
 The adapter is the tiny fixture container's (`tests/support/fixture.h`: hidden 128, ffn 256) one
