@@ -6,8 +6,7 @@ backward needs the same weight as plain int8 for the transposed product `dX = dY
 turns one stored weight's IQR codes into that grid and its scales, into caller-provided scratch,
 for a range of output rows.
 
-- Device: `src/adjoint/device/iqr_decode.hip`, entry points `r97_iqr_decode` and
-  `r97_iqr_decode_wait` in `libr97.so`.
+- Device: `src/adjoint/device/iqr_decode.hip`, entry point `r97_iqr_decode` in `libr97.so`.
 - Host reference: `r97_iqr_decode_host` in `src/iqr_decode.h`, the same arithmetic as the kernel
   inline, for tests and the host tier.
 - Tests: `tests/host/iqr_decode.cpp` (synthetic forms against libquant's `grid_decode` /
@@ -63,13 +62,21 @@ R97IqrDecodeDesc d{};
 //      scale_dtype, scale_block_rows/cols, scale_row_bytes, scale2_*,
 //      codes, codes_row_bytes, scale, scale2, lut, mad/mad_a/mad_b,
 //      out_codes, out_scale
-r97_iqr_decode(&d);       // asynchronous; 0, or 1 outside the rules
-r97_iqr_decode_wait();    // hipDeviceSynchronize()
+r97_iqr_decode(&d, stream);   // asynchronous on `stream`; 0, or 1 outside the rules
+rad_stream_sync(stream);      // the caller's wait, on the stream it handed in
 ```
 
 `r97_iqr_validate` is the rule list, and both the host and device entry points call it before
 touching memory. The device descriptor is a **host** struct whose pointers are device pointers;
 the kernel copies it by value.
+
+The kernel launches on the `RadStream` the caller hands in (`R97IqrStream`, radiance's opaque
+`void*`), with `hipLaunchKernelGGL`, and does not sync: the caller's `rad_stream_sync` on that
+same stream orders its read of the outputs after the launch, so the uploads, the decode and the
+downloads are one queue's work on the caller's stream rather than the whole device's. A caller
+with the codes on another stream hands that stream in; there is no hidden legacy stream.
+`tests/gpu/iqr_decode.cpp` is the caller that shows it: one stream for its uploads, the launch
+and its downloads.
 
 ## Layout of the launch
 
@@ -82,8 +89,8 @@ exactly `rows × cols` int8 plus `rows × cols/128` bf16.
 ## Measured
 
 AMD Radeon AI PRO R9700 (gfx1201, 32 GB), `R97_DEVICE=0`, one queue; the numbers are the launch
-and `r97_iqr_decode_wait`, best of five, with the planes uploaded once. `tests/gpu/iqr_decode.cpp`
-prints them.
+and the caller's `rad_stream_sync` on that queue, best of five, with the planes uploaded once.
+`tests/gpu/iqr_decode.cpp` prints them.
 
 | weight | shape `[out, in]` | out | scales | decode |
 |---|---|---:|---:|---:|

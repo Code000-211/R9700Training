@@ -230,15 +230,18 @@ void decode_case(const std::string& so, rad::RadFile& f, const RadFileEntry& e, 
     dd.out_codes = (int8_t*)dout;
     dd.out_scale = (uint16_t*)dsc;
 
-    using DecodeFn = int (*)(const R97IqrDecodeDesc*);
-    using WaitFn = void (*)();
+    using DecodeFn = int (*)(const R97IqrDecodeDesc*, R97IqrStream);
     void* h = dlopen(so.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!h) throw std::runtime_error(std::string("dlopen: ") + dlerror());
     DecodeFn dec = (DecodeFn)dlsym(h, "r97_iqr_decode");
-    WaitFn wait = (WaitFn)dlsym(h, "r97_iqr_decode_wait");
-    if (!dec || !wait) throw std::runtime_error("the device plugin has no IQR decode");
-    expect(dec(&dd) == 0, std::string(f.str(e.name)) + ": the device decode starts");
-    wait();
+    if (!dec) throw std::runtime_error("the device plugin has no IQR decode");
+    // No hidden stream: a call with none is refused rather than quietly run on the legacy one.
+    expect(dec(&dd, nullptr) == 1, std::string(f.str(e.name)) + ": no stream, no launch");
+    // The kernel launches on the stream this test made, so the same stream's sync is what orders
+    // the download after it and what the timing below measures.
+    expect(dec(&dd, dev.stream) == 0, std::string(f.str(e.name)) + ": the device decode starts");
+    if (rad_stream_sync(dev.stream) != 0)
+        throw std::runtime_error(std::string("rad_stream_sync: ") + rad_dev_last_error());
 
     std::vector<int8_t> got((size_t)out_code_bytes(hd));
     std::vector<uint16_t> gsc((size_t)out_scale_bytes(hd) / sizeof(uint16_t));
@@ -301,20 +304,20 @@ void time_case(const std::string& so, rad::RadFile& f, const RadFileEntry& e, in
     if (rad_stream_sync(dev.stream) != 0)
         throw std::runtime_error(std::string("rad_stream_sync: ") + rad_dev_last_error());
 
-    using DecodeFn = int (*)(const R97IqrDecodeDesc*);
-    using WaitFn = void (*)();
+    using DecodeFn = int (*)(const R97IqrDecodeDesc*, R97IqrStream);
     void* h = dlopen(so.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!h) throw std::runtime_error(std::string("dlopen: ") + dlerror());
     DecodeFn dec = (DecodeFn)dlsym(h, "r97_iqr_decode");
-    WaitFn wait = (WaitFn)dlsym(h, "r97_iqr_decode_wait");
-    if (!dec || !wait) throw std::runtime_error("the device plugin has no IQR decode");
-    expect(dec(&dd) == 0, "the timed decode starts");
-    wait();
+    if (!dec) throw std::runtime_error("the device plugin has no IQR decode");
+    expect(dec(&dd, dev.stream) == 0, "the timed decode starts");
+    if (rad_stream_sync(dev.stream) != 0)
+        throw std::runtime_error(std::string("rad_stream_sync: ") + rad_dev_last_error());
     double best = 1e30;
     for (int i = 0; i < 5; ++i) {
         const auto t0 = std::chrono::steady_clock::now();
-        expect(dec(&dd) == 0, "the timed decode starts");
-        wait();
+        expect(dec(&dd, dev.stream) == 0, "the timed decode starts");
+        if (rad_stream_sync(dev.stream) != 0)
+            throw std::runtime_error(std::string("rad_stream_sync: ") + rad_dev_last_error());
         const auto t1 = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         if (ms < best) best = ms;

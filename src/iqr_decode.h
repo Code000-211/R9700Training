@@ -306,8 +306,12 @@ inline int32_t r97_iqr_decode_host(const R97IqrDecodeDesc& d) {
     return 0;
 }
 
-// The device kernel's entry point, in libr97. It launches asynchronously; r97_iqr_decode_wait
-// waits for the launched work. Returns 0, or 1 when the description is outside the kernel's
-// rules (r97_iqr_validate).
-extern "C" int r97_iqr_decode(const R97IqrDecodeDesc* desc);
-extern "C" int r97_iqr_decode_wait(void);
+// The stream a launch runs on: radiance's RadStream, an opaque pointer. The caller brings its
+// own, so the decode is one queue's work with the copies around it.
+typedef void* R97IqrStream;
+
+// The device kernel's entry point, in libr97. It launches asynchronously on `stream`; the caller's
+// rad_stream_sync on that same stream is what orders its reads of out_codes and out_scale after
+// the launch. Returns 0, or 1 when the description is outside the kernel's rules
+// (r97_iqr_validate) or there is no stream to launch on.
+extern "C" int r97_iqr_decode(const R97IqrDecodeDesc* desc, R97IqrStream stream);

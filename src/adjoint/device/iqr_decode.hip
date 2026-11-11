@@ -6,6 +6,11 @@
 // from those and then walks its run. Threads in a workgroup cover consecutive columns, so at each row
 // they read consecutive codes of the same packed row: the access is coalesced. The math is
 // src/iqr_decode.h's, the same the host test checks against libquant.
+//
+// The launch follows docs/kernels/README.md's discipline: it runs on the stream the caller hands
+// in, so the copies around it and the wait for them are the caller's queue rather than the whole
+// device's. The kernel does not sync: the caller's rad_stream_sync on that same stream is what
+// orders its read of the outputs after the launch, and it is what the harness times.
 #include "../../iqr_decode.h"
 
 #include <hip/hip_runtime.h>
@@ -27,13 +32,11 @@ __global__ __launch_bounds__(kThreads) void iqr_decode_kernel(R97IqrDecodeDesc d
 
 }  // namespace
 
-extern "C" int r97_iqr_decode(const R97IqrDecodeDesc* desc) {
-    if (!desc) return 1;
+extern "C" int r97_iqr_decode(const R97IqrDecodeDesc* desc, R97IqrStream stream) {
+    if (!desc || !stream) return 1;
     if (r97_iqr_validate(*desc)) return 1;
     const int64_t runs = (desc->rows + desc->run_rows - 1) / desc->run_rows;
     const dim3 grid((unsigned)((desc->cols + kThreads - 1) / kThreads), (unsigned)runs);
-    iqr_decode_kernel<<<grid, kThreads>>>(*desc);
+    hipLaunchKernelGGL(iqr_decode_kernel, grid, dim3(kThreads), 0, (hipStream_t)stream, *desc);
     return 0;
 }
-
-extern "C" int r97_iqr_decode_wait(void) { return (int)hipDeviceSynchronize(); }
