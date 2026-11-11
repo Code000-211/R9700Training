@@ -86,10 +86,11 @@ message(STATUS "r97: radiance at ${R97_RADIANCE_COPY}, commit ${R97_RADIANCE_COM
                "patch set ${R97_PATCH_SET}, ${R97_PATCH_FILES} patches applied")
 
 # Build rad_core out of tree: the subproject is configured (Ninja, like us) and built for rad_core,
-# the two host kernel libraries, the qwen35_bf16 architecture plugin and rad-convert, which turns a
-# checkpoint into a container -- what a host test loads and runs. The radiance server and the other
-# tools are not this build's business. An IMPORTED target hands the archive to this project's
-# consumers, with the include directories and link libraries rad_core itself publishes (see
+# the host kernel libraries, the architecture plugins (qwen35_bf16 and qwen35_w8a8), the quantizer
+# libquant (the int8 fixture's conversion) and rad-convert, which turns a checkpoint into a
+# container -- what a host test loads and runs. The radiance server and the other tools are not this
+# build's business. An IMPORTED target hands the archive to this project's consumers, with the
+# include directories and link libraries rad_core itself publishes (see
 # third_party/core/CMakeLists.txt).
 include(ExternalProject)
 find_package(Threads REQUIRED)
@@ -136,7 +137,7 @@ ExternalProject_Add(radiance_core
     -DRAD_WITH_HIP=${RAD_WITH_HIP}
     -DRAD_GPU_TARGETS=${RAD_GPU_TARGETS}
     -DR97_PATCH_STAMP=${R97_PATCH_STAMP}
-  BUILD_COMMAND ${CMAKE_COMMAND} --build . --target rad_core libref libavx rad-convert qwen35_bf16
+  BUILD_COMMAND ${CMAKE_COMMAND} --build . --target rad_core libref libavx libquant rad-convert qwen35_bf16 qwen35_w8a8
   INSTALL_COMMAND ""
   BUILD_ALWAYS FALSE
   USES_TERMINAL_BUILD TRUE
@@ -228,7 +229,9 @@ if(R97_BUILD_TESTS)
     target_include_directories(r97_host_tests PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/tests
       ${R97_RADIANCE_COPY}/tests)   # radiance's write_qwen35, the fixture's checkpoint writer
-    target_compile_definitions(r97_host_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
+    target_compile_definitions(r97_host_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}"
+      # the int8 fixture's recipe, the one docs/FIXTURES.md prints
+      R97_FIXTURE_W8A8_RECIPE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/w8a8_fwht128.recipe")
   endif()
 
   # gpu tests: need the card, run serially. Same shape as the host binary; empty until the device
