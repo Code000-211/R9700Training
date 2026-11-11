@@ -8,6 +8,10 @@
 //
 // It also checks the parts the container does not exercise: a chunk that starts at a run boundary
 // and a weight whose last run is short, and the chunk's output against the whole weight's.
+//
+// libquant is required, not optional: a library or symbol that cannot be found fails the test,
+// because a run whose reference comparison never happened must not read as one that passed (the
+// libref load of tests/host/adjoint_qk.cpp fails the same way).
 #include "../../src/iqr_decode.h"
 
 #include "../../third_party/radiance/libquant/lq_grid.h"
@@ -52,7 +56,28 @@ std::string find_libquant() {
     return {};
 }
 
-// The libquant symbol is a C++ one (namespace lq); dlsym needs its mangled name.
+// Loads libquant and takes the two reference decodes out of it. The handle stays open for the rest
+// of the run: the function pointers below are called until the test ends.
+void load_libquant() {
+    const std::string path = find_libquant();
+    if (path.empty())
+        throw std::runtime_error(
+            "test: cannot find libquant; set R97_LIBQUANT to the radiance build's "
+            "radiance_home/quantizers/libquant.so (also looked up from '.', '..', '../..' and "
+            "'../../..')");
+    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) throw std::runtime_error("test: cannot load libquant at " + path + ": " + dlerror());
+    void* p = dlsym(h, kGridTcqDecode);
+    if (!p)
+        throw std::runtime_error("test: " + path + " has no lq::grid_tcq_decode (" +
+                                 kGridTcqDecode + "); has its signature changed?");
+    std::memcpy(&g_lq, &p, sizeof(p));
+    p = dlsym(h, kGridDecode);
+    if (!p)
+        throw std::runtime_error("test: " + path + " has no lq::grid_decode (" + kGridDecode +
+                                 "); has its signature changed?");
+    std::memcpy(&g_grid, &p, sizeof(p));
+}
 
 struct Synth {
     int bits = 4, state_bits = 16, run_rows = 256, rb = 1, mad = 0;
@@ -265,27 +290,23 @@ void one_case(const char* name, int bits, int L, int rb, int mad, int scale_dtyp
     expect(hcodes == codes, nm + ": the host path's codes are the column loop's");
     expect(hscales == scales, nm + ": the host path's scales are the column loop's");
 
-    if (g_lq) {
-        std::vector<float> ref((size_t)(s.rows * s.cols), 0.0f);
-        const int rc = g_lq(&s.enc, s.rows, s.cols, s.ptr.data(), 0, s.rows, ref.data());
-        expect(rc == 0, nm + ": libquant decodes it, rc=" + std::to_string(rc));
-        if (rc == 0) {
-            size_t bad = 0, first = 0;
-            for (size_t i = 0; i < ref.size(); ++i) {
-                // A zero is a zero: rb rounding turns a negative-zero value into the int8 code 0,
-                // and the code times a positive block scale cannot carry the sign back.
-                if (ref[i] == 0.0f && values[i] == 0.0f) continue;
-                if (std::memcmp(&ref[i], &values[i], sizeof(float)) != 0) {
-                    if (!bad) first = i;
-                    ++bad;
-                }
-            }
-            expect(bad == 0, nm + ": the values are libquant's bits (" + std::to_string(bad) +
-                                 " differ, first at " + std::to_string(first) + ": libquant " +
-                                 std::to_string(ref[first]) + ", ours " +
-                                 std::to_string(values[first]) + ")");
+    std::vector<float> ref((size_t)(s.rows * s.cols), 0.0f);
+    const int rc = g_lq(&s.enc, s.rows, s.cols, s.ptr.data(), 0, s.rows, ref.data());
+    expect(rc == 0, nm + ": libquant decodes it, rc=" + std::to_string(rc));
+    size_t bad = 0, first = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        // A zero is a zero: rb rounding turns a negative-zero value into the int8 code 0,
+        // and the code times a positive block scale cannot carry the sign back.
+        if (ref[i] == 0.0f && values[i] == 0.0f) continue;
+        if (std::memcmp(&ref[i], &values[i], sizeof(float)) != 0) {
+            if (!bad) first = i;
+            ++bad;
         }
     }
+    expect(bad == 0, nm + ": the values are libquant's bits (" + std::to_string(bad) +
+                         " differ, first at " + std::to_string(first) + ": libquant " +
+                         std::to_string(ref[first]) + ", ours " + std::to_string(values[first]) +
+                         ")");
 
     if (s.rows > s.run_rows) {
         // A chunk that starts at a run boundary: rows [run_rows, 2*run_rows).
@@ -393,30 +414,28 @@ void one_affine_case(const char* name, int bits, int zero_bits, int scale_dtype,
                    nm + ": the scale is the block's");
     }
 
-    if (g_grid) {
-        lq::Grid grid{};
-        grid.asym = true;
-        size_t bad = 0, first = 0;
-        float first_ref = 0.0f;
-        for (int64_t r = 0; r < rows; ++r) {
-            for (int64_t j = 0; j < cols; ++j) {
-                const int64_t kb = j >> 7;
-                lq::BlockScale b;
-                b.s = r97_iqr_block_scale(d, r, kb);
-                b.zero = (int)rad_load_bits(zero.data() + r * zrow, zero_bits, kb);
-                const float ref = g_grid(grid, b, (int)rad_load_bits(codes.data() + r * crow, bits, j));
-                const size_t i = (size_t)(r * cols + j);
-                if (std::memcmp(&ref, &values[i], sizeof(float)) != 0) {
-                    if (!bad) { first = i; first_ref = ref; }
-                    ++bad;
-                }
+    lq::Grid grid{};
+    grid.asym = true;
+    size_t bad = 0, first = 0;
+    float first_ref = 0.0f;
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t j = 0; j < cols; ++j) {
+            const int64_t kb = j >> 7;
+            lq::BlockScale b;
+            b.s = r97_iqr_block_scale(d, r, kb);
+            b.zero = (int)rad_load_bits(zero.data() + r * zrow, zero_bits, kb);
+            const float ref = g_grid(grid, b, (int)rad_load_bits(codes.data() + r * crow, bits, j));
+            const size_t i = (size_t)(r * cols + j);
+            if (std::memcmp(&ref, &values[i], sizeof(float)) != 0) {
+                if (!bad) { first = i; first_ref = ref; }
+                ++bad;
             }
         }
-        expect(bad == 0, nm + ": the values are libquant's bits (" + std::to_string(bad) +
-                             " differ, first at " + std::to_string(first) + ": libquant " +
-                             std::to_string(first_ref) + ", ours " +
-                             std::to_string(values[first]) + ")");
     }
+    expect(bad == 0, nm + ": the values are libquant's bits (" + std::to_string(bad) +
+                         " differ, first at " + std::to_string(first) + ": libquant " +
+                         std::to_string(first_ref) + ", ours " + std::to_string(values[first]) +
+                         ")");
 
     // A chunk of the rows, as a vocabulary-sized head decodes it.
     R97IqrDecodeDesc cd = d;
@@ -444,16 +463,7 @@ void one_affine_case(const char* name, int bits, int zero_bits, int scale_dtype,
 }  // namespace
 
 R97_TEST(iqr_decode) {
-    void* h = dlopen(find_libquant().c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (h) {
-        void* p = dlsym(h, kGridTcqDecode);
-        if (p) std::memcpy(&g_lq, &p, sizeof(p));
-        p = dlsym(h, kGridDecode);
-        if (p) std::memcpy(&g_grid, &p, sizeof(p));
-    }
-    if (!g_lq) std::printf("note: libquant not found; the libquant comparisons are skipped\n");
-    else if (!g_grid)
-        std::printf("note: libquant's grid_decode not found; the affine comparisons are skipped\n");
+    load_libquant();
 
     // Every form the container stores: computed and stored codebooks, the three scale layouts,
     // and the code widths the head's k3..k6 use.
@@ -479,6 +489,4 @@ R97_TEST(iqr_decode) {
     one_affine_case("drafter", 2, 8, R97_IQR_F16, 512);
     one_affine_case("drafter-narrow-zero", 2, 4, R97_IQR_F16, 384);
     one_affine_case("drafter-bf16", 4, 8, R97_IQR_BF16, 256);
-
-    if (h) dlclose(h);
 }

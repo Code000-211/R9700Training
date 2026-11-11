@@ -162,11 +162,13 @@ chunk.
 `tests/host/iqr_decode.cpp` covers the forms synthetically: code widths 3-6, trellis table and
 computed (`mad`) values, f32/bf16/e4m3 scales, a second-level scale, `rb` 8 and 16, L=12 and
 16, a shorter last run, a partial workgroup, and a chunk against the whole decode; every case is
-also checked against libquant's host decode when `R97_LIBQUANT` points at `libquant.so`. The
-affine form has its own cases: u2 codes under a u8 zero with an f16 scale (the container's
-shape), a u4 zero to exercise a packed zero plane, and bf16, a 100-row chunk at `row0 = 128`, and
-refusal of a descriptor without its zero. Each affine case is compared value by value with
-libquant's `grid_decode` over a constructed `Grid{asym}` and `BlockScale{s, zero}`.
+also checked against libquant's host decode. That reference is required, not optional: the test
+loads `libquant.so` from the radiance build (`R97_LIBQUANT` overrides the path) and a library or
+symbol it cannot find fails the test instead of turning the comparison off. The affine form has
+its own cases: u2 codes under a u8 zero with an f16 scale (the container's shape), a u4 zero to
+exercise a packed zero plane, and bf16, a 100-row chunk at `row0 = 128`, and refusal of a
+descriptor without its zero. Each affine case is compared value by value with libquant's
+`grid_decode` over a constructed `Grid{asym}` and `BlockScale{s, zero}`.
 
 `tests/gpu/iqr_decode.cpp` reads the real container (label `model`, `R97_MODEL_DIR`, default
 `/srv/models/qwen3.8-27b-iqr-v4`) and, for a tensor of each of the container's trellis encodings
