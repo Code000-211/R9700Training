@@ -145,14 +145,18 @@ hf download StillDeadcode/qwen3.8-27b-iqr-v4 qwen3.8-27b-iq4r-s-v4.rad
   register the plugin's rows after the r97 registry they go into is destroyed).
   `tests/gpu/adjoint_add.cpp` is the example of a device test.
 - `reference`: `r97train train --reference --model <tiny.rad> --out <dir>` runs a full training
-  step with no card. The forward and backward are the fixture's op graph in f64, from the
+  run with no card. The forward and backward are the fixture's op graph in f64, from the
   registered twins and host adjoints (`src/reference_step.cpp`); the live trace runs the plugin's
   host chain (`libref`) only to hand them its `OpRecord`s and never touches `libr4d`. Over the
   batch `tests/fixtures/programs/oracle.json` records, `--program` reads the op list from that
   file instead and runs no `rad_issue` at all, so the process loads neither kernel library
   (`tests/host/reference_step.cpp` takes that step in a child run with `R97_TEST_ONLY`, which
   starts with neither library loaded and checks its own maps before and after the step; a step
-  refuses a batch the recorded one does not match). This proves the loop, the checkpoint, the
-  batcher and the resume on the real graph shape, and it proves the adjoints compose; it does
-  **not** prove the int8 path, the GPU kernels or the device library, which it deliberately never
-  loads.
+  refuses a batch the recorded one does not match). Over the three fixed conversations
+  (`tests/fixtures/chat_small.jsonl`), `tests/host/train_reference_cli.cpp` runs the command
+  itself: 20 steps overfit them (every conversation's loss at least halves), and a 20-step run
+  equals its own 10-step checkpoint resumed for 10 more, loss for loss and file for file, while
+  the loader's own log (`LD_DEBUG=libs`) names a host kernel library and never `libr4d`. This
+  proves the loop, the checkpoint, the batcher and the resume on the real graph shape, and it
+  proves the adjoints compose; it does **not** prove the int8 path, the GPU kernels or the device
+  library, which it deliberately never loads.
