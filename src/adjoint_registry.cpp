@@ -47,25 +47,42 @@ std::string params_text(const std::vector<OpParam>& params) {
 
 const char* side_text(Side side) { return side == Side::host ? "host" : "device"; }
 
+// A row with a predicate is the more specific one, so it wins over a catch-all whatever order
+// their files registered in: a file added later for one shape cannot be shadowed by the family's
+// unconditional row. Rows with the same specificity keep registration order.
 template <typename Row>
 const Row* first_match(const std::multimap<std::string, Row>& table, const std::string& op,
                        const std::vector<OpParam>& params) {
-    for (auto it = table.find(op); it != table.end() && it->first == op; ++it)
-        if (!it->second.pred || it->second.pred(params)) return &it->second;
-    return nullptr;
+    const Row* catch_all = nullptr;
+    for (auto it = table.find(op); it != table.end() && it->first == op; ++it) {
+        const Row& r = it->second;
+        if (!r.pred) {
+            if (!catch_all) catch_all = &r;
+            continue;
+        }
+        if (r.pred(params)) return &r;
+    }
+    return catch_all;
 }
 
-// The adjoint row that serves one op on one side: the first row of that side whose predicate
-// accepts the parameters. Both adjoint_find and adjoint_frozen read the row through here, so the
-// frozen positions a walk skips are always the ones of the adjoint it calls.
+// The adjoint row that serves one op on one side: the first specific row of that side whose
+// predicate accepts the parameters, else its catch-all. Both adjoint_find and adjoint_frozen read
+// the row through here, so the frozen positions a walk skips are always the ones of the adjoint it
+// calls.
 const AdjointEntry* adjoint_match(const std::string& op, Side side,
                                  const std::vector<OpParam>& params) {
     const auto& table = Table::get().adjoints;
+    const AdjointEntry* catch_all = nullptr;
     for (auto it = table.find(op); it != table.end() && it->first == op; ++it) {
         const AdjointEntry& r = it->second;
-        if (r.side == side && (!r.pred || r.pred(params))) return &r;
+        if (r.side != side) continue;
+        if (!r.pred) {
+            if (!catch_all) catch_all = &r;
+            continue;
+        }
+        if (r.pred(params)) return &r;
     }
-    return nullptr;
+    return catch_all;
 }
 
 }  // namespace

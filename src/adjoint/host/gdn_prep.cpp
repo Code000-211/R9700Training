@@ -303,15 +303,7 @@ void gdn_conv_prep_twin(const OpRecord& rec, const std::vector<AdValue>& op,
     l2_normalise(g, u, &o[wK], g.Hg * g.K);
 
     /* Phase 3: the gate accumulates its per-token increment within a chunk, and
-     * beta is the sigmoid of its projection. The engine may record `a` and `b_gate`
-     * as the parent x buffer (the runtime hands the kernel a column view, and a tape
-     * keeps the buffer it points into); their row stride is then x's, and their first
-     * column is x's last 2H. A test that feeds narrow [T, H] views gets the packed
-     * layout, so both are read through their own shape. */
-    const bool narrow_gate = a.shape != x.shape;
-    const int64_t gate_stride = narrow_gate ? g.H : g.xw;
-    const int64_t a_off = narrow_gate ? 0 : g.xw - 2 * g.H;
-    const int64_t b_off = narrow_gate ? 0 : g.xw - g.H;
+     * beta is the sigmoid of its projection. */
     for (int64_t n = 0; n < g.N; ++n) {
         const int64_t bos = (int64_t)cu.value[(size_t)n];
         const int64_t slen = (int64_t)cu.value[(size_t)(n + 1)] - bos;
@@ -321,11 +313,9 @@ void gdn_conv_prep_twin(const OpRecord& rec, const std::vector<AdValue>& op,
             for (int64_t t = 0; t < slen; ++t) {
                 if (t % g.chunk == 0) run = 0.0;
                 const int64_t at = (bos + t) * g.H + h;
-                const size_t av = (size_t)((bos + t) * gate_stride + a_off + h);
-                const size_t bv = (size_t)((bos + t) * gate_stride + b_off + h);
-                run += decay * softplus(a.value[av] + dt_bias.value[(size_t)h]);
+                run += decay * softplus(a.value[(size_t)at] + dt_bias.value[(size_t)h]);
                 o[wG].value[(size_t)at] = run;
-                o[wBeta].value[(size_t)at] = sigmoid(b_gate.value[bv]);
+                o[wBeta].value[(size_t)at] = sigmoid(b_gate.value[(size_t)at]);
             }
         }
     }
@@ -463,15 +453,9 @@ void gdn_conv_prep_host_adjoint(const AdjointCall& call) {
 
     /* The gate: g is a within-chunk running sum of increments, so the cotangent
      * of an increment is the sum of its own and every later g in its chunk; the
-     * increment's two factors give a and, through beta's sigmoid, b_gate. The
-     * cotangents keep the shape of the forward operand, parent-buffer view and
-     * all, so the walk adds them back to x's columns. */
+     * increment's two factors give a and, through beta's sigmoid, b_gate. */
     AdValue& da = call.dc->at(kA);
     AdValue& d_bgate = call.dc->at(kBGate);
-    const bool narrow_gate = f[kA].shape != f[kX].shape;
-    const int64_t gate_stride = narrow_gate ? g.H : g.xw;
-    const int64_t a_off = narrow_gate ? 0 : g.xw - 2 * g.H;
-    const int64_t b_off = narrow_gate ? 0 : g.xw - g.H;
     for (int64_t n = 0; n < g.N; ++n) {
         const int64_t bos = (int64_t)cu.value[(size_t)n];
         const int64_t slen = (int64_t)cu.value[(size_t)(n + 1)] - bos;
@@ -481,13 +465,11 @@ void gdn_conv_prep_host_adjoint(const AdjointCall& call) {
             for (int64_t t = slen - 1; t >= 0; --t) {
                 if (t == slen - 1 || (t + 1) % g.chunk == 0) tail = 0.0;
                 const size_t at = (size_t)((bos + t) * g.H + h);
-                const size_t av = (size_t)((bos + t) * gate_stride + a_off + h);
-                const size_t bv = (size_t)((bos + t) * gate_stride + b_off + h);
                 tail += d_g.value[at];
-                const double a_val = f[kA].value[av] + f[kDtBias].value[(size_t)h];
-                da.value[av] += tail * decay * softplus_grad(a_val);
-                const double s = sigmoid(f[kBGate].value[bv]);
-                d_bgate.value[bv] += d_beta.value[at] * s * (1.0 - s);
+                const double av = f[kA].value[at] + f[kDtBias].value[(size_t)h];
+                da.value[at] += tail * decay * softplus_grad(av);
+                const double s = sigmoid(f[kBGate].value[at]);
+                d_bgate.value[at] += d_beta.value[at] * s * (1.0 - s);
             }
         }
     }

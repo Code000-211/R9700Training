@@ -208,59 +208,20 @@ void scale_host_adjoint(const AdjointCall& call) {
 
 /* ------------------------------------------------------------------ sigmoid: y = 1/(1+e^-x) */
 
-/* A fused head writes q and gate into the first and second head_dim columns of a rank-3
- * [tokens, heads, 2 * head_dim] buffer. The op then normalizes or gates one column slice, so its
- * output is half the input: `view` is that factor and `offset` picks the slice (q comes first).
- * Keeping the geometry here lets the twin and its adjoint read the same columns. */
-struct ColumnView {
-    int64_t n = 0;
-    int64_t groups = 0;
-    int64_t stride = 1;
-    int64_t offset = 0;
-};
-
-ColumnView column_view(const OpRecord& rec, const AdValue& x, int64_t slot, bool second) {
-    ColumnView v;
-    v.n = width_of(rec, x.shape);
-    std::vector<int64_t> out_shape =
-        slot < (int64_t)rec.operands.size() ? rec.operands[(size_t)slot].shape : x.shape;
-    const int64_t out_numel = numel(out_shape);
-    const int64_t in_numel = (int64_t)x.value.size();
-    if (v.n <= 0 || out_numel <= 0 || in_numel <= 0) return v;
-    if (in_numel % out_numel == 0 && in_numel > out_numel) {
-        v.stride = in_numel / out_numel;
-        if (second) v.offset = v.n;
-    }
-    v.groups = out_numel / v.n;
-    return v;
-}
-
-void sigmoid_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector<AdValue>* out) {
+void sigmoid_twin(const OpRecord&, const std::vector<AdValue>& op, std::vector<AdValue>* out) {
     if (op.size() < 1) return;
     const AdValue& x = op[0];
-    const ColumnView g = column_view(rec, x, 1, true);
-    AdValue y = write_value(rec, 1, rec.operands[1].shape);
-    for (int64_t r = 0; r < g.groups; ++r)
-        for (int64_t i = 0; i < g.n; ++i) {
-            const int64_t src = r * g.n * g.stride + g.offset;
-            y.value[(size_t)(r * g.n + i)] = sigmoid(x.value[(size_t)(src + i)]);
-        }
+    AdValue y = x;
+    for (size_t i = 0; i < y.value.size(); ++i) y.value[i] = sigmoid(x.value[i]);
     out->push_back(std::move(y));
 }
 
 void sigmoid_host_adjoint(const AdjointCall& call) {
     if (call.cot.empty() || call.fwd.size() < 2 || call.dc->empty()) return;
-    const AdValue &x = call.fwd[0], &dy = call.cot[0];  /* x, cotangent */
-    const ColumnView g = column_view(call.rec, x, 1, true);
+    const AdValue &y = call.fwd[1], &dy = call.cot[0];  /* y, the op's own output */
     AdValue& dx = call.dc->at(0);
-    for (int64_t r = 0; r < g.groups; ++r)
-        for (int64_t i = 0; i < g.n; ++i) {
-            const int64_t src = r * g.n * g.stride + g.offset;
-            const int64_t b = r * g.n + i;
-            /* The tape snaps a written operand before the write, so take y from x, not fwd[1]. */
-            const double s = sigmoid(x.value[(size_t)(src + i)]);
-            dx.value[(size_t)(src + i)] += dy.value[(size_t)b] * s * (1.0 - s);
-        }
+    for (size_t i = 0; i < dy.value.size(); ++i)
+        dx.value[i] += dy.value[i] * y.value[i] * (1.0 - y.value[i]);
 }
 
 /* ------------------------------------------------------------------ silu: y = x * sigmoid(x) */
@@ -375,24 +336,24 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
     if (op.empty()) return;
     const AdValue& x = op[0];
     const AdValue* w = op.size() > 1 && !op[1].value.empty() ? &op[1] : nullptr;
-    const ColumnView g = column_view(rec, x, 2, false);
-    if (g.n <= 0 || g.groups <= 0) return;
-    if (w && (int64_t)w->value.size() < g.n) return;
+    const int64_t n = width_of(rec, x.shape);
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0) return;
+    if (w && (int64_t)w->value.size() < n) return;
     const double eps = param_num(rec, "eps", 1e-6);
     const double wadd = param_num(rec, "wadd", 0.0);
     const double mult = param_num(rec, "mult", 1.0);
     if (!w && wadd != 0.0) return;
 
-    AdValue y = write_value(rec, 2, rec.operands[2].shape);
-    for (int64_t r = 0; r < g.groups; ++r) {
-        const int64_t b = r * g.n;
-        const int64_t src = r * g.n * g.stride + g.offset;
+    AdValue y = write_value(rec, 2, x.shape);
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t b = r * n;
         double ss = 0.0;
-        for (int64_t i = 0; i < g.n; ++i) ss += x.value[(size_t)(src + i)] * x.value[(size_t)(src + i)];
-        const double s = 1.0 / std::sqrt(ss / (double)g.n + eps);
-        for (int64_t i = 0; i < g.n; ++i)
-            y.value[(size_t)(b + i)] = x.value[(size_t)(src + i)] * s *
-                                       (w ? w->value[(size_t)i] + wadd : 1.0) * mult;
+        for (int64_t i = 0; i < n; ++i) ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
+        const double s = 1.0 / std::sqrt(ss / (double)n + eps);
+        for (int64_t i = 0; i < n; ++i)
+            y.value[(size_t)(b + i)] =
+                x.value[(size_t)(b + i)] * s * (w ? w->value[(size_t)i] + wadd : 1.0) * mult;
     }
     out->push_back(std::move(y));
 }
@@ -406,32 +367,30 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
     const AdValue& x = call.fwd[0];
     const AdValue* w = call.fwd.size() > 1 && !call.fwd[1].value.empty() ? &call.fwd[1] : nullptr;
     const AdValue& dy = call.cot[0];
-    const ColumnView g = column_view(call.rec, x, 2, false);
-    if (g.n <= 0 || g.groups <= 0) return;
-    if (w && (int64_t)w->value.size() < g.n) return;
+    const int64_t n = width_of(call.rec, x.shape);
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0) return;
+    if (w && (int64_t)w->value.size() < n) return;
     const double eps = param_num(call.rec, "eps", 1e-6);
     const double wadd = param_num(call.rec, "wadd", 0.0);
     const double mult = param_num(call.rec, "mult", 1.0);
     if (!w && wadd != 0.0) return;
 
     AdValue& dx = call.dc->at(0);
-
-    for (int64_t r = 0; r < g.groups; ++r) {
-        const int64_t b = r * g.n;
-        const int64_t src = r * g.n * g.stride + g.offset;
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t b = r * n;
         double ss = 0.0;
-        for (int64_t i = 0; i < g.n; ++i)
-            ss += x.value[(size_t)(src + i)] * x.value[(size_t)(src + i)];
-        const double s = 1.0 / std::sqrt(ss / (double)g.n + eps);
+        for (int64_t i = 0; i < n; ++i) ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
+        const double s = 1.0 / std::sqrt(ss / (double)n + eps);
         double t = 0.0;
-        for (int64_t i = 0; i < g.n; ++i) {
+        for (int64_t i = 0; i < n; ++i) {
             const double c = w ? w->value[(size_t)i] + wadd : 1.0;
-            t += dy.value[(size_t)(b + i)] * x.value[(size_t)(src + i)] * c;
+            t += dy.value[(size_t)(b + i)] * x.value[(size_t)(b + i)] * c;
         }
-        for (int64_t i = 0; i < g.n; ++i) {
+        for (int64_t i = 0; i < n; ++i) {
             const double c = w ? w->value[(size_t)i] + wadd : 1.0;
-            const double shared = s * s * s * x.value[(size_t)(src + i)] * t / (double)g.n;
-            dx.value[(size_t)(src + i)] += mult * (s * c * dy.value[(size_t)(b + i)] - shared);
+            const double shared = s * s * s * x.value[(size_t)(b + i)] * t / (double)n;
+            dx.value[(size_t)(b + i)] += mult * (s * c * dy.value[(size_t)(b + i)] - shared);
         }
     }
 }

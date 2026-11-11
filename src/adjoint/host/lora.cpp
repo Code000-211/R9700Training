@@ -114,13 +114,6 @@ std::string grad_name(const char* prefix, const char* leaf) {
     return std::string(prefix) + "." + leaf;
 }
 
-/* The name of a slot's trainable leaf: the callback names the module when the fused record holds
- * several of them, and the walk's prefix otherwise. */
-std::string slot_grad_name(const AdjointCall& call, const char* leaf, int64_t slot) {
-    if (call.slot_prefix) return grad_name(call.slot_prefix(slot).c_str(), leaf);
-    return grad_name(call.prefix, leaf);
-}
-
 /* bf16 rounding, which lora_expand_mm's twin needs and r97's own arithmetic never does. Ties go to
  * the even significand and a value below bf16's normal range flushes, as rad_f32_to_bf16 does. */
 double rounded_bf16(double v) {
@@ -156,16 +149,12 @@ bool shrink_layout(const OpRecord& rec, const AdValue* v, size_t n, Shrink* sh) 
     const AdValue& held = v[1];  // a_scale, or the place an absent one keeps
     const AdValue& slot = v[2];
     const AdValue& la = v[3];
-    if (a.shape.size() < 2 || slot.shape.size() != 1 || la.shape.size() != 3) return false;
+    if (a.shape.size() != 2 || slot.shape.size() != 1 || la.shape.size() != 3) return false;
     /* The record's `dtype` and its operand 1 have to agree: a coded trunk passes a_scale, a float
      * trunk's position is the absent one the runtime left (radiance names it `invalid`). */
     const bool absent = held.dtype == "invalid";
     if (coded == absent) return false;
-    const int64_t M = a.shape[0], S = la.shape[0], R = la.shape[1];
-    /* The trunk may hand a head split (a rank-3 [rows][heads][width]); the adapter's K is the
-     * flattened trailing width. */
-    int64_t K = a.shape[1];
-    for (size_t d = 2; d < a.shape.size(); ++d) K *= a.shape[d];
+    const int64_t M = a.shape[0], K = a.shape[1], S = la.shape[0], R = la.shape[1];
     if (M <= 0 || K <= 0 || R <= 0 || S <= 0) return false;
     if (la.shape[2] != K || slot.shape[0] != M) return false;
     if ((int64_t)a.value.size() != M * K || (int64_t)slot.value.size() != M ||
@@ -265,18 +254,13 @@ void lora_shrink_host_adjoint(const AdjointCall& call) {
         if ((int64_t)s_cot->value.size() != sh.M * sh.groups) return;
     }
 
-    std::vector<Param*> da_by_slot((size_t)sh.S, nullptr);
-    const auto da_for = [&](int64_t s) -> Param* {
-        Param*& p = da_by_slot[(size_t)s];
-        if (!p) p = &grad_entry(call.grads, slot_grad_name(call, "lora_A", s), {sh.R, sh.K});
-        return p;
-    };
+    Param* da = nullptr;
+    if (call.grads) da = &grad_entry(call.grads, grad_name(call.prefix, "lora_A"), {sh.R, sh.K});
 
     std::vector<double> g((size_t)sh.K, 0.0);
     for (int64_t m = 0; m < sh.M; ++m) {
         const int64_t s = row_slot(sh, m);
         if (s < 0) continue;  // a base row: no cotangent, no gradient
-        Param* const da = call.grads ? da_for(s) : nullptr;
         std::fill(g.begin(), g.end(), 0.0);
         for (int64_t j = 0; j < sh.R; ++j) {
             const double c = t_cot.value[(size_t)(m * sh.R + j)];
@@ -395,17 +379,12 @@ void lora_expand_host_adjoint(const AdjointCall& call) {
     AdValue& t_cot = call.dc->at(0);
     if ((int64_t)t_cot.value.size() != ex.M * ex.R) return;
 
-    std::vector<Param*> db_by_slot((size_t)ex.S, nullptr);
-    const auto db_for = [&](int64_t s) -> Param* {
-        Param*& p = db_by_slot[(size_t)s];
-        if (!p) p = &grad_entry(call.grads, slot_grad_name(call, "lora_B", s), {ex.N, ex.R});
-        return p;
-    };
+    Param* db = nullptr;
+    if (call.grads) db = &grad_entry(call.grads, grad_name(call.prefix, "lora_B"), {ex.N, ex.R});
 
     for (int64_t m = 0; m < ex.M; ++m) {
         const int64_t s = row_slot(ex, m);
         if (s < 0) continue;
-        Param* const db = call.grads ? db_for(s) : nullptr;
         for (int64_t n = 0; n < ex.N; ++n) {
             const double c = y_cot.value[(size_t)(m * ex.N + n)];
             if (c == 0.0) continue;

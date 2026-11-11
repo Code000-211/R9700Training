@@ -335,6 +335,9 @@ std::vector<NormOp> normalize(const std::vector<OpRecord>& input, const ModelMet
             if (param_int(n.rec, "M", -1) >= 0) set_param(&n.rec, "M", active);
             if (param_int(n.rec, "q_len", -1) >= 0) set_param(&n.rec, "q_len", active);
         }
+        /* Ask for the reference-shaped rows in reference_<family>.cpp; ordinary walks leave this
+         * parameter off and get the family rows and docs unchanged. */
+        set_param(&n.rec, "r97ref", 1);
         // A few ops read or write a reshape of the same storage (attn_qg [T,4,64] against the
         // linear's [T,256]); the equal element count carries the values and the core only needs
         // the shape its adjoint expects.
@@ -525,88 +528,6 @@ private:
 };
 
 // ------------------------------------------------------------------ the step
-
-// A private op: add a narrow increment into a column range of a wider buffer. The LoRA expand of a
-// fused weight produces its own module's [M, W] block; this is how it lands in the fused output
-// without widening the module's B or losing the column offset.
-void ref_add_cols_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
-                       std::vector<AdValue>* out) {
-    const AdValue& y = operands[0];
-    const AdValue& inc = operands[1];
-    const int64_t off = param_int(rec, "off", 0);
-    if (y.shape.empty() || inc.shape.size() != 2 || inc.shape[0] != y.shape[0])
-        throw std::runtime_error("ref_add_cols: shape mismatch");
-    const int64_t row = ref_numel(y.shape) / y.shape[0];
-    if (off + inc.shape[1] > row)
-        throw std::runtime_error("ref_add_cols: increment past the row");
-    AdValue o = y;
-    for (int64_t m = 0; m < inc.shape[0]; ++m)
-        for (int64_t c = 0; c < inc.shape[1]; ++c)
-            o.value[(size_t)(m * row + off + c)] += inc.value[(size_t)(m * inc.shape[1] + c)];
-    out->push_back(std::move(o));
-}
-
-void ref_add_cols_adjoint(const AdjointCall& call) {
-    const AdValue& y = call.fwd[0];
-    const AdValue& inc = call.fwd[1];
-    const AdValue& dy = call.cot[0];
-    const int64_t off = param_int(call.rec, "off", 0);
-    AdValue& dy_in = call.dc->at(0);
-    AdValue& dinc = call.dc->at(1);
-    for (size_t i = 0; i < dy_in.value.size(); ++i) dy_in.value[i] += dy.value[i];
-    const int64_t row = ref_numel(y.shape) / y.shape[0];
-    for (int64_t m = 0; m < inc.shape[0]; ++m)
-        for (int64_t c = 0; c < inc.shape[1]; ++c)
-            dinc.value[(size_t)(m * inc.shape[1] + c)] +=
-                dy.value[(size_t)(m * row + off + c)];
-
-}
-
-// A private op: select rows of the full logits into the boundary's buffer. The forward writes one
-// logits row per token (the BOS row included); the boundary has the batch's row space, one row per
-// non-BOS token, so this is where the two row spaces meet.
-void ref_select_rows_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
-                          std::vector<AdValue>* out) {
-    const AdValue& x = operands[0];
-    const AdValue& idx = operands[1];
-    if (x.shape.size() != 2 || idx.value.empty())
-        throw std::runtime_error("ref_select_rows: bad operands");
-    const int64_t M = (int64_t)idx.value.size();
-    const int64_t V = x.shape[1];
-    AdValue y = make_value(x.dtype, {M, V}, std::vector<double>((size_t)(M * V), 0.0));
-    for (int64_t r = 0; r < M; ++r) {
-        const int64_t src = (int64_t)idx.value[(size_t)r];
-        if (src < 0 || src >= x.shape[0]) throw std::runtime_error("ref_select_rows: row out of range");
-        for (int64_t c = 0; c < V; ++c)
-            y.value[(size_t)(r * V + c)] = x.value[(size_t)(src * V + c)];
-    }
-    out->push_back(std::move(y));
-    (void)rec;
-}
-
-void ref_select_rows_adjoint(const AdjointCall& call) {
-    const AdValue& idx = call.fwd[1];
-    const AdValue& dy = call.cot[0];
-    AdValue& dx = call.dc->at(0);
-    const int64_t V = dy.shape[1];
-    for (int64_t r = 0; r < (int64_t)idx.value.size(); ++r) {
-        const int64_t dst = (int64_t)idx.value[(size_t)r];
-        for (int64_t c = 0; c < V; ++c)
-            dx.value[(size_t)(dst * V + c)] += dy.value[(size_t)(r * V + c)];
-    }
-}
-
-[[maybe_unused]] const bool kRefSelectRowsRegistered = [] {
-    twin_register("ref_select_rows", ref_select_rows_twin, nullptr);
-    adjoint_register("ref_select_rows", Side::host, ref_select_rows_adjoint, {}, nullptr);
-    return true;
-}();
-
-[[maybe_unused]] const bool kRefAddColsRegistered = [] {
-    twin_register("ref_add_cols", ref_add_cols_twin, nullptr);
-    adjoint_register("ref_add_cols", Side::host, ref_add_cols_adjoint, {}, nullptr);
-    return true;
-}();
 
 class ReferenceStep {
 public:
@@ -917,7 +838,10 @@ private:
         seln.rec = std::move(sel);
         seln.synthetic = true;
         with_lora.push_back(std::move(seln));
-        for (size_t i = 0; i < with_lora.size(); ++i) with_lora[i].rec.position = (int64_t)i;
+        for (size_t i = 0; i < with_lora.size(); ++i) {
+            with_lora[i].rec.position = (int64_t)i;
+            set_param(&with_lora[i].rec, "r97ref", 1);
+        }
         return with_lora;
     }
 
@@ -946,9 +870,10 @@ private:
         for (size_t oi = 0; oi < out.ops.size(); ++oi) {
             const NormOp& n = out.ops[oi];
             const OpRecord& rec = n.rec;
-            // Every operand as the op saw it: reads are resolved, a write is the value the buffer
-            // held just before (an in-place op's input), or a zero of its shape. The backward core
-            // asks for a snapshot of every operand, not just the reads.
+            // Every operand as the op saw it (docs/BACKWARD.md): a read is resolved, an ordinary
+            // written operand is the value the twin wrote, and the two in-place writes -- rope's
+            // operand 0 and a `kv:` state update -- are the value the buffer held before. The
+            // backward core asks for a snapshot of every operand, not just the reads.
             std::vector<AdValue> pre(rec.operands.size());
             std::vector<AdValue> reads;
             for (size_t i = 0; i < rec.operands.size(); ++i) {
@@ -979,6 +904,11 @@ private:
                 if (wi >= writes.size())
                     throw std::runtime_error("reference step: twin wrote too little for " + rec.op);
                 out.writes[oi].push_back(writes[wi]);
+                const bool in_place = rec.op == "rope" && i == 0;
+                const bool state = o.buffer.rfind("kv:", 0) == 0;
+                if (!in_place && !state)
+                    pre[i] = reshape_copy(writes[wi], o.shape,
+                                          o.dtype.empty() ? writes[wi].dtype : o.dtype);
                 apply_write(n, i, writes[wi], &env);
                 if (o.buffer == "logits" && o.shape.size() == 2 &&
                     int64_t(writes[wi].value.size()) == out.rows * layout.vocab)
