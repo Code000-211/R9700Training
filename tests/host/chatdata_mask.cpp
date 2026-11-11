@@ -9,10 +9,8 @@
 #include "support/fixture.h"
 
 // radiance's tests/rad_test.h, which the fixture header brings in, defines CHECK for its own
-// TEST() registry; self_check.h aliases CHECK to R97_CHECK and would redefine it. This file checks
-// with R97_CHECK only, so the alias is dropped here rather than warned about at every build.
-#undef CHECK
-#include "support/self_check.h"
+// TEST() registry. This file checks with R97_CHECK only, so it leaves that CHECK alone.
+#include "support/test.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -211,10 +209,10 @@ static void chatdata_reports_a_malformed_line_and_its_number() {
     R97_CHECK(batch.size() == 1);   // the first line still counted and appended
 }
 
-R97_SELF_CHECK(chatdata_mask_one_turn)
-R97_SELF_CHECK(chatdata_mask_three_turns)
-R97_SELF_CHECK(chatdata_mask_with_system_message)
-R97_SELF_CHECK(chatdata_shortens_trailing_turns_until_it_fits)
-R97_SELF_CHECK(chatdata_reads_the_small_chat_file)
-R97_SELF_CHECK(chatdata_skips_a_conversation_with_no_assistant_turn)
-R97_SELF_CHECK(chatdata_reports_a_malformed_line_and_its_number)
+R97_TEST(chatdata_mask_one_turn) { chatdata_mask_one_turn(); }
+R97_TEST(chatdata_mask_three_turns) { chatdata_mask_three_turns(); }
+R97_TEST(chatdata_mask_with_system_message) { chatdata_mask_with_system_message(); }
+R97_TEST(chatdata_shortens_trailing_turns_until_it_fits) { chatdata_shortens_trailing_turns_until_it_fits(); }
+R97_TEST(chatdata_reads_the_small_chat_file) { chatdata_reads_the_small_chat_file(); }
+R97_TEST(chatdata_skips_a_conversation_with_no_assistant_turn) { chatdata_skips_a_conversation_with_no_assistant_turn(); }
+R97_TEST(chatdata_reports_a_malformed_line_and_its_number) { chatdata_reports_a_malformed_line_and_its_number(); }
