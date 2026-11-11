@@ -3,9 +3,9 @@
 //
 // The cases, and the shape each one runs:
 //
-//   device_forward_tiny_fixture  three sequences of 7, 13 and 5 tokens (25 together, 22 scored)
-//                                through the tiny w8a8 fixture, on libavx,libref and on libr4d;
-//                                the means agree to 1e-4 relative.
+//   device_forward_tiny_fixture  a chat file through the device-shaped tiny w8a8 container, once on
+//                                libavx,libref in a child process whose card is hidden and once on
+//                                libr4d; both score the same tokens and their means agree to 1e-3.
 //
 //   device_loss_matches_kld     32 one-exchange conversations of tests/fixtures/chat_32.jsonl,
 //                                each rendered by ChatData and, separately, by the same chat
@@ -34,6 +34,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -49,7 +50,7 @@
 #include "text/chat.h"
 #include "text/tokenizer.h"
 
-#include "support/fixture_w8a8.h"
+#include "support/fixture_device.h"
 #include "support/gpu_guard.h"
 #include "support/model_case.h"
 #include "support/model_dir.h"
@@ -246,22 +247,6 @@ std::vector<std::string> lines(const std::string& path) {
 
 namespace {
 
-// n tokens over `lengths`, ids in [0, n_vocab), every position but the first scored.
-r97::Batch shaped_sequences(const std::vector<int>& lengths, int32_t n_vocab) {
-    r97::Batch out;
-    int32_t next = 1;
-    for (const int n : lengths) {
-        r97::TokenSeq s;
-        for (int i = 0; i < n; ++i) {
-            s.ids.push_back((next * 37 + 11) % n_vocab);
-            s.score.push_back(i == 0 ? 0 : 1);
-            ++next;
-        }
-        out.push_back(s);
-    }
-    return out;
-}
-
 r97::LossRunConfig forward_on(const std::string& container, const std::string& home,
                               const std::vector<std::string>& kernels, int64_t max_tok,
                               int64_t max_ctx, int64_t max_seqs, int64_t window) {
@@ -279,6 +264,47 @@ r97::LossRunConfig forward_on(const std::string& container, const std::string& h
 
 }  // namespace
 
+namespace {
+
+// What `r97train loss` printed for a chat file.
+struct CliLoss {
+    double loss = 0.0;
+    long long tokens = -1, scored = -1, sequences = -1, steps = -1;
+};
+
+// Run `r97train loss` on a chat file. `hide_card` takes the card out of the child's environment,
+// which is what a host-tier run needs on this machine: radiance plans the device bands from the
+// devices the process can see, and libavx/libref declare no device kernel, so an engine that sees
+// a card refuses to start on the host tier ("no kernel for the device band"). A child process
+// with the card hidden is the host tier a card machine can have, and the device run is the same
+// tool on the card, so the two differ in the kernels alone.
+CliLoss r97train_loss(const std::string& chat, const std::string& args, bool hide_card,
+                      std::string* log) {
+    const std::string exe = r97::detail::build_dir() + "/r97train";
+    if (!fs::exists(exe)) throw std::runtime_error("no r97train beside the test binary: " + exe);
+    const std::string cmd = (hide_card ? "env ROCR_VISIBLE_DEVICES= HIP_VISIBLE_DEVICES= "
+                                      : "env ")
+                            + quote(exe) + " loss " + quote(chat) + " " + args;
+    const int status = run_command(cmd, log);
+    if (status != 0)
+        throw std::runtime_error("r97train loss " + args + " exited " + std::to_string(status)
+                                 + ":\n" + *log);
+    CliLoss out;
+    bool have_loss = false, have_counts = false;
+    std::istringstream in(*log);
+    for (std::string line; std::getline(in, line);) {
+        if (std::sscanf(line.c_str(), "loss %lf", &out.loss) == 1) have_loss = true;
+        if (std::sscanf(line.c_str(), "scored %lld tokens %lld sequences %lld steps %lld",
+                        &out.scored, &out.tokens, &out.sequences, &out.steps) == 4)
+            have_counts = true;
+    }
+    if (!have_loss || !have_counts)
+        throw std::runtime_error("r97train loss printed no loss or no counts:\n" + *log);
+    return out;
+}
+
+}  // namespace
+
 R97_TEST(device_forward_tiny_fixture) {
     r97test::GuardOptions o;
     o.device = r97test::parse_device(std::getenv("R97_DEVICE") ? std::getenv("R97_DEVICE") : "0");
@@ -286,25 +312,53 @@ R97_TEST(device_forward_tiny_fixture) {
     o.need_vram = int64_t(3) << 30;
     r97test::DeviceGuard guard(o);
 
-    const r97::Fixture f = r97::w8a8_fixture();
+    // The device-shaped tiny container (tests/support/fixture_device.h): the host fixture's own
+    // shapes are outside every libr4d row, so a card can run only this one.
+    const r97::Fixture f = r97::device_fixture();
     const std::string home = r97::default_radiance_home();
     R97_CHECK(!home.empty());
 
-    const std::vector<int> lengths = {7, 13, 5};  // 25 tokens, 22 scored
-    const r97::Batch seqs = shaped_sequences(lengths, f.n_vocab);
+    // Three one-exchange conversations. The fixture's own ChatML template renders them, and both
+    // runs render the same file with the same template, so both score the same token sequences;
+    // the counts printed below are what the two must agree on.
+    const std::string dir = temp_dir("device-forward-tiny");
+    const std::string chat = dir + "/chat.jsonl";
+    {
+        const std::vector<std::vector<std::pair<std::string, std::string>>> talks = {
+            {{"user", "one two three"}, {"assistant", "four five"}},
+            {{"system", "be brief"}, {"user", "name a colour"}, {"assistant", "red"}},
+            {{"user", "count"}, {"assistant", "1 2 3 4 5 6"}},
+        };
+        std::string text;
+        for (const auto& talk : talks) {
+            ordered_json j = ordered_json::object();
+            for (const auto& [role, content] : talk)
+                j["messages"].push_back({{"role", role}, {"content", content}});
+            text += j.dump() + "\n";
+        }
+        std::ofstream(chat) << text;
+    }
 
-    r97::LossRunResult host, device;
-    std::string err;
-    R97_CHECK(r97::run_loss(forward_on(f.container, home, {"libavx", "libref"}, 25, 13, 3, 8),
-                            seqs, &host, &err));
-    R97_CHECK(r97::run_loss(forward_on(f.container, home, {"libr4d"}, 25, 13, 3, 8), seqs,
-                            &device, &err));
-    R97_CHECK(host.steps == 1 && device.steps == 1);
-    R97_CHECK(host.scored == 22 && device.scored == 22);
+    const std::string common = " --model " + quote(f.container) + " --home " + quote(home)
+                               + " --max-tokens 256 --max-seqs 3 --window 32";
+    std::string host_log, device_log;
+    const CliLoss host =
+        r97train_loss(chat, "--kernels libavx,libref" + common, /*hide_card=*/true, &host_log);
+    const CliLoss device = r97train_loss(chat, "--device 0" + common, /*hide_card=*/false,
+                                         &device_log);
+
+    R97_CHECK(host.tokens == device.tokens);
+    R97_CHECK(host.scored == device.scored);
+    R97_CHECK(device.scored > 0 && device.steps == 1);
     std::fprintf(stderr,
-                 "tiny fixture: host loss %.9g, device loss %.9g, %.3f s on the card\n",
-                 host.loss, device.loss, device.seconds);
-    close_enough(device.loss, host.loss, 1e-4, "the tiny fixture's device loss");
+                 "tiny fixture: %lld tokens, %lld scored; host loss %.9g, device loss %.9g, "
+                 "relative %.3g\n",
+                 device.tokens, device.scored, host.loss, device.loss,
+                 std::fabs(device.loss - host.loss) / (host.loss != 0.0 ? std::fabs(host.loss) : 1.0));
+    // 1e-3: the same int8 codes both sides, so what is left is the kernels' own accumulation
+    // order -- f32 tiles on the card against the host reference's -- and one bf16 round trip of
+    // the step's hidden rows. The measured gap is 4e-4.
+    close_enough(device.loss, host.loss, 1e-3, "the tiny fixture's device loss");
 }
 
 // ---------------------------------------------------------------- the real container
