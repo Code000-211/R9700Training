@@ -3,6 +3,9 @@
 Three test labels, and the variables that run them. ctest runs each tier's binary; the sources are
 globs of their directories (`tests/<tier>/*.cpp`), so a new test file needs no edit anywhere, and
 the tests inside one binary register themselves with `R97_TEST(name)` (`tests/support/test.h`).
+A test that also needs the real container registers with `R97_MODEL_TEST(name)`, which marks it
+`model`; the gpu binary holds both kinds and ctest starts it twice, once per label, because the
+labels make different promises (see below).
 Each tier's binary holds one `main` in its own directory: `tests/host/vector_tape.cpp`,
 `tests/gpu/main.cpp`, `tests/model/info_meta.cpp`. Checks are `R97_CHECK`, not
 `assert`: the default build is `RelWithDebInfo`, which defines `NDEBUG` and compiles `assert` out.
@@ -13,7 +16,7 @@ Each tier's binary holds one `main` in its own directory: `tests/host/vector_tap
 |---|---|---|---|
 | `host` | `r97_host_tests` | no card | never — runs anywhere |
 | `gpu` | `r97_gpu_tests` | one card, under the guard | never — a missing card is a failure |
-| `model` | `r97_model_tests` | the real container | skipped, exit 77, naming where it looked |
+| `model` | `r97_model_tests`, `r97_gpu_tests --model` | the real container; the gpu binary's model cases need the card as well | skipped, exit 77, naming where it looked |
 
 ```sh
 cmake -B build -G Ninja && cmake --build build
@@ -21,6 +24,11 @@ ctest --test-dir build -L host    # no card needed
 ctest --test-dir build -L gpu     # the card, serially
 ctest --test-dir build -L model   # the container, exit 77 (skip) when absent
 ```
+
+A `gpu` run never skips and a `model` run does, so one process cannot be both: the gpu binary runs
+the `gpu` label's own tests (no container) by default and its model cases, `R97_MODEL_TEST`, with
+`--model`. ctest starts it once for each (`gpu_tests`, `gpu_model_tests`), and both runs are
+`RUN_SERIAL`, so they queue on the card like any other gpu test.
 
 ## The GPU test guard
 
@@ -103,6 +111,11 @@ process with exit 77, which ctest records as skipped (`SKIP_RETURN_CODE`). Every
 the container, so the skip is the whole run. `r97test::resolve_container` is the same resolution
 without the exit, for a caller that reports the absence itself.
 
+The resolution comes first, before the guard and before the card is opened: a `model` test in the
+gpu binary (`R97_MODEL_TEST`) resolves the container, then takes the card, so a machine without
+the container skips instead of holding a card for a run that would decode nothing
+(`tests/gpu/iqr_decode.cpp` is the example).
+
 ## Variables
 
 | Variable | Meaning |
@@ -124,7 +137,8 @@ hf download StillDeadcode/qwen3.8-27b-iqr-v4 qwen3.8-27b-iq4r-s-v4.rad
 - `tests/gpu/gpu_guard_smoke.cpp` is the tier's smoke test: it opens the card through radiance's
   device layer, allocates 1 GiB and frees it, and proves the per-card lock from a child process
   (a second copy asking with `fail_fast` is refused at once, rather than opening the card too).
-  To see two copies serialise, start two: `./build/r97_gpu_tests & ./build/r97_gpu_tests & wait`.
+  To see two copies serialise, start two: `./build/r97_gpu_tests & ./build/r97_gpu_tests & wait`
+  (add `--model` for the runs that need the container).
 - The guard holds a lock, never ownership: it never stops a process it did not start. If a stale
   holder is wedged, kill only processes you started.
 - `r97_gpu_tests` runs its tests from `main`, not from the at-exit runner the host and model tiers

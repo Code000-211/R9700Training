@@ -384,14 +384,19 @@ if(R97_BUILD_TESTS)
   set_tests_properties(patch_sets PROPERTIES LABELS host)
 
   if(TARGET r97_gpu_tests)
+    # The gpu binary holds two kinds of test, and the labels promise different things: a `gpu` test
+    # never skips, while a `model` test resolves the container first thing and skips with 77 when it
+    # is absent. One process cannot be both, so ctest starts the binary twice and each run is one
+    # kind. The card's own tests:
     add_test(NAME gpu_tests COMMAND r97_gpu_tests)
-    # The container cases in the gpu binary make it a model test too, when the container the
-    # build found is on disk; without one the binary skips them and stays a gpu test.
-    set(R97_GPU_TEST_LABELS gpu)
-    if(EXISTS "${R97_MODEL_RAD}")
-      list(APPEND R97_GPU_TEST_LABELS model)
-    endif()
-    set_tests_properties(gpu_tests PROPERTIES LABELS "${R97_GPU_TEST_LABELS}" RUN_SERIAL TRUE)
+    set_tests_properties(gpu_tests PROPERTIES LABELS gpu RUN_SERIAL TRUE)
+    # ... and the tests that also need the real container (`R97_MODEL_TEST`), which is what makes
+    # the IQR decode a `gpu` `model` test:
+    add_test(NAME gpu_model_tests COMMAND r97_gpu_tests --model)
+    set_tests_properties(gpu_model_tests PROPERTIES
+      LABELS "gpu;model"
+      RUN_SERIAL TRUE
+      SKIP_RETURN_CODE 77)   # the model cases skip when the container is absent, like model_tests
   endif()
 
   if(TARGET r97_model_tests)
