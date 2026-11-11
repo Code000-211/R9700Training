@@ -206,6 +206,17 @@ else()
   target_include_directories(r97train PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools
                                               ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(r97train PRIVATE ${R97_LINK_WHOLE})
+
+  # The oracle's checkpoint writer: the tests' own tiny fixture, written to a directory the
+  # Python generator loads. It sits in its own subdirectory so it is not one of r97train's
+  # sources, and it is separate from the tests because only regenerating the reference needs it.
+  # It reads the fixture's header only, so it never looks an op up and links r97 as it comes.
+  add_executable(r97_write_fixture tools/oracle/write_fixture.cpp)
+  target_compile_features(r97_write_fixture PRIVATE cxx_std_20)
+  target_include_directories(r97_write_fixture PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    ${R97_RADIANCE_COPY}/tests)
+  target_link_libraries(r97_write_fixture PRIVATE r97)
 endif()
 
 # ------------------------------------------------------------------ tests
