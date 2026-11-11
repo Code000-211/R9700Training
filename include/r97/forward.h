@@ -59,6 +59,7 @@ struct ForwardConfig {
     int32_t max_seqs = 8;    // sequences one step may hold
     int64_t window_rows = 256;  // positions of the "logits" boundary one Objective call reads
     std::string kv_dtype = "bf16";  // the key-value pool's dtype: only bf16, nothing else is accepted
+    std::string lora;        // an adapter directory; empty is the base model
 };
 
 // One block boundary as it stood during the step: the residual at the block's entry or exit. Its
