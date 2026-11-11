@@ -118,7 +118,7 @@ dv[j][e]   += beta_j r
 dbeta[j]   += sum_e r (v[j][e] - e^{g_j} sk2_j[e])     (= sum_e r W[j][e]/beta_j)
 dg[j]      -= beta_j e^{g_j} sum_e r sk2_j[e]
 dk[j][d]   -= sum_e beta_j e^{g_j} S0[d][e] r
-dS0[d][e]  -= sum_e beta_j e^{g_j} k_j[d] r
+dS0[d][e]  -= beta_j e^{g_j} k_j[d] r            (r is already r[j][e]: no sum)
 ```
 
 The twin's own `W` and `V'` are recomputed from the forward operands and the
