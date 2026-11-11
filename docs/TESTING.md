@@ -127,3 +127,7 @@ hf download StillDeadcode/qwen3.8-27b-iqr-v4 qwen3.8-27b-iq4r-s-v4.rad
   To see two copies serialise, start two: `./build/r97_gpu_tests & ./build/r97_gpu_tests & wait`.
 - The guard holds a lock, never ownership: it never stops a process it did not start. If a stale
   holder is wedged, kill only processes you started.
+- `r97_gpu_tests` runs its tests from `main`, not from the at-exit runner the host and model tiers
+  use (`tests/gpu/main.cpp` says why: a device test `dlopen`s `libr97.so`, and a handler armed
+  during static initialisation would register the plugin's rows after the r97 registry they go
+  into is destroyed). `tests/gpu/adjoint_add.cpp` is the example of a device test.
