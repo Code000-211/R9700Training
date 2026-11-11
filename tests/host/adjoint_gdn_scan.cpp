@@ -3,10 +3,13 @@
 // reference kernel for gdn_chunk_scan, and the host adjoint against central finite
 // differences of that twin. The shapes cover a sequence shorter than a chunk, exactly one
 // chunk, several chunks and a ragged batch of different lengths; the first is the tiny
-// fixture's gdn geometry.
+// fixture's gdn geometry. One shape indexes a state cache larger than the batch through the
+// optional `state_idx` read, and one test pins the scale the architecture issues when a
+// record off the tape carries none.
 #include "../support/adjoint_check.h"
 #include "../support/test.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -35,8 +38,10 @@ int64_t numel_of(const std::vector<int64_t>& shape) {
 }
 
 /* One gdn_chunk_scan geometry. `k` and `v` are the per-head widths, `hk` and `hv`
- * the head counts, `chunk` the gate's chunk length; `lens` is one sequence length
- * per sequence in the batch. */
+ * the head counts, `chunk` the gate's chunk length, `scale` the record's scale
+ * parameter; `lens` is one sequence length per sequence in the batch. `slots` is
+ * the state cache's slot count (0 for one slot per sequence) and `sidx` the
+ * per-sequence slot indices (empty for no `state_idx` operand). */
 struct ScanShape {
     const char* name;
     int64_t k;
@@ -44,7 +49,10 @@ struct ScanShape {
     int64_t hk;
     int64_t hv;
     int64_t chunk;
+    double scale;
     std::vector<int64_t> lens;
+    int64_t slots = 0;
+    std::vector<int64_t> sidx;
 
     int64_t tokens() const {
         int64_t t = 0;
@@ -52,6 +60,7 @@ struct ScanShape {
         return t;
     }
     int64_t seqs() const { return (int64_t)lens.size(); }
+    int64_t state_slots() const { return slots > 0 ? slots : seqs(); }
 };
 
 /* The first is the tiny fixture's gdn geometry -- two key heads and four value
@@ -62,33 +71,52 @@ struct ScanShape {
  * scope object with a destructor would already be gone by then. */
 std::vector<ScanShape> scan_shapes() {
     return {
-        {"tiny-fixture-short", 16, 16, 2, 4, 4, {3}},
-        {"one-chunk", 8, 8, 2, 2, 5, {5}},
-        {"several-chunks", 4, 6, 1, 2, 3, {11}},
-        {"ragged", 8, 8, 2, 2, 5, {2, 7, 13}},
+        {"tiny-fixture-short", 16, 16, 2, 4, 4, 0.5, {3}},
+        {"one-chunk", 8, 8, 2, 2, 5, 0.25, {5}},
+        {"several-chunks", 4, 6, 1, 2, 3, 0.125, {11}},
+        {"ragged", 8, 8, 2, 2, 5, 0.75, {2, 7, 13}},
+        /* A state pool deeper than the batch: sequence 0 keeps slot 2 and
+         * sequence 1 slot 0, so slot 1 stays untouched and a twin that ignores
+         * `state_idx` writes and reads the wrong slot. */
+        {"state-pool", 8, 8, 1, 2, 4, 0.5, {5, 4}, 3, {2, 0}},
     };
+}
+
+/* A parameter's text, exactly representable: the f64 parameters travel as strings
+ * on the tape, which carries integers and strings and drops a double. */
+std::string f64_text(double v) {
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%.17g", v);
+    return buf;
 }
 
 OpRecord scan_rec(const ScanShape& s) {
     const int64_t t = s.tokens();
     const int64_t seq = s.seqs();
+    const int64_t slots = s.state_slots();
     OpRecord rec;
     rec.op = "gdn_chunk_scan";
-    rec.params = {
-        {"M", t}, {"head_k", s.k}, {"head_v", s.v}, {"chunk", s.chunk}};
+    rec.params = {{"M", t},
+                  {"head_k", s.k},
+                  {"head_v", s.v},
+                  {"chunk", s.chunk},
+                  {"scale", f64_text(s.scale)}};
     rec.n = t;
     rec.operands = {
         {"q", "bf16", {t, s.hk, s.k}, 0, t, false},
         {"k", "bf16", {t, s.hk, s.k}, 0, t, false},
         {"v", "bf16", {t, s.hv, s.v}, 0, t, false},
-        {"A", "f32", {t, s.hv, s.chunk}, 0, t, false},
+        {"A", "bf16", {t, s.hv, s.chunk}, 0, t, false},
         {"g", "f32", {t, s.hv}, 0, t, false},
         {"beta", "f32", {t, s.hv}, 0, t, false},
-        {"h0", "f32", {seq, s.hv, s.v, s.k}, 0, seq, false},
+        {"h0", "f32", {slots, s.hv, s.v, s.k}, 0, slots, false},
         {"cu", "i32", {seq + 1}, 0, 1, false},
         {"o", "bf16", {t, s.hv, s.v}, 0, t, true},
-        {"ht", "f32", {seq, s.hv, s.v, s.k}, 0, seq, true},
+        {"ht", "f32", {slots, s.hv, s.v, s.k}, 0, slots, true},
     };
+    /* The optional read is schema position 10, after the two writes. */
+    if (!s.sidx.empty())
+        rec.operands.push_back({"state_idx", "i32", {seq}, 0, 1, false});
     return rec;
 }
 
@@ -120,6 +148,8 @@ Case scan_case(const OpRecord& rec, const ScanShape& s, uint64_t seed) {
             val.value[0] = 0.0;
             for (size_t n = 0; n < s.lens.size(); ++n)
                 val.value[n + 1] = val.value[n] + (double)s.lens[n];
+        } else if (o.buffer == "state_idx") {
+            for (size_t n = 0; n < s.sidx.size(); ++n) val.value[n] = (double)s.sidx[n];
         } else if (o.buffer == "h0") {
             val.value.assign(val.value.size(), 0.0);
         } else if (o.buffer == "g") {
@@ -183,4 +213,59 @@ R97_TEST(adjoint_gdn_chunk_scan_agrees_with_finite_differences) {
         const Case c = scan_case(rec, s, 0x5eed0badull);
         require_fd(s, check_adjoint(rec, c.in, c.out, fd_tol));
     }
+}
+
+/* The architecture issues this op with `scale = 1/sqrt(head_k)`, and the tape
+ * drops an f64 parameter, so a record off a recorded step carries no `scale` at
+ * all. The twin must then use the architecture's value -- the one the kernel ran
+ * with -- and not the op's own default of 1, or every scan's output is
+ * sqrt(head_k) too large. */
+R97_TEST(adjoint_gdn_chunk_scan_defaults_scale_to_the_architectures) {
+    const ScanShape s = {"one-chunk", 8, 8, 2, 2, 5, 0.25, {5}};
+    const OpRecord rec = scan_rec(s);
+    const Case c = scan_case(rec, s, 0x5ca1e5a11ull);
+
+    std::string note;
+    const TwinFn twin = twin_find(rec.op, rec.params, &note);
+    if (!twin) fail(note);
+
+    auto at_scale = [&](bool present, double v) {
+        OpRecord r = rec;
+        r.params.erase(std::remove_if(r.params.begin(), r.params.end(),
+                                      [](const OpParam& p) { return p.first == "scale"; }),
+                       r.params.end());
+        if (present) r.params.push_back({"scale", f64_text(v)});
+        return r;
+    };
+    auto twin_out = [&](const OpRecord& r) {
+        std::vector<AdValue> y;
+        twin(r, c.in, &y);
+        return y;
+    };
+
+    const double arch = 1.0 / std::sqrt((double)s.k);
+    const std::vector<AdValue> absent = twin_out(at_scale(false, 0.0));
+    const std::vector<AdValue> explicit_arch = twin_out(at_scale(true, arch));
+    const std::vector<AdValue> explicit_one = twin_out(at_scale(true, 1.0));
+    if (absent.size() != explicit_arch.size() || absent.empty() || absent[0].value.empty())
+        fail("the twin's output count changed with the scale");
+
+    double worst = 0.0;
+    for (size_t e = 0; e < absent[0].value.size(); ++e)
+        worst = std::max(worst, std::fabs(absent[0].value[e] - explicit_arch[0].value[e]));
+    if (worst > 1e-12)
+        fail("a record without `scale` is not the one at 1/sqrt(head_k): off by " +
+             std::to_string(worst));
+
+    /* o is linear in the scale, so the default-1 twin is the arch's times sqrt(head_k).
+     * A twin that ignores `scale` entirely would match the arch's output instead. */
+    double linear = 0.0;
+    for (size_t e = 0; e < absent[0].value.size(); ++e)
+        linear = std::max(linear, std::fabs(explicit_one[0].value[e] - absent[0].value[e] / arch));
+    if (linear > 1e-9)
+        fail("the twin's default-1 output is not the arch's times sqrt(head_k): off by " +
+             std::to_string(linear));
+
+    std::printf("gdn_chunk_scan default scale: 1/sqrt(%lld) = %.6g, o off by %.2e\n",
+                (long long)s.k, arch, linear);
 }

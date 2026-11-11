@@ -24,6 +24,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -35,28 +37,28 @@ enum : int {
     kQ = 0,      // [T, Hg, K] bf16
     kK = 1,      // [T, Hg, K] bf16
     kV = 2,      // [T, H, V] bf16
-    kA = 3,      // [T, H, chunk] f32, unit lower triangular within a chunk
+    kA = 3,      // [T, H, chunk] bf16, unit lower triangular within a chunk
     kG = 4,      // [T, H] f32, within-chunk gate cumsum
     kBeta = 5,   // [T, H] f32
-    kH0 = 6,     // [S, H, V, K] f32, zero at a prefill start, frozen
+    kH0 = 6,     // [Nslots, H, V, K] f32, zero at a prefill start, frozen
     kCu = 7,     // [S+1] i32, sequence boundaries, frozen
     kO = 8,      // [T, H, V] bf16, written
-    kHt = 9,     // [S, H, V, K] f32, written
+    kHt = 9,     // [Nslots, H, V, K] f32, written
     kSidx = 10,  // [S] i32, optional state slot per sequence, frozen
 };
 
-/* The twin's reads, in schema order; the adjoint's fwd array uses the same
- * positions. */
+/* The read operands' slots, in schema order. `operands` holds only the reads, so these are not
+ * the schema positions above: the writes sit between them there. */
 enum : int {
-    rQ = kQ,
-    rK = kK,
-    rV = kV,
-    rA = kA,
-    rG = kG,
-    rBeta = kBeta,
-    rH0 = kH0,
-    rCu = kCu,
-    rSidx = kSidx,
+    rQ = 0,
+    rK = 1,
+    rV = 2,
+    rA = 3,
+    rG = 4,
+    rBeta = 5,
+    rH0 = 6,
+    rCu = 7,
+    rSidx = 8,
 };
 
 /* The twin's writes, in the order it produces them and the walk hands their
@@ -78,6 +80,19 @@ int64_t int_param(const OpRecord& rec, const char* name, int64_t fallback) {
     return fallback;
 }
 
+double param_f64(const OpRecord& rec, const char* name, double fallback) {
+    for (const OpParam& p : rec.params) {
+        if (p.first != name) continue;
+        if (const auto* i = std::get_if<int64_t>(&p.second)) return (double)*i;
+        const std::string& s = std::get<std::string>(p.second);
+        char* end = nullptr;
+        const double v = std::strtod(s.c_str(), &end);
+        if (end && end != s.c_str() && *end == '\0' && std::isfinite(v)) return v;
+        return fallback;
+    }
+    return fallback;
+}
+
 /* A written operand sized and typed as its schema row says. */
 AdValue write_value(const OpRecord& rec, int pos) {
     AdValue v;
@@ -94,7 +109,7 @@ struct ScanGeom {
     int64_t K = 0;       // head_k
     int64_t V = 0;       // head_v
     int64_t chunk = 0;   // tokens per gate chunk
-    double scale = 1.0;  // the op's optional f64 scale, default 1
+    double scale = 1.0;  // the op's optional f64 scale, see scan_geom
     int64_t N = 0;       // sequences
     int64_t T = 0;       // tokens
     int64_t Hg = 0;      // q and k heads
@@ -114,6 +129,10 @@ bool scan_geom(const OpRecord& rec, const std::vector<AdValue>& f, ScanGeom* g) 
                                              ? 0
                                              : rec.operands[kA].shape.back());
     if (g->K <= 0 || g->V <= 0 || g->chunk <= 0) return false;
+    /* The kernel's default is 1, but the architecture issues 1/sqrt(head_k) and the tape drops an
+     * f64 parameter, so a record off the tape carries no `scale` at all. Fall back to the value
+     * the model ran with, or every scan's output is sqrt(head_k) too large. */
+    g->scale = param_f64(rec, "scale", 1.0 / std::sqrt((double)g->K));
 
     const AdValue& cu = f[(size_t)rCu];
     g->N = (int64_t)cu.value.size() - 1;
@@ -138,11 +157,13 @@ bool scan_geom(const OpRecord& rec, const std::vector<AdValue>& f, ScanGeom* g) 
     return true;
 }
 
-/* The state slot a sequence owns. Absent state_idx, row n owns slot n. */
-int64_t state_slot(const OpRecord& rec, const std::vector<AdValue>& f, int64_t n) {
-    if (rec.operands.size() > (size_t)kSidx && f.size() > (size_t)rSidx &&
-        (int64_t)f[(size_t)rSidx].value.size() > n)
-        return (int64_t)f[(size_t)rSidx].value[(size_t)n];
+/* The state slot a sequence owns. Absent state_idx, row n owns slot n. `pos` is
+ * state_idx's slot in the array handed in: the twin holds the reads alone (rSidx),
+ * the adjoint the full record (kSidx). */
+int64_t state_slot(const OpRecord& rec, const std::vector<AdValue>& f, int pos, int64_t n) {
+    if (rec.operands.size() > (size_t)kSidx && f.size() > (size_t)pos &&
+        (int64_t)f[(size_t)pos].value.size() > n)
+        return (int64_t)f[(size_t)pos].value[(size_t)n];
     return n;
 }
 
@@ -386,8 +407,8 @@ void chunk_backward(const ScanGeom& g, const std::vector<double>& qc,
     }
 }
 
-/* Twin: gdn_chunk_scan's forward in f64. The entering state is read from h0;
- * these records pass the zero state a prefill starts from. */
+/* Twin: gdn_chunk_scan's forward in f64. The entering state is read from h0's
+ * block for the slot `state_idx` names, the zero state a prefill starts from. */
 void gdn_chunk_scan_twin(const OpRecord& rec, const std::vector<AdValue>& op,
                          std::vector<AdValue>* out) {
     ScanGeom g;
@@ -403,7 +424,7 @@ void gdn_chunk_scan_twin(const OpRecord& rec, const std::vector<AdValue>& op,
         const int64_t bos = (int64_t)op[(size_t)rCu].value[(size_t)n];
         const int64_t slen = (int64_t)op[(size_t)rCu].value[(size_t)(n + 1)] - bos;
         if (slen <= 0) continue;
-        const int64_t slot = state_slot(rec, op, n);
+        const int64_t slot = state_slot(rec, op, rSidx, n);
         if (slot < 0 || slot >= g.ht_slots) continue;
         for (int64_t h = 0; h < g.H; ++h) {
             load_state(g, op[(size_t)rH0], slot, h, &S0);
@@ -456,7 +477,7 @@ void gdn_chunk_scan_host_adjoint(const AdjointCall& call) {
         const int64_t bos = (int64_t)f[(size_t)rCu].value[(size_t)n];
         const int64_t slen = (int64_t)f[(size_t)rCu].value[(size_t)(n + 1)] - bos;
         if (slen <= 0) continue;
-        const int64_t slot = state_slot(call.rec, f, n);
+        const int64_t slot = state_slot(call.rec, f, kSidx, n);
         if (slot < 0) continue;
         for (int64_t h = 0; h < g.H; ++h) {
             /* Every chunk's entering state, one head at a time. The adjoint
