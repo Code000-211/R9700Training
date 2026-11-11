@@ -1,5 +1,10 @@
-// tests/host/adapter_io.cpp -- the adapter directory on disk, and the container's targetable
+// tests/host/late_adapter_io.cpp -- the adapter directory on disk, and the container's targetable
 // linears from its metadata. docs/ADAPTER.md owns both.
+//
+// The `late_` prefix is on purpose: the tier's checks run from an atexit handler armed by the first
+// check's static initialiser (tests/support/test.h), so a file that initialises before the tier's
+// older ones arms it before the library's registries exist and brings the run down at exit. These
+// checks live with the late ones, beside tests/support/late_fixture.h, whose comment has the rest.
 //
 // Three independent statements, on purpose:
 //
@@ -8,8 +13,9 @@
 //     and not only itself;
 //   * reading that directory gives the factors and the config back, bit for bit;
 //   * read_model_meta on the tiny fixture container (tests/support/fixture.h: hidden 128, ffn 256,
-//     four layers of which layer 3 is full attention) gives the modules and shapes the document's
-//     table states -- q/k/v/o, the ssm_inz split, gate/up, down -- and a natural basis.
+//     four layers of which layer 3 is full attention) gives the modules, the shapes and the
+//     addresses the document's table states -- q/k/v/o, the ssm_in/ssm_z split, gate/up, down,
+//     each with the declared weight it lands in and its slot there -- and a natural basis.
 //
 // Label: host. The fixture container is converted by rad-convert, which needs no card.
 #include "support/late_fixture.h"
@@ -194,26 +200,31 @@ R97_TEST(adapter_io_model_meta_of_the_fixture) {
     R97_CHECK(meta.arch == "qwen35");
     R97_CHECK(meta.input_basis.empty());  // a bf16 trunk carries no transform
 
+    // `weight` is the declared weight the module lands in and `slot` its index among that
+    // weight's targeted sources, in the order the plugin concatenates them (docs/ADAPTER.md 2.1).
     struct Want {
         const char* module;
+        const char* weight;
+        int64_t slot;
         int64_t in, out;
     };
     const Want attention[] = {
-        {"model.layers.3.self_attn.q_proj", 128, 256},  // the whole attn_qg: query and its gate
-        {"model.layers.3.self_attn.k_proj", 128, 64},
-        {"model.layers.3.self_attn.v_proj", 128, 64},
-        {"model.layers.3.self_attn.o_proj", 128, 128},
-        {"model.layers.3.mlp.gate_proj", 128, 256},
-        {"model.layers.3.mlp.up_proj", 128, 256},
-        {"model.layers.3.mlp.down_proj", 256, 128},
+        // the whole declared weight: query and its gate
+        {"model.layers.3.self_attn.q_proj", "blk.3.attn_qg", 0, 128, 256},
+        {"model.layers.3.self_attn.k_proj", "blk.3.attn_k", 0, 128, 64},
+        {"model.layers.3.self_attn.v_proj", "blk.3.attn_v", 0, 128, 64},
+        {"model.layers.3.self_attn.o_proj", "blk.3.attn_output", 0, 128, 128},
+        {"model.layers.3.mlp.gate_proj", "blk.3.ffn_gate_up", 0, 128, 256},
+        {"model.layers.3.mlp.up_proj", "blk.3.ffn_gate_up", 1, 128, 256},
+        {"model.layers.3.mlp.down_proj", "blk.3.ffn_down", 0, 256, 128},
     };
     const Want delta[] = {
-        {"model.layers.0.linear_attn.in_proj_qkv", 128, 128},
-        {"model.layers.0.linear_attn.in_proj_z", 128, 64},
-        {"model.layers.0.linear_attn.out_proj", 64, 128},
-        {"model.layers.0.mlp.gate_proj", 128, 256},
-        {"model.layers.0.mlp.up_proj", 128, 256},
-        {"model.layers.0.mlp.down_proj", 256, 128},
+        {"model.layers.0.linear_attn.in_proj_qkv", "blk.0.ssm_in", 0, 128, 128},
+        {"model.layers.0.linear_attn.in_proj_z", "blk.0.ssm_z", 0, 128, 64},
+        {"model.layers.0.linear_attn.out_proj", "blk.0.ssm_out", 0, 64, 128},
+        {"model.layers.0.mlp.gate_proj", "blk.0.ffn_gate_up", 0, 128, 256},
+        {"model.layers.0.mlp.up_proj", "blk.0.ffn_gate_up", 1, 128, 256},
+        {"model.layers.0.mlp.down_proj", "blk.0.ffn_down", 0, 256, 128},
     };
     R97_CHECK(meta.targetable.size() == 3 * 6 + 7);
 
@@ -224,6 +235,8 @@ R97_TEST(adapter_io_model_meta_of_the_fixture) {
         if ((l + 1) % 4 == 0) {
             for (const Want& w : attention) {
                 R97_CHECK(meta.targetable[at].module == w.module);
+                R97_CHECK(meta.targetable[at].weight_name == w.weight);
+                R97_CHECK(meta.targetable[at].slot == w.slot);
                 R97_CHECK(meta.targetable[at].in == w.in);
                 R97_CHECK(meta.targetable[at].out == w.out);
                 ++at;
@@ -232,7 +245,11 @@ R97_TEST(adapter_io_model_meta_of_the_fixture) {
             for (const Want& w : delta) {
                 std::string module = w.module;
                 module.replace(module.find("layers.0."), 9, "layers." + std::to_string(l) + ".");
+                std::string weight = w.weight;
+                weight.replace(weight.find("blk.0."), 6, "blk." + std::to_string(l) + ".");
                 R97_CHECK(meta.targetable[at].module == module);
+                R97_CHECK(meta.targetable[at].weight_name == weight);
+                R97_CHECK(meta.targetable[at].slot == w.slot);
                 R97_CHECK(meta.targetable[at].in == w.in);
                 R97_CHECK(meta.targetable[at].out == w.out);
                 ++at;

@@ -345,17 +345,26 @@ ModelMeta read_model_meta(const std::string& container) {
             targeted.push_back(e);
             return e;
         };
-        auto add = [&](const char* module, int64_t in, int64_t out) {
+        // A targetable linear is addressed by the declared weight it lands in and its slot there:
+        // the index among that weight's targeted sources, in the order the plugin concatenates
+        // them (docs/ADAPTER.md 2.1).
+        auto add = [&](const char* weight, const char* module, int64_t slot, int64_t in,
+                       int64_t out) {
             if (in <= 0 || out <= 0) fail("'" + container + "' has a degenerate " + prefix + module);
-            meta.targetable.push_back(ModelMeta::Linear{prefix + module, in, out});
+            meta.targetable.push_back(ModelMeta::Linear{
+                prefix + module, "blk." + std::to_string(l) + "." + weight, slot, in, out});
         };
 
         // attn_qg is not split for PEFT: the checkpoint's q_proj already carries query and its
         // gate interleaved per head, so one module owns all of it.
-        if (const RadFileEntry* qg = declared("attn_qg")) add("self_attn.q_proj", cols(*qg), rows(*qg));
-        if (const RadFileEntry* k = declared("attn_k")) add("self_attn.k_proj", cols(*k), rows(*k));
-        if (const RadFileEntry* v = declared("attn_v")) add("self_attn.v_proj", cols(*v), rows(*v));
-        if (const RadFileEntry* o = declared("attn_output")) add("self_attn.o_proj", cols(*o), rows(*o));
+        if (const RadFileEntry* qg = declared("attn_qg"))
+            add("attn_qg", "self_attn.q_proj", 0, cols(*qg), rows(*qg));
+        if (const RadFileEntry* k = declared("attn_k"))
+            add("attn_k", "self_attn.k_proj", 0, cols(*k), rows(*k));
+        if (const RadFileEntry* v = declared("attn_v"))
+            add("attn_v", "self_attn.v_proj", 0, cols(*v), rows(*v));
+        if (const RadFileEntry* o = declared("attn_output"))
+            add("attn_output", "self_attn.o_proj", 0, cols(*o), rows(*o));
 
         // The delta net's input projection: [q|k|v] (in_proj_qkv) plus the output gate
         // (in_proj_z). A container fuses them into `ssm_inz` or keeps `ssm_in` and `ssm_z` apart;
@@ -385,17 +394,19 @@ ModelMeta read_model_meta(const std::string& container) {
                 fail("'" + container + "' layer " + std::to_string(l) + " has " +
                      std::to_string(rows(*input)) + " input-projection rows, not a convolution of " +
                      std::to_string(conv_dim) + " channels beside a gate of " + std::to_string(vdim));
-            add("linear_attn.in_proj_qkv", cols(*input), conv_dim);
-            add("linear_attn.in_proj_z", cols(*input), vdim);
+            add(fused ? "ssm_inz" : "ssm_in", "linear_attn.in_proj_qkv", 0, cols(*input), conv_dim);
+            add(fused ? "ssm_inz" : (z ? "ssm_z" : "ssm_in"), "linear_attn.in_proj_z",
+                (fused || !z) ? 1 : 0, cols(*input), vdim);
         }
-        if (out) add("linear_attn.out_proj", cols(*out), rows(*out));
+        if (out) add("ssm_out", "linear_attn.out_proj", 0, cols(*out), rows(*out));
 
         if (const RadFileEntry* gu = declared("ffn_gate_up")) {
             const int64_t n_ff = rows(*gu) / 2;
-            add("mlp.gate_proj", cols(*gu), n_ff);
-            add("mlp.up_proj", cols(*gu), n_ff);
+            add("ffn_gate_up", "mlp.gate_proj", 0, cols(*gu), n_ff);
+            add("ffn_gate_up", "mlp.up_proj", 1, cols(*gu), n_ff);
         }
-        if (const RadFileEntry* dn = declared("ffn_down")) add("mlp.down_proj", cols(*dn), rows(*dn));
+        if (const RadFileEntry* dn = declared("ffn_down"))
+            add("ffn_down", "mlp.down_proj", 0, cols(*dn), rows(*dn));
     }
 
     meta.input_basis = read_basis(f, targeted);

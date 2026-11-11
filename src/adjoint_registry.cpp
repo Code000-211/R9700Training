@@ -27,14 +27,10 @@ struct Table {
     std::multimap<std::string, AdjointEntry> adjoints;
 
     // A function-local static: rows register from other files' static initialisers, whose order
-    // against this one the standard leaves open. It is deliberately never destroyed: the host
-    // tests run from an exit handler, which runs after this table's static would have been torn
-    // down, and a check would then look up rows in freed memory. A table that outlives the
-    // process is a table no reader can see destroyed (src/model.cpp says the same of the model
-    // registries).
+    // against this one the standard leaves open.
     static Table& get() {
-        static auto* t = new Table();
-        return *t;
+        static Table t;
+        return t;
     }
 };
 

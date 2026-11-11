@@ -21,9 +21,12 @@
 #include "../support/model_dir.h"
 #include "../support/self_check.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -54,6 +57,47 @@ void delta_lora_parameter_count() {
     CHECK(total == kWant);
 }
 
+// The addresses the wire record carries on this container, which the tiny fixture only shows in
+// part: the weight_name is a weight of the same layer the module path names, and the slots inside
+// a shared weight are 0..n-1 in module order -- docs/ADAPTER.md 2.1's rule, whatever the container
+// fuses (it keeps the 27b's `ssm_inz` and `ffn_gate_up` fused, the fixture does not).
+void delta_lora_wire_addresses() {
+    const std::string rad = r97test::container_or_skip(R97_MODEL_RAD);
+    const r97::ModelMeta meta = r97::read_model_meta(rad);
+
+    const std::string kPath = "model.layers.";
+    std::map<std::string, std::vector<int64_t>> slots;  // weight_name -> the slots seen
+    int64_t delta_in = 0;
+    for (const r97::ModelMeta::Linear& lin : meta.targetable) {
+        CHECK(lin.module.starts_with(kPath));
+        const std::string rest = lin.module.substr(kPath.size());
+        const std::string blk = "blk." + rest.substr(0, rest.find('.')) + ".";
+        // The layer number in the weight names the same layer as the module path does.
+        CHECK(lin.weight_name.starts_with(blk));
+        slots[lin.weight_name].push_back(lin.slot);
+        if (lin.module.ends_with(".linear_attn.in_proj_qkv") ||
+            lin.module.ends_with(".linear_attn.in_proj_z"))
+            ++delta_in;
+    }
+
+    int64_t shared = 0;
+    for (auto& [weight, seen] : slots) {
+        CHECK(!seen.empty());
+        if (seen.size() == 1) {
+            CHECK(seen[0] == 0);  // a weight with one targeted source needs no slot
+            continue;
+        }
+        ++shared;
+        std::vector<int64_t> want(seen.size());
+        for (size_t i = 0; i < want.size(); ++i) want[i] = int64_t(i);
+        std::sort(seen.begin(), seen.end());
+        CHECK(seen == want);  // the shared weight's slots are 0..n-1, each once
+    }
+    CHECK(delta_in == 2 * 48);  // one qkv and one z module per delta-net layer, in 48 layers
+    CHECK(shared > 0);          // this container fuses at least one weight pair
+}
+
 }  // namespace
 
 R97_SELF_CHECK(delta_lora_parameter_count)
+R97_SELF_CHECK(delta_lora_wire_addresses)

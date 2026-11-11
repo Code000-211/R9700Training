@@ -1,7 +1,8 @@
 // src/delta_lora.cpp -- the `lora` trainable kind, registered under the kind "lora".
 //
 // docs/ADAPTER.md owns this shape: one A [r, K] and one B [N, r] per targeted linear, A from
-// PEFT's own initialisation and B zero, and a wire site per linear whose scale is alpha/r. The
+// PEFT's own initialisation and B zero, and a wire site per linear carrying its factors, its
+// address (the declared weight it lands in and its slot there) and the scale alpha/r. The
 // ParamSet names are `<module>.lora_A` and `<module>.lora_B`, so the adjoint's `<prefix>.lora_A`
 // needs no prefix of its own: grad_prefix() is empty and each site carries its module.
 //
@@ -104,6 +105,12 @@ public:
 
         const std::vector<size_t> lines = select(meta, cfg.targets);
         alpha_ = cfg.alpha;
+        // The wire record's address comes from the same meta init() saw: which declared weight each
+        // module lands in, and where in it (docs/ADAPTER.md 5).
+        address_.clear();
+        for (size_t index : lines)
+            address_[meta.targetable[index].module] = Address{meta.targetable[index].weight_name,
+                                                              meta.targetable[index].slot};
 
         // PEFT's reset_lora_parameters: A is kaiming_uniform_ with a=sqrt(5), whose bound is
         // 1/sqrt(fan_in), and B is zero so the adapter starts as a no-op. One stream for the whole
@@ -172,7 +179,14 @@ public:
                 throw std::invalid_argument("r97: LoraDelta::to_wire: '" + module +
                                             "' has a shape and value size that disagree");
 
+            const auto at = address_.find(module);
+            if (at == address_.end())
+                throw std::invalid_argument("r97: LoraDelta::to_wire: '" + module +
+                                            "' is not one of this delta's initialised targets");
+
             WireBuffers::Site site;
+            site.weight_name = at->second.weight_name;
+            site.slot = at->second.slot;
             site.module = module;
             site.rank = pa.shape[0];
             site.scale = alpha_ / double(site.rank);
@@ -183,7 +197,14 @@ public:
     }
 
 private:
+    // Where a module's factors land on the engine's side: the declared weight and the slot in it.
+    struct Address {
+        std::string weight_name;
+        int64_t slot = 0;
+    };
+
     double alpha_;  // the config's alpha; the wire site's scale is alpha/r
+    std::map<std::string, Address> address_;  // module -> its address, from the last init()
 };
 
 }  // namespace
