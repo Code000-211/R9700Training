@@ -59,7 +59,10 @@ refuses, naming the buffer:
 3. two seeds of one result that overlap on a buffer — the per-result rule; a seed and the
    cotangent handed down from the block above do not overlap, they add;
 4. a differentiated read of a boundary that no seed of the result answers (a seed answers
-   a read when its row range covers the read's);
+   a read when their row ranges share a row; it need not cover the read — a loss may read
+   its whole window and seed only the rows it scores, so a window whose ends are unscored
+   is answered by the seed over its scored middle, and one wide read may be answered by
+   several adjacent seeds);
 5. a seed on a boundary the objective never read as differentiated.
 
 A result with no seed at all is valid: it is a forward-only objective, so long as the
@@ -79,12 +82,10 @@ refused, so a driver cannot pass the check unrecorded.
    factory takes `const Config&` and gives an `Objective` or a `std::shared_ptr<Delta>`.
    The `name`/`kind` must be a bare identifier; registering the same one twice is refused
    when the binary starts. The file may live anywhere under `src/`: the glob collects it
-   into the `r97` library, so no existing file changes. A registration is a static
-   initialiser, so it runs when the binary starts, and `r97train objectives` (or
-   `r97train deltas`) is where you see it. `r97` is a static archive, so the linker keeps
-   only the members something references: a file whose only export is its registration has
-   to be linked whole for the registration to run, and a name that is missing from that
-   listing is that, not a registry fault.
+   into the `r97` library, so no existing file changes. `r97` is an object library, so every
+   target that links it links all of its objects; the registration's static initialiser
+   runs even when the file exports nothing else. `r97train objectives` (or `r97train
+   deltas`) is where you see it.
 3. **Document it.** Add the name and one line on what it does to the list below, and, for
    a new trainable kind, its meaning to `docs/ADAPTER.md`. Nothing else changes:
    `r97train objectives` and `r97train deltas` print whatever is registered, so the new

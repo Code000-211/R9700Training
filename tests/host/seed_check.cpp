@@ -134,6 +134,26 @@ R97_TEST(seed_check) {
         r97::check_seeds(tape, result);
     }
 
+    // A read whose window ends are unscored: the seed spans the scored rows inside it, so it
+    // answers the read without covering all of it.
+    {
+        r97test::RecordedVectorTape tape = tape_with_logits();
+        tape.set_window("logits", 1, 5);
+        r97::ObjectiveResult result;
+        result.seeds = {ones("logits", 2, 4)};
+        tape.read("logits", 1, 5, true);
+        r97::check_seeds(tape, result);
+    }
+
+    // One wide read answered by two adjacent seeds: either seed shares a row with it.
+    {
+        r97test::RecordedVectorTape tape = tape_with_logits();
+        r97::ObjectiveResult result;
+        result.seeds = {ones("logits", 0, 2), ones("logits", 2, 4)};
+        tape.read("logits", 0, 4, true);
+        r97::check_seeds(tape, result);
+    }
+
     // No seed at all and no differentiated read: a forward-only objective.
     {
         r97test::RecordedVectorTape tape = tape_with_logits();

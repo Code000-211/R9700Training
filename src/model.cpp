@@ -179,7 +179,10 @@ void check_seeds(const ForwardTape& fwd, const ObjectiveResult& result) {
         bool answered = false;
         for (const Seed& seed : result.seeds) {
             if (seed.buffer != read.buffer) continue;
-            if (seed.row_lo <= read.row_lo && read.row_hi <= seed.row_hi) {
+            // A seed answers a read when the two share a row. It need not cover the read: the
+            // loss reads its whole window but seeds only the rows it scores, so a window whose
+            // ends are unscored is answered by the seed over its scored middle.
+            if (seed.row_lo < read.row_hi && read.row_lo < seed.row_hi) {
                 answered = true;
                 break;
             }
