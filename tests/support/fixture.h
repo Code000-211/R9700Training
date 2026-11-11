@@ -249,9 +249,10 @@ inline std::vector<Prefill> run_prefill(const Fixture& f,
     cfg.radiance_home    = detail::radiance_home();
     cfg.kernel_hierarchy = {"libavx", "libref"};
     cfg.n_spec           = 0;    // speculation off: one prefill step, nothing drafted
-    cfg.max_tok          = 512;  // room for the three-sequence batch as well as the 96-token case
+    cfg.max_tok          = 512;  // one step holds the full-length case, and the three-sequence batch
     cfg.max_seqs         = 8;
     cfg.max_ctx          = 512;  // the KV pool covers what these prompts need, not the 4096 trained
+                                 // (a prefill-only request fills it exactly: no generation slot)
     cfg.prefill_prompts  = sequences;
 
     rad::Engine engine(std::move(cfg));

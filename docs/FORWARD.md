@@ -17,7 +17,9 @@ the reason it is shaped this way:
 So speculation, the drafter, the multi-token-prediction head and the vision tower stay off, and a
 batch the step cannot hold is refused rather than cut: a batch over `max_tok` tokens (or a
 container that would need a second step for it) throws with a message saying that one step holds
-the batch. The key-value pool is **bf16**, and only bf16: the backward differentiates through the
+the batch. A prompt fills `max_ctx` exactly if it must: the step draws no token, so the engine
+reserves no generation slot for it, and the last position of a prompt of `max_ctx` tokens is still
+in the pool. The key-value pool is **bf16**, and only bf16: the backward differentiates through the
 pool, and bf16 is the one dtype with an adjoint here, so `ForwardConfig::kv_dtype` set to anything
 else is refused when the driver opens, not when a step runs.
 

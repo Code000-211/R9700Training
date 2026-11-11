@@ -332,10 +332,12 @@ R97_TEST(forward_batch_is_not_one_chain) {
     same_double(worst, 0.0, 0.0, "the two copies of one sequence in one batch");
 }
 
-// A sequence of the fixture's full length runs: 96 tokens, the prompt its reference was made on.
+// A sequence of the fixture's full length runs: 512 tokens, the context the fixture's engine holds.
+// A prompt of exactly that length leaves no room for a generation slot, and a prefill-only step
+// draws no token, so it fills the context exactly.
 R97_TEST(forward_runs_a_sequence_of_the_fixtures_length) {
     const r97::Fixture& f = r97::fixture();
-    const std::vector<std::vector<int32_t>> prompts = {prompt(96, 3)};
+    const std::vector<std::vector<int32_t>> prompts = {prompt(512, 3)};
     const Batch batch = batch_of(prompts);
     const std::vector<r97::Prefill> pre = r97::run_prefill(f, prompts);
 
@@ -343,23 +345,23 @@ R97_TEST(forward_runs_a_sequence_of_the_fixtures_length) {
     const r97::StepResult got = driver->step(ce_model())(batch, r97::ParamSet(), nullptr);
 
     same_double(got.loss, r97::ce_loss(batch, reference_rows(pre, batch, f.n_vocab), f.n_vocab).loss,
-                0.0, "96 tokens' loss and the reference's");
-    R97_CHECK(got.scored == 95);
+                0.0, "512 tokens' loss and the reference's");
+    R97_CHECK(got.scored == 511);
     R97_CHECK(std::isfinite(got.loss));
 
     // The step kept what the backward reads off it: the seeds, and the head's hidden state at each
     // scored position.
     const r97::ForwardStep& last = driver->last();
     R97_CHECK(last.seeds().size() == 1);
-    R97_CHECK(last.hidden_rows().size() == 95);
+    R97_CHECK(last.hidden_rows().size() == 511);
     R97_CHECK(last.hidden_cols() == f.hidden);
-    R97_CHECK(last.hidden().size() == 95 * size_t(f.hidden));
+    R97_CHECK(last.hidden().size() == 511 * size_t(f.hidden));
     for (float v : last.hidden()) R97_CHECK(std::isfinite(v));
     // Consecutive rows of the head's input: one per scored position, in the batch's row order.
     for (size_t i = 0; i < last.hidden_rows().size(); ++i)
         R97_CHECK(last.hidden_rows()[i] == last.hidden_rows()[0] + (int64_t)i);
     R97_CHECK(last.hidden_rows()[0] >= 0);
-    std::printf("  forward: 96 tokens, 95 scored, hidden 95 x %d ok\n", f.hidden);
+    std::printf("  forward: 512 tokens, 511 scored, hidden 511 x %d ok\n", f.hidden);
 }
 
 // Windows are chunks of positions and their Results are summed: the same loss, more calls, and a
@@ -467,6 +469,25 @@ R97_TEST(forward_loss_on_the_int8_fixture) {
     R97_CHECK(driver->last().hidden_rows().size() == 32);
     R97_CHECK(driver->last().hidden_cols() == f.hidden);
     std::printf("  forward: the int8 fixture's 32 scored tokens give %.9f ok\n", got.loss);
+}
+
+// The full length on the int8 fixture too: 512 tokens, the context its engine holds, and the loss
+// the reference prefill of the same 512 tokens gives.
+R97_TEST(forward_runs_an_int8_sequence_of_the_fixtures_length) {
+    const r97::Fixture& f = r97::w8a8_fixture();
+    const std::vector<std::vector<int32_t>> prompts = {prompt(512, 7)};
+    const Batch batch = batch_of(prompts);
+    const std::vector<r97::Prefill> pre = r97::run_prefill(f, prompts);
+
+    std::unique_ptr<r97::ForwardDriver> driver = open_forward(forward_config(f));
+    const r97::StepResult got = driver->step(ce_model())(batch, r97::ParamSet(), nullptr);
+
+    same_double(got.loss, r97::ce_loss(batch, reference_rows(pre, batch, f.n_vocab), f.n_vocab).loss,
+                0.0, "the int8 fixture's 512 tokens and the reference's");
+    R97_CHECK(got.scored == 511);
+    R97_CHECK(driver->last().hidden_rows().size() == 511);
+    R97_CHECK(driver->last().hidden_cols() == f.hidden);
+    std::printf("  forward: the int8 fixture's 511 scored tokens of 512 give %.9f ok\n", got.loss);
 }
 
 // What the driver will not do: a pool dtype the backward has no adjoint for, and a batch that does
