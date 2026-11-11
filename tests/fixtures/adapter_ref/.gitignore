@@ -1,0 +1,2 @@
+# The reference adapter is a committed fixture: its bytes are what the writer is compared to.
+!*.safetensors

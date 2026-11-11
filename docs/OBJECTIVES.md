@@ -103,6 +103,8 @@ binary, the subcommands in `r97train`.
 
 ## Registered today
 
+- `lora` — the trainable kind `docs/ADAPTER.md` describes: PEFT's A and B factors for each
+  targeted linear (`src/delta_lora.cpp`).
 - `ce` — the reference cross-entropy loss, `CeObjective` in `src/loss.cpp`
   (`include/r97/loss.h`), registered by `src/objective_ce_register.cpp`. It divides by
   `total_scored()`, seeds once per window over the first to the last scored row, and reads
