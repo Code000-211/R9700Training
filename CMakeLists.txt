@@ -163,7 +163,7 @@ ExternalProject_Add(radiance_core
     -DRAD_GPU_TARGETS=${RAD_GPU_TARGETS}
     -DR97_PATCH_STAMP=${R97_PATCH_STAMP}
   BUILD_COMMAND ${CMAKE_COMMAND} --build . --target rad_core libref libavx libquant
-                ${R97_LIBR4D_TARGET} rad-convert qwen35_bf16 qwen35_w8a8
+                ${R97_LIBR4D_TARGET} rad-convert qwen35_bf16 qwen35_w8a8 radiance
   INSTALL_COMMAND ""
   BUILD_ALWAYS FALSE
   USES_TERMINAL_BUILD TRUE
@@ -345,8 +345,10 @@ if(R97_BUILD_TESTS)
     target_link_libraries(r97_gpu_tests PRIVATE ${R97_LINK_WHOLE})
     target_include_directories(r97_gpu_tests PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/tests
+      ${R97_RADIANCE_COPY}/tests   # radiance's write_qwen35, the tiny fixtures' builder
       ${CMAKE_CURRENT_SOURCE_DIR}/src)   # the device harness reads the scratch ledger
-    target_compile_definitions(r97_gpu_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}")
+    target_compile_definitions(r97_gpu_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}"
+      R97_FIXTURE_W8A8_RECIPE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/w8a8_fwht128.recipe")
     if(TARGET libr97)
       add_dependencies(r97_gpu_tests libr97)
       target_compile_definitions(r97_gpu_tests PRIVATE

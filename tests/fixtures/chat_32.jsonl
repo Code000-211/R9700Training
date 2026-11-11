@@ -1,0 +1,32 @@
+{"messages": [{"role": "user", "content": "Name three primary colours."}, {"role": "assistant", "content": "Red, blue and yellow are the primary colours of paint."}]}
+{"messages": [{"role": "user", "content": "What is the capital of Portugal?"}, {"role": "assistant", "content": "Lisbon is the capital of Portugal."}]}
+{"messages": [{"role": "user", "content": "How many days are in a leap year?"}, {"role": "assistant", "content": "A leap year has 366 days, one more than an ordinary year."}]}
+{"messages": [{"role": "user", "content": "What gas do plants take from the air?"}, {"role": "assistant", "content": "Plants take carbon dioxide from the air and give back oxygen."}]}
+{"messages": [{"role": "user", "content": "Which ocean is the largest?"}, {"role": "assistant", "content": "The Pacific is the largest and deepest ocean."}]}
+{"messages": [{"role": "user", "content": "What is 12 times 12?"}, {"role": "assistant", "content": "12 times 12 is 144."}]}
+{"messages": [{"role": "user", "content": "Who wrote Pride and Prejudice?"}, {"role": "assistant", "content": "Jane Austen wrote Pride and Prejudice."}]}
+{"messages": [{"role": "user", "content": "What is the boiling point of water at sea level?"}, {"role": "assistant", "content": "Water boils at 100 degrees Celsius at sea level."}]}
+{"messages": [{"role": "user", "content": "Name the largest planet."}, {"role": "assistant", "content": "Jupiter is the largest planet in the solar system."}]}
+{"messages": [{"role": "user", "content": "What does HTTP stand for?"}, {"role": "assistant", "content": "HTTP stands for Hypertext Transfer Protocol."}]}
+{"messages": [{"role": "user", "content": "How many strings does a violin have?"}, {"role": "assistant", "content": "A violin has four strings."}]}
+{"messages": [{"role": "user", "content": "What is the smallest prime number?"}, {"role": "assistant", "content": "Two is the smallest prime number."}]}
+{"messages": [{"role": "user", "content": "Which country invented paper?"}, {"role": "assistant", "content": "Paper was invented in China."}]}
+{"messages": [{"role": "user", "content": "What is the chemical symbol for gold?"}, {"role": "assistant", "content": "The symbol for gold is Au."}]}
+{"messages": [{"role": "user", "content": "How long is a marathon?"}, {"role": "assistant", "content": "A marathon is 42.195 kilometres long."}]}
+{"messages": [{"role": "user", "content": "What is the hardest natural material?"}, {"role": "assistant", "content": "Diamond is the hardest natural material."}]}
+{"messages": [{"role": "user", "content": "Who painted the Mona Lisa?"}, {"role": "assistant", "content": "Leonardo da Vinci painted the Mona Lisa."}]}
+{"messages": [{"role": "user", "content": "How many continents are there?"}, {"role": "assistant", "content": "There are seven continents."}]}
+{"messages": [{"role": "user", "content": "What is the freezing point of water in Fahrenheit?"}, {"role": "assistant", "content": "Water freezes at 32 degrees Fahrenheit."}]}
+{"messages": [{"role": "user", "content": "Which language has the most native speakers?"}, {"role": "assistant", "content": "Mandarin Chinese has the most native speakers."}]}
+{"messages": [{"role": "user", "content": "What is a group of wolves called?"}, {"role": "assistant", "content": "A group of wolves is called a pack."}]}
+{"messages": [{"role": "user", "content": "How many sides does a hexagon have?"}, {"role": "assistant", "content": "A hexagon has six sides."}]}
+{"messages": [{"role": "user", "content": "What is the speed of light?"}, {"role": "assistant", "content": "Light travels at about 299792 kilometres per second in a vacuum."}]}
+{"messages": [{"role": "user", "content": "Which metal is liquid at room temperature?"}, {"role": "assistant", "content": "Mercury is liquid at room temperature."}]}
+{"messages": [{"role": "user", "content": "What is the square root of 81?"}, {"role": "assistant", "content": "The square root of 81 is nine."}]}
+{"messages": [{"role": "user", "content": "Who discovered penicillin?"}, {"role": "assistant", "content": "Alexander Fleming discovered penicillin."}]}
+{"messages": [{"role": "user", "content": "What is the longest river in Africa?"}, {"role": "assistant", "content": "The Nile is the longest river in Africa."}]}
+{"messages": [{"role": "user", "content": "How many bones are in the adult human body?"}, {"role": "assistant", "content": "An adult human body has 206 bones."}]}
+{"messages": [{"role": "user", "content": "What does CPU stand for?"}, {"role": "assistant", "content": "CPU stands for Central Processing Unit."}]}
+{"messages": [{"role": "user", "content": "Which gas makes up most of Earth's atmosphere?"}, {"role": "assistant", "content": "Nitrogen makes up most of Earth's atmosphere."}]}
+{"messages": [{"role": "user", "content": "What is the capital of Canada?"}, {"role": "assistant", "content": "Ottawa is the capital of Canada."}]}
+{"messages": [{"role": "user", "content": "How many minutes are in a day?"}, {"role": "assistant", "content": "A day has 1440 minutes."}]}
