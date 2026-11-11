@@ -48,18 +48,26 @@ the host adjoint's f64 sum, and the reason the two are compared by tolerance rat
 equality: each term carries a relative error up to 2^-9, so a heavily cancelling sum can show a
 larger relative error than any single term.
 
-The test holds the kernel to two forms of one tolerance, `bf16_tol` = `1e-2` in the test file. At
-the fixture's shapes, and at the model's hidden width with sixteen rows, it compares the whole of
-`dx` against the host row's: the relative L2 over the tensor, and every element within 2% of its own
-value plus a tenth of the tensor's RMS. The RMS term is there because a sum over hundreds of terms
-carries the same absolute rounding error whatever it cancels to, so a rule relative to the element
-alone would fail the kernel for an element that came out near zero; the harness's own per-element
-rule (`kAbsTol`, `kRelTol` in `tests/support/device_check.h`) is built for kernels whose outputs do
-not cancel. At the model's real shapes, where a full f64 product would be hundreds of GMAC on one
-thread, the test compares 512 spread `(m,k)` probes against the same f64 sum the host adjoint forms,
-as the relative L2 norm over the sample. A kernel that dropped one row of `dx` is rejected by the
-whole-tensor comparison. The card run of the previous revision, whose kernel and staging are
-unchanged, put the probe sample's error at 0.0021-0.0028 over the model shapes.
+The test holds the kernel to the harness's tolerance with one term added, `Options::allow` in
+`tests/support/device_check.h`: every element it compares is within 2% of the host row's value plus
+`1e-3` plus a tenth of the RMS of the elements compared, and the relative L2 over those elements is
+under `bf16_tol` = `1e-2` in the test file. The RMS term is there because a sum over hundreds of
+terms carries the same absolute rounding error whatever it cancels to, so a rule relative to the
+element alone would fail a kernel that is right for an element that came out near zero.
+
+At the fixture's shapes, and at the model's hidden width with sixteen rows, the whole of `dx` is
+compared. At the model's real shapes no test can pay for the host row of the whole tensor -- 4096
+rows of the widest linear is about seven hundred GMAC of f64 on one thread, and the host row's inner
+loop strides the weight, which makes it slower still -- so the case samples rows (`Options::rows`)
+and the reference is the host adjoint, the registry's own host row, on a record of just those rows.
+The sample is the first row, two spread through the tensor, the two rows a 256-row band turns over
+at, and the last two, so a partial band and a batch's tail are in it; the rows are compared whole,
+so every block of `K` is, and the seven rows are held to the same tolerance as the whole tensor.
+
+A comparison has to have teeth, so the test runs three deliberately wrong kernels through the same
+harness and requires it to reject them: `dx` from the codes without the weight's scale grid, and `dx`
+over half the reduction, in both weight forms. The card run put the relative L2 of the whole-tensor
+cases at 0.0021-0.0031 and of the sampled rows at 0.0027-0.0028.
 
 ## The tile
 
@@ -87,16 +95,24 @@ sixteen lanes write 32 contiguous bytes of one row of `dx` per step, and the row
 
 ## Shapes
 
+The fixture's shapes of both ops, and the model's hidden width with sixteen rows, are compared over
+the whole of `dx`; the model's other shapes are compared on the sampled rows above, where a shape
+with two token counts is checked at both. The bench, when the binary is asked for it, calls every
+one of them.
+
 | shape | `M` | `N` | `K` |
 | --- | --- | --- | --- |
 | fixture, `gemm_nt_q` | 4 | 256 | 128 |
 | fixture, `gemm_nt_q` | 1 | 128 | 256 |
 | fixture, `gemm_nt_q` | 7 | 320 | 384 |
 | fixture, the gated-delta-net projection's width, int8 form | 3 | 8 | 128 |
+| fixture, `gemm_nt` | 4 | 256 | 128 |
+| fixture, `gemm_nt` | 1 | 128 | 256 |
+| fixture, `gemm_nt` | 7 | 320 | 384 |
 | fixture, the gated-delta-net projection, bf16 | 3 | 8 | 128 |
 | fixture, `ssm_out` | 2 | 128 | 64 |
-| the hidden width whole | 16 | 5120 | 5120 |
-| `attn_k/v` | 4096 | 1024 | 5120 |
+| the hidden width whole, both ops | 16 | 5120 | 5120 |
+| `attn_k/v` | 1024, 4096 | 1024 | 5120 |
 | `attn_output` | 4096 | 5120 | 6144 |
 | `attn_qg` | 1024, 4096 | 12288 | 5120 |
 | `ssm_inz` | 4096 | 16384 | 5120 |
@@ -129,7 +145,8 @@ One call allocates and frees, at `Np` the padded `N` and `G = K/128`: `2*M*Np` b
 `Np*K` of weights (one byte per code, two per weight for the bf16 form), `2*Np*G` of bf16 scales, and
 `2*M*K` of bf16 `dx` results, which the host adds into the cotangent slot. That is 53.1 MiB for
 `attn_k/v` at 4096 rows, 250.7 MiB for `ffn_gate_up` at 1024 rows and 484.7 MiB for `ffn_gate_up` at
-4096 -- arithmetic on the formula, not a measurement. The buffers come from the plugin's scratch
+4096 -- arithmetic on the formula, and the peaks the card runs reported are 53.1, 250.7 and 484.6
+MiB, so the formula is what the call asks for. The buffers come from the plugin's scratch
 ledger (`src/adjoint/device/scratch.h`), so they are charged to radiance's VRAM pool, and the
 test resets the ledger around the call, measures the peak the call asked for, and fails a kernel
 that leaves any of it behind (`live_bytes` back to zero).
@@ -150,9 +167,12 @@ The adjoint's whole call is what the contract makes it pay: the host's f64 -> bf
 conversion of `dy`, the weight and the scale grid, the uploads, the kernel and the download of `dx`.
 The table splits it into its two measured halves, from the card run that this file carried before
 the plugin landed (the kernel and the staging are unchanged; the buffers now come from the plugin's
-scratch ledger instead of a private allocation). The forward column is the f64 host twin -- the op's
-own forward, one thread -- timed on the host by the same `twin_find`/`TwinFn` path the bench uses,
-in seconds:
+scratch ledger instead of a private allocation). The card is one R9700 (gfx1201, 32 GB), one of this
+machine's two; `R97_DEVICE` picks which of them the run holds, and the sibling kernels' numbers in
+`docs/kernels/elementwise.md` and `docs/kernels/qk.md` come from a card of the same model, so they
+are the ones to hold this table against -- numbers from another card are not comparable. The
+forward column is the f64 host twin -- the op's own forward, one thread -- timed on the host by the
+same `twin_find`/`TwinFn` path the bench uses, in seconds:
 
 | shape | staging (host conversion + transfer) | kernel | whole call | forward twin (s) | TFLOP/s | scratch |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -174,12 +194,19 @@ called twice and the second call is the one reported, so the code object's first
 number; the bench warms up once and averages three calls instead. The scratch column is the peak the
 call actually asked the ledger for, and it matches the formula above.
 
-The card numbers are the last of three runs of this kernel on a machine other contributors' builds
-share, and the columns move between them: the kernel column repeated within about 5% of itself for
-every shape but `attn_k/v` at 4096 rows, which the three runs put at 3.98, 1.68 and 1.06 ms, and the
-staging column, which is host work on a shared CPU, varied by up to three times (`ffn_gate_up` at
-4096 rows: 1.23 s to 4.02 s). Read a factor of two into a single kernel number for this reason, and
-the scratch column, which is arithmetic, as exact.
+The card numbers are the last of three runs of this kernel on one R9700 (gfx1201, 32 GB) of this
+machine's two, while contributors' builds shared it, and the columns move between them: the kernel
+column repeated within about 5% of itself for every shape but `attn_k/v` at 4096 rows, which the
+three runs put at 3.98, 1.68 and 1.06 ms, and the staging column, which is host work on a shared
+CPU, varied by up to three times (`ffn_gate_up` at 4096 rows: 1.23 s to 4.02 s). Read a factor of
+two into a single kernel number for this reason, and the scratch column, which is arithmetic, as
+exact.
+
+A run of this revision's bench on `card1` of the two -- the card `R97_DEVICE=0` reserves -- put
+`attn_k/v` at 4096 rows at 98.6 ms and `attn_output` at 4096 rows at 313.4 ms against the table's
+51.6 and 236.0 ms, which is the spread the paragraph above describes. Its line for `attn_k/v` at
+1024 rows, which the table has no row for, is 41.2 ms. That run was stopped after the third shape to
+hand the card back to the builds queued behind it, so the widest shapes were not repeated.
 
 The staging column is not what a backward pays. It is dominated by converting the weight from the
 harness's f64 values to the int8 codes the kernel wants -- 178 million elements at `ffn_gate_up`,
@@ -196,9 +223,9 @@ on this machine while it is quiet: 20.1 s at `attn_k/v`, 121.7 s at `attn_output
 under a load of 91 on 48 cores, where the same loop measured 0.29-0.85 GMAC/s, so the other rows
 state the twin's product at 1.06 GMAC/s rather than a time off a contended machine. At the smallest
 shape that arithmetic gives 20.3 s against the 20.1 s timed, and at the widest one a call is about
-eleven and a half minutes. The bench times the twin once per shape rather than `reps + 1`
-times for the same reason: the whole column is three quarters of an hour of one core when the
-machine is quiet. A card's own forward, when an op has one, is what a kernel's `kernel` column
+eleven and a half minutes. `print_bench(c, 3, 1)` times the twin once per shape rather than as often
+as the adjoint for the same reason: the whole column is three quarters of an hour of one core when
+the machine is quiet. A card's own forward, when an op has one, is what a kernel's `kernel` column
 should be held against; the twin beside the adjoint says how much of a backward is the staging.
 
 The card tier runs its tests from `main` (`tests/gpu/main.cpp`), not from the exit-time runner the
