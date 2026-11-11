@@ -4,7 +4,7 @@ Three test labels, and the variables that run them. ctest runs each tier's binar
 globs of their directories (`tests/<tier>/*.cpp`), so a new test file needs no edit anywhere, and
 the tests inside one binary register themselves with `R97_TEST(name)` (`tests/support/test.h`).
 Each tier's binary holds one `main` in its own directory: `tests/host/vector_tape.cpp`,
-`tests/gpu/gpu_guard_smoke.cpp`, `tests/model/info_meta.cpp`. Checks are `R97_CHECK`, not
+`tests/gpu/main.cpp`, `tests/model/info_meta.cpp`. Checks are `R97_CHECK`, not
 `assert`: the default build is `RelWithDebInfo`, which defines `NDEBUG` and compiles `assert` out.
 
 ## The three labels
