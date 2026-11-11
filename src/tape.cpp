@@ -73,6 +73,8 @@ OperandContent Tape::content(size_t op, size_t operand) const { return contents_
 
 void Tape::set_bracket_hook(BracketHook hook) { bracket_hook_ = std::move(hook); }
 
+void Tape::set_issue_hook(IssueHook hook) { issue_hook_ = std::move(hook); }
+
 void Tape::observe_op(void* user, RadCtx* /*ctx*/, const RadIssueOp* issue) {
     if (user && issue) static_cast<Tape*>(user)->record(*issue);
 }
@@ -116,11 +118,12 @@ void Tape::record(const RadIssueOp& issue) {
         op.rows = o.rows;
         op.written = o.written != 0;
         rec.operands.push_back(std::move(op));
-        content.push_back(OperandContent{o.data, static_cast<size_t>(o.bytes)});
+        content.push_back(OperandContent{o.data, static_cast<size_t>(o.bytes), o.name != nullptr});
     }
 
     ops_.push_back(std::move(rec));
     contents_.push_back(std::move(content));
+    if (issue_hook_) issue_hook_(*this, ops_.back(), contents_.back());
 }
 
 void Tape::open_block(int64_t block) {

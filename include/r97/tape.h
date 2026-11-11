@@ -29,10 +29,13 @@
 namespace r97 {
 
 // One operand's content at the issue: the slice the kernel saw, not the whole declared buffer.
-// `bytes` is 0 when the slice is not one contiguous span.
+// `bytes` is 0 when the slice is not one contiguous span. `named` says the operand named a
+// declared buffer or weight; the tape's identities for KV, raw and table operands are synthetic, so
+// a reader that must find one declared buffer by name (the replay's residual) ignores those.
 struct OperandContent {
     const void* data = nullptr;
     size_t bytes = 0;
+    bool named = false;
 };
 
 class Tape {
@@ -65,6 +68,13 @@ public:
     using BracketHook = std::function<void(const Tape& tape, int64_t block, bool begin)>;
     void set_bracket_hook(BracketHook hook);
 
+    // Called after an op is recorded and while the step's buffers still hold what it read and
+    // wrote, so a reader that must copy an op's output does it here, before the planner reuses the
+    // buffer. `operands` is contents(op.position). One hook; a later set replaces it.
+    using IssueHook = std::function<void(const Tape& tape, const OpRecord& op,
+                                         const std::vector<OperandContent>& operands)>;
+    void set_issue_hook(IssueHook hook);
+
     const std::vector<OpRecord>& ops() const { return ops_; }
     const std::vector<Block>& blocks() const { return blocks_; }
 
@@ -85,6 +95,7 @@ private:
 
     RadCtx* ctx_ = nullptr;
     BracketHook bracket_hook_;
+    IssueHook issue_hook_;
     int64_t block_ = -1;
     std::vector<OpRecord> ops_;
     std::vector<std::vector<OperandContent>> contents_;
