@@ -2,10 +2,13 @@
 //
 // Given the training data (one `TokenSeq` per example) the Batcher plans the epoch: it groups
 // similar lengths into buckets (sorted by token count, cut at power-of-two length classes) and
-// shuffles the bucket order under the seed, so a batch never mixes one long sequence with many
-// short ones, and packs each sub-batch's total token count under the budget. A dataset that fits
-// one bucket has no bucket order to shuffle, so that bucket's sequences are shuffled instead;
-// either way the seed and the epoch reach the batches. Each step hands out `devices`
+// shuffles the bucket order and each bucket's own order under the seed, so a batch never mixes one
+// long sequence with many short ones, and packs each sub-batch's total token count under the
+// budget. The epoch's first bucket advances by one every epoch, so two consecutive epochs cannot
+// hand out the same order; inside a bucket the order is a shuffle as well, so the seed reaches
+// every plan and not only the order of the buckets. A dataset that fits one bucket has no bucket
+// order to shuffle, so that bucket's sequences are shuffled under the seed and rotated by the
+// epoch; either way the seed and the epoch reach the batches. Each step hands out `devices`
 // sub-batches with balanced token counts, one per device, and only the epoch's last tail hands out
 // fewer -- a sequence of no tokens can also leave one short, since it is a class of its own and a
 // step of one sub-batch has no spread to admit it under. A sub-batch is not a candidate for a
@@ -16,11 +19,14 @@
 // classes never meet inside one sub-batch. A step never hands out an empty sub-batch. The budget
 // is per sub-batch, so a step may spend up to `devices * token_budget` tokens. A sequence longer
 // than the budget is reported (in `skipped()`) and never batched. A sub-batch holds its sequences
-// in the planned order, which the seed and the epoch choose through the bucket order even where
-// the packing's outcome is fixed.
+// in the planned order, which the seed and the epoch choose both through the bucket order and
+// through the shuffle inside a bucket.
 //
 // Deterministic for a given seed: the same seed replays the same batches, each epoch is a new
-// shuffle, and a position (epoch, step) saved and restored resumes with the same batches.
+// shuffle -- two consecutive epochs never hand out the same plan -- and a position (epoch, step)
+// saved and restored resumes with the same batches. How far apart two seeds are is bounded by how
+// many plans there are: a dataset whose buckets each hold one sequence has `n!` of them for `n`
+// buckets, so two seeds must agree on some of those datasets.
 #pragma once
 
 #include <cstdint>

@@ -13,15 +13,28 @@ An epoch is planned on demand from `(seed, epoch)` and cached (`Batcher::plan`):
    class always starts a new bucket. Any two lengths inside a bucket therefore differ by less
    than a factor of two, which is what keeps a batch from mixing one long sequence with many
    short ones.
-2. **Shuffle the buckets.** The bucket order is Fisher-Yates shuffled with a splitmix64 stream
-   derived from the config's seed and the epoch number, then rotated by `(epoch + 3 * seed)`
-   modulo the bucket count. The rotation matters when there are only a couple of buckets:
-   Fisher-Yates can hand the same order to nearby seeds, and the rotation makes the seed shift
-   the order and each epoch advance its starting bucket, which breaks the usual repeated order.
-   A sequence inside a bucket stays in length order. The one exception is a dataset that fits
-   one bucket: there is no bucket order to shuffle, so that bucket's sequences are shuffled
-   under the seed and rotated by the epoch, which keeps the seed and the epoch reaching the
-   batches even when the whole dataset is one length class.
+2. **Shuffle the buckets, and what is inside them.** The bucket order is Fisher-Yates shuffled
+   with a splitmix64 stream derived from the config's seed and the epoch number, then rotated to
+   start on the bucket the epoch names: the seed chooses where in the bucket cycle an epoch
+   begins, and every epoch moves that start on by one. Two consecutive epochs therefore start on
+   different buckets, which -- a bucket never being empty -- is a different order of the
+   sequences, whatever the shuffle draws. Rotating a fresh shuffle by an offset drawn from the
+   same `(seed, epoch)` cannot promise that: the shuffle and the offset are drawn independently,
+   so an epoch's order lands on the previous epoch's exactly when the two shuffles are rotations
+   of each other. Nor may the offset be a linear function of the seed, as `(epoch + 3 * seed)`
+   was: that term vanishes whenever the bucket count divides three times the seed, and two seeds
+   then hand out one order.
+
+   The sequences inside a bucket are shuffled too, from a stream for `(seed, epoch, bucket)`. The
+   sort did its work when it formed the bucket: inside one, every length is in one power-of-two
+   class, so shuffling them costs the grouping nothing, and it is what gives the seed and the
+   epoch room to differ. The bucket order alone is a small space for a dataset of a few classes --
+   `n` buckets have `n!` orders and no more -- so two seeds would hand out the same batches one
+   time in two or six on a dataset of two or three classes however the seed were hashed, and a
+   fresh draw per epoch would repeat another epoch's order about as often. A dataset that fits one
+   bucket is the exception: there is no bucket order to shuffle, so that bucket's sequences are
+   shuffled under the seed and rotated by the epoch, which keeps consecutive epochs apart even
+   when the whole dataset is one length class and has only two sequences.
 3. **Pack each sub-batch under the budget.** Walking the buckets in their shuffled order, each
    sequence goes to the least-loaded of the `devices` sub-batches that can still take it: it has
    room under the budget (`load + length <= token_budget`) and adding it keeps the step's spread
@@ -70,11 +83,15 @@ plan out of bounds.
 
 Everything rests on splitmix64 and a Fisher-Yates over it — no `rand`, no locale, no
 unordered containers. Same seed, same batches, every run. Which sequences a bucket holds is
-fixed by the data (the grouping); what the seed and the epoch choose is the bucket order, so
-even a dataset whose buckets each hold one sequence changes its step order. For a dataset that
-fits one bucket, the seed chooses a shuffle of it and the epoch rotates that shuffle, so
-consecutive epochs differ even when there are only two sequences. The same seed and epoch replay
-the same plan, so a saved position resumes identically.
+fixed by the data (the grouping); what the seed and the epoch choose is the bucket order and the
+order inside each bucket, so even a dataset whose buckets each hold one sequence changes its plan
+with both. A dataset whose buckets all hold a single sequence has only `n!` plans for its `n`
+buckets, so two seeds must agree on some such datasets — two buckets leave two orders — and the
+seed is hashed into the choice so that it reaches every one of them; every bucket that holds more
+than one sequence multiplies the plans by its own orders. For a dataset that fits one bucket, the
+seed chooses a shuffle of it and the epoch rotates that shuffle, so consecutive epochs differ even
+when there are only two sequences. Two consecutive epochs never hand out the same plan.
+The same seed and epoch replay the same plan, so a saved position resumes identically.
 
 ## Tests
 
@@ -115,6 +132,15 @@ the bucket is cut at the length class and a step stops at the bucket edge — th
 plain shuffle, or buckets of 32 without the class cut, would lose. A saved position with a negative
 step or epoch resumes at the epoch's first step or shuffle, and one past the epoch's end sits at its
 end and hands out nothing, so a stepped-back or corrupted position cannot read outside the plan.
+Two shapes the last round's review reproduced — twelve sequences across four length classes at a
+budget that keeps every sequence under it, where two consecutive epochs handed out the same steps,
+and eight sequences where two seeds did — are checked epoch by epoch against each other, and the
+two seeds' first epochs against one another. Because "each epoch is a new shuffle" is a promise
+over ordinary data and not over the shapes a test happens to pick, a few hundred generated datasets
+(20..49 sequences, every one under the budget, two to four devices, lengths in a handful of
+classes) compare four epochs each against the epoch before, and check each step on the way for the
+budget, the spread, the one-class sub-batches and the filled devices; and over sixty datasets
+spread across eight length classes or more, three seeds must give three different first epochs.
 `tests/headers/hdr_batcher.cpp` is the standalone-compile check of the header.
 
 The host test binary has a single `main`, in `tests/host/vector_tape.cpp`; a second one cannot link.
