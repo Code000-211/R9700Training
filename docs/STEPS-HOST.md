@@ -128,7 +128,9 @@ against a tolerance of 0.21), layer 3 `self_attn.k_proj` 268 %, layer 2 `linear_
 gradients come in at 10 % to 25 % (`mlp.down_proj` layer 0: -26.96 against -22.41; `in_proj_qkv`
 layer 1: -44.35 against -28.67), and every module passes the scatter rule. The pattern is a
 systematic one: the difference under-reads the larger gradients by 15 % to 35 % at every step in
-the usable range, and only the noise-sized modules scatter in both directions.
+the usable range, and only the noise-sized modules scatter in both directions. It is not one
+factor, which is what a scale error in the gradient would put there: at the same step pair
+`mlp.down_proj` reads 1.20 against its difference and `linear_attn.in_proj_qkv` 1.55.
 
 Ten random directions over the whole adapter, each differenced at the same steps
 (`host_step_gradient_holds_ten_whole_adapter_directions`). Measured: the analytic sums to -403.965
@@ -137,15 +139,41 @@ with the per-direction ratios 0.653, 0.874, 0.779, 0.726, 0.686, 0.975, 0.512, 0
 -- relative errors against the issue's 1e-3 of 0.35, 0.13, 0.22, 0.27, 0.31, 0.025, 0.49, 0.13,
 0.083 and 0.0057, each of which the case prints beside the step pair it used.
 Nine of the ten sit between 0.65 and 1.08, i.e. inside their own scatter; direction 6 comes in at
-0.512 with a scatter of only 0.197, which is the figure to watch: the pair of steps agrees with
-itself to under two per cent and still disagrees with the gradient by half. Either the rounded loss
-quantises that direction's response -- the loss is a mean of bf16 logits, so its own quantum can
-dominate a direction whose response is small -- or the gradient is wrong there. This card did not
-settle which, and the check is on the ten together for that reason.
+0.512 with a scatter of only 0.197, which is the figure that asks whether the secant or the
+gradient is wrong: the pair of steps agrees with itself to under two per cent and still disagrees
+with the gradient by half.
 
-The issue's 1e-3 relative is not reached and cannot be reached on this fixture. The forward is bf16
-throughout, and the loss is a rounded function of the adapter, so no step makes the difference
-exact; the issue's premise does not hold. Two effects put the figures there. The first is depth: a
+That question has an exact forward to answer it. `make_reference_step` runs the same recorded op
+graph in f64 from the registered twins, with no card and no bf16, so
+`host_step_gradient_against_the_exact_step_at_the_same_steps` runs it beside the join on the same
+Model, the same adapter and the same batch, and asks three things of the two:
+
+* the exact step's gradient against its own central difference at `h = 2^-17`. That step is below
+  the bf16 grid's ulp at every adapter value, exact in f32, and its truncation on an f64 difference
+  is under 1e-8 of itself, so this is the issue's `1e-3` held per direction with no floor -- a
+  difference that cannot answer a gradient is not asked to;
+* the exact step's own secant at the ten-direction case's steps, `16` and `32` units of `2^-11`:
+  the secant's bias with the trunk's rounding taken out. A direction whose exact secant is also far
+  from its gradient is one where the step is the limit; one whose exact secant is close is one
+  where the step is fine and any gap left is the forward's;
+* the join's gradient against the exact step's. The only thing between the two is the bf16 trunk,
+  whose own agreement the oracle case below measures per boundary (cosine 0.812 at worst, 0.58 of
+  itself), so each direction is held to `0.75` of the exact gradient: a gradient that is wrong in
+  the join -- a factor of two, a lost cotangent term -- is `1.0` there, and nothing the forward
+  does is.
+
+The line it prints per direction (`exact g`, `fd(2^-17)`, `fd16`, `fd32`, `join g`, `fd16`,
+`fd32`, `fd(2^-17)`, `secant bias`, `gap`) is what settles direction 6. The join's `fd(2^-17)` is
+the other half of the same story: below one bf16 quantum of the adapter the trunk's loss does not
+move at all, so a difference of that loss has a floor the exact step's does not, and the case fails
+if a step of `2^-17` moves the join's loss by more than a quarter of the gradient -- i.e. if the
+adapter ever reaches the trunk off the grid these steps assume.
+
+The issue's `1e-3` relative is not reached against the *driver's* loss and no step makes it
+reachable: the forward is bf16 throughout, so the loss is a rounded function of the adapter and a
+difference of it has that floor under it. It is reached against the exact step's loss, where the
+issue's number is a statement about a difference and not about a rounded forward. Two effects put
+the driver's figures where they are. The first is depth: a
 GDN layer's recurrence contracts, so a relative error in the values it passes back grows through the
 transpose of that contraction, and by layer 0 the trunk's bf16 rounding has eaten much of the
 cotangent (the oracle below shows the same fall, from a cosine of 0.997 down to 0.812). The second
@@ -213,7 +241,17 @@ The case prints every figure per boundary and per adapted linear and holds all o
 boundary floors are 0.80/0.88/0.85/0.98/0.99 with the norm floors above, and the adapter default is
 0.75 with 0.30 norm, with tighter rows for the modules measured above it. The issue's own criterion
 -- a cosine above 0.999 with the norm within 2 % -- is what the trace uses to name the boundary
-where the cotangent leaves the reference; the case does not pretend to hold it.
+where the cotangent leaves the reference, and the case reports the count that miss it rather than
+pretending to hold it.
+
+Where the criterion *is* held is the half with an exact counterpart. The adapter gradients the walk
+produces are checked against the reference at the issue's own numbers by
+`reference_step_loss_and_gradients_match_the_oracle`, which walks the same `backward_block` through
+the f64 twins: the oracle's loss to 1.75e-8 and every `A` and `B` to 7.1e-5 of its largest value.
+The boundary cotangents have no such counterpart to be held against -- `make_reference_step`
+returns a `StepResult`, the loss and the gradients, and the boundary values and cotangents exist
+only in this join's `HostStepReport` -- so the cotangent half is measured against the criterion and
+attributed, not held.
 
 Two things the criterion's wording forces and the case does check. The gradient set is compared
 whole: every parameter the delta hands the join must have a reference tensor and every reference
@@ -240,7 +278,8 @@ and for the driver's own loss, and `make_reference_step` computes neither (it is
 So the join runs the driver, and every figure on this page is the bf16 forward's. What proves the
 adjoints is the f64 twin walk, below. The cost is the issue's 1e-3 finite-difference tolerance and
 its 0.999/2 % oracle criterion: neither is reachable on this forward, for the reason in the next
-paragraph, and this page reports what is measured instead of moving the forward.
+paragraph. The 1e-3 is held where it can be, on the exact step's own difference (the ten-direction
+note below), and this page reports what the join's forward measures instead of moving the forward.
 
 *The bf16 forward, not the adjoints.* What the join measures short of the reference is the driver's
 bf16 forward: `reference_step_loss_and_gradients_match_the_oracle`
@@ -252,11 +291,16 @@ backwards by the GDN recurrences, and nothing in the join can remove them while 
 bf16 kernel chain the model runs. The issue's 0.999/2 % criterion would need either an f64 forward
 or a tolerance that says bf16.
 
-*One whole-adapter direction.* Of the ten directions the issue asks for, one comes in at half the
-gradient's value while the pair of steps agrees with itself to 1.5 %. The other nine are between
-0.65 and 1.08, and the per-module checks pass, so the likeliest explanation is the rounded loss
-quantising that direction's response; it is not established, and the figure is printed by
-`host_step_gradient_holds_ten_whole_adapter_directions` rather than hidden.
+*One whole-adapter direction.* Of the ten directions the issue asks for, one came in at half the
+gradient's value while the pair of steps agreed with itself to 1.5 %; the other nine were between
+0.65 and 1.08, and the per-module checks pass.
+`host_step_gradient_against_the_exact_step_at_the_same_steps` now measures those same ten
+directions against the f64 reference step, so the figure is attributed rather than left standing:
+the exact step's gradient is held to its own difference at `2^-17` (the issue's tolerance, on a step
+that is a derivative), the exact step's secant at the same two grid steps is printed beside the
+join's, and the join's gradient is held to `0.75` of the exact one -- the bf16 trunk's own measured
+agreement and nothing wider. A gradient that is wrong in the join fails on a number there; a step
+that is too coarse is visible as the exact step's own secant, printed on the same line.
 
 *The GDN convolution path.* The first version of this join snapshotted an in-place read after the
 op's write, so the replay fed the conv prep the value the op had just produced instead of the value

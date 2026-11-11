@@ -53,6 +53,13 @@ constexpr double kResidualNorm = 1e-2;     // and within 1 %
 // The issue's own criterion -- a cosine above 0.999 and a norm within 2 % -- is used to say where
 // a figure *leaves the reference*, which is the trace this test prints. What it asserts is the
 // measured agreement: the floors below are today's, with the slack named in the comment.
+// Where the criterion *is* held is the half that has an exact counterpart: the adapter gradients
+// this same walk produces are held to it against the reference by
+// `reference_step_loss_and_gradients_match_the_oracle`, which walks the same `backward_block`
+// through the f64 twins (the oracle's loss to 1.75e-8, every `A` and `B` to 7.1e-5). The boundary
+// cotangents have no such counterpart to be held against -- `make_reference_step` returns a
+// `StepResult`, and the boundary values and cotangents live only in this join's report -- so the
+// cotangent half is measured against the criterion and attributed here.
 // `docs/STEPS-HOST.md` records every figure and the effect that puts them there: the trunk is bf16
 // while the reference is f64, and each GDN layer's attenuating recurrence amplifies the rounding
 // as the cotangent travels back, so the floors fall with depth. The convolution path's
