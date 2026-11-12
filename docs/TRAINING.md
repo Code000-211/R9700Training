@@ -108,6 +108,21 @@ held-out loss = sum(loss) / sum(scored)
 over the whole held-out set. If no token was scored the loss is logged as 0 and `scored` is 0.
 Evaluation does not change the weights.
 
+### The run's configuration in the output directory
+
+When a run first enters `run_steps()` it writes `<out>/run.json`: every `Config` key as it was
+configured, the objective's name under `objective`, the delta's name under `delta.kind` (its
+rank, alpha, targets and gate follow as `delta.*`), and `base_id`. The trainer cannot ask the
+objective or the delta for their names, so both are configuration keys (`Config::objective`,
+`Config::delta`) that the caller that built them fills in; `base_id` is the caller's too --
+`r97train train` sets it to `sha256:` plus the SHA-256 of the container file, which is what the
+checkpoint's `trainer.state` records and what a resume compares.
+
+The file is written through `run.json.tmp` and renamed, so a reader never sees half of it. It is
+written once, at the first call, before any step: a resumed run keeps the configuration the run
+being resumed started with, and a resume that is refused -- a `base_id` from another container --
+throws before the loop and so leaves the file untouched.
+
 ## Logging
 
 Every train step writes one line to the terminal (when `TrainerOptions::terminal` is not null) and
