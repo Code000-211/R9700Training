@@ -351,23 +351,36 @@ The adapter is initialised in the basis the container names. `Engine::lora_set_w
 header, so a live adapter on the rotated trunk is read in the same basis as the container's int8
 rows.
 
+The head's int8 weight is joined into one buffer by the engine: a `RadPlanesHeader`, then the codes,
+then a scale per group. The ABI's byte count for the operand is the codes' declared elements, so a
+tape that copied only that many bytes dropped the scales and the walk dequantised the head's codes
+with the codes alone. `Tape::record` now follows the header's own account of the operand's span for
+a joined weight, and `snapshot` reads the planes out by their roles (`joined_dense`): code times
+scale, at the block the scale plane declares, is the bf16 weight the GEMM's epilogue actually
+formed. The head cotangent that enters the trunk is therefore the dequantised one, and its factor
+is comparable with the bf16 model's.
+
 `host_step_int8` checks the two properties a quantised trunk can give: the straight-through
-gradient is finite and nonzero, and a small step along it lowers the driver's scored loss. The
-step is normalised, because the head's int8 weight has a dequantisation scale that the
-`logits_gemm` record does not carry: the tape hands the host the codes and no scale operand, so
-the head cotangent carries the codes' magnitude rather than the dequantised weights'. The check
-therefore tests the descent direction on a step whose size does not depend on that factor; the
-missing head scale is a container/tape gap, not a property of the trunk adjoints, and is left
-open below.
+gradient is finite and nonzero, and a small step along it lowers the driver's scored loss.
+`host_step_int8_head_points_the_way_bf16_does` runs the same adapter on the same batch through
+both containers and compares the cotangents at the two boundaries where the difference is
+measurable: the head's input (cosine 0.9999) and the top block's input, after a whole block of int8
+linears (0.9777). The two losses have to agree to within a percent first, which is what the
+adapter's basis mapping gives: the int8 trunk rotates its activations into the Hadamard basis, so
+the bf16 side runs the same `lora_A` mapped through `R = H/sqrt(128)`.
 
 ## What is left open
 
-- **The int8 head's dequantisation scale.** `logits_gemm` reads `output.weight`'s codes but the
-  tape record has no scale operand, so the host walk cannot reconstruct the bf16 head weight. The
-  factor that reaches the trunk through the head is therefore the codes' factor, not the
-  dequantised one; the int8 step check normalises its step so it tests the trunk adjoints rather
-  than that missing scale. A record that carried `output.weight.scale`, or a `logits_gemm` adjoint
-  that read it from the container, would close the gap.
+- **The two containers' parameter gradients are not comparable, so the issue's cosine over the
+  whole gradient is not measurable in the form it asks.** The int8 container fuses the delta net's
+  input projection with its gate (`ssm_inz`) and hands `gdn_conv_prep` the AB projection as an
+  operand of its own, where the bf16 container gives that op one 136-wide `gdn_in` and reads the AB
+  operand as slices of the same buffer. From the delta net's scan on the two walks differentiate different records, and the
+  adapter gradients differ by more than the quantiser (measured: a cosine of 0.38 over the nine
+  targets, with the per-block diffs localised to `gdn_chunk_scan` and `attn_paged`). The issue's
+  direction check is therefore taken at the boundaries above, which the fusion does not affect. A
+  pair of containers that lay the delta net out the same way would make the whole-gradient cosine
+  measurable.
 
 *The join is the bf16 forward, by decision.* An earlier round of this card made `host_step`
 delegate to `make_reference_step`, so that the checks could be met at the issue's tolerance; the

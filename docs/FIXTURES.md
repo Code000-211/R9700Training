@@ -137,6 +137,26 @@ No kernel plugin of this repository was needed: each name in the table has a row
 (the `i8a8h` operands of `gemm_nt_q` and the int8 head's operands included), so `libr97ref` does
 not exist.
 
+### How this graph differs from the bf16 one
+
+The two containers are the same checkpoint, but not the same graph, and a reader comparing them
+should know where the difference is:
+
+- **The delta net's projections are fused differently.** This container has a `ssm_inz` record
+  writing the input projection and the gate as one packed 192-wide buffer, and the AB projection
+  reaches `gdn_conv_prep` as an operand of its own; the bf16 graph hands that op a single 136-wide
+  `gdn_in` and reads the AB operand as 4-wide slices of the same buffer. From `gdn_chunk_scan` on
+  the two graphs record different operands.
+- **The head's int8 weight is a joined buffer.** `output.weight` reaches the tape as a
+  `RadPlanesHeader`, the codes and the scales, and the ABI's byte count covers the codes only; a
+  reader that wants the dequantised weight has to read the planes (see `docs/STEPS-HOST.md`).
+- Everything else in the table has a bf16 counterpart of the same shape and the same operand
+  order, so per-boundary values and cotangents are comparable between the two.
+
+The consequence for a gradient check is that the adapter's *parameter* gradients of the two
+containers are not comparable -- the walks differentiate different records -- while the
+*boundaries* are. `tests/host/step_host_int8.cpp` compares the boundaries for that reason.
+
 ### The attention gate on a narrow head
 
 The fused gate producers write one scale per (token, head) row. That is the out projection's one

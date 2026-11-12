@@ -262,7 +262,19 @@ scale and `out_bf16` (`p = bf16(act(g) * u)`). For `silu`, `act(g) = g sigmoid(g
     dgate += dp * u * act'(g),      dup += dp * act(g).
 
 Both ops are registered in the `quant` family beside the int8 quantiser, and the host step walks
-them on the int8 trunk.
+them on the int8 trunk. Each also has the linearised twin the finite-difference harness needs, under
+`rmsnorm_quant_fp8_ste` and `gated_quant_fp8_ste`: the base point (the bf16 activation the
+quantiser saw) is appended to the schema after the activation's write, at position 6 and 4, which is
+where the frozen list names it, and the twin is then
+
+    codes(x) = c0 + live(x) * (v(x) - v0) / s0,     scale(x) = s0,
+
+with `v` the activation in f64 and no rounding step, so the finite differences see the norm's or the
+gate's Jacobian and the quantiser's slope rather than a bf16 step. `live(x)` is the clamp's mask at
+the point the adjoint reads, not the base point's, because the adjoint's mask comes from the
+activation in `fwd`. `tests/host/adjoint_quant.cpp` holds both ops to `check_kernel` against
+`ref_rmsnorm_quant_fp8` / `ref_gated_quant_fp8` and to `check_adjoint` through those twins, at the
+trunk's 128 columns and at two groups of 32.
 
 ## 7. What this does not cover
 
@@ -279,9 +291,10 @@ them on the int8 trunk.
   the clamp from the one the adjoint assumes. That is the last-bit arithmetic of section 1, and the
   adjoint does not chase it: making the mask depend on the storage precision of the scale would
   make it differ between a run that keeps the scale in f32 and one that rounds it.
-- **The fused producers have no `<op>_ste` twin yet.** Section 6's two rows are checked through
-  the int8 trunk's descent test (`tests/host/step_host_int8.cpp`), not through the
-  finite-difference harness that holds the int8 quantiser.
+- **The fused producers' finite differences hold a linearised twin.** Their forward rounds the
+  residual and the bf16 activation, so the check compares the adjoint with a twin that has no
+  rounding step (section 6); the kernel check is where the rounding is compared, and it is exact at
+  every shape the tests take.
 - **The weight side.** `i8a8h`'s weight quantisation and the group factor of the rotation live on
   the other operand of the product and are another family's adjoint.
 - **Any op of this family that turns up later** in the op inventory belongs here, against the same
