@@ -1,0 +1,689 @@
+From b557479c4d3c58760fd81d5d35c870f39ab14e9b Mon Sep 17 00:00:00 2001
+From: Moebius <agent@moebius>
+Date: Thu, 12 Nov 2026 20:42:45 +0100
+Subject: [PATCH] Fold the int8 card reading into serve-patch 0210
+
+The PR's serving patch 0211 could not stand alone: its hunks in
+libr4d, libhalo and docs/OPS.md replace lines that 0210 first writes
+(the gemm_dtype gate, the OPS paragraph), so it applied only after
+0210. Every serving patch must apply on the pinned radiance by itself
+(CONTRIBUTING.md, docs/UPSTREAM.md). Fold 0211's card rows into 0210
+and drop 0211; the serving set produces the identical tree in both
+application orders (checked against the PR's build state). Budget in
+docs/UPSTREAM.md rises to 440 (+383/-37) with the reason recorded;
+docs/ADAPTER.md, docs/PLAN.md and the test comments follow the fold.
+---
+ docs/ADAPTER.md                               |   8 +-
+ docs/PLAN.md                                  |   4 +-
+ docs/UPSTREAM.md                              |  10 +-
+ ...-host.patch => 0210-lora-int8-trunk.patch} | 221 ++++++++++++++--
+ patches/serving/0211-lora-int8-code-r4d.patch | 235 ------------------
+ tests/gpu/lora_shrink_step_order_r4d.cpp      |   4 +-
+ tests/host/lora_shrink_step_order.cpp         |   2 +-
+ tests/host/lora_w8a8.cpp                      |   2 +-
+ 8 files changed, 220 insertions(+), 266 deletions(-)
+ rename patches/serving/{0210-lora-int8-trunk-host.patch => 0210-lora-int8-trunk.patch} (77%)
+ delete mode 100644 patches/serving/0211-lora-int8-code-r4d.patch
+
+diff --git a/docs/ADAPTER.md b/docs/ADAPTER.md
+index 7736692..7faec27 100644
+--- a/docs/ADAPTER.md
++++ b/docs/ADAPTER.md
+@@ -84,10 +84,10 @@ exchanged" — the middle two dwords of each sixteen-byte step are exchanged, ho
+ `libavx/avx_quant.cpp:53`). That order belongs to the per-row quantiser, **not** to
+ `quant_act_i8g` / `had_quant_act_i8g`, which `qwen35_w8a8`'s sites use: their codes are plain
+ column order. `lora_shrink` reads codes by column, so an adapter over a step-order site would be
+-wrong — which is why radiance refused it (§3). Patch `0210` lifts that refusal on the host kernels
+-(`libref`, `libavx`) by unexchanging the middle dwords when it builds a column-ordered `x`, and
+-patch `0211` does the same on the card (`libr4d`, `libhalo`); the `i8a8h` sites of this contract
+-need only the column-order path above. What says which order a
++wrong — which is why radiance refused it (§3). Patch `0210` lifts that refusal everywhere by unexchanging the middle dwords: the host rows
++(`libref`, `libavx`) do it when they build a column-ordered `x`, the card rows (`libr4d`,
++`libhalo`) do it in the kernel; the `i8a8h` sites of this contract need only the column-order path
++above. What says which order a
+ shrink's codes are in is the encoding of the GEMM whose activation it reads, so the patch has the
+ core declare `lora_shrink` with a `gemm_dtype` parameter holding that GEMM's own `dtype` string
+ (`i8a8h`, `w8a8`, ...). `dtype` alone cannot: it is the activation's element dtype, `i8` at every
+diff --git a/docs/PLAN.md b/docs/PLAN.md
+index 748df97..498646a 100644
+--- a/docs/PLAN.md
++++ b/docs/PLAN.md
+@@ -54,7 +54,7 @@ No speed target is set; the issues ask for measurements next to the forward's ti
+ | Loss and trainable kind | Not built into the engine. An `Objective` owns the loss and names, as `Seed`s, the forward buffers where its gradient enters the tape. A `Delta` owns the trainable parameters, their initialisation and how they cross to radiance. A `Model` is one of each. First pair: `CeObjective` with `LoraDelta`. |
+ | Contracts from the start (Q1) | `objective.h`, `delta.h` and `config.h` are contract headers of issue 0. The reference loss, the adapter, the forward driver, the backward core and the joins are written against them; nothing is hardcoded and migrated later. Issue 59 lands beside issue 0. |
+ | Two milestones (Q2) | The first stays plain assistant-turn cross-entropy (issues 54 and 56). The ALoDLM objective is the second (issues 62 to 65), separate, on the same base. |
+-| Patch sets | `patches/serving/` (`0201`, `0210`, `0211`) is what a radiance needs to serve an adapter trained here; it must stand alone and is what goes upstream. `patches/training/` (`0101`, `0102`) is what only the trainer needs. `-DR97_PATCH_SET=serving` builds the serving radiance. |
++| Patch sets | `patches/serving/` (`0201`, `0210`) is what a radiance needs to serve an adapter trained here; it must stand alone and is what goes upstream. `patches/training/` (`0101`, `0102`) is what only the trainer needs. `-DR97_PATCH_SET=serving` builds the serving radiance. |
+ | Training and serving | They share the card and never run at once. The trainer exits, then the serving-only radiance loads the adapter directory. |
+ | A step without a card | `ReferenceStepFn`: the tiny fixture's op graph in f64 from the twins and the host adjoints. No value comes from a radiance kernel, no kernel library is loaded on the `--program` path, no Python, no card; the default path runs the host kernel chain once per batch and keeps only its `OpRecord`s, and both paths read the weights through `rad_core`'s reader. The loop, the checkpoint and the resume are tested on it. |
+ | Seam to radiance | As small as possible: kernels and adjoints stay behind radiance's plugin ABI; every patch has one concern, a size budget and an upstream status in `docs/UPSTREAM.md`. |
+@@ -207,7 +207,7 @@ backward core wait for it. It is small and needs no model.
+ |---|---|---|---|---|
+ | 35 | 5 | Host backward on the bf16 trunk, checked end to end by finite differences and against the PyTorch reference | 15, 17, 18, 23, 29 to 33 | none |
+ | 39 | 5 | Device forward on the real container at 4096 tokens | 5, 17 to 19 | one |
+-| 51 | 5 | radiance patch `0211`: int8-code LoRA on the R9700 kernels | 5, 16 | one |
++| 51 | 5 | radiance patch `0210`, card side: int8-code LoRA on the R9700 kernels | 5, 16 | one |
+ | 60 | 5 | `ReferenceStepFn`: the tiny fixture in f64 from the twins, `train --reference` | 6, 11, 12, 17, 20 to 29, 33, 34 | none |
+ | 66 | 5 | Patch-surface audit, size budgets, `docs/UPSTREAM.md` | 0, 8, 15, 32 | none |
+ | 36 | 6 | Host backward on the int8 trunk, checked by descent | 13, 16, 22, 35 | none |
+diff --git a/docs/UPSTREAM.md b/docs/UPSTREAM.md
+index a79d4dd..dc71177 100644
+--- a/docs/UPSTREAM.md
++++ b/docs/UPSTREAM.md
+@@ -39,8 +39,7 @@ calls the join. See
+ | --- | --- | --- | --- | --- | --- | --- |
+ | `patches/serving/0201-lora-set-weights.patch` | serving | 75 | 0 | 85 | not-submitted | put an adapter slot in service from factors already in memory, not only from a directory |
+ | `patches/serving/0201-narrow-head-gate.patch` | serving | 6 | 3 | 15 | not-submitted | an int8 attention gate on a head narrower than the 128-column quantiser group |
+-| `patches/serving/0210-lora-int8-trunk-host.patch` | serving | 303 | 29 | 340 | not-submitted | a LoRA adapter on the rotated int8 trunk, through the host kernels |
+-| `patches/serving/0211-lora-int8-code-r4d.patch` | serving | 86 | 14 | 110 | not-submitted | a lora_shrink on a step-order int8 site reads the codes back, on the card |
++| `patches/serving/0210-lora-int8-trunk.patch` | serving | 383 | 37 | 440 | not-submitted | a LoRA adapter on the rotated int8 trunk, through the host and card kernels |
+ | `patches/training/0101-issue-observer.patch` | training | 152 | 0 | 170 | not-submitted | an optional issue observer and layer block brackets on the runtime context |
+ | `patches/training/0102-replay-block.patch` | training | 114 | 19 | 150 | not-submitted | re-running one block of a step from a restored residual, after its ops have run |
+ | `patches/training/0103-prefill-logits.patch` | training | 201 | 20 | 240 | not-submitted | a training-fixture prefill that keeps every position's logits, driven through the engine |
+@@ -81,6 +80,7 @@ what it removed from each patch, is in `docs/reports/2026-11-11-patch-audit.md`.
+   returns, and `lora::load_adapter` keeps the basis a file's header declares. It is written that
+   way, rather than as a copy out of the engine's config in `lora_set_weights`, because that
+   function belongs to `0201`: a line inside it has no context on a bare radiance and so cannot stand
+-  in a patch of its own, and every patch of this set applies on the pin by itself. That is why its
+-  budget rises from 325 to 340 as well. `0211` is reserved in `docs/PLAN.md` for issue 51's
+-  int8-code LoRA on the R9700 kernels.
++  in a patch of its own, and every patch of this set applies on the pin by itself. The budget is
++  440 because issue 51's int8-code LoRA on the R9700 kernels went in here instead of a patch of its
++  own (`0211`): the card rows' hunks of it replace lines the host hunks of `0210` first write, so
++  such a patch would never have applied on the pin by itself.
+diff --git a/patches/serving/0210-lora-int8-trunk-host.patch b/patches/serving/0210-lora-int8-trunk.patch
+similarity index 77%
+rename from patches/serving/0210-lora-int8-trunk-host.patch
+rename to patches/serving/0210-lora-int8-trunk.patch
+index 365a92c..88949aa 100644
+--- a/patches/serving/0210-lora-int8-trunk-host.patch
++++ b/patches/serving/0210-lora-int8-trunk.patch
+@@ -1,7 +1,7 @@
+-Concern: a LoRA adapter on the rotated int8 trunk, through the host kernels
++Concern: a LoRA adapter on the rotated int8 trunk, through the host and card kernels
+ Upstream: not-submitted
+ diff --git a/core/engine_lora.cpp b/core/engine_lora.cpp
+-index 353a637..4623465 100644
++index a8e0a08..0811ac2 100644
+ --- a/core/engine_lora.cpp
+ +++ b/core/engine_lora.cpp
+ @@ -59,6 +59,27 @@ int read_targets(const std::string& dir, std::set<std::string>* out, std::string
+@@ -478,7 +478,7 @@ index 11156ce..4d0265e 100644
+  }  /* namespace lora */
+  }  /* namespace rad */
+ diff --git a/docs/OPS.md b/docs/OPS.md
+-index 57d9412..e796bfd 100644
++index 57d9412..87a4140 100644
+ --- a/docs/OPS.md
+ +++ b/docs/OPS.md
+ @@ -880,7 +880,7 @@ butterfly), so every tile is byte-identical (`tests/r4d_emu/test_f32.cpp`).
+@@ -490,17 +490,19 @@ index 57d9412..e796bfd 100644
+  | `lora_expand` | `M`(range) `N` `R` `S` `dtype` | `t`, `slot`, `lora_b`, `scale`, `y`:inout |
+  | `lora_expand_mm` | `M`(range) `N` `R` `S` `dtype` | `t`, `slot`, `lora_b`, `scale`, `y`:inout |
+  
+-@@ -903,6 +903,13 @@ GEMM's rows need not be the pass's token rows.
++@@ -903,6 +903,15 @@ GEMM's rows need not be the pass's token rows.
+    `group` is a cross-check on the stream's grid -- `ceil(K / group)` groups along K -- and 0 means
+    none; `dtype` is `a`'s tensor dtype name
+    (`rad_dtype_name`: `bf16`, `f16`, `f32`, `fp8_e4m3`, `i8`, ...), not a combined quant string.
+ +  `gemm_dtype` is the encoding of the GEMM whose activation `a` is (`i8a8h`, `w8a8`, ...), which
+ +  says how that GEMM reads the codes: at `w4a8`/`w8a8`/`w2a8` `quant_act_i8` writes them in the
+ +  int8 WMMA's step order, while the rotated producers write column order. The core declares it from
+-+  the GEMM's `dtype`; it is absent when the GEMM has none (a `bf16` `gemm_nt`). libref's and
+-+  libavx's rows read either order, exchanging the step order back as `gemm_nt_q` does; libr4d's and
+-+  libhalo's rows read a row's codes by column only, so they refuse a step-order `gemm_dtype` with
+-+  an `i8` `a` (`RAD_E_UNSUPPORTED`) rather than fold the codes of the wrong columns.
+++  the GEMM's `dtype`; it is absent when the GEMM has none (a `bf16` `gemm_nt`). Every row --
+++  libref's and libavx's, libr4d's and libhalo's -- reads either order, unexchanging the step order
+++  back as `gemm_nt_q` does, so a `lora_shrink` on a `w4a8`/`w8a8`/`w2a8` site multiplies the code
+++  of each column by the `lora_a` factor of that column. The unexchange is a shuffle of each
+++  16-byte step, so a step-order `i8` `a` must be whole 16-byte steps, contiguous along the row:
+++  otherwise the row refuses (`RAD_E_SHAPE` / `RAD_E_STRIDE`).
+    `lora_a` is `[S, R, K]` bf16, `t` is `[M, R]` f32.
+  - `lora_expand`: `y[m, n] = y[m, n] + scale[s, n] · Σ_j t[m, j] · lora_b[s, n, j]`, f32
+    accumulate, one rounding to `y`'s dtype (`bf16`/`f16`/`f32`, named by `dtype`). `lora_b` is
+@@ -564,7 +566,7 @@ index 1dbd2e5..d7c9938 100644
+                                                OPD("lora_a"), OUT("t") };
+  static const RadParamSpec pLoraExpand[]   = { P_INT("M"), P_INT("N"), P_INT("R"), P_INT("S"),
+ diff --git a/libhalo/halo_lora_bf16.hip b/libhalo/halo_lora_bf16.hip
+-index 459e7d5..74e8904 100644
++index 459e7d5..d843be3 100644
+ --- a/libhalo/halo_lora_bf16.hip
+ +++ b/libhalo/halo_lora_bf16.hip
+ @@ -52,6 +52,7 @@
+@@ -575,7 +577,42 @@ index 459e7d5..74e8904 100644
+  #include <map>
+  #include <mutex>
+  #include <utility>
+-@@ -295,6 +296,17 @@ static bool dtype_agrees(const RadArgs* a, uint32_t dt) {
++@@ -66,6 +67,15 @@ namespace halo_lora {
++ /* What `a` holds; a template argument so the decode is chosen once per launch, not per element. */
++ enum { kBF16 = 0, kF16 = 1, kF32 = 2, kE4M3 = 3, kE5M2 = 4, kI8 = 5 };
++ 
+++/* The int8 WMMA's step order (libref/ref_common.h, i8_step_pos): within a 16-byte step the middle
+++ * two dwords are exchanged, so logical column c sits at byte i8_step_pos(c). Bits 2 and 3 of c
+++ * are swapped; the map is a fixed shuffle of one 16-byte step and its own inverse. quant_act_i8
+++ * writes a row in it for the w4a8/w8a8/w2a8 GEMM, and the rows here read it back so a lora_shrink
+++ * on that site multiplies the code of each column by the A factor of that column. */
+++__device__ __forceinline__ int i8_step_pos(int c) {
+++    return (c & ~12) | ((c & 4) << 1) | ((c & 8) >> 1);
+++}
+++
++ struct ShrinkArgs {
++     const void*     a;    long long a_rs, a_cs;        /* element strides of `a` */
++     const float*    as;   long long s_rs, s_cs;        /* null: no scale stream */
++@@ -73,6 +83,7 @@ struct ShrinkArgs {
++     const uint16_t* la;   long long la_s0, la_s1, la_s2;
++     float*          t;    long long t_rs, t_cs;
++     int             K, group, R, S;                  /* K < 2^31: 32-bit k and k / group */
+++    int             step;                            /* a's i8 codes in the int8 WMMA's step order */
++ };
++ 
++ struct ExpandArgs {
++@@ -197,7 +208,9 @@ __global__ __launch_bounds__(256) void lora_shrink_kernel(ShrinkArgs A) {
++         const uint16_t* arow = A.la + (long long)s * A.la_s0 + (long long)j * A.la_s1;
++         float acc = 0.0f;
++         for (int k = lane; k < A.K; k += 32) {
++-            float x = ld_act<ADT>(A.a, x0 + (long long)k * A.a_cs);
+++            /* i8 in the step order: the code of column k is at byte i8_step_pos(k) of the row. */
+++            const int kc = (ADT == kI8 && A.step) ? i8_step_pos(k) : k;
+++            float x = ld_act<ADT>(A.a, x0 + (long long)kc * A.a_cs);
++             if (A.as) x = x * A.as[s0 + (long long)(k / A.group) * A.s_cs];
++             acc += x * bf2f(arow[(long long)k * A.la_s2]);
++         }
++@@ -295,6 +308,17 @@ static bool dtype_agrees(const RadArgs* a, uint32_t dt) {
+      return !d || rad_dtype_parse(d) == dt;
+  }
+  
+@@ -593,14 +630,75 @@ index 459e7d5..74e8904 100644
+  /* The scalar rows' launches, one per dtype instantiation: M blocks for shrink and M strips of 256
+   * columns for expand, 256 threads each, whatever the slots hold. */
+  template <int ADT>
+-@@ -335,6 +347,7 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
++@@ -335,6 +359,7 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
+      }
+      if (!dtype_agrees(a, X->dtype)) return RAD_E_DTYPE;
+      if (adt >= kE4M3 && !XS) return RAD_E_INVAL;     /* a code without its scale has no value */
+-+    if (adt == kI8 && i8_steps_dtype(rad_args_gets(a, "gemm_dtype"))) return RAD_E_UNSUPPORTED;
+++    const int step = (adt == kI8 && i8_steps_dtype(rad_args_gets(a, "gemm_dtype"))) ? 1 : 0;
+      if (LA->dtype != RAD_BF16 || T->dtype != RAD_F32 || SL->dtype != RAD_I32) return RAD_E_DTYPE;
+  
+      int64_t M = 0, t_rs = 0, t_cs = 0, xr = 0, x_rs = 0, x_cs = 0, sr = 0, sl_st = 0;
++@@ -380,6 +405,11 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
++     P.t = (float*)T->data; P.t_rs = t_rs; P.t_cs = t_cs;
++     P.K = (int)K; P.R = (int)R; P.S = (int)S;
++     if (!P.as) P.group = (int)K;
+++    P.step = step;
+++    if (step) {
+++        if (K % 16) return RAD_E_SHAPE;              /* the step order is whole 16-byte steps */
+++        if (x_cs != 1) return RAD_E_STRIDE;          /* ...contiguous along the row */
+++    }
++     *out = P;
++     *adt_out = adt;
++     *M_out = M;
++@@ -571,10 +601,12 @@ __device__ __forceinline__ v16bf ld_pool_frag(const uint16_t* row, int k0, int K
++     return ld_u16<V>(row + (long long)k0 * cs, K - k0, cs);
++ }
++ 
++-/* An activation row's fragment: bf16 as it is, a code as the bf16 that holds it exactly. */
+++/* An activation row's fragment: bf16 as it is, a code as the bf16 that holds it exactly. A step
+++ * is the 16-byte int8 WMMA order (i8_step_pos); its slot e is the code of column k0 + e, so it is
+++ * read back through i8_step_pos. */
++ template <int ADT, bool V>
++ __device__ __forceinline__ v16bf ld_act_frag(const void* a, long long row, int k0, int K,
++-                                            long long cs, bool on) {
+++                                            long long cs, bool on, bool step) {
++     if (!on) return zero_frag();
++     if (ADT == kBF16) {
++         const uint16_t* p = (const uint16_t*)a + row;
++@@ -582,6 +614,22 @@ __device__ __forceinline__ v16bf ld_act_frag(const void* a, long long row, int k
++     }
++     const uint8_t* p = (const uint8_t*)a + row;
++     union { uint16_t h[16]; uint4 w[1]; v16bf f; } u;
+++    if (ADT == kI8 && step) {
+++        if (V && k0 + 16 <= K) {
+++            u.w[0] = *(const uint4*)(p + k0);
+++            uint16_t h[16];
+++#pragma unroll
+++            for (int e = 0; e < 16; ++e) h[e] = (uint16_t)code_bf16<ADT>(((const uint8_t*)&u.w[0])[i8_step_pos(e)]);
+++#pragma unroll
+++            for (int e = 0; e < 16; ++e) u.h[e] = h[e];
+++            return u.f;
+++        }
+++#pragma unroll
+++        for (int e = 0; e < 16; ++e)
+++            u.h[e] = (k0 + e < K) ? (uint16_t)code_bf16<ADT>(p[(long long)k0 + i8_step_pos(e)])
+++                                  : (uint16_t)0;
+++        return u.f;
+++    }
++     if (V && k0 + 16 <= K) {
++         u.w[0] = *(const uint4*)(p + k0);
++         uint16_t h[16];
++@@ -655,8 +703,8 @@ __global__ __launch_bounds__(kShThreads) void lora_shrink_wmma_kernel(ShrinkTArg
++                 const int k = su * kShStep;
++                 af[u][0] = ld_pool_frag<VA>(ap, k, A.K, A.la_s2, aon && in);
++                 af[u][1] = ld_pool_frag<VA>(ap, k + 16, A.K, A.la_s2, aon && in);
++-                xf[u][0] = ld_act_frag<ADT, VX>(A.a, xrow, k, A.K, A.a_cs, xon && in);
++-                xf[u][1] = ld_act_frag<ADT, VX>(A.a, xrow, k + 16, A.K, A.a_cs, xon && in);
+++                xf[u][0] = ld_act_frag<ADT, VX>(A.a, xrow, k, A.K, A.a_cs, xon && in, A.step);
+++                xf[u][1] = ld_act_frag<ADT, VX>(A.a, xrow, k + 16, A.K, A.a_cs, xon && in, A.step);
++                 sc[u] = 0.0f;
++                 if (ADT != kBF16 && xon && in)
++                     sc[u] = A.as[srow + (long long)((su * kShStep) / A.group) * A.s_cs];
+ diff --git a/libhalo/halo_rows.cpp b/libhalo/halo_rows.cpp
+ index af041c8..5f1c3a1 100644
+ --- a/libhalo/halo_rows.cpp
+@@ -614,7 +712,7 @@ index af041c8..5f1c3a1 100644
+  static const RadOperandSpec oLoraShrink[] = {
+      { "a",       RAD_OPD_IN,  0 },
+ diff --git a/libr4d/r4d_lora_bf16.hip b/libr4d/r4d_lora_bf16.hip
+-index 0eb48ba..68576d1 100644
++index 0eb48ba..d016d5f 100644
+ --- a/libr4d/r4d_lora_bf16.hip
+ +++ b/libr4d/r4d_lora_bf16.hip
+ @@ -50,6 +50,7 @@
+@@ -625,7 +723,85 @@ index 0eb48ba..68576d1 100644
+  #include <map>
+  #include <mutex>
+  #include <utility>
+-@@ -768,6 +769,17 @@ static bool dtype_agrees(const RadArgs* a, uint32_t dt) {
++@@ -63,6 +64,15 @@ namespace r4d_lora {
++ /* What `a` holds; a template argument so the decode is chosen once per launch, not per element. */
++ enum { kBF16 = 0, kF16 = 1, kF32 = 2, kE4M3 = 3, kE5M2 = 4, kI8 = 5 };
++ 
+++/* The int8 WMMA's step order (libref/ref_common.h, i8_step_pos): within a 16-byte step the middle
+++ * two dwords are exchanged, so logical column c sits at byte i8_step_pos(c). Bits 2 and 3 of c
+++ * are swapped; the map is a fixed shuffle of one 16-byte step and its own inverse. quant_act_i8
+++ * writes a row in it for the w4a8/w8a8/w2a8 GEMM, and the rows here read it back so a lora_shrink
+++ * on that site multiplies the code of each column by the A factor of that column. */
+++__device__ __forceinline__ int i8_step_pos(int c) {
+++    return (c & ~12) | ((c & 4) << 1) | ((c & 8) >> 1);
+++}
+++
++ struct ShrinkArgs {
++     const void*     a;    long long a_rs, a_cs;        /* element strides of `a` */
++     const float*    as;   long long s_rs, s_cs;        /* null: no scale stream */
++@@ -70,6 +80,7 @@ struct ShrinkArgs {
++     const uint16_t* la;   long long la_s0, la_s1, la_s2;
++     float*          t;    long long t_rs, t_cs;
++     int             K, group, R, S;                  /* K < 2^31: 32-bit k and k / group */
+++    int             step;                            /* a's i8 codes in the int8 WMMA's step order */
++ };
++ 
++ struct ExpandArgs {
++@@ -194,7 +205,9 @@ __global__ __launch_bounds__(256) void lora_shrink_kernel(ShrinkArgs A) {
++         const uint16_t* arow = A.la + (long long)s * A.la_s0 + (long long)j * A.la_s1;
++         float acc = 0.0f;
++         for (int k = lane; k < A.K; k += 32) {
++-            float x = ld_act<ADT>(A.a, x0 + (long long)k * A.a_cs);
+++            /* i8 in the step order: the code of column k is at byte i8_step_pos(k) of the row. */
+++            const int kc = (ADT == kI8 && A.step) ? i8_step_pos(k) : k;
+++            float x = ld_act<ADT>(A.a, x0 + (long long)kc * A.a_cs);
++             if (A.as) x = x * A.as[s0 + (long long)(k / A.group) * A.s_cs];
++             acc += x * bf2f(arow[(long long)k * A.la_s2]);
++         }
++@@ -333,7 +346,7 @@ __device__ __forceinline__ void ld_pool16(const uint16_t* p, int k, int K, long
++  * bf16 that holds it. Off (the row is another slot's, or past M): zeros, and nothing is read. */
++ template <int ADT, bool V>
++ __device__ __forceinline__ void ld_act16(const void* a, long long row, int k, int K, long long cs,
++-                                         bool on, lr_v8s* f) {
+++                                         bool on, lr_v8s* f, bool step) {
++     f[0] = (lr_v8s)(short)0;
++     f[1] = (lr_v8s)(short)0;
++     if (!on) return;
++@@ -342,6 +355,24 @@ __device__ __forceinline__ void ld_act16(const void* a, long long row, int k, in
++         return;
++     }
++     const uint8_t* p = (const uint8_t*)a + row;
+++    if (ADT == kI8 && step) {
+++        /* i8 in the step order: slot e is the code of column k + e, stored at byte k +
+++         * i8_step_pos(e) -- the 16 bytes of the step are the permutation, so read them back. */
+++        if (V && k + 16 <= K) {
+++            const lr_v4u q = *(const lr_v4u*)(p + k);
+++            for (int e = 0; e < 16; ++e) {
+++                const int pe = i8_step_pos(e);
+++                f[e >> 3][e & 7] = (short)code_bf16<ADT>((q[pe >> 2] >> (8 * (pe & 3))) & 0xffu);
+++            }
+++        } else {
+++            for (int e = 0; e < 16; ++e)
+++                if (k + e < K) {
+++                    const int pe = i8_step_pos(e);
+++                    f[e >> 3][e & 7] = (short)code_bf16<ADT>(p[(long long)k + pe]);
+++                }
+++        }
+++        return;
+++    }
++     if (V && k + 16 <= K) {
++         const lr_v4u q = *(const lr_v4u*)(p + k);
++         for (int e = 0; e < 16; ++e)
++@@ -418,7 +449,7 @@ __global__ __launch_bounds__(kShThreads) void lora_shrink_wmma_kernel(ShrinkTArg
++                 const bool in = su < st1;
++                 const int k = su * kShStep + half * 16;
++                 ld_pool16<VA>(ap, k, A.K, A.la_s2, aon && in, af[u]);
++-                ld_act16<ADT, VX>(A.a, xrow, k, A.K, A.a_cs, xon && in, xf[u]);
+++                ld_act16<ADT, VX>(A.a, xrow, k, A.K, A.a_cs, xon && in, xf[u], A.step);
++                 sc[u] = 0.0f;
++                 if (ADT != kBF16 && xon && in)
++                     sc[u] = A.as[srow + (long long)((su * kShStep) / A.group) * A.s_cs];
++@@ -768,6 +799,17 @@ static bool dtype_agrees(const RadArgs* a, uint32_t dt) {
+      return !d || rad_dtype_parse(d) == dt;
+  }
+  
+@@ -643,14 +819,26 @@ index 0eb48ba..68576d1 100644
+  /* The scalar rows' launches, one per dtype instantiation: M blocks for shrink and M strips of 256
+   * columns for expand, 256 threads each, whatever the slots hold. */
+  template <int ADT>
+-@@ -808,6 +820,7 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
++@@ -808,6 +850,7 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
+      }
+      if (!dtype_agrees(a, X->dtype)) return RAD_E_DTYPE;
+      if (adt >= kE4M3 && !XS) return RAD_E_INVAL;     /* a code without its scale has no value */
+-+    if (adt == kI8 && i8_steps_dtype(rad_args_gets(a, "gemm_dtype"))) return RAD_E_UNSUPPORTED;
+++    const int step = (adt == kI8 && i8_steps_dtype(rad_args_gets(a, "gemm_dtype"))) ? 1 : 0;
+      if (LA->dtype != RAD_BF16 || T->dtype != RAD_F32 || SL->dtype != RAD_I32) return RAD_E_DTYPE;
+  
+      int64_t M = 0, t_rs = 0, t_cs = 0, xr = 0, x_rs = 0, x_cs = 0, sr = 0, sl_st = 0;
++@@ -853,6 +896,11 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
++     P.t = (float*)T->data; P.t_rs = t_rs; P.t_cs = t_cs;
++     P.K = (int)K; P.R = (int)R; P.S = (int)S;
++     if (!P.as) P.group = (int)K;
+++    P.step = step;
+++    if (step) {
+++        if (K % 16) return RAD_E_SHAPE;              /* the step order is whole 16-byte steps */
+++        if (x_cs != 1) return RAD_E_STRIDE;          /* ...contiguous along the row */
+++    }
++     *out = P;
++     *adt_out = adt;
++     *M_out = M;
+ diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
+ index fdd53f8..058d4a2 100644
+ --- a/libr4d/r4d_rows.cpp
+@@ -711,3 +899,4 @@ index e7a05c2..3d1e548 100644
+  static const RadOperandSpec oLoraShrink[] = { OPD("a"), OPD_O("a_scale"), OPD("slot"),
+                                                OPD("lora_a"), OUT("t") };
+  static const RadParamSpec pLoraExpand[] = { P_INT("M"), P_INT("N"), P_INT("R"), P_INT("S"),
++
+diff --git a/patches/serving/0211-lora-int8-code-r4d.patch b/patches/serving/0211-lora-int8-code-r4d.patch
+deleted file mode 100644
+index 6064c18..0000000
+--- a/patches/serving/0211-lora-int8-code-r4d.patch
++++ /dev/null
+@@ -1,235 +0,0 @@
+-Concern: a lora_shrink on a step-order int8 site reads the codes back, on the card
+-Upstream: not-submitted
+-diff --git a/docs/OPS.md b/docs/OPS.md
+-index e796bfd..87a4140 100644
+---- a/docs/OPS.md
+-+++ b/docs/OPS.md
+-@@ -906,10 +906,12 @@ GEMM's rows need not be the pass's token rows.
+-   `gemm_dtype` is the encoding of the GEMM whose activation `a` is (`i8a8h`, `w8a8`, ...), which
+-   says how that GEMM reads the codes: at `w4a8`/`w8a8`/`w2a8` `quant_act_i8` writes them in the
+-   int8 WMMA's step order, while the rotated producers write column order. The core declares it from
+--  the GEMM's `dtype`; it is absent when the GEMM has none (a `bf16` `gemm_nt`). libref's and
+--  libavx's rows read either order, exchanging the step order back as `gemm_nt_q` does; libr4d's and
+--  libhalo's rows read a row's codes by column only, so they refuse a step-order `gemm_dtype` with
+--  an `i8` `a` (`RAD_E_UNSUPPORTED`) rather than fold the codes of the wrong columns.
+-+  the GEMM's `dtype`; it is absent when the GEMM has none (a `bf16` `gemm_nt`). Every row --
+-+  libref's and libavx's, libr4d's and libhalo's -- reads either order, unexchanging the step order
+-+  back as `gemm_nt_q` does, so a `lora_shrink` on a `w4a8`/`w8a8`/`w2a8` site multiplies the code
+-+  of each column by the `lora_a` factor of that column. The unexchange is a shuffle of each
+-+  16-byte step, so a step-order `i8` `a` must be whole 16-byte steps, contiguous along the row:
+-+  otherwise the row refuses (`RAD_E_SHAPE` / `RAD_E_STRIDE`).
+-   `lora_a` is `[S, R, K]` bf16, `t` is `[M, R]` f32.
+- - `lora_expand`: `y[m, n] = y[m, n] + scale[s, n] · Σ_j t[m, j] · lora_b[s, n, j]`, f32
+-   accumulate, one rounding to `y`'s dtype (`bf16`/`f16`/`f32`, named by `dtype`). `lora_b` is
+-diff --git a/libhalo/halo_lora_bf16.hip b/libhalo/halo_lora_bf16.hip
+-index 74e8904..d843be3 100644
+---- a/libhalo/halo_lora_bf16.hip
+-+++ b/libhalo/halo_lora_bf16.hip
+-@@ -67,6 +67,15 @@ namespace halo_lora {
+- /* What `a` holds; a template argument so the decode is chosen once per launch, not per element. */
+- enum { kBF16 = 0, kF16 = 1, kF32 = 2, kE4M3 = 3, kE5M2 = 4, kI8 = 5 };
+- 
+-+/* The int8 WMMA's step order (libref/ref_common.h, i8_step_pos): within a 16-byte step the middle
+-+ * two dwords are exchanged, so logical column c sits at byte i8_step_pos(c). Bits 2 and 3 of c
+-+ * are swapped; the map is a fixed shuffle of one 16-byte step and its own inverse. quant_act_i8
+-+ * writes a row in it for the w4a8/w8a8/w2a8 GEMM, and the rows here read it back so a lora_shrink
+-+ * on that site multiplies the code of each column by the A factor of that column. */
+-+__device__ __forceinline__ int i8_step_pos(int c) {
+-+    return (c & ~12) | ((c & 4) << 1) | ((c & 8) >> 1);
+-+}
+-+
+- struct ShrinkArgs {
+-     const void*     a;    long long a_rs, a_cs;        /* element strides of `a` */
+-     const float*    as;   long long s_rs, s_cs;        /* null: no scale stream */
+-@@ -74,6 +83,7 @@ struct ShrinkArgs {
+-     const uint16_t* la;   long long la_s0, la_s1, la_s2;
+-     float*          t;    long long t_rs, t_cs;
+-     int             K, group, R, S;                  /* K < 2^31: 32-bit k and k / group */
+-+    int             step;                            /* a's i8 codes in the int8 WMMA's step order */
+- };
+- 
+- struct ExpandArgs {
+-@@ -198,7 +208,9 @@ __global__ __launch_bounds__(256) void lora_shrink_kernel(ShrinkArgs A) {
+-         const uint16_t* arow = A.la + (long long)s * A.la_s0 + (long long)j * A.la_s1;
+-         float acc = 0.0f;
+-         for (int k = lane; k < A.K; k += 32) {
+--            float x = ld_act<ADT>(A.a, x0 + (long long)k * A.a_cs);
+-+            /* i8 in the step order: the code of column k is at byte i8_step_pos(k) of the row. */
+-+            const int kc = (ADT == kI8 && A.step) ? i8_step_pos(k) : k;
+-+            float x = ld_act<ADT>(A.a, x0 + (long long)kc * A.a_cs);
+-             if (A.as) x = x * A.as[s0 + (long long)(k / A.group) * A.s_cs];
+-             acc += x * bf2f(arow[(long long)k * A.la_s2]);
+-         }
+-@@ -347,7 +359,7 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
+-     }
+-     if (!dtype_agrees(a, X->dtype)) return RAD_E_DTYPE;
+-     if (adt >= kE4M3 && !XS) return RAD_E_INVAL;     /* a code without its scale has no value */
+--    if (adt == kI8 && i8_steps_dtype(rad_args_gets(a, "gemm_dtype"))) return RAD_E_UNSUPPORTED;
+-+    const int step = (adt == kI8 && i8_steps_dtype(rad_args_gets(a, "gemm_dtype"))) ? 1 : 0;
+-     if (LA->dtype != RAD_BF16 || T->dtype != RAD_F32 || SL->dtype != RAD_I32) return RAD_E_DTYPE;
+- 
+-     int64_t M = 0, t_rs = 0, t_cs = 0, xr = 0, x_rs = 0, x_cs = 0, sr = 0, sl_st = 0;
+-@@ -393,6 +405,11 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
+-     P.t = (float*)T->data; P.t_rs = t_rs; P.t_cs = t_cs;
+-     P.K = (int)K; P.R = (int)R; P.S = (int)S;
+-     if (!P.as) P.group = (int)K;
+-+    P.step = step;
+-+    if (step) {
+-+        if (K % 16) return RAD_E_SHAPE;              /* the step order is whole 16-byte steps */
+-+        if (x_cs != 1) return RAD_E_STRIDE;          /* ...contiguous along the row */
+-+    }
+-     *out = P;
+-     *adt_out = adt;
+-     *M_out = M;
+-@@ -584,10 +601,12 @@ __device__ __forceinline__ v16bf ld_pool_frag(const uint16_t* row, int k0, int K
+-     return ld_u16<V>(row + (long long)k0 * cs, K - k0, cs);
+- }
+- 
+--/* An activation row's fragment: bf16 as it is, a code as the bf16 that holds it exactly. */
+-+/* An activation row's fragment: bf16 as it is, a code as the bf16 that holds it exactly. A step
+-+ * is the 16-byte int8 WMMA order (i8_step_pos); its slot e is the code of column k0 + e, so it is
+-+ * read back through i8_step_pos. */
+- template <int ADT, bool V>
+- __device__ __forceinline__ v16bf ld_act_frag(const void* a, long long row, int k0, int K,
+--                                            long long cs, bool on) {
+-+                                            long long cs, bool on, bool step) {
+-     if (!on) return zero_frag();
+-     if (ADT == kBF16) {
+-         const uint16_t* p = (const uint16_t*)a + row;
+-@@ -595,6 +614,22 @@ __device__ __forceinline__ v16bf ld_act_frag(const void* a, long long row, int k
+-     }
+-     const uint8_t* p = (const uint8_t*)a + row;
+-     union { uint16_t h[16]; uint4 w[1]; v16bf f; } u;
+-+    if (ADT == kI8 && step) {
+-+        if (V && k0 + 16 <= K) {
+-+            u.w[0] = *(const uint4*)(p + k0);
+-+            uint16_t h[16];
+-+#pragma unroll
+-+            for (int e = 0; e < 16; ++e) h[e] = (uint16_t)code_bf16<ADT>(((const uint8_t*)&u.w[0])[i8_step_pos(e)]);
+-+#pragma unroll
+-+            for (int e = 0; e < 16; ++e) u.h[e] = h[e];
+-+            return u.f;
+-+        }
+-+#pragma unroll
+-+        for (int e = 0; e < 16; ++e)
+-+            u.h[e] = (k0 + e < K) ? (uint16_t)code_bf16<ADT>(p[(long long)k0 + i8_step_pos(e)])
+-+                                  : (uint16_t)0;
+-+        return u.f;
+-+    }
+-     if (V && k0 + 16 <= K) {
+-         u.w[0] = *(const uint4*)(p + k0);
+-         uint16_t h[16];
+-@@ -668,8 +703,8 @@ __global__ __launch_bounds__(kShThreads) void lora_shrink_wmma_kernel(ShrinkTArg
+-                 const int k = su * kShStep;
+-                 af[u][0] = ld_pool_frag<VA>(ap, k, A.K, A.la_s2, aon && in);
+-                 af[u][1] = ld_pool_frag<VA>(ap, k + 16, A.K, A.la_s2, aon && in);
+--                xf[u][0] = ld_act_frag<ADT, VX>(A.a, xrow, k, A.K, A.a_cs, xon && in);
+--                xf[u][1] = ld_act_frag<ADT, VX>(A.a, xrow, k + 16, A.K, A.a_cs, xon && in);
+-+                xf[u][0] = ld_act_frag<ADT, VX>(A.a, xrow, k, A.K, A.a_cs, xon && in, A.step);
+-+                xf[u][1] = ld_act_frag<ADT, VX>(A.a, xrow, k + 16, A.K, A.a_cs, xon && in, A.step);
+-                 sc[u] = 0.0f;
+-                 if (ADT != kBF16 && xon && in)
+-                     sc[u] = A.as[srow + (long long)((su * kShStep) / A.group) * A.s_cs];
+-diff --git a/libr4d/r4d_lora_bf16.hip b/libr4d/r4d_lora_bf16.hip
+-index 68576d1..d016d5f 100644
+---- a/libr4d/r4d_lora_bf16.hip
+-+++ b/libr4d/r4d_lora_bf16.hip
+-@@ -64,6 +64,15 @@ namespace r4d_lora {
+- /* What `a` holds; a template argument so the decode is chosen once per launch, not per element. */
+- enum { kBF16 = 0, kF16 = 1, kF32 = 2, kE4M3 = 3, kE5M2 = 4, kI8 = 5 };
+- 
+-+/* The int8 WMMA's step order (libref/ref_common.h, i8_step_pos): within a 16-byte step the middle
+-+ * two dwords are exchanged, so logical column c sits at byte i8_step_pos(c). Bits 2 and 3 of c
+-+ * are swapped; the map is a fixed shuffle of one 16-byte step and its own inverse. quant_act_i8
+-+ * writes a row in it for the w4a8/w8a8/w2a8 GEMM, and the rows here read it back so a lora_shrink
+-+ * on that site multiplies the code of each column by the A factor of that column. */
+-+__device__ __forceinline__ int i8_step_pos(int c) {
+-+    return (c & ~12) | ((c & 4) << 1) | ((c & 8) >> 1);
+-+}
+-+
+- struct ShrinkArgs {
+-     const void*     a;    long long a_rs, a_cs;        /* element strides of `a` */
+-     const float*    as;   long long s_rs, s_cs;        /* null: no scale stream */
+-@@ -71,6 +80,7 @@ struct ShrinkArgs {
+-     const uint16_t* la;   long long la_s0, la_s1, la_s2;
+-     float*          t;    long long t_rs, t_cs;
+-     int             K, group, R, S;                  /* K < 2^31: 32-bit k and k / group */
+-+    int             step;                            /* a's i8 codes in the int8 WMMA's step order */
+- };
+- 
+- struct ExpandArgs {
+-@@ -195,7 +205,9 @@ __global__ __launch_bounds__(256) void lora_shrink_kernel(ShrinkArgs A) {
+-         const uint16_t* arow = A.la + (long long)s * A.la_s0 + (long long)j * A.la_s1;
+-         float acc = 0.0f;
+-         for (int k = lane; k < A.K; k += 32) {
+--            float x = ld_act<ADT>(A.a, x0 + (long long)k * A.a_cs);
+-+            /* i8 in the step order: the code of column k is at byte i8_step_pos(k) of the row. */
+-+            const int kc = (ADT == kI8 && A.step) ? i8_step_pos(k) : k;
+-+            float x = ld_act<ADT>(A.a, x0 + (long long)kc * A.a_cs);
+-             if (A.as) x = x * A.as[s0 + (long long)(k / A.group) * A.s_cs];
+-             acc += x * bf2f(arow[(long long)k * A.la_s2]);
+-         }
+-@@ -334,7 +346,7 @@ __device__ __forceinline__ void ld_pool16(const uint16_t* p, int k, int K, long
+-  * bf16 that holds it. Off (the row is another slot's, or past M): zeros, and nothing is read. */
+- template <int ADT, bool V>
+- __device__ __forceinline__ void ld_act16(const void* a, long long row, int k, int K, long long cs,
+--                                         bool on, lr_v8s* f) {
+-+                                         bool on, lr_v8s* f, bool step) {
+-     f[0] = (lr_v8s)(short)0;
+-     f[1] = (lr_v8s)(short)0;
+-     if (!on) return;
+-@@ -343,6 +355,24 @@ __device__ __forceinline__ void ld_act16(const void* a, long long row, int k, in
+-         return;
+-     }
+-     const uint8_t* p = (const uint8_t*)a + row;
+-+    if (ADT == kI8 && step) {
+-+        /* i8 in the step order: slot e is the code of column k + e, stored at byte k +
+-+         * i8_step_pos(e) -- the 16 bytes of the step are the permutation, so read them back. */
+-+        if (V && k + 16 <= K) {
+-+            const lr_v4u q = *(const lr_v4u*)(p + k);
+-+            for (int e = 0; e < 16; ++e) {
+-+                const int pe = i8_step_pos(e);
+-+                f[e >> 3][e & 7] = (short)code_bf16<ADT>((q[pe >> 2] >> (8 * (pe & 3))) & 0xffu);
+-+            }
+-+        } else {
+-+            for (int e = 0; e < 16; ++e)
+-+                if (k + e < K) {
+-+                    const int pe = i8_step_pos(e);
+-+                    f[e >> 3][e & 7] = (short)code_bf16<ADT>(p[(long long)k + pe]);
+-+                }
+-+        }
+-+        return;
+-+    }
+-     if (V && k + 16 <= K) {
+-         const lr_v4u q = *(const lr_v4u*)(p + k);
+-         for (int e = 0; e < 16; ++e)
+-@@ -419,7 +449,7 @@ __global__ __launch_bounds__(kShThreads) void lora_shrink_wmma_kernel(ShrinkTArg
+-                 const bool in = su < st1;
+-                 const int k = su * kShStep + half * 16;
+-                 ld_pool16<VA>(ap, k, A.K, A.la_s2, aon && in, af[u]);
+--                ld_act16<ADT, VX>(A.a, xrow, k, A.K, A.a_cs, xon && in, xf[u]);
+-+                ld_act16<ADT, VX>(A.a, xrow, k, A.K, A.a_cs, xon && in, xf[u], A.step);
+-                 sc[u] = 0.0f;
+-                 if (ADT != kBF16 && xon && in)
+-                     sc[u] = A.as[srow + (long long)((su * kShStep) / A.group) * A.s_cs];
+-@@ -820,7 +850,7 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
+-     }
+-     if (!dtype_agrees(a, X->dtype)) return RAD_E_DTYPE;
+-     if (adt >= kE4M3 && !XS) return RAD_E_INVAL;     /* a code without its scale has no value */
+--    if (adt == kI8 && i8_steps_dtype(rad_args_gets(a, "gemm_dtype"))) return RAD_E_UNSUPPORTED;
+-+    const int step = (adt == kI8 && i8_steps_dtype(rad_args_gets(a, "gemm_dtype"))) ? 1 : 0;
+-     if (LA->dtype != RAD_BF16 || T->dtype != RAD_F32 || SL->dtype != RAD_I32) return RAD_E_DTYPE;
+- 
+-     int64_t M = 0, t_rs = 0, t_cs = 0, xr = 0, x_rs = 0, x_cs = 0, sr = 0, sl_st = 0;
+-@@ -866,6 +896,11 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
+-     P.t = (float*)T->data; P.t_rs = t_rs; P.t_cs = t_cs;
+-     P.K = (int)K; P.R = (int)R; P.S = (int)S;
+-     if (!P.as) P.group = (int)K;
+-+    P.step = step;
+-+    if (step) {
+-+        if (K % 16) return RAD_E_SHAPE;              /* the step order is whole 16-byte steps */
+-+        if (x_cs != 1) return RAD_E_STRIDE;          /* ...contiguous along the row */
+-+    }
+-     *out = P;
+-     *adt_out = adt;
+-     *M_out = M;
+diff --git a/tests/gpu/lora_shrink_step_order_r4d.cpp b/tests/gpu/lora_shrink_step_order_r4d.cpp
+index 964108c..69069d2 100644
+--- a/tests/gpu/lora_shrink_step_order_r4d.cpp
++++ b/tests/gpu/lora_shrink_step_order_r4d.cpp
+@@ -1,8 +1,8 @@
+ // tests/gpu/lora_shrink_step_order_r4d.cpp -- libr4d's lora_shrink reads a step-order
+ // activation, on the card.
+ //
+-// patches/serving/0211-lora-int8-code-r4d.patch replaces the RAD_E_UNSUPPORTED refusal that
+-// 0210 left in libr4d's (and libhalo's) lora_shrink with the read itself: when `gemm_dtype`
++// the serving patch `0210` replaces the RAD_E_UNSUPPORTED refusal that libr4d's (and
++// libhalo's) lora_shrink once raised with the read itself: when `gemm_dtype`
+ // names a GEMM whose `quant_act_i8` wrote the codes in the int8 WMMA's step order (w4a8/w8a8/
+ // w2a8), each column's codes are multiplied by the lora_a factor of that column. The i8a8h
+ // trunk -- codes in column order -- keeps the plain reading: the gate is the GEMM's encoding,
+diff --git a/tests/host/lora_shrink_step_order.cpp b/tests/host/lora_shrink_step_order.cpp
+index 1cdac0e..59b719f 100644
+--- a/tests/host/lora_shrink_step_order.cpp
++++ b/tests/host/lora_shrink_step_order.cpp
+@@ -7,7 +7,7 @@
+ // codes are stored: quant_act_i8 writes them in the int8 WMMA's step order at w4a8/w8a8/w2a8 (the
+ // middle dwords of every 16-byte step exchanged) and the rotated producers write column order.
+ //
+-// patches/serving/0210-lora-int8-trunk-host.patch makes libref's lora_shrink unexchange the step
++// patches/serving/0210-lora-int8-trunk.patch makes libref's lora_shrink unexchange the step
+ // order when `gemm_dtype` names one of those. The int8 fixture's trunk is i8a8h, whose codes are
+ // already in column order, so the fixture test exercises only the column-order reading; this runs
+ // the reference kernel directly, with the parameter set radiance declares at such a site: the
+diff --git a/tests/host/lora_w8a8.cpp b/tests/host/lora_w8a8.cpp
+index 2ce9594..ff179e6 100644
+--- a/tests/host/lora_w8a8.cpp
++++ b/tests/host/lora_w8a8.cpp
+@@ -1,6 +1,6 @@
+ // tests/host/lora_w8a8.cpp -- a LoRA adapter on the rotated int8 trunk, through the host kernels.
+ //
+-// patches/serving/0210-lora-int8-trunk-host.patch lifts, for an adapter that declares
++// patches/serving/0210-lora-int8-trunk.patch lifts, for an adapter that declares
+ // `"radiance_input_basis": "fwht128"` (the key docs/ADAPTER.md defines), both refusals in
+ // core/lora/lora.cpp: the weight "stored in the 'fwht128' transform basis" one and the step-order
+ // dtype one (w4a8/w8a8/w2a8), because the host lora_shrink form now unexchanges quant_act_i8's
+-- 
+2.43.0
+
