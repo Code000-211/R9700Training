@@ -13,6 +13,7 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <sys/wait.h>
@@ -98,6 +99,41 @@ R97_TEST(data_cli) {
     const Run missing =
         run("data --model /nonexistent/r97-data-cli.rad --data " + quote(chat_small()));
     R97_CHECK(missing.status == 3);
+}
+
+// The corpus radiance's KL mode reads (docs/EVAL.md), written from the same chat file: one document
+// per contiguous scored run, `score_from` the row that predicts the run's first target. A document's
+// rows are the tokens after `score_from`, so the corpus's row count is the `scored` the trainer
+// reports -- the tokens the loss is taken over -- and radiance's record of them is the number
+// docs/RUNBOOK.md holds the trainer's to.
+R97_TEST(data_cli_kld_corpus) {
+    const std::string model = r97::fixture().container;
+    const fs::path dir = fs::path(radtest::tmpdir()) / "data_cli_kld";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    const fs::path corpus = dir / "chat_small.kld.jsonl";
+
+    const Run wrote = run("data --model " + quote(model) + " --data " + quote(chat_small()) +
+                          " --kld-corpus " + quote(corpus.string()));
+    R97_CHECK(wrote.status == 0);
+
+    const long scored = field(wrote.output, "scored");
+    const long documents = field(wrote.output, "kld documents");
+    const long rows = field(wrote.output, "kld rows");
+    R97_CHECK(documents > 0);
+    R97_CHECK(rows == scored);
+
+    std::ifstream in(corpus);
+    R97_CHECK(in.good());
+    std::string line;
+    long lines = 0;
+    while (std::getline(in, line)) {
+        R97_CHECK(line.find("\"prompt\"") != std::string::npos);
+        R97_CHECK(line.find("\"score_from\"") != std::string::npos);
+        ++lines;
+    }
+    R97_CHECK(lines == documents);
 }
 
 #endif  // R97_FIXTURE_PREFILL

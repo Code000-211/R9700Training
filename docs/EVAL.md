@@ -52,9 +52,20 @@ python3 tools/kld_loss.py /tmp/chat_small.kld
 
 The corpus is one JSONL document per contiguous scored run of a conversation: `{"prompt":
 "<the conversation prefix through that run>", "score_from": <the row predicting the run's first
-token>}`. Its rows are then exactly the rows the trainer scores. `tests/host/loss_cli.cpp` builds
-that corpus from `ChatData` for `tests/fixtures/chat_small.jsonl`, reads the record's NLL column
-itself (the host tier runs no Python), and checks the two losses agree to 1e-4 relative.
+token>}`. Its rows are then exactly the rows the trainer scores, and `r97train data --kld-corpus
+<file>` writes it from a chat file (`docs/USAGE.md`):
+
+```sh
+r97train data --model tiny_qwen35_bf16.rad --data tests/fixtures/chat_small.jsonl \
+              --kld-corpus /tmp/chat_small.kld.jsonl
+```
+
+`tests/host/loss_cli.cpp` builds the same corpus from `ChatData` for
+`tests/fixtures/chat_small.jsonl`, reads the record's NLL column itself (the host tier runs no
+Python), and checks the two losses agree to 1e-4 relative; `tests/host/data_cli.cpp` checks that
+what `--kld-corpus` writes has one row per scored token. `docs/RUNBOOK.md` §7 takes the served
+alternative further and scores a trained adapter through radiance's LoRA slot (`--lora` and
+`--kld-lora`), which is the served loss that document holds the trainer's to.
 
 `tools/kld_loss.py` reads the NLL column of `rows.f32` and prints it in the same format as
 `r97train loss`; it accepts full and `--kld-top` records.

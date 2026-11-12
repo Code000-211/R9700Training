@@ -106,7 +106,7 @@ outside the valid range. Write them in the file and the two agree.
 ### `data`
 
 ```text
-usage: r97train data --model <file.rad> --data <file.jsonl> [--show N]
+usage: r97train data --model <file.rad> --data <file.jsonl> [--show N] [--kld-corpus <file>]
 ```
 
 | flag | state | what it does |
@@ -114,11 +114,15 @@ usage: r97train data --model <file.rad> --data <file.jsonl> [--show N]
 | `--model <file.rad>` | now | the container whose chat template and vocabulary tokenise the file |
 | `--data <file.jsonl>` | now | the chat-format file to read |
 | `--show N` | now | print the first N conversations, the scored runs marked `[[…]]`; default 0 |
+| `--kld-corpus <file>` | now | also write the file as radiance's KL corpus, one document per scored run, and report its `kld documents` and `kld rows` |
 
 The cheap read of a run's input, beside `info`. It prints the counts the batcher will see —
 `conversations`, `kept`, `shortened`, `skipped`, `tokens`, `scored` — and `--show` prints the
 conversations with what the loss is taken over marked. A `skipped` count above zero is a template or
-format problem, not something to train through: `docs/CHATDATA.md` says which.
+format problem, not something to train through: `docs/CHATDATA.md` says which. `--kld-corpus`
+writes the same scored runs in the shape radiance's KL mode reads, so `tools/kld_loss.py` prints the
+same loss radiance serves: `docs/EVAL.md` holds the two numbers against each other, and
+`docs/RUNBOOK.md` §7 runs it on a trained adapter.
 
 ### `deltas`
 

@@ -27,9 +27,10 @@ the whole conversation is being rendered, not a request for the next turn. The
 BOS rule is the one the server uses: a BOS token is added only when the
 container asks for one and the render does not already start with it.
 
-`r97train data --model <file.rad> --data <file.jsonl> [--show N]` prints the
-statistics below and then the first `N` kept conversations, with each scored
-token wrapped in `[[...]]` so the mask is visible in the rendered text.
+`r97train data --model <file.rad> --data <file.jsonl> [--show N] [--kld-corpus <file>]` prints
+the statistics below and then the first `N` kept conversations, with each scored token wrapped in
+`[[...]]` so the mask is visible in the rendered text; `--kld-corpus` writes the same scored runs as
+radiance's KL corpus (`docs/EVAL.md`).
 
 ## The mask
 
