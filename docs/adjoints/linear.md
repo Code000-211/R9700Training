@@ -51,13 +51,16 @@ The activation `a` is the dequantised, rotated activation of the forward: its co
 in the adjoint is the dequantised weight:
 
 ```text
-W[n,k] = b_code[n,k] * sb[n,g]
-dx_hat[m,k] += sum_n dy[m,n] * W[n,k]
+W[n,k]  = b_code[n,k] * sb[n,g]
+dx_code[m,k] += sa[m,g] * sum_n dy[m,n] * W[n,k]
 ```
 
-`dx_hat` is therefore a cotangent in the rotated, dequantised basis. The scale `sa` does not appear
-in it: the quantiser's straight-through adjoint passes `dx_hat` to its own bf16 input unchanged.
-There is no cotangent for the codes, and no weight gradient.
+`dx_code` is therefore a cotangent in the codes' basis, which is what the walk hands an op that
+writes codes (`docs/adjoints/quant.md` section 3): the quantiser's straight-through adjoint
+divides it by `s` on the way to its bf16 input, and the two cancel on the path where nothing else
+reads the codes. The dequantised `dx_hat = dx_code / sa` is what a consumer of the dequantised
+product would be handed; it is not what this row returns, because the walk's contract is the
+codes. There is no weight gradient.
 
 The host issues `gemm_nt_q` (not the fp8 `gemm_nt_q_gated` form) for `qwen35_w8a8`'s gated MLP:
 `gate_up.i8` disables that arch's gated fold and the two halves are two ordinary int8 linears. No
@@ -113,8 +116,8 @@ Each op's twin, `embed_lookup`'s included, is compared with radiance's host kern
 tolerance on three shapes, one of them the tiny fixture's (hidden 128, MLP 256, vocabulary 320).
 Each adjoint that answers is compared with central finite differences of the twin to `1e-6`
 relative; `embed_lookup`'s stop is checked to add nothing to either of its operands. For
-`gemm_nt_q` the finite-difference case holds the activation scale at one, because the adjoint
-describes the dequantised basis; a separate check perturbs the codes by `eps / sa` and confirms
-`dx_hat` against the dequantised directional derivative with a real scale. One more check pins the
-frozen positions of every row against the table above, so this page and the registration cannot
-drift apart.
+`gemm_nt_q` the finite-difference case holds the activation scale at one, where the codes' basis
+and the dequantised one are the same; a separate check keeps a real scale and perturbs the codes
+by `eps * dir`, confirming `dx_code` against the code-basis directional derivative. One more check
+pins the frozen positions of every row against the table above, so this page and the registration
+cannot drift apart.

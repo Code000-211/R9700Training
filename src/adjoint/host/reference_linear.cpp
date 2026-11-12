@@ -203,14 +203,19 @@ void gemm_nt_q_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     }
 }
 
-// dx in the dequantised activation basis: dy * W, where W dequantises the int8 weight codes.
+// dx in the codes' basis: the activation operand is a code stream, and the walk hands its
+// cotangent to the quantiser that wrote it, whose adjoint reads the codes' cotangent
+// (docs/adjoints/quant.md, section 3). dy * W dequantises the weight, and the row's a_scale
+// dequantises the activation, so both appear exactly once.
 void gemm_nt_q_adjoint(const AdjointCall& call) {
     const int ia = operand_pos(call.rec, "a");
+    const int ias = operand_pos(call.rec, "a_scale");
     const int ib = operand_pos(call.rec, "b");
     const int ibs = operand_pos(call.rec, "b_scale");
     if (ia < 0 || ib < 0 || call.cot.empty()) return;
     const AdValue& a = call.fwd[static_cast<std::size_t>(ia)];
     const AdValue& b = call.fwd[static_cast<std::size_t>(ib)];
+    const AdValue* as = ias >= 0 ? &call.fwd[static_cast<std::size_t>(ias)] : nullptr;
     const AdValue* bs = ibs >= 0 ? &call.fwd[static_cast<std::size_t>(ibs)] : nullptr;
     const AdValue& dy = call.cot[0];
     const int64_t K = param_int(call.rec, "K", a.shape.size() >= 2 ? a.shape[1] : 0);
@@ -228,7 +233,7 @@ void gemm_nt_q_adjoint(const AdjointCall& call) {
                        b.value[static_cast<std::size_t>(n * K + k)] *
                        scale_at(bs, n, g, N, groups);
             }
-            dx.value[static_cast<std::size_t>(m * K + k)] += acc;
+            dx.value[static_cast<std::size_t>(m * K + k)] += acc * scale_at(as, m, g, M, groups);
         }
     }
 }
