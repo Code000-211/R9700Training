@@ -144,11 +144,13 @@ void ForwardDriver::set_block_hook(std::function<void(const BlockView&)> hook) {
 }
 
 void ForwardDriver::set_lora(int64_t max_loras, int64_t max_rank,
-                             std::vector<std::string> targets, std::string adapter_name) {
+                             std::vector<std::string> targets, std::string adapter_name,
+                             std::string input_basis) {
     lora_max_loras_ = max_loras;
     lora_max_rank_ = max_rank;
     lora_targets_ = std::move(targets);
     lora_adapter_name_ = std::move(adapter_name);
+    lora_input_basis_ = std::move(input_basis);
 }
 
 void ForwardDriver::set_engine_hook(std::function<void(rad::Engine&)> hook) {
@@ -261,6 +263,7 @@ void ForwardDriver::run_engine(const Batch& batch) {
     cfg.lora.max_loras = lora_max_loras_;
     cfg.lora.max_rank = lora_max_rank_;
     cfg.lora.targets = lora_targets_;
+    cfg.lora.input_basis = lora_input_basis_;
     cfg.prefill_lora = lora_adapter_name_;
 
     engine_.reset(new rad::Engine(std::move(cfg)));

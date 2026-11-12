@@ -60,8 +60,10 @@ for bit. So the row exists and is never read: no token, no end-of-text test, no 
   the multiples of the layer count.
 - **twin / host / device** -- whether `r97train ops --registered` holds a forward twin, a host
   adjoint or a device adjoint for the op. The family issues merged so far give a twin and a host
-  adjoint to every op here except `rope_table`, `rmsnorm_quant_fp8`, `gated_quant_fp8` and
-  `quant_act_fp8`; `rope` and `kv_store` get their twin and their host row from
+  adjoint to every op here except `rope_table`; `rmsnorm_quant_fp8`, `gated_quant_fp8` and
+  `quant_act_fp8` get theirs from `src/adjoint/host/rmsnorm_quant.cpp`, `gated_quant.cpp` and
+  `quant_fp8.cpp`, the fused quantisers of the int8 trunk. `rope` and `kv_store` get their twin
+  and their host row from
   `src/adjoint/host/rope.cpp` and `src/adjoint/host/kv_store.cpp`, which the qk family registered,
   not from the join. The device column is read by a host-only run with
   `--kernels libavx,libref`, which never loads the device plugin: `src/adjoint/device/add.hip`

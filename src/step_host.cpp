@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "engine.h"  // the complete rad::Engine behind ForwardDriver's unique_ptr
+#include "rad_plugin.h"  // rad_fp8e4m3_to_f32: the head's fp8 activation payload
 #include "r97/step_host.h"
 #include "r97/adapter_io.h"
 #include "r97/adjoint.h"
@@ -42,7 +43,9 @@ int64_t elem_size(const std::string& dtype) {
     if (dtype == "bf16" || dtype == "f16") return 2;
     if (dtype == "f32" || dtype == "i32" || dtype == "u32") return 4;
     if (dtype == "f64" || dtype == "i64" || dtype == "u64") return 8;
-    if (dtype == "i8" || dtype == "u8" || dtype == "f8") return 1;
+    if (dtype == "i8" || dtype == "u8" || dtype == "f8" || dtype == "fp8_e4m3" ||
+        dtype == "fp8_e5m2")
+        return 1;
     return 0;
 }
 
@@ -55,6 +58,8 @@ double read_elem(const std::string& dtype, const void* data, int64_t i) {
     if (dtype == "u64") return static_cast<double>(static_cast<const uint64_t*>(data)[i]);
     if (dtype == "i8") return static_cast<const int8_t*>(data)[i];
     if (dtype == "u8") return static_cast<const uint8_t*>(data)[i];
+    if (dtype == "fp8_e4m3") return rad_fp8e4m3_to_f32(static_cast<const uint8_t*>(data)[i]);
+    if (dtype == "fp8_e5m2") return rad_fp8e5m2_to_f32(static_cast<const uint8_t*>(data)[i]);
     if (dtype == "bf16") {
         const uint32_t u = static_cast<uint32_t>(static_cast<const uint16_t*>(data)[i]) << 16;
         float f;
@@ -406,6 +411,24 @@ void fill_missing_grads(ParamSet* grads, const ParamSet& params) {
     }
 }
 
+// The caller compares a step's gradients to the parameters position by position, and the split
+// replaces entries (erase + append) rather than writing them in place. Put the set back in the
+// parameters' order once everything is in it. A name this step did not produce is left for the
+// caller's own check to report.
+void order_grads_like(ParamSet* grads, const ParamSet& params) {
+    if (!grads || grads->size() != params.size()) return;
+    ParamSet ordered;
+    ordered.reserve(params.size());
+    for (const Param& p : params) {
+        auto it = std::find_if(grads->begin(), grads->end(),
+                               [&](const Param& g) { return g.name == p.name; });
+        if (it == grads->end()) return;
+        ordered.push_back(std::move(*it));
+        grads->erase(it);
+    }
+    *grads = std::move(ordered);
+}
+
 // A delta parameter's leaf under its module, found by the shape the split is about to write. The
 // adjoint's own leaf names are the engine's spelling, which the join must not repeat: a second
 // adapter kind names its factors differently and this still finds and writes them.
@@ -529,8 +552,10 @@ std::string module_leaf(const std::string& module) {
 // boundaries and snapshots.
 std::string linear_schema_name(const OpRecord& rec, size_t j) {
     if (rec.op == "gemm_nt") return j == 0 ? "a" : j == 1 ? "b" : "";
+    // gemm_nt_q's schema is a, a_scale, b, b_scale, c: the activation's scale sits between the
+    // activation and the weight, not behind them.
     if (rec.op == "gemm_nt_q")
-        return j == 0 ? "a" : j == 1 ? "b" : j == 2 ? "a_scale" : j == 3 ? "b_scale" : "";
+        return j == 0 ? "a" : j == 1 ? "a_scale" : j == 2 ? "b" : j == 3 ? "b_scale" : "";
     if (rec.op == "logits_gemm") return j == 0 ? "x" : j == 1 ? "lm_head" : "";
     if (rec.op == "gather_rows") return j == 0 ? "x" : j == 1 ? "idx" : "";
     if (rec.op == "embed_lookup") return j == 0 ? "tokens" : j == 1 ? "wte" : "";
@@ -614,7 +639,7 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
         std::vector<std::string> targets(target_set.begin(), target_set.end());
         const bool live = model.delta && !wire.sites.empty();
         driver.set_lora(live ? 1 : 0, live ? std::max<int64_t>(max_rank, 1) : 0, targets,
-                        live ? "train" : std::string());
+                        live ? "train" : std::string(), meta.input_basis);
 
         std::shared_ptr<BoundaryRecorder> recorder;
         driver.set_engine_hook([&driver, &recorder, &wire, live, targets, max_rank, tokens,
@@ -876,6 +901,7 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
         // under every module name the split then adds the real gradient for.
         split_adapter_grads(grads, params, groups, grad_prefix);
         fill_missing_grads(grads, params);
+        order_grads_like(grads, params);
         // The report's own boundary copies grow with the number of layers; name them rather than
         // fold them into the peaks, which describe the join's working set.
         for (const std::vector<double>& v : measured.boundary_value)

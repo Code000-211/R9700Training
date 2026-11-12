@@ -248,3 +248,20 @@ composition of the forward's two piecewise pieces, not a rule about the code.
   the other operand of the product and are another family's adjoint.
 - **Any op of this family that turns up later** in the op inventory belongs here, against the same
   standard, with the formulas added to this document.
+
+## 7. Open: the int8 trunk's whole-gradient scale
+
+Every row here passes its own finite-difference check, and so does the bf16 walk over the whole
+adapter (`tests/host/step_host_grad.cpp`), where `train` halves each conversation's loss in twenty
+steps. The int8 trunk's whole gradient does not: over a direction in the adapter, the analytic
+derivative is about `1.3e4` where a secant of the mean loss over the same direction gives `1.1e2`,
+and a run at `1e-2` leaves the basin after a few steps instead of overfitting. The mean loss is
+bounded near `2`, so no direction can move it by the analytic amount: one of the ops a rotated
+trunk composes -- the fused quantisers, the coded `lora_shrink`, or the gated-delta-net chain
+between them -- is multiplying a cotangent by a scale a consumer already applied, or dropping the
+one that cancels. The per-op checks cannot see it because each holds its own input fixed.
+
+The check that found this, `tests/host/step_host_w8a8_grad.cpp`, compared the walk's projection
+onto a fixed direction with a central difference of the same run's mean loss; it is not in the tree
+while the gap is open, because the host tier ships no failing or skipping case. It belongs back, under
+that name, with the fix.
