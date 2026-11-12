@@ -316,29 +316,42 @@ struct Expand {
     const AdValue* t = nullptr;
     const AdValue* slot = nullptr;
     const AdValue* lb = nullptr;
-    const AdValue* sc = nullptr;
+    const AdValue* sc = nullptr;  // null: a float trunk's record, whose y is the fourth operand
     int64_t M = 0, N = 0, R = 0, S = 0;
 };
 
-bool expand_layout(const AdValue* v, size_t n, Expand* ex) {
+/* The scale the expand reads for y(m, n), or the 1 a float trunk's record leaves it at. */
+double expand_scale(const Expand& ex, int64_t s, int64_t n) {
+    return ex.sc ? ex.sc->value[(size_t)(s * ex.N + n)] : 1.0;
+}
+
+bool expand_layout(const OpRecord& rec, const AdValue* v, size_t n, Expand* ex) {
+    /* A record with a scale operand carries it as t, slot, lora_b, scale, y (five), or as the
+     * fourth read operand when the write is not among the reads (four). A float trunk's record has
+     * no scale at all, and its fourth is the y the op writes -- the one operand there that the
+     * record marks as written. Reading that y as a scale multiplies every row by whatever the
+     * buffer held, and, when the pool has more than one slot, reads past it. */
     if (n != 4u && n != 5u) return false;
     const AdValue& t = v[0];
     const AdValue& slot = v[1];
     const AdValue& lb = v[2];
-    const AdValue& sc = v[3];
-    if (t.shape.size() != 2 || slot.shape.size() != 1 || lb.shape.size() != 3 ||
-        sc.shape.size() != 2)
+    const bool has_scale = n == 5u || !rec.operands[3].written;
+    const AdValue* sc = has_scale ? &v[3] : nullptr;
+    if (t.shape.size() != 2 || slot.shape.size() != 1 || lb.shape.size() != 3)
         return false;
     const int64_t M = t.shape[0], R = t.shape[1], S = lb.shape[0], N = lb.shape[1];
     if (M <= 0 || N <= 0 || R <= 0 || S <= 0) return false;
-    if (lb.shape[2] != R || slot.shape[0] != M || sc.shape[0] != S || sc.shape[1] != N) return false;
+    if (lb.shape[2] != R || slot.shape[0] != M) return false;
     if ((int64_t)t.value.size() != M * R || (int64_t)slot.value.size() != M ||
-        (int64_t)lb.value.size() != S * N * R || (int64_t)sc.value.size() != S * N)
+        (int64_t)lb.value.size() != S * N * R)
+        return false;
+    if (sc && (sc->shape.size() != 2 || sc->shape[0] != S || sc->shape[1] != N ||
+               (int64_t)sc->value.size() != S * N))
         return false;
     ex->t = &t;
     ex->slot = &slot;
     ex->lb = &lb;
-    ex->sc = &sc;
+    ex->sc = sc;
     ex->M = M;
     ex->N = N;
     ex->R = R;
@@ -360,7 +373,7 @@ int64_t row_slot(const Expand& ex, int64_t m) {
 void lora_expand_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
                       std::vector<AdValue>* out) {
     Expand ex;
-    if (!expand_layout(operands.data(), operands.size(), &ex)) return;
+    if (!expand_layout(rec, operands.data(), operands.size(), &ex)) return;
     const bool round_t = rec.op == "lora_expand_mm";
     AdValue y;
     y.dtype = write_dtype(rec, "bf16");
@@ -376,7 +389,7 @@ void lora_expand_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
                 acc += (round_t ? rounded_bf16(tv) : tv) *
                        ex.lb->value[(size_t)((s * ex.N + n) * ex.R + j)];
             }
-            y.value[(size_t)(m * ex.N + n)] = ex.sc->value[(size_t)(s * ex.N + n)] * acc;
+            y.value[(size_t)(m * ex.N + n)] = expand_scale(ex, s, n) * acc;
         }
     }
     out->push_back(std::move(y));
@@ -392,7 +405,7 @@ void lora_expand_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
  */
 void lora_expand_host_adjoint(const AdjointCall& call) {
     Expand ex;
-    if (!expand_layout(call.fwd.data(), call.fwd.size(), &ex)) return;
+    if (!expand_layout(call.rec, call.fwd.data(), call.fwd.size(), &ex)) return;
     if (call.cot.empty()) return;
     const AdValue& y_cot = call.cot[0];
     if ((int64_t)y_cot.value.size() != ex.M * ex.N) return;
@@ -410,15 +423,21 @@ void lora_expand_host_adjoint(const AdjointCall& call) {
         const int64_t s = row_slot(ex, m);
         if (s < 0) continue;
         Param* const db = call.grads ? db_for(s) : nullptr;
-        for (int64_t n = 0; n < ex.N; ++n) {
+        /* The op's own N is the buffer's padded width; the parameter's shape, which the trainer
+         * allocated, is the module's true width. A record wider than its lora_B -- a padded row
+         * round -- has no columns past the parameter's, and reading them is past the end. */
+        const int64_t cols = call.fused_slots ? ex.S * ex.R : ex.R;
+        int64_t n_end = ex.N;
+        if (db && cols > 0 && db->value.size() < (size_t)(n_end * cols))
+            n_end = (int64_t)db->value.size() / cols;
+        for (int64_t n = 0; n < n_end; ++n) {
             const double c = y_cot.value[(size_t)(m * ex.N + n)];
             if (c == 0.0) continue;
-            const double cs = c * ex.sc->value[(size_t)(s * ex.N + n)];
+            const double cs = c * expand_scale(ex, s, n);
             const size_t b0 = (size_t)((s * ex.N + n) * ex.R);
             for (int64_t j = 0; j < ex.R; ++j)
                 t_cot.value[(size_t)(m * ex.R + j)] += cs * ex.lb->value[b0 + (size_t)j];
             if (db) {
-                const int64_t cols = call.fused_slots ? ex.S * ex.R : ex.R;
                 const int64_t col0 = call.fused_slots ? s * ex.R : 0;
                 for (int64_t j = 0; j < ex.R; ++j)
                     db->value[(size_t)(n * cols + col0 + j)] +=

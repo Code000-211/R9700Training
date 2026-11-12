@@ -461,6 +461,24 @@ void fill_missing_grads(ParamSet* grads, const ParamSet& params) {
     }
 }
 
+// The caller compares a step's gradients to the parameters position by position, and the split
+// replaces entries (erase + append) rather than writing them in place. Put the set back in the
+// parameters' order once everything is in it. A name this step did not produce is left for the
+// caller's own check to report.
+void order_grads_like(ParamSet* grads, const ParamSet& params) {
+    if (!grads || grads->size() != params.size()) return;
+    ParamSet ordered;
+    ordered.reserve(params.size());
+    for (const Param& p : params) {
+        auto it = std::find_if(grads->begin(), grads->end(),
+                               [&](const Param& g) { return g.name == p.name; });
+        if (it == grads->end()) return;
+        ordered.push_back(std::move(*it));
+        grads->erase(it);
+    }
+    *grads = std::move(ordered);
+}
+
 // A delta parameter's leaf under its module, found by the shape the split is about to write. The
 // adjoint's own leaf names are the engine's spelling, which the join must not repeat: a second
 // adapter kind names its factors differently and this still finds and writes them.
@@ -934,6 +952,7 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
         // under every module name the split then adds the real gradient for.
         split_adapter_grads(grads, params, groups, grad_prefix);
         fill_missing_grads(grads, params);
+        order_grads_like(grads, params);
         // The report's own boundary copies grow with the number of layers; name them rather than
         // fold them into the peaks, which describe the join's working set.
         for (const std::vector<double>& v : measured.boundary_value)

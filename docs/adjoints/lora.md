@@ -60,8 +60,12 @@ with its `a_scale` an absent position rather than a missing one.
     y[m, n] += scale[s, n] * sum_j t[m, j] * B[s, n, j]      s = slot[m]
 
 `scale` is the adapter's `alpha / r` (2.0 by default, `docs/ADAPTER.md` 4) laid out per adapter row
-and output row. `lora_expand_mm` is the same op with `t` rounded to bf16 before the sum, the
-formulation a GEMM that reads bf16 operands uses.
+and output row. A coded trunk's record carries it as a fifth operand; a bf16 trunk's record has no
+scale operand at all, and its fourth is the `y` the op writes. The layout therefore takes the
+scale from a five-operand record only, and reads a four-operand one at `1.0`: the written `y` is a
+buffer, not a factor, and reading it as `scale` multiplies every row by whatever it held.
+`lora_expand_mm` is the same op with `t` rounded to bf16 before the sum, the formulation a GEMM
+that reads bf16 operands uses.
 
 Both ops are in radiance's op inventory at this pin, `lora_shrink` including the coded activation
 (`ref_lora.cpp` reads the scale stream for it), so the int8 form is checked against the kernel and

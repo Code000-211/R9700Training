@@ -151,6 +151,31 @@ std::string number(double value) {
     return out.str();
 }
 
+// A JSON string literal. A path with a quote or a backslash must not break run.json.
+std::string quoted(const std::string& text) {
+    std::string out = "\"";
+    for (const char c : text) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    static const char* digits = "0123456789abcdef";
+                    out += "\\u00";
+                    out += digits[(static_cast<unsigned char>(c) >> 4) & 0xf];
+                    out += digits[static_cast<unsigned char>(c) & 0xf];
+                } else {
+                    out += c;
+                }
+        }
+    }
+    out += '"';
+    return out;
+}
+
 uint64_t splitmix64(uint64_t state) {
     state += 0x9e3779b97f4a7c15ull;
     state = (state ^ (state >> 30)) * 0xbf58476d1ce4e5b9ull;
@@ -580,6 +605,7 @@ struct Trainer::Impl {
     uint64_t rng_state = 0;
     int64_t last_saved_step = -1;
     int64_t last_eval_step = -1;
+    bool config_written = false;
 
     Impl(StepFn step, StepFn eval, ParamSet& parameters, Optimiser& optimiser_,
          Batcher& batcher_, TrainerOptions options_)
@@ -615,6 +641,60 @@ struct Trainer::Impl {
     bool horizon_reached() const {
         if (config.steps > 0) return step >= config.steps;
         return batcher.position().epoch >= config.epochs;
+    }
+
+    // The run's configuration, beside the log: the objective's and the delta's names as the caller
+    // resolved them, the schedule the loop runs, and the base_id every checkpoint carries. Written
+    // once when the loop first runs, so a refused resume -- which throws before this -- leaves the
+    // configuration it refused in place.
+    void write_run_config() {
+        if (config_written) return;
+        std::ostringstream json;
+        json << "{\"model\":" << quoted(config.model) << ",\"data\":" << quoted(config.data)
+             << ",\"heldout\":" << quoted(config.heldout)
+             << ",\"out\":" << quoted(config.out)
+             << ",\"objective\":" << quoted(config.objective)
+             << ",\"delta.kind\":" << quoted(config.delta.kind)
+             << ",\"delta.rank\":" << config.delta.rank
+             << ",\"delta.alpha\":" << number(config.delta.alpha)
+             << ",\"delta.targets\":[";
+        for (size_t i = 0; i < config.delta.targets.size(); ++i) {
+            if (i > 0) json << ',';
+            json << quoted(config.delta.targets[i]);
+        }
+        json << "]"
+             << ",\"delta.gate\":" << (config.delta.gate ? "true" : "false")
+             << ",\"lr\":" << number(config.lr)
+             << ",\"weight_decay\":" << number(config.weight_decay)
+             << ",\"warmup_steps\":" << config.warmup_steps
+             << ",\"token_budget\":" << config.token_budget
+             << ",\"accumulation\":" << config.accumulation
+             << ",\"steps\":" << config.steps << ",\"epochs\":" << config.epochs
+             << ",\"seed\":" << config.seed << ",\"eval_every\":" << config.eval_every
+             << ",\"checkpoint_every\":" << config.checkpoint_every
+             << ",\"base_id\":" << quoted(config.base_id) << "}\n";
+
+        const fs::path target = fs::path(config.out) / "run.json";
+        const fs::path temporary = fs::path(config.out) / "run.json.tmp";
+        {
+            std::ofstream out(temporary.string(), std::ios::trunc);
+            if (!out)
+                throw std::runtime_error("r97: trainer: cannot write '" + temporary.string() +
+                                         "'");
+            out << json.str();
+            if (!out)
+                throw std::runtime_error("r97: trainer: cannot write '" + temporary.string() +
+                                         "'");
+        }
+        std::error_code error;
+        fs::rename(temporary, target, error);
+        if (error) {
+            std::error_code ignored;
+            fs::remove(temporary, ignored);
+            throw std::runtime_error("r97: trainer: cannot replace '" + target.string() +
+                                     "': " + error.message());
+        }
+        config_written = true;
     }
 
     TrainerState make_state() const {
@@ -874,6 +954,7 @@ int64_t Trainer::run_steps(int64_t count) {
     if (count < 0)
         throw std::invalid_argument("r97: trainer: run_steps needs a non-negative count");
     Impl& trainer = *impl_;
+    trainer.write_run_config();
     int64_t taken = 0;
     while (taken < count && !trainer.horizon_reached()) {
         if (!trainer.take_step()) continue;
