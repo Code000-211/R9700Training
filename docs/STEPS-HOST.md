@@ -156,15 +156,15 @@ factor, which is what a scale error in the gradient would put there: at the same
 `mlp.down_proj` reads 1.20 against its difference and `linear_attn.in_proj_qkv` 1.55.
 
 Ten random directions over the whole adapter, each differenced at the same steps
-(`host_step_gradient_holds_ten_whole_adapter_directions`). Measured: the analytic sums to -403.965
-against the difference's -334.671, an error of 69.3 over a scatter sum of 152.0 (tolerance 473),
-with the per-direction ratios 0.653, 0.874, 0.779, 0.726, 0.686, 0.975, 0.512, 0.868, 1.083, 1.006
--- relative errors against the issue's 1e-3 of 0.35, 0.13, 0.22, 0.27, 0.31, 0.025, 0.49, 0.13,
-0.083 and 0.0057, each of which the case prints beside the step pair it used.
-Nine of the ten sit between 0.65 and 1.08, i.e. inside their own scatter; direction 6 comes in at
-0.512 with a scatter of only 0.197, which is the figure that asks whether the secant or the
-gradient is wrong: the pair of steps agrees with itself to under two per cent and still disagrees
-with the gradient by half.
+(`host_step_gradient_holds_ten_whole_adapter_directions`). Measured: the analytic sums to -386.041
+against the difference's -369.11, an error of 16.9 over a scatter sum of 173 (tolerance 537),
+with the per-direction ratios 0.9425, 1.139, 0.898, 0.765, 0.904, 0.867, 0.952, 1.466, 0.826, 0.990
+-- relative errors against the issue's 1e-3 of 0.0575, 0.138, 0.102, 0.235, 0.0963, 0.133, 0.0484,
+0.466, 0.174 and 0.00994, each of which the case prints beside the step pair it used.
+Nine of the ten sit between 0.76 and 1.14, i.e. inside their own scatter; direction 7 comes in at
+1.466 with a scatter of 25 against a difference of 52.6, so the case's scatter rule passes it, but
+the figure still asks whether the secant or the gradient is wrong, and the secants themselves
+cannot say.
 
 That question has an exact forward to answer it. `make_reference_step` runs the same recorded op
 graph in f64 from the registered twins, with no card and no bf16, so
@@ -192,18 +192,19 @@ against the reference's 7.73519858105, 1.7e-8 of itself.
   directions: 5.8e-5, 5.1e-5, 1.5e-4, 6.6e-5, 5.0e-5, 6.0e-6, 4.1e-5, 8.8e-5, 1.1e-5, 5.2e-5 --
   worst 1.5e-4; halving the step moves the difference by 3.7e-5 to 3.2e-3 of the gradient;
 * the exact step's own secant at the ten-direction case's steps, `16` and `32` units of `2^-11`:
-  the secant's bias with the trunk's rounding taken out. It sits 57 % to 134 % of the gradient away
-  -- measured 0.575, 0.814, 0.873, 0.874, 1.00, 1.07, 1.11, 1.15, 1.28, 1.34 -- so the
+  the secant's bias with the trunk's rounding taken out. It sits 79 % to 126 % of the gradient away
+  -- measured 1.24, 0.803, 0.794, 1.10, 1.08, 1.01, 0.883, 1.03, 0.796, 1.26 -- so the
   ten-direction case's steps are not a derivative even on an f64 forward, and the case fails if any
-  direction comes in under half the gradient there. That is the whole of the answer to direction 6
+  direction comes in under half the gradient there. That is the whole of the answer to direction 7
   above: the step, not the gradient;
 * the join's gradient against the exact step's, on the join as shipped (its default
   reference-shaped head split, the one the oracle case and `r97train grad` use). The only thing
   between the two is the bf16 trunk, whose own agreement the oracle case below measures per
   boundary and per adapted linear. Each direction's ratio must stay in `[1/kJoinGap, kJoinGap]`,
   with `kJoinGap` 2.0: a direction may not flip and a factor is a real bound, not a sign-blind
-  absolute difference. Measured over the ten seeded directions (`kJoinDirectionSeed`
-  `0x4b35b4a458955dd5`): 0.678, 1.25, 0.639, 0.562, 1.03, 1.20, 0.946, 0.742, 1.23 and 0.784 --
+  absolute difference. Measured over the same ten seeded directions (`kDirectionSeed`
+  `0x4b35b4a458955dd5` and `kDirectionStride`): 0.678, 1.25, 0.639, 0.562, 1.03, 1.20, 0.946,
+  0.742, 1.23 and 0.784 --
   all the same sign, worst factor 1.78. The directions are a guard, not a measurement (a random
   Rademacher direction can be nearly orthogonal to the difference), so the whole gradients are
   also held directly: cosine 0.8716 against floors 0.85, norm ratio 0.9754 against 0.10.

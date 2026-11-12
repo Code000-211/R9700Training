@@ -3,9 +3,7 @@ Upstream: not-submitted
 
 --- a/abi/rad_runtime.h
 +++ b/abi/rad_runtime.h
-@@ -943,6 +943,7 @@
-     int64_t  view_stride[RAD_MAX_RANK];
-     int64_t  view_off;
+@@ -936,4 +936,5 @@
      uint8_t  written;      /* 1 for RAD_OPD_OUT and RAD_OPD_INOUT, 0 otherwise */
 +    uint8_t  inout;        /* 1 for RAD_OPD_INOUT, whose previous value the kernel also reads */
  } RadIssueOperand;

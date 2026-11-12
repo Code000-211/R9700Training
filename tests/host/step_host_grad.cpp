@@ -68,6 +68,11 @@ constexpr int kGridShift = 11;         // the adapter's grid: k * 2^-11
 constexpr int32_t kGridMax = 64;       // |k| <= 64, so |p| <= 1/32
 constexpr int kStepFine = 16;          // 16 * 2^-11, the fine central difference
 constexpr int kStepCoarse = 32;         // 32 * 2^-11, the coarse one the pair extrapolates from
+// The ten seeded directions every case here uses: one seed and one stride, so trial i is the same
+// direction in the driver's case and in the exact-step case, as the issue asks. The driver's
+// figures in `docs/STEPS-HOST.md` are measured along them.
+constexpr uint64_t kDirectionSeed = 0x4b35b4a458955dd5ULL;
+constexpr uint64_t kDirectionStride = 0x9e3779b97f4a7c15ULL;
 
 // Measured agreement with central differences, one whole-module direction each, at the two step
 // sizes above. The relative figures are today's with half again as much room. Every adapted linear
@@ -325,7 +330,7 @@ R97_TEST(host_step_gradient_holds_ten_whole_adapter_directions) {
                 std::ldexp(double(kStepCoarse), -kGridShift));
     double sum_analytic = 0.0, sum_fd = 0.0, sum_scatter = 0.0, worst = 0.0;
     for (int trial = 0; trial < 10; ++trial) {
-        uint64_t st = 0x2545f4914f6cdd1dULL + 0x9e3779b97f4a7c15ULL * uint64_t(trial);
+        uint64_t st = kDirectionSeed + kDirectionStride * uint64_t(trial);
         const Direction dir = whole_adapter_direction(params, &st);
         const double analytic = dot(dir, params, grads);
         const double fine = secant(dir, kStepFine);
@@ -702,7 +707,8 @@ R97_TEST(host_step_memory_does_not_grow_with_layers) {
 //     guard, because a random direction mixes every adapted linear and the rounding's share of
 //     one direction can be more than the gradient itself.
 //
-// The direction seeds are the ten-direction case's, so trial 6 here is trial 6 there.
+// The directions are the ten-direction case's, from one seed and one stride: trial i here is
+// trial i there.
 // `docs/STEPS-HOST.md` records the figures and what they settle.
 //
 // The reference step keeps each slot's factor under the module that owns it, as this join's
@@ -795,9 +801,8 @@ R97_TEST(host_step_gradient_against_the_exact_step_at_the_same_steps) {
     double join_worst = 0.0;
     double bias_worst = 1.0;
     double wobble_worst = 0.0;
-    constexpr uint64_t kJoinDirectionSeed = 0x4b35b4a458955dd5ULL;
     for (int trial = 0; trial < 10; ++trial) {
-        uint64_t st = kJoinDirectionSeed + 0x9e3779b97f4a7c15ULL * uint64_t(trial);
+        uint64_t st = kDirectionSeed + kDirectionStride * uint64_t(trial);
         const Direction dir = whole_adapter_direction(params, &st);
 
         const double g_exact = dot(dir, params, exact_grads);

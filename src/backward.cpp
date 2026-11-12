@@ -492,7 +492,6 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             // replaced carries the write's cotangent unchanged (an expand adds its branch to y
             // without touching the read's slot; a mul, a rope or a state update fill theirs).
             for (size_t j = 0; j < rec.operands.size(); ++j) {
-                if (rec.op != "lora_expand" && rec.op != "lora_expand_mm") continue;
                 if (!in_place_read(rec, j) || cot_index[j] < 0) continue;
                 double written = 0.0;
                 for (double v : dc[j].value) written += std::fabs(v);
@@ -501,8 +500,8 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             }
         }
 
-        // The writers' adjoint has run: their cotangent storage is done. This is every walk's,
-        // not only the passthrough one: nothing below reads a written version's cotangent again.
+        // The writers' adjoint has run: their cotangent storage is done. Nothing below reads a
+        // written version's cotangent again.
         for (size_t j = 0; j < rec.operands.size(); ++j)
             if (rec.operands[j].written && plan.write_version[i][j] >= 0)
                 release(version_at(i, j));
