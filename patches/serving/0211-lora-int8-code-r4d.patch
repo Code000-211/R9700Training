@@ -1,0 +1,234 @@
+Concern: a lora_shrink on a step-order int8 site reads the codes back, on the card
+Upstream: not-submitted
+diff --git a/docs/OPS.md b/docs/OPS.md
+index e796bfd..87a4140 100644
+--- a/docs/OPS.md
++++ b/docs/OPS.md
+@@ -906,10 +906,12 @@ GEMM's rows need not be the pass's token rows.
+   `gemm_dtype` is the encoding of the GEMM whose activation `a` is (`i8a8h`, `w8a8`, ...), which
+   says how that GEMM reads the codes: at `w4a8`/`w8a8`/`w2a8` `quant_act_i8` writes them in the
+   int8 WMMA's step order, while the rotated producers write column order. The core declares it from
+-  the GEMM's `dtype`; it is absent when the GEMM has none (a `bf16` `gemm_nt`). libref's and
+-  libavx's rows read either order, exchanging the step order back as `gemm_nt_q` does; libr4d's and
+-  libhalo's rows read a row's codes by column only, so they refuse a step-order `gemm_dtype` with
+-  an `i8` `a` (`RAD_E_UNSUPPORTED`) rather than fold the codes of the wrong columns.
++  the GEMM's `dtype`; it is absent when the GEMM has none (a `bf16` `gemm_nt`). Every row --
++  libref's and libavx's, libr4d's and libhalo's -- reads either order, unexchanging the step order
++  back as `gemm_nt_q` does, so a `lora_shrink` on a `w4a8`/`w8a8`/`w2a8` site multiplies the code
++  of each column by the `lora_a` factor of that column. The unexchange is a shuffle of each
++  16-byte step, so a step-order `i8` `a` must be whole 16-byte steps, contiguous along the row:
++  otherwise the row refuses (`RAD_E_SHAPE` / `RAD_E_STRIDE`).
+   `lora_a` is `[S, R, K]` bf16, `t` is `[M, R]` f32.
+ - `lora_expand`: `y[m, n] = y[m, n] + scale[s, n] · Σ_j t[m, j] · lora_b[s, n, j]`, f32
+   accumulate, one rounding to `y`'s dtype (`bf16`/`f16`/`f32`, named by `dtype`). `lora_b` is
+diff --git a/libhalo/halo_lora_bf16.hip b/libhalo/halo_lora_bf16.hip
+index 74e8904..86f8231 100644
+--- a/libhalo/halo_lora_bf16.hip
++++ b/libhalo/halo_lora_bf16.hip
+@@ -67,6 +67,15 @@ namespace halo_lora {
+ /* What `a` holds; a template argument so the decode is chosen once per launch, not per element. */
+ enum { kBF16 = 0, kF16 = 1, kF32 = 2, kE4M3 = 3, kE5M2 = 4, kI8 = 5 };
+ 
++/* The int8 WMMA's step order (libref/ref_common.h, i8_step_pos): within a 16-byte step the middle
++ * two dwords are exchanged, so logical column c sits at byte i8_step_pos(c). Bits 2 and 3 of c
++ * are swapped; the map is a fixed shuffle of one 16-byte step and its own inverse. quant_act_i8
++ * writes a row in it for the w4a8/w8a8/w2a8 GEMM, and the rows here read it back so a lora_shrink
++ * on that site multiplies the code of each column by the A factor of that column. */
++__device__ __forceinline__ int i8_step_pos(int c) {
++    return (c & ~12) | ((c & 4) << 1) | ((c & 8) >> 1);
++}
++
+ struct ShrinkArgs {
+     const void*     a;    long long a_rs, a_cs;        /* element strides of `a` */
+     const float*    as;   long long s_rs, s_cs;        /* null: no scale stream */
+@@ -74,6 +83,7 @@ struct ShrinkArgs {
+     const uint16_t* la;   long long la_s0, la_s1, la_s2;
+     float*          t;    long long t_rs, t_cs;
+     int             K, group, R, S;                  /* K < 2^31: 32-bit k and k / group */
++    int             step;                            /* a's i8 codes in the int8 WMMA's step order */
+ };
+ 
+ struct ExpandArgs {
+@@ -198,7 +208,9 @@ __global__ __launch_bounds__(256) void lora_shrink_kernel(ShrinkArgs A) {
+         const uint16_t* arow = A.la + (long long)s * A.la_s0 + (long long)j * A.la_s1;
+         float acc = 0.0f;
+         for (int k = lane; k < A.K; k += 32) {
+-            float x = ld_act<ADT>(A.a, x0 + (long long)k * A.a_cs);
++            /* i8 in the step order: the code of column k is at byte i8_step_pos(k) of the row. */
++            const int kc = (ADT == kI8 && A.step) ? i8_step_pos(k) : k;
++            float x = ld_act<ADT>(A.a, x0 + (long long)kc * A.a_cs);
+             if (A.as) x = x * A.as[s0 + (long long)(k / A.group) * A.s_cs];
+             acc += x * bf2f(arow[(long long)k * A.la_s2]);
+         }
+@@ -347,7 +359,7 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
+     }
+     if (!dtype_agrees(a, X->dtype)) return RAD_E_DTYPE;
+     if (adt >= kE4M3 && !XS) return RAD_E_INVAL;     /* a code without its scale has no value */
+-    if (adt == kI8 && i8_steps_dtype(rad_args_gets(a, "gemm_dtype"))) return RAD_E_UNSUPPORTED;
++    const int step = (adt == kI8 && i8_steps_dtype(rad_args_gets(a, "gemm_dtype"))) ? 1 : 0;
+     if (LA->dtype != RAD_BF16 || T->dtype != RAD_F32 || SL->dtype != RAD_I32) return RAD_E_DTYPE;
+ 
+     int64_t M = 0, t_rs = 0, t_cs = 0, xr = 0, x_rs = 0, x_cs = 0, sr = 0, sl_st = 0;
+@@ -393,6 +405,11 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
+     P.t = (float*)T->data; P.t_rs = t_rs; P.t_cs = t_cs;
+     P.K = (int)K; P.R = (int)R; P.S = (int)S;
+     if (!P.as) P.group = (int)K;
++    P.step = step;
++    if (step) {
++        if (K % 16) return RAD_E_SHAPE;              /* the step order is whole 16-byte steps */
++        if (x_cs != 1) return RAD_E_STRIDE;          /* ...contiguous along the row */
++    }
+     *out = P;
+     *adt_out = adt;
+     *M_out = M;
+@@ -584,10 +601,12 @@ __device__ __forceinline__ v16bf ld_pool_frag(const uint16_t* row, int k0, int K
+     return ld_u16<V>(row + (long long)k0 * cs, K - k0, cs);
+ }
+ 
+-/* An activation row's fragment: bf16 as it is, a code as the bf16 that holds it exactly. */
++/* An activation row's fragment: bf16 as it is, a code as the bf16 that holds it exactly. A step
++ * is the 16-byte int8 WMMA order (i8_step_pos); its slot e is the code of column k0 + e, so it is
++ * read back through i8_step_pos. */
+ template <int ADT, bool V>
+ __device__ __forceinline__ v16bf ld_act_frag(const void* a, long long row, int k0, int K,
+-                                            long long cs, bool on) {
++                                            long long cs, bool on, bool step) {
+     if (!on) return zero_frag();
+     if (ADT == kBF16) {
+         const uint16_t* p = (const uint16_t*)a + row;
+@@ -595,6 +614,21 @@ __device__ __forceinline__ v16bf ld_act_frag(const void* a, long long row, int k
+     }
+     const uint8_t* p = (const uint8_t*)a + row;
+     union { uint16_t h[16]; uint4 w[1]; v16bf f; } u;
++    if (ADT == kI8 && step) {
++        if (V && k0 + 16 <= K) {
++            u.w[0] = *(const uint4*)(p + k0);
++            const uint8_t* b = (const uint8_t*)&u.w[0];
++#pragma unroll
++            for (int e = 0; e < 16; ++e)
++                u.h[e] = (uint16_t)code_bf16<ADT>(b[i8_step_pos(e)]);
++            return u.f;
++        }
++#pragma unroll
++        for (int e = 0; e < 16; ++e)
++            u.h[e] = (k0 + e < K) ? (uint16_t)code_bf16<ADT>(p[(long long)k0 + i8_step_pos(e)])
++                                  : (uint16_t)0;
++        return u.f;
++    }
+     if (V && k0 + 16 <= K) {
+         u.w[0] = *(const uint4*)(p + k0);
+         uint16_t h[16];
+@@ -668,8 +702,8 @@ __global__ __launch_bounds__(kShThreads) void lora_shrink_wmma_kernel(ShrinkTArg
+                 const int k = su * kShStep;
+                 af[u][0] = ld_pool_frag<VA>(ap, k, A.K, A.la_s2, aon && in);
+                 af[u][1] = ld_pool_frag<VA>(ap, k + 16, A.K, A.la_s2, aon && in);
+-                xf[u][0] = ld_act_frag<ADT, VX>(A.a, xrow, k, A.K, A.a_cs, xon && in);
+-                xf[u][1] = ld_act_frag<ADT, VX>(A.a, xrow, k + 16, A.K, A.a_cs, xon && in);
++                xf[u][0] = ld_act_frag<ADT, VX>(A.a, xrow, k, A.K, A.a_cs, xon && in, A.step);
++                xf[u][1] = ld_act_frag<ADT, VX>(A.a, xrow, k + 16, A.K, A.a_cs, xon && in, A.step);
+                 sc[u] = 0.0f;
+                 if (ADT != kBF16 && xon && in)
+                     sc[u] = A.as[srow + (long long)((su * kShStep) / A.group) * A.s_cs];
+diff --git a/libr4d/r4d_lora_bf16.hip b/libr4d/r4d_lora_bf16.hip
+index 68576d1..d016d5f 100644
+--- a/libr4d/r4d_lora_bf16.hip
++++ b/libr4d/r4d_lora_bf16.hip
+@@ -64,6 +64,15 @@ namespace r4d_lora {
+ /* What `a` holds; a template argument so the decode is chosen once per launch, not per element. */
+ enum { kBF16 = 0, kF16 = 1, kF32 = 2, kE4M3 = 3, kE5M2 = 4, kI8 = 5 };
+ 
++/* The int8 WMMA's step order (libref/ref_common.h, i8_step_pos): within a 16-byte step the middle
++ * two dwords are exchanged, so logical column c sits at byte i8_step_pos(c). Bits 2 and 3 of c
++ * are swapped; the map is a fixed shuffle of one 16-byte step and its own inverse. quant_act_i8
++ * writes a row in it for the w4a8/w8a8/w2a8 GEMM, and the rows here read it back so a lora_shrink
++ * on that site multiplies the code of each column by the A factor of that column. */
++__device__ __forceinline__ int i8_step_pos(int c) {
++    return (c & ~12) | ((c & 4) << 1) | ((c & 8) >> 1);
++}
++
+ struct ShrinkArgs {
+     const void*     a;    long long a_rs, a_cs;        /* element strides of `a` */
+     const float*    as;   long long s_rs, s_cs;        /* null: no scale stream */
+@@ -71,6 +80,7 @@ struct ShrinkArgs {
+     const uint16_t* la;   long long la_s0, la_s1, la_s2;
+     float*          t;    long long t_rs, t_cs;
+     int             K, group, R, S;                  /* K < 2^31: 32-bit k and k / group */
++    int             step;                            /* a's i8 codes in the int8 WMMA's step order */
+ };
+ 
+ struct ExpandArgs {
+@@ -195,7 +205,9 @@ __global__ __launch_bounds__(256) void lora_shrink_kernel(ShrinkArgs A) {
+         const uint16_t* arow = A.la + (long long)s * A.la_s0 + (long long)j * A.la_s1;
+         float acc = 0.0f;
+         for (int k = lane; k < A.K; k += 32) {
+-            float x = ld_act<ADT>(A.a, x0 + (long long)k * A.a_cs);
++            /* i8 in the step order: the code of column k is at byte i8_step_pos(k) of the row. */
++            const int kc = (ADT == kI8 && A.step) ? i8_step_pos(k) : k;
++            float x = ld_act<ADT>(A.a, x0 + (long long)kc * A.a_cs);
+             if (A.as) x = x * A.as[s0 + (long long)(k / A.group) * A.s_cs];
+             acc += x * bf2f(arow[(long long)k * A.la_s2]);
+         }
+@@ -334,7 +346,7 @@ __device__ __forceinline__ void ld_pool16(const uint16_t* p, int k, int K, long
+  * bf16 that holds it. Off (the row is another slot's, or past M): zeros, and nothing is read. */
+ template <int ADT, bool V>
+ __device__ __forceinline__ void ld_act16(const void* a, long long row, int k, int K, long long cs,
+-                                         bool on, lr_v8s* f) {
++                                         bool on, lr_v8s* f, bool step) {
+     f[0] = (lr_v8s)(short)0;
+     f[1] = (lr_v8s)(short)0;
+     if (!on) return;
+@@ -343,6 +355,24 @@ __device__ __forceinline__ void ld_act16(const void* a, long long row, int k, in
+         return;
+     }
+     const uint8_t* p = (const uint8_t*)a + row;
++    if (ADT == kI8 && step) {
++        /* i8 in the step order: slot e is the code of column k + e, stored at byte k +
++         * i8_step_pos(e) -- the 16 bytes of the step are the permutation, so read them back. */
++        if (V && k + 16 <= K) {
++            const lr_v4u q = *(const lr_v4u*)(p + k);
++            for (int e = 0; e < 16; ++e) {
++                const int pe = i8_step_pos(e);
++                f[e >> 3][e & 7] = (short)code_bf16<ADT>((q[pe >> 2] >> (8 * (pe & 3))) & 0xffu);
++            }
++        } else {
++            for (int e = 0; e < 16; ++e)
++                if (k + e < K) {
++                    const int pe = i8_step_pos(e);
++                    f[e >> 3][e & 7] = (short)code_bf16<ADT>(p[(long long)k + pe]);
++                }
++        }
++        return;
++    }
+     if (V && k + 16 <= K) {
+         const lr_v4u q = *(const lr_v4u*)(p + k);
+         for (int e = 0; e < 16; ++e)
+@@ -419,7 +449,7 @@ __global__ __launch_bounds__(kShThreads) void lora_shrink_wmma_kernel(ShrinkTArg
+                 const bool in = su < st1;
+                 const int k = su * kShStep + half * 16;
+                 ld_pool16<VA>(ap, k, A.K, A.la_s2, aon && in, af[u]);
+-                ld_act16<ADT, VX>(A.a, xrow, k, A.K, A.a_cs, xon && in, xf[u]);
++                ld_act16<ADT, VX>(A.a, xrow, k, A.K, A.a_cs, xon && in, xf[u], A.step);
+                 sc[u] = 0.0f;
+                 if (ADT != kBF16 && xon && in)
+                     sc[u] = A.as[srow + (long long)((su * kShStep) / A.group) * A.s_cs];
+@@ -820,7 +850,7 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
+     }
+     if (!dtype_agrees(a, X->dtype)) return RAD_E_DTYPE;
+     if (adt >= kE4M3 && !XS) return RAD_E_INVAL;     /* a code without its scale has no value */
+-    if (adt == kI8 && i8_steps_dtype(rad_args_gets(a, "gemm_dtype"))) return RAD_E_UNSUPPORTED;
++    const int step = (adt == kI8 && i8_steps_dtype(rad_args_gets(a, "gemm_dtype"))) ? 1 : 0;
+     if (LA->dtype != RAD_BF16 || T->dtype != RAD_F32 || SL->dtype != RAD_I32) return RAD_E_DTYPE;
+ 
+     int64_t M = 0, t_rs = 0, t_cs = 0, xr = 0, x_rs = 0, x_cs = 0, sr = 0, sl_st = 0;
+@@ -866,6 +896,11 @@ static int shrink_operands(const RadArgs* a, ShrinkArgs* out, int* adt_out, int6
+     P.t = (float*)T->data; P.t_rs = t_rs; P.t_cs = t_cs;
+     P.K = (int)K; P.R = (int)R; P.S = (int)S;
+     if (!P.as) P.group = (int)K;
++    P.step = step;
++    if (step) {
++        if (K % 16) return RAD_E_SHAPE;              /* the step order is whole 16-byte steps */
++        if (x_cs != 1) return RAD_E_STRIDE;          /* ...contiguous along the row */
++    }
+     *out = P;
+     *adt_out = adt;
+     *M_out = M;
