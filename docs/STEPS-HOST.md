@@ -375,12 +375,12 @@ the bf16 side runs the same `lora_A` mapped through `R = H/sqrt(128)`.
   whole gradient is not measurable in the form it asks.** The int8 container fuses the delta net's
   input projection with its gate (`ssm_inz`) and hands `gdn_conv_prep` the AB projection as an
   operand of its own, where the bf16 container gives that op one 136-wide `gdn_in` and reads the AB
-  operand as slices of the same buffer. From the delta net's scan on the two walks differentiate different records, and the
-  adapter gradients differ by more than the quantiser (measured: a cosine of 0.38 over the nine
-  targets, with the per-block diffs localised to `gdn_chunk_scan` and `attn_paged`). The issue's
-  direction check is therefore taken at the boundaries above, which the fusion does not affect. A
-  pair of containers that lay the delta net out the same way would make the whole-gradient cosine
-  measurable.
+  operand as slices of the same buffer. From the delta net's scan on the two walks differentiate
+  different records, and the adapter gradients differ by more than the quantiser (measured: a
+  cosine of 0.38 over the nine targets, with the per-block diffs localised to `gdn_chunk_scan` and
+  `attn_paged`). The issue's direction check is therefore taken at the boundaries above, which the
+  fusion does not affect. A pair of containers that lay the delta net out the same way would make
+  the whole-gradient cosine measurable.
 
 *The join is the bf16 forward, by decision.* An earlier round of this card made `host_step`
 delegate to `make_reference_step`, so that the checks could be met at the issue's tolerance; the

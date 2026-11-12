@@ -567,12 +567,14 @@ FusedCase fused_case(const char* op, const FusedShape& s, bool linearised, uint6
             const std::vector<AdValue> fwd = forward(fused_rec(op, s, false), c.in);
             c.in.push_back(fwd[3]); /* the bf16 activation the quantiser saw */
         }
-        c.out.push_back(values("bf16", {s.rows, s.n}, std::vector<double>((size_t)(s.rows * s.n), 0)));
+        c.out.push_back(
+            values("bf16", {s.rows, s.n}, std::vector<double>((size_t)(s.rows * s.n), 0)));
         c.out.push_back(values("fp8_e4m3", {s.rows, s.n},
                                std::vector<double>((size_t)(s.rows * s.n), 0)));
         c.out.push_back(values("f32", {s.rows, ngrp},
                                std::vector<double>((size_t)(s.rows * ngrp), 0)));
-        c.out.push_back(values("bf16", {s.rows, s.n}, std::vector<double>((size_t)(s.rows * s.n), 0)));
+        c.out.push_back(
+            values("bf16", {s.rows, s.n}, std::vector<double>((size_t)(s.rows * s.n), 0)));
         return c;
     }
     const std::vector<double> gu = activation(Shape{s.name, s.rows, 2 * s.n, s.group}, seed);

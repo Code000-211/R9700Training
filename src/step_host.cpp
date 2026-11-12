@@ -127,14 +127,16 @@ bool joined_dense(const Operand& op, const OperandContent& content, std::vector<
     const auto* scale_bytes = static_cast<const uint8_t*>(scale_data);
     for (int64_t r = 0; r < rows; ++r) {
         for (int64_t c = 0; c < cols; ++c) {
-            const double code = read_elem(code_name, code_bytes + r * codes->row_bytes + c * code_es, 0);
+            const double code =
+                read_elem(code_name, code_bytes + r * codes->row_bytes + c * code_es, 0);
             double scale = 1.0;
             if (scale_bytes != nullptr) {
                 const int64_t sr = r / block_r;
                 const int64_t sc = c / block_c;
                 if (sr >= scales->rows || sc >= scales->cols)
                     throw std::runtime_error("host step: a joined weight's scale plane is short");
-                scale = read_elem(scale_name, scale_bytes + sr * scales->row_bytes + sc * scale_es, 0);
+                scale =
+                    read_elem(scale_name, scale_bytes + sr * scales->row_bytes + sc * scale_es, 0);
             }
             (*out)[static_cast<size_t>(r * cols + c)] = code * scale;
         }

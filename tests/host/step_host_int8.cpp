@@ -119,7 +119,8 @@ void hadamard_128(std::vector<float>& v, int64_t rows) {
                         line[static_cast<size_t>(i + j + step)] = a - b;
                     }
             for (int64_t i = 0; i < block; ++i)
-                v[static_cast<size_t>(r * cols + c0 + i)] = static_cast<float>(line[static_cast<size_t>(i)] * scale);
+                v[static_cast<size_t>(r * cols + c0 + i)] =
+                    static_cast<float>(line[static_cast<size_t>(i)] * scale);
         }
     }
 }
