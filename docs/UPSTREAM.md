@@ -29,7 +29,8 @@ two header lines and any explanation) is free; only the diff counts.
 `-DR97_PATCH_SKIP=<number>` leaves out every patch whose number (the leading digits of its file
 name) is `<number>`, which is how a build proves that a patch is optional. A build with
 `-DR97_PATCH_SKIP=0102` has the issue observer but no layer replay; the host tier skips the two
-replay tests by name, and `r97train grad` is not registered because it calls the join. See
+replay tests and the ten host-join cases by name, and `r97train grad` is not registered because it
+calls the join. See
 `docs/reports/2026-11-11-patch-audit.md`.
 
 ## The patches

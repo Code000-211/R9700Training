@@ -35,7 +35,6 @@
 #include "r97/step.h"
 #include "r97/step_host.h"
 #include "support/late_fixture.h"
-#include "support/test.h"
 
 #include <algorithm>
 #include <cmath>
@@ -48,7 +47,8 @@
 #include <string>
 #include <vector>
 
-#if R97_FORWARD
+#if R97_FORWARD && defined(RAD_REPLAY_BLOCK)
+#include "../support/test.h"
 namespace {
 
 // The adapter's parameters are pinned to a grid of 2^-11 with |k| <= 64, so a perturbation of one
@@ -302,5 +302,19 @@ R97_TEST(host_step_boundary_cotangents_match_finite_differences) {
         throw std::runtime_error(all);
     }
 }
-#endif
+#else
+#include "../support/self_check.h"
 
+namespace {
+
+// The tier says a skip by name, not a test that silently disappears from its output.
+constexpr const char* kNoJoin =
+    "radiance patch 0102 (the replay block) is not in this build, so the host join cannot run";
+struct StepHostSkips {
+    StepHostSkips() {
+        ::r97test::skip("host_step_boundary_cotangents_match_finite_differences", kNoJoin);
+    }
+} step_host_skips;
+
+}  // namespace
+#endif  // R97_FORWARD && defined(RAD_REPLAY_BLOCK)

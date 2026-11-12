@@ -319,11 +319,6 @@ if(R97_BUILD_TESTS)
   # host tests, one binary; every source under tests/host/ joins it.
   file(GLOB R97_HOST_TEST_SOURCES CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_SOURCE_DIR}/tests/host/*.cpp)
-  # The host join needs the replay patch's layer replay; a build that leaves it out has no host
-  # step to test, and the cases' sources would not compile against the empty header.
-  if(R97_PATCH_SKIP MATCHES "0102")
-    list(FILTER R97_HOST_TEST_SOURCES EXCLUDE REGEX ".*/step_host_(boundary|grad|oracle)[.]cpp$")
-  endif()
   if(NOT R97_HOST_TEST_SOURCES STREQUAL "")
     add_executable(r97_host_tests ${R97_HOST_TEST_SOURCES})
     # The plugins are dlopen()ed and call back into rad_core, so its symbols must be in the

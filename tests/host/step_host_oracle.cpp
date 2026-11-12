@@ -26,7 +26,6 @@
 #include "r97/step_host.h"
 #include "support/late_fixture.h"
 #include "support/oracle.h"
-#include "support/test.h"
 
 #include <algorithm>
 #include <cmath>
@@ -38,7 +37,8 @@
 #include <variant>
 #include <vector>
 
-#if R97_FORWARD
+#if R97_FORWARD && defined(RAD_REPLAY_BLOCK)
+#include "../support/test.h"
 
 namespace {
 
@@ -264,20 +264,19 @@ R97_TEST(host_step_matches_the_oracle_boundaries_and_adapter_gradient) {
             const Figure v = compare(at + " value", value, ref.tensor(seq + "/residual." +
                                                                      std::to_string(i)).data);
             const BoundaryFloor& floor = kBoundaryFloors[i];
-            const bool held = floor.cosine >= 0.0;
-            std::printf("  oracle %s: cotangent cosine %.6f ratio %.4f (|mine| %.4g |ref| %.4g)  "
-                        "residual cosine %.6f ratio %.4f%s\n",
+            std::printf("  oracle %s: cotangent cosine %.6f ratio %.4f (|mine| %.4g |ref| %.4g)%s  "
+                        "residual cosine %.6f ratio %.4f\n",
                         at.c_str(), f.cosine, f.ratio, norm(mine), norm(ref.tensor(seq +
-                        "/residual_grad." + std::to_string(i)).data), v.cosine, v.ratio,
-                        held ? "" : "  (not held)");
+                        "/residual_grad." + std::to_string(i)).data), f.miss ? "  (miss)" : "",
+                        v.cosine, v.ratio);
             // The residual values are the forward's own: they must match the reference's.
             if (!(v.cosine >= kResidualCosine && std::fabs(v.ratio - 1.0) <= kResidualNorm))
                 throw std::runtime_error("oracle: " + v.name +
                                          " does not match the reference's residual: cosine " +
                                          std::to_string(v.cosine) + ", norm ratio " +
                                          std::to_string(v.ratio));
-            if (held && !(f.cosine >= floor.cosine &&
-                          (floor.norm == 0.0 || std::fabs(f.ratio - 1.0) <= floor.norm)))
+            if (!(f.cosine >= floor.cosine &&
+                  (floor.norm == 0.0 || std::fabs(f.ratio - 1.0) <= floor.norm)))
                 throw std::runtime_error("oracle: " + f.name +
                                          " is below the measured floor: cosine " +
                                          std::to_string(f.cosine) + " of " +
@@ -367,5 +366,19 @@ R97_TEST(host_step_matches_the_oracle_boundaries_and_adapter_gradient) {
                                  std::to_string(loss_rel));
 }
 
-#endif  // R97_FORWARD
+#else
+#include "../support/self_check.h"
 
+namespace {
+
+// The tier says a skip by name, not a test that silently disappears from its output.
+constexpr const char* kNoJoin =
+    "radiance patch 0102 (the replay block) is not in this build, so the host join cannot run";
+struct StepHostSkips {
+    StepHostSkips() {
+        ::r97test::skip("host_step_matches_the_oracle_boundaries_and_adapter_gradient", kNoJoin);
+    }
+} step_host_skips;
+
+}  // namespace
+#endif  // R97_FORWARD && defined(RAD_REPLAY_BLOCK)
