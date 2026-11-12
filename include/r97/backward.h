@@ -50,6 +50,9 @@ public:
     void set(int64_t position, size_t operand, AdValue value);
     const AdValue* at(int64_t position, size_t operand) const override;
     size_t size() const { return values_.size(); }
+    // The payload the store holds, in bytes of values (not shapes or names), so a caller that
+    // keeps a whole block's snapshots can say what it holds.
+    int64_t bytes() const;
 
 private:
     std::map<std::pair<int64_t, size_t>, AdValue> values_;
@@ -69,12 +72,31 @@ struct BackwardOptions {
     Side side = Side::host;          // which adjoint rows the walk asks the registry for
     ParamSet* grads = nullptr;       // added to, or null when the walk adds no gradients
     const char* prefix = "";         // the name prefix the grads entries carry (Delta::grad_prefix)
-    // When set, a fused lora record's per-slot leaf names come from this callback instead of
-    // `prefix` (slot -> module path). Empty for a delta with no fused slots.
-    std::function<std::string(int64_t slot)> slot_prefix;
+    // Optional: when set, a fused lora record's per-slot leaf names come from this callback instead
+    // of `prefix` (slot -> module path). It is given the record, because a fused weight's lora
+    // record carries several modules in one pool and the caller needs the record's weight to say
+    // which pool the slot belongs to. Empty for a delta with no fused slots.
+    std::function<std::string(const OpRecord&, int64_t)> slot_prefix;
+    // Optional: the name a record's parameter gradients take, when one walk covers records whose
+    // parameters live in different places (a fused pool's modules, or a record that names none and
+    // keeps `prefix`). Empty keeps `prefix` for every record.
+    std::function<std::string(const OpRecord&)> record_prefix;
+    // Optional: the record the adjoint sees. A live tape names the engine's buffers and its op
+    // parameters can give the engine's capacity where the schema names the step's own rows; the
+    // walk's versions, boundaries and snapshots still use the record as recorded. The callback
+    // fills `out` from the record when it wants a different view.
+    std::function<void(const OpRecord&, OpRecord*)> prepare_record;
     // Op names whose path ends here: their adjoint never runs and no cotangent reaches their
     // reads. The record still consumes the cotangent of what it wrote.
     std::vector<std::string> stops;
+    // A write that replaces the value it read also carries that value's cotangent on the direct
+    // path. Set when the caller's adjoint row leaves the in-place read's slot empty; the walk then
+    // copies the write's cotangent into it, and the read travels to the version it saw.
+    bool in_place_passthrough = false;
+    // A record's slots share one fused factor: the lora rows write a slot's rows into one
+    // [S*R, K] (A) / [N, S*R] (B) gradient under the record's prefix, for a caller that splits it
+    // afterwards. False keeps each slot under `prefix` or `slot_prefix`.
+    bool fused_slots = false;
 };
 
 // The cotangent of one of the block's inputs: a buffer the block read but never wrote. It is dense
@@ -88,9 +110,9 @@ struct InputCotangent {
 };
 
 // What the walk held at once, in bytes of tensor payload (values, not shapes or names): the
-// forward values of one op (the only snapshots the core holds itself), and the cotangents -- the
-// live version store, the block-input accumulators, and the cot/dc vectors of the op being
-// adjointed.
+// forward values of one op (the only snapshots the core holds itself, beside the provider the
+// caller holds), and the cotangents -- the live version store, the block-input accumulators, and
+// the cot/dc vectors of the op being adjointed.
 struct BackwardReport {
     int64_t peak_snapshot_bytes = 0;
     int64_t peak_cotangent_bytes = 0;

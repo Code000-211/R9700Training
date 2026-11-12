@@ -205,6 +205,16 @@ double a_at(const Shrink& sh, int64_t s, int64_t j, int64_t k) {
     return sh.la->value[(size_t)((s * sh.R + j) * sh.K + k)];
 }
 
+// A slot's trainable factor goes under the record's fused name when the caller splits a fused
+// factor afterwards, under the slot's module when the walk names modules, and under the record's
+// prefix otherwise. The shape's slot axis is the caller's business, and the writers place a slot's
+// rows at its offset in that axis.
+std::string factor_grad_name(const AdjointCall& call, const char* leaf, int64_t slot) {
+    if (call.fused_slots) return grad_name(call.prefix, leaf);
+    if (call.slot_prefix) return grad_name(call.slot_prefix(slot).c_str(), leaf);
+    return grad_name(call.prefix, leaf);
+}
+
 void lora_shrink_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
                       std::vector<AdValue>* out) {
     Shrink sh;
@@ -254,8 +264,14 @@ void lora_shrink_host_adjoint(const AdjointCall& call) {
         if ((int64_t)s_cot->value.size() != sh.M * sh.groups) return;
     }
 
-    Param* da = nullptr;
-    if (call.grads) da = &grad_entry(call.grads, grad_name(call.prefix, "lora_A"), {sh.R, sh.K});
+    // `grad_entry` hands a reference into the ParamSet, which a later entry may move: ask again
+    // for each slot and use the reference before the next entry is made.
+    const auto da_for = [&](int64_t s) -> Param* {
+        const std::vector<int64_t> shape =
+            call.fused_slots ? std::vector<int64_t>{sh.S * sh.R, sh.K}
+                             : std::vector<int64_t>{sh.R, sh.K};
+        return &grad_entry(call.grads, factor_grad_name(call, "lora_A", s), shape);
+    };
 
     std::vector<double> g((size_t)sh.K, 0.0);
     for (int64_t m = 0; m < sh.M; ++m) {
@@ -278,13 +294,17 @@ void lora_shrink_host_adjoint(const AdjointCall& call) {
             a_cot.value[e] += g[(size_t)k] * scale;
             s_cot->value[ge] += g[(size_t)k] * sh.a->value[e];
         }
-        if (da)
+        if (call.grads) {
+            Param* da = da_for(s);
+            const int64_t row0 = call.fused_slots ? s * sh.R : 0;
             for (int64_t j = 0; j < sh.R; ++j) {
                 const double c = t_cot.value[(size_t)(m * sh.R + j)];
                 if (c == 0.0) continue;
                 for (int64_t k = 0; k < sh.K; ++k)
-                    da->value[(size_t)(j * sh.K + k)] += (float)(c * x_at(sh, m, k));
+                    da->value[(size_t)((row0 + j) * sh.K + k)] +=
+                        (float)(c * x_at(sh, m, k));
             }
+        }
     }
 }
 
@@ -379,12 +399,17 @@ void lora_expand_host_adjoint(const AdjointCall& call) {
     AdValue& t_cot = call.dc->at(0);
     if ((int64_t)t_cot.value.size() != ex.M * ex.R) return;
 
-    Param* db = nullptr;
-    if (call.grads) db = &grad_entry(call.grads, grad_name(call.prefix, "lora_B"), {ex.N, ex.R});
+    const auto db_for = [&](int64_t s) -> Param* {
+        const std::vector<int64_t> shape =
+            call.fused_slots ? std::vector<int64_t>{ex.N, ex.S * ex.R}
+                             : std::vector<int64_t>{ex.N, ex.R};
+        return &grad_entry(call.grads, factor_grad_name(call, "lora_B", s), shape);
+    };
 
     for (int64_t m = 0; m < ex.M; ++m) {
         const int64_t s = row_slot(ex, m);
         if (s < 0) continue;
+        Param* const db = call.grads ? db_for(s) : nullptr;
         for (int64_t n = 0; n < ex.N; ++n) {
             const double c = y_cot.value[(size_t)(m * ex.N + n)];
             if (c == 0.0) continue;
@@ -392,10 +417,13 @@ void lora_expand_host_adjoint(const AdjointCall& call) {
             const size_t b0 = (size_t)((s * ex.N + n) * ex.R);
             for (int64_t j = 0; j < ex.R; ++j)
                 t_cot.value[(size_t)(m * ex.R + j)] += cs * ex.lb->value[b0 + (size_t)j];
-            if (db)
+            if (db) {
+                const int64_t cols = call.fused_slots ? ex.S * ex.R : ex.R;
+                const int64_t col0 = call.fused_slots ? s * ex.R : 0;
                 for (int64_t j = 0; j < ex.R; ++j)
-                    db->value[(size_t)(n * ex.R + j)] +=
+                    db->value[(size_t)(n * cols + col0 + j)] +=
                         (float)(cs * ex.t->value[(size_t)(m * ex.R + j)]);
+            }
         }
     }
 }
