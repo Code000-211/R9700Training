@@ -243,7 +243,14 @@ inline KernelReport check_kernel(const OpRecord& rec, const std::vector<AdValue>
     for (size_t i = 0; i < rec.operands.size(); ++i) {
         const bool inout = rec.operands[i].written &&
                            std::find(in_place.begin(), in_place.end(), i) != in_place.end();
-        const AdValue& a = (rec.operands[i].written && !inout) ? out_spec[w++] : in[r++];
+        // An in-place operand is both: its place among the writes picks the tensor's
+        // dtype and shape from `out_spec`, and its old value, which `in` carries, is
+        // what the buffer is filled with. Both cursors advance, so the operands after
+        // it line up.
+        const bool reads = !rec.operands[i].written || inout;
+        const AdValue& a = rec.operands[i].written ? out_spec[w++] : in[r];
+        const AdValue* old_value = reads ? &in[r] : nullptr;
+        if (reads) ++r;
         RadTensor x{};
         x.dtype = rad_dtype_parse(a.dtype.c_str());
         x.rank = (uint32_t)a.shape.size();
@@ -256,9 +263,9 @@ inline KernelReport check_kernel(const OpRecord& rec, const std::vector<AdValue>
         // Packed dtypes place several elements in a byte; bytes round up.
         const int64_t bits = (int64_t)rad_dtype_bits(x.dtype) * n;
         x.data = std::calloc((size_t)((bits + 7) / 8 > 0 ? (bits + 7) / 8 : 1), 1);
-        if (!rec.operands[i].written || inout)  // a plain write starts zeroed
+        if (old_value != nullptr)  // a plain write starts zeroed
             for (int64_t e = 0; e < n; ++e)
-                rad_store_f32(x.data, x.dtype, e, (float)a.value[(size_t)e]);
+                rad_store_f32(x.data, x.dtype, e, (float)old_value->value[(size_t)e]);
         t[i] = x;
     }
 
@@ -306,7 +313,8 @@ inline KernelReport check_kernel(const OpRecord& rec, const std::vector<AdValue>
                 rep.ok = false;
                 if (rep.note.empty())
                     rep.note = "kernel " + std::to_string(kv) + " vs twin " + std::to_string(tv) +
-                               " at element " + std::to_string(e);
+                               " at element " + std::to_string(e) + " of operand '" +
+                               rec.operands[i].buffer + "'";
             }
         }
         ++o;
@@ -363,8 +371,10 @@ inline FdReport check_adjoint(const OpRecord& rec, const std::vector<AdValue>& i
         return std::find(frozen.begin(), frozen.end(), i) != frozen.end();
     };
 
-    // The forward over the full schema: reads keep `in`'s values; writes get
-    // what the twin produced, which an adjoint may read back.
+    // The forward over the full schema: reads keep `in`'s values; every written operand gets what
+    // the twin produced, which an adjoint may read back. An in-place operand is both -- the twin
+    // writes its new value and an adjoint reads that, not the old one -- so the write's place in
+    // the twin's output list counts whether or not it is also a read.
     std::vector<AdValue> out_vals;
     twin(rec, in, &out_vals);
     if (out_vals.size() != out_spec.size()) {
@@ -376,10 +386,9 @@ inline FdReport check_adjoint(const OpRecord& rec, const std::vector<AdValue>& i
     {
         size_t r = 0, w = 0;
         for (size_t i = 0; i < rec.operands.size(); ++i) {
-            if (rec.operands[i].written && !inout_at(i))
-                fwd[i] = out_vals[w++];
-            else
-                fwd[i] = in[r++];
+            const bool reads = !rec.operands[i].written || inout_at(i);
+            fwd[i] = rec.operands[i].written ? out_vals[w++] : in[r];
+            if (reads) ++r;
         }
     }
 

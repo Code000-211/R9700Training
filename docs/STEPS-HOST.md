@@ -335,7 +335,84 @@ the prefix in the walk's slot names and in the split, that case fails on the val
 tensor -- the parameter would be left for the zero fill.
 
 
-## What is left open
+## The int8 trunk
+
+The same join walks the w8a8 container. Its op graph differs in three places: the residual add
+and norm are fused into `rmsnorm_quant_fp8`, the MLP's product and its rounding into
+`gated_quant_fp8`, and every trunk linear reads `had_quant_act_i8g`'s int8 codes through
+`gemm_nt_q`. The quantisers' adjoints hand back the **codes'** cotangent (section 3 of
+`docs/adjoints/quant.md`), while `gemm_nt_q`'s family adjoint is documented in the dequantised
+activation basis. The host step therefore tags its records and selects a code-basis wrapper for
+`gemm_nt_q` (`src/adjoint/host/host_step_record.h`); the family row and its finite-difference
+check are unchanged.
+
+The adapter is initialised in the basis the container names. `Engine::lora_set_weights` builds its
+factors from the caller's map, so the basis the container was configured for has to reach them, as
+a file adapter reads its own from its header: `build_sites` records `cfg_.lora.input_basis` on
+every site and `lora::pack_modules` copies it into the `AdapterInfo` it returns (patch `0210`).
+Reading it from the sites rather than from the engine's config keeps that out of `0201`'s function,
+so `0210` still applies on a bare radiance. A live adapter on the rotated trunk is thus read in the
+same basis as the container's int8 rows.
+
+The head's int8 weight is joined into one buffer by the engine: a `RadPlanesHeader`, then the codes,
+then a scale per group. The ABI's byte count for the operand is the codes' declared elements, so a
+tape that copied only that many bytes dropped the scales and the walk dequantised the head's codes
+with the codes alone. `Tape::record` now follows the header's own account of the operand's span for
+a joined weight, and `snapshot` reads the planes out by their roles (`joined_dense`): code times
+scale, at the block the scale plane declares, is the bf16 weight the GEMM's epilogue actually
+formed. The head cotangent that enters the trunk is therefore the dequantised one, and its factor
+is comparable with the bf16 model's.
+
+`host_step_int8` checks the property a quantised trunk can give: the straight-through gradient is
+finite and nonzero, and a step along it lowers the driver's scored loss, while a step of the same
+length against it raises the loss -- so the check cannot be passed by a direction that merely has
+a negative projection.
+
+`host_step_int8_gradient_points_the_way_bf16_does` runs the same adapter on the same batch through
+both containers and compares the adapter's gradients, per site, per layer and whole. Both sides
+start from the same adapter, which takes two things. `init` leaves `lora_B` at zero, and at `B = 0`
+neither the loss nor the `lora_A` gradient depends on the adapter at all, so the test seeds a
+deterministic nonzero `B`. And the int8 trunk rotates each 128-wide group of the activation before
+the GEMM, so what `lora_A` is applied to there is `H*x`, the container's dequantised activation
+with `H` the *unnormalised* Sylvester transform (as `docs/ADAPTER.md` records it and the kernels
+build it): the bf16 side runs `A_i8 * H`, and the int8 gradient comes back through `H/128`. The
+two losses agreeing to within a percent is what that mapping gets, and it is the check the mapping
+has to pass: the wrong normalisation (`H/sqrt(128)`, or no mapping at all) moves the same loss by
+five percent.
+
+What the walk measures on this tree, with that mapping and a nonzero `B`: the two losses agree to
+0.7 %; the gradients agree with a cosine of 0.67 whole and 0.66 over the top block; the top block's
+magnitude is 0.84 of the bf16 one. The per-site cosines run from -0.63 to 0.96 and the per-site
+magnitudes from 0.37 to 1.84.
+
+## The floors the int8 check holds
+
+- **The criterion is the measured basis, not a hoped-for 0.9.** `docs/PLAN.md` records it. The bf16
+  walk's own whole gradient scores 0.8716 against the exact reference and is held at 0.85
+  (`tests/host/step_host_oracle.cpp`, `tests/host/step_host_grad.cpp`); the int8 walk's scores 0.67
+  against the bf16 one and is held at 0.6, with the per-site cosines running -0.63 to 0.96. The
+  adapter gradients are comparable -- the two containers' fused and unfused layouts are layouts,
+  and the walk and the split make the nine targets match element for element (see
+  `docs/FIXTURES.md`) -- and the gap between the two containers is inside the blocks, not at their
+  edges or in the join: the boundaries they share agree to 0.9999 at the head and 0.978 at the top
+  block's input, and the losses to a percent, yet the sites' gradients disagree by more than their
+  blocks' boundaries do. Raise a floor when the walk improves; never lower one.
+- **The anti-correlated sites are the straight-through boundary, in plain sight.** In the int8 chain
+  every quantiser's derivative is defined as one: the walk passes the cotangent straight through
+  the code quantisers (`had_quant_act_i8g`, `rmsnorm_quant_fp8`, `gated_quant_fp8`, and
+  `gemm_nt_q`'s code-basis wrapper, `docs/adjoints/quant.md`), so a site whose cotangent is a
+  near-cancelling sum follows the quantised forward's rounding in place of the bf16 one and can
+  come out anti-correlated with it. That is exactly what the first block shows: its three `mlp`
+  sites and its `in_proj_z` read -0.63 to -0.13 of the bf16 gradient while the same block's
+  `in_proj_qkv` agrees at 0.96. It is the definition of the gradient the issue asks for, not a
+  defect of the walk, and it is why the fixture's floor is 0.6 and not 0.9.
+
+*The 10-12x magnitude the last round measured was the test's, not the walk's.* The committed test
+mapped `lora_A` through `H/sqrt(128)`, which is the normalisation the transform does not carry in
+this container: `H` is its own inverse up to 128, so `A_i8 * H` maps into the natural basis and
+`H/128` maps a gradient back. With the wrong normalisation the top block's gradients came out
+11-12 times the bf16 ones; with the right one they come out between 0.4 and 1.8, which is why the
+comparison above is on magnitudes and not only on directions.
 
 *The join is the bf16 forward, by decision.* An earlier round of this card made `host_step`
 delegate to `make_reference_step`, so that the checks could be met at the issue's tolerance; the

@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "rad_planes.h"
+
 namespace r97 {
 
 // Pack a strided view's values, element by element, for a tape that keeps operand bytes. Returns
@@ -174,6 +176,16 @@ void Tape::record(const RadIssueOp& issue) {
             // view is dense, which is what a copy has to assume. A reader that asked for copies is
             // the one that can tell: its comparison is against these bytes.
             int64_t bytes = o.bytes;
+            // A weight the engine joins from planes (a quantised lm_head: its codes, then a scale
+            // per group) reaches the observer as one span, but the ABI's byte count is the codes'
+            // declared elements; the planes sit past it, at the offsets the header records. A copy
+            // that stopped at the declared size would drop the scales, and a reader would decode
+            // the head's cotangent from the codes alone. The header is the operand's own account
+            // of its span, so the copy follows it.
+            if (bytes > 0 && bytes >= static_cast<int64_t>(sizeof(RadPlanesHeader))) {
+                const RadPlanesHeader* joined = rad_planes_header(o.data);
+                if (joined && joined->bytes > bytes) bytes = joined->bytes;
+            }
             if (bytes <= 0 && o.view_rank > 0) {
                 // A strided view is not one span: the copy is its own values, packed, which the
                 // declared shape cannot hold. A reader compares against the view, not the buffer.

@@ -264,10 +264,10 @@ R97_TEST(adjoint_linear_embed_lookup_is_a_stop) {
         for (double x : a.value) R97_CHECK(x == 0.0);
 }
 
-// gemm_nt_q's adjoint is a cotangent for the stored codes, the basis the walk hands the quantiser
-// that wrote them (docs/adjoints/quant.md, section 3): a code the op's own row carries, not the
-// dequantised product. Perturbing the code by eps is therefore the direction to difference.
-R97_TEST(adjoint_linear_gemm_nt_q_code_basis) {
+// gemm_nt_q's adjoint is a cotangent for the dequantised activation. Perturbing the stored code by
+// eps / a_scale changes the dequantised activation by exactly eps, which is the direction the
+// adjoint describes.
+R97_TEST(adjoint_linear_gemm_nt_q_dequant_basis) {
     const OpRecord rec = gemm_nt_q_rec(3, 5, 128);
     const Case c = make_case(rec, 0x6001);
     std::string err;
@@ -301,8 +301,10 @@ R97_TEST(adjoint_linear_gemm_nt_q_code_basis) {
 
     auto loss = [&](double eps, double sign) {
         std::vector<AdValue> in = c.in;
-        for (std::size_t e = 0; e < in[0].value.size(); ++e)
-            in[0].value[e] += sign * eps * dir[e];
+        for (std::size_t e = 0; e < in[0].value.size(); ++e) {
+            const double scale = in[1].value[static_cast<std::size_t>((e / K) * (K / 128) + (e % K) / 128)];
+            in[0].value[e] += sign * eps * dir[e] / scale;
+        }
         std::vector<AdValue> y;
         twin(rec, in, &y);
         double sum = 0.0;
@@ -314,6 +316,6 @@ R97_TEST(adjoint_linear_gemm_nt_q_code_basis) {
     double analytic = 0.0;
     for (std::size_t e = 0; e < dir.size(); ++e) analytic += dc[0].value[e] * dir[e];
     const double rel = std::fabs(numeric - analytic) / std::fmax(1.0, std::fabs(analytic));
-    std::printf("gemm_nt_q code basis rel err %.3g\n", rel);
+    std::printf("gemm_nt_q dequant basis rel err %.3g\n", rel);
     R97_CHECK(rel < fd_tol);
 }
