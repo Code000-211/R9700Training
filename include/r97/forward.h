@@ -186,11 +186,13 @@ public:
     // training patches bracket both qwen35 builds, including the bf16 one the fixture uses.
     void set_block_hook(std::function<void(const BlockView&)> hook);
 
-    // The LoRA slots the next steps' engine must offer, and the adapter name the step's
-    // sequences acquire. The join sets these from the sites Delta::to_wire yields; the driver
-    // itself never looks at a Delta.
+    // The LoRA slots the next steps' engine must offer, the adapter name the step's
+    // sequences acquire, and the basis the adapter's A factors are stored in (the container's
+    // "radiance_input_basis": empty for a natural trunk, "fwht128" for the rotated int8 one).
+    // The join sets these from the sites Delta::to_wire yields and the model's metadata; the
+    // driver itself never looks at a Delta.
     void set_lora(int64_t max_loras, int64_t max_rank, std::vector<std::string> targets,
-                  std::string adapter_name = {});
+                  std::string adapter_name = {}, std::string input_basis = {});
 
     // Called after the engine starts and before it serves, so a caller can load the live adapter
     // into a slot the engine has already built. The hook runs inside step().
@@ -223,6 +225,7 @@ private:
     int64_t lora_max_rank_ = 0;
     std::vector<std::string> lora_targets_;
     std::string lora_adapter_name_;
+    std::string lora_input_basis_;
     int64_t step_tokens_ = 0;       // the token rows the step's boundaries cover
     bool residual_seen_ = false;    // a bracket found the residual at least once
     std::string residual_name_;     // the buffer every bracket must answer with

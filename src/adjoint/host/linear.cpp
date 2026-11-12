@@ -6,6 +6,8 @@
 
 #include "r97/adjoint.h"
 
+#include "host_step_record.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -107,7 +109,9 @@ void gemm_nt_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     if (a == nullptr || b == nullptr) return;
     const int64_t K = param_int(rec, "K", a->shape.size() >= 2 ? a->shape[1] : 0);
     const int64_t N = param_int(rec, "N", b->shape.size() >= 2 ? b->shape[0] : 0);
-    const int64_t M = param_int(rec, "M", a->shape.empty() ? 0 : a->shape[0]);
+    // `M` is the weight's capacity; the operand's own first dimension is how many rows this call
+    // actually has, and the one a tightened record carries.
+    const int64_t M = a->shape.empty() ? param_int(rec, "M", 0) : a->shape[0];
     const Operand* w = first_write(rec);
     out->push_back(make_value(w != nullptr ? w->dtype : a->dtype, {M, N}));
     AdValue& y = out->back();
@@ -156,7 +160,7 @@ void gemm_nt_q_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     if (a == nullptr || b == nullptr) return;
     const int64_t K = param_int(rec, "K", a->shape.size() >= 2 ? a->shape[1] : 0);
     const int64_t N = param_int(rec, "N", b->shape.size() >= 2 ? b->shape[0] : 0);
-    const int64_t M = param_int(rec, "M", a->shape.empty() ? 0 : a->shape[0]);
+    const int64_t M = a->shape.empty() ? param_int(rec, "M", 0) : a->shape[0];
     const int64_t group = param_int(rec, "group", K > 0 ? K : 1);
     const int64_t groups = group > 0 ? (K + group - 1) / group : 1;
     const Operand* w = first_write(rec);
@@ -192,7 +196,7 @@ void gemm_nt_q_adjoint(const AdjointCall& call) {
     const AdValue& dy = call.cot[0];
     const int64_t K = param_int(call.rec, "K", a.shape.size() >= 2 ? a.shape[1] : 0);
     const int64_t N = param_int(call.rec, "N", b.shape.size() >= 2 ? b.shape[0] : 0);
-    const int64_t M = param_int(call.rec, "M", a.shape.empty() ? 0 : a.shape[0]);
+    const int64_t M = a.shape.empty() ? param_int(call.rec, "M", 0) : a.shape[0];
     const int64_t group = param_int(call.rec, "group", K > 0 ? K : 1);
     const int64_t groups = group > 0 ? (K + group - 1) / group : 1;
     AdValue& dx = (*call.dc)[static_cast<std::size_t>(ia)];
@@ -328,6 +332,26 @@ void embed_lookup_twin(const OpRecord& rec, const std::vector<AdValue>& operands
 
 void embed_lookup_adjoint(const AdjointCall&) {}
 
+// The host step's int8 walk consumes code operands: its quantisers divide the code cotangent by
+// the group scale. The family row's cotangent is for the dequantised activation, so this wrapper
+// multiplies it by the activation scale to hand the codes' cotangent back.
+void gemm_nt_q_code_adjoint(const AdjointCall& call) {
+    gemm_nt_q_adjoint(call);
+    const int ia = operand_pos(call.rec, "a");
+    const int ias = operand_pos(call.rec, "a_scale");
+    if (ia < 0 || ias < 0) return;
+    const AdValue& a = call.fwd[static_cast<std::size_t>(ia)];
+    const AdValue* as = &call.fwd[static_cast<std::size_t>(ias)];
+    const int64_t K = param_int(call.rec, "K", a.shape.size() >= 2 ? a.shape[1] : 0);
+    const int64_t M = a.shape.empty() ? param_int(call.rec, "M", 0) : a.shape[0];
+    const int64_t group = param_int(call.rec, "group", K > 0 ? K : 1);
+    const int64_t groups = group > 0 ? (K + group - 1) / group : 1;
+    AdValue& dx = (*call.dc)[static_cast<std::size_t>(ia)];
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t k = 0; k < K; ++k)
+            dx.value[static_cast<std::size_t>(m * K + k)] *= scale_at(as, m, k / group, M, groups);
+}
+
 }  // namespace
 
 R97_REGISTER_TWIN("gemm_nt", gemm_nt_twin)
@@ -335,6 +359,7 @@ R97_REGISTER_ADJOINT_F("gemm_nt", host, gemm_nt_adjoint, 1)
 
 R97_REGISTER_TWIN("gemm_nt_q", gemm_nt_q_twin)
 R97_REGISTER_ADJOINT_F("gemm_nt_q", host, gemm_nt_q_adjoint, 1, 2, 3)
+R97_REGISTER_ADJOINT_IF_F("gemm_nt_q", host, gemm_nt_q_code_adjoint, host_step_record, 1, 2, 3)
 
 R97_REGISTER_TWIN("logits_gemm", logits_gemm_twin)
 R97_REGISTER_ADJOINT_F("logits_gemm", host, logits_gemm_adjoint, 1)

@@ -393,10 +393,6 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             continue;
         }
 
-        std::string err;
-        const AdjointFn fn = adjoint_find(rec.op, options.side, rec.params, &err);
-        if (!fn) refuse(err);
-
         // The forward values of every operand, as this op saw them.
         std::vector<AdValue> fwd(rec.operands.size());
         int64_t snapshot_bytes = 0;
@@ -460,16 +456,22 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         }
 
 
-        // The adjoint sees the record the caller prepared when it wants one: the walk keeps the
-        // tape's own record for its versions, boundaries and snapshots.
-        // The join may hand the adjoint a record whose names and rows differ from the tape's; the
-        // walk keeps the tape's record for versions, boundaries and snapshots.
+        // The adjoint sees the record the caller prepared when it wants one: the join may hand it
+        // names and rows that differ from the tape's, while the walk keeps the tape's record for
+        // its versions, boundaries and snapshots. The row is resolved from the prepared record's
+        // parameters because that record is the one the adjoint is called with: a predicate the
+        // caller sets there (the join's `r97host`) is what picks a shape-aware row, and asking the
+        // tape's parameters for it would always find the catch-all.
         OpRecord named;
         const OpRecord* adjoint_rec = &rec;
         if (options.prepare_record) {
             options.prepare_record(rec, &named);
             adjoint_rec = &named;
         }
+
+        std::string err;
+        const AdjointFn fn = adjoint_find(adjoint_rec->op, options.side, adjoint_rec->params, &err);
+        if (!fn) refuse(err);
 
         std::string record_prefix;
         const char* prefix = options.prefix;
@@ -509,7 +511,8 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         // Hand what the adjoint produced to the versions each read saw, or out of the block. An
         // in-place write's cotangent is also what the value it replaced takes: its read segments
         // name that prior version, so it travels the same way a read's does.
-        const std::vector<int> frozen = adjoint_frozen(rec.op, options.side, rec.params);
+        const std::vector<int> frozen =
+            adjoint_frozen(adjoint_rec->op, options.side, adjoint_rec->params);
         const std::set<size_t> frozen_at(frozen.begin(), frozen.end());
         for (size_t j = 0; j < rec.operands.size(); ++j) {
             const bool in_place = in_place_read(rec, j);

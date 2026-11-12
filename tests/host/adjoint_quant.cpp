@@ -454,6 +454,15 @@ R97_TEST(adjoint_quant_serves_both_ops) {
     const std::vector<OpParam> params = {{"n", 64}, {"group", 32}};
     R97_CHECK(adjoint_frozen("quant_act_i8g_ste", Side::host, params) == std::vector<int>{1});
     R97_CHECK(adjoint_frozen("had_quant_act_i8g_ste", Side::host, params) == std::vector<int>{1});
+    /* The fused producers append their base point after the activation's write. */
+    R97_CHECK(adjoint_frozen("rmsnorm_quant_fp8_ste", Side::host, params) == std::vector<int>{6});
+    R97_CHECK(adjoint_frozen("gated_quant_fp8_ste", Side::host, params) == std::vector<int>{4});
+    for (const char* op : {"rmsnorm_quant_fp8", "gated_quant_fp8", "rmsnorm_quant_fp8_ste",
+                           "gated_quant_fp8_ste"}) {
+        const OpRows rows = op_rows(op);
+        R97_CHECK(rows.twin);
+        R97_CHECK(rows.host_adjoint);
+    }
 
     /* A record no kernel of the family takes is refused by name, not silently
      * computed. */
@@ -468,6 +477,153 @@ R97_TEST(adjoint_quant_serves_both_ops) {
     OpRecord missing = quant_rec(false, {"1 x 4, one group", 1, 4, 4}, false);
     missing.params = {{"M", 1}, {"group", 4}};
     refuses(missing, {values("bf16", {1, 4}, {1.0, 0.5, 0.25, 0.125})}, "has no 'n'");
+}
+
+/* -- (6) the int8 trunk's fused producers ---------------------------------- */
+
+/* The trunk replaces a residual add, a norm and an E4M3 quantiser with one
+ * record, `rmsnorm_quant_fp8`, and a gate, its product and the same quantiser
+ * with `gated_quant_fp8`. Both write the bf16 activation beside the codes, so
+ * their adjoints have a path the unfused quantisers do not have: the bf16
+ * write's own Jacobian. The record also writes its activation before the
+ * quantiser reads it, so the linearised twin appends its base point after the
+ * activation's write -- a schema position the unfused record does not use --
+ * and the adjoint keeps the positions it has in the trunk. */
+struct FusedShape {
+    const char* name;
+    int64_t rows, n, group;
+};
+
+std::vector<FusedShape> fused_shapes() {
+    /* The trunk's shape (128 columns, one scale per row) and two groups of 32,
+     * so the group loop and a short last group are both taken. */
+    return {{"trunk-128", 5, 128, 128}, {"two-groups", 3, 64, 32}};
+}
+
+int64_t fused_groups(const FusedShape& s) {
+    const int64_t g = (s.group <= 0 || s.group > s.n) ? s.n : s.group;
+    return (s.n + g - 1) / g;
+}
+
+bool is_rmsnorm(const char* op) { return std::strcmp(op, "rmsnorm_quant_fp8") == 0; }
+
+/* The record the trunk gives the op. `rmsnorm_quant_fp8` reads the activation,
+ * the residual it adds in place and the gain, and writes the residual, the
+ * codes, the scale and the bf16 activation; `gated_quant_fp8` reads the gated
+ * projection, whose two halves are the gate and the up-projection, and writes
+ * the codes, the scale and the product. */
+OpRecord fused_rec(const char* op, const FusedShape& s, bool linearised) {
+    const int64_t ngrp = fused_groups(s);
+    OpRecord rec;
+    rec.op = op;
+    if (linearised) rec.op += "_ste";
+    rec.n = s.rows;
+    if (is_rmsnorm(op)) {
+        rec.params = {{"M", s.rows},   {"n", s.n},     {"eps", "1e-6"},
+                      {"group", s.group}, {"dtype", "bf16"}, {"wadd", int64_t{0}}};
+        rec.operands = {{"x", "bf16", {s.rows, s.n}, 0, s.rows, false},
+                        {"residual", "bf16", {s.rows, s.n}, 0, s.rows, true, true},
+                        {"w", "f32", {s.n}, 0, 1, false},
+                        {"codes", "fp8_e4m3", {s.rows, s.n}, 0, s.rows, true},
+                        {"scale", "f32", {s.rows, ngrp}, 0, s.rows, true},
+                        {"y", "bf16", {s.rows, s.n}, 0, s.rows, true}};
+    } else {
+        rec.params = {{"M", s.rows},   {"n", s.n},        {"group", s.group},
+                      {"dtype", "bf16"}, {"act", "silu"}};
+        rec.operands = {{"gate_up", "bf16", {s.rows, 2 * s.n}, 0, s.rows, false},
+                        {"q", "fp8_e4m3", {s.rows, s.n}, 0, s.rows, true},
+                        {"scale", "f32", {s.rows, ngrp}, 0, s.rows, true},
+                        {"p", "bf16", {s.rows, s.n}, 0, s.rows, true}};
+    }
+    if (linearised) rec.operands.push_back({"base", "bf16", {s.rows, s.n}, 0, s.rows, false});
+    return rec;
+}
+
+/* The gain the trunk stores: f32, near one, so the norm's Jacobian is not a
+ * diagonal of zeros. */
+std::vector<double> gain(int64_t n, uint64_t seed) {
+    std::vector<double> w((size_t)n);
+    for (double& v : w) v = 1.0 + 0.5 * urand(&seed);
+    return w;
+}
+
+struct FusedCase {
+    std::vector<AdValue> in;   /* reads, in schema order */
+    std::vector<AdValue> out;  /* writes, in write order */
+};
+
+/* One call of the op. The base point, when asked for, is the forward's own
+ * activation: the quantiser is linearised where the trunk's record sits. */
+FusedCase fused_case(const char* op, const FusedShape& s, bool linearised, uint64_t seed) {
+    const int64_t ngrp = fused_groups(s);
+    FusedCase c;
+    if (is_rmsnorm(op)) {
+        const std::vector<double> x = activation(Shape{s.name, s.rows, s.n, s.group}, seed);
+        const std::vector<double> res = activation(Shape{s.name, s.rows, s.n, s.group}, seed + 1);
+        const std::vector<double> w = gain(s.n, seed + 2);
+        c.in = {values("bf16", {s.rows, s.n}, x), values("bf16", {s.rows, s.n}, res),
+                values("f32", {s.n}, w)};
+        if (linearised) {
+            const std::vector<AdValue> fwd = forward(fused_rec(op, s, false), c.in);
+            c.in.push_back(fwd[3]); /* the bf16 activation the quantiser saw */
+        }
+        c.out.push_back(
+            values("bf16", {s.rows, s.n}, std::vector<double>((size_t)(s.rows * s.n), 0)));
+        c.out.push_back(values("fp8_e4m3", {s.rows, s.n},
+                               std::vector<double>((size_t)(s.rows * s.n), 0)));
+        c.out.push_back(values("f32", {s.rows, ngrp},
+                               std::vector<double>((size_t)(s.rows * ngrp), 0)));
+        c.out.push_back(
+            values("bf16", {s.rows, s.n}, std::vector<double>((size_t)(s.rows * s.n), 0)));
+        return c;
+    }
+    const std::vector<double> gu = activation(Shape{s.name, s.rows, 2 * s.n, s.group}, seed);
+    c.in = {values("bf16", {s.rows, 2 * s.n}, gu)};
+    if (linearised) {
+        const std::vector<AdValue> fwd = forward(fused_rec(op, s, false), c.in);
+        c.in.push_back(fwd[2]); /* the product the quantiser saw */
+    }
+    c.out.push_back(values("fp8_e4m3", {s.rows, s.n},
+                           std::vector<double>((size_t)(s.rows * s.n), 0)));
+    c.out.push_back(values("f32", {s.rows, ngrp}, std::vector<double>((size_t)(s.rows * ngrp), 0)));
+    c.out.push_back(values("bf16", {s.rows, s.n}, std::vector<double>((size_t)(s.rows * s.n), 0)));
+    return c;
+}
+
+/* The residual is written in place, which is the schema index the tape marks
+ * and the adjoint reads back. */
+std::vector<size_t> fused_in_place(const char* op) {
+    return is_rmsnorm(op) ? std::vector<size_t>{1} : std::vector<size_t>{};
+}
+
+void fused_kernel_check(const char* op, const FusedShape& s) {
+    const OpRecord rec = fused_rec(op, s, false);
+    const FusedCase c = fused_case(op, s, false, 0x9e3779b9ull);
+    const KernelReport k = check_kernel(rec, c.in, c.out, bf16_tol, fused_in_place(op));
+    std::printf("%-20s %-28s kernel max err %.6g\n", rec.op.c_str(), s.name, k.max_err);
+    require(k);
+}
+
+void fused_fd_check(const char* op, const FusedShape& s) {
+    const OpRecord rec = fused_rec(op, s, true);
+    const FusedCase c = fused_case(op, s, true, 0x5deece66dull);
+    const FdReport fd = check_adjoint(rec, c.in, c.out, fd_tol, 0xc0ffeeull, fused_in_place(op));
+    std::printf("%-20s %-28s adjoint rel err %.3g\n", rec.op.c_str(), s.name, fd.rel);
+    require(fd);
+}
+
+R97_TEST(adjoint_fused_quant_twin_matches_the_host_kernel) {
+    for (const FusedShape& s : fused_shapes()) {
+        fused_kernel_check("rmsnorm_quant_fp8", s);
+        fused_kernel_check("gated_quant_fp8", s);
+    }
+}
+
+R97_TEST(adjoint_fused_quant_agrees_with_finite_differences) {
+    for (const FusedShape& s : fused_shapes()) {
+        fused_fd_check("rmsnorm_quant_fp8", s);
+        fused_fd_check("gated_quant_fp8", s);
+    }
 }
 
 }  // namespace

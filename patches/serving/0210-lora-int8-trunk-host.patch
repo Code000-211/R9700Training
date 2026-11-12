@@ -173,7 +173,7 @@ index ad04866..1dc9afc 100644
                  vs[2] = RAD_INT("R", rv);
                  ep[2] = RAD_INT("R", rv);
 diff --git a/core/lora/lora.cpp b/core/lora/lora.cpp
-index 708784a..7f5f514 100644
+index 708784a..89d5f7e 100644
 --- a/core/lora/lora.cpp
 +++ b/core/lora/lora.cpp
 @@ -566,6 +566,27 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
@@ -304,7 +304,13 @@ index 708784a..7f5f514 100644
          if (!targeted_idx(prog, mi, b, targets)) continue;
          if (other_reader.count(prog.weights[b].source)) continue;
          if (gen_scope(prog)) {
-@@ -731,7 +774,8 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
+@@ -726,12 +769,14 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
+                                 "LoRA geometry; one pool per weight cannot serve both",
+                                 s.weight.c_str(), f.gemm, f.op.c_str(), s.gemm, s.op.c_str()));
+         }
++        s.input_basis = basis == kInputFwht128 ? "fwht128" : "";
+         out->push_back(std::move(s));
+     }
      return RAD_OK;
  }
  
@@ -314,7 +320,7 @@ index 708784a..7f5f514 100644
      const std::string want[3] = {
          module,
          module.starts_with("model.") && !module.starts_with("model.language_model.")
-@@ -773,7 +817,7 @@ std::string explain_module(const Program& prog, const TargetSet& targets, const
+@@ -773,7 +818,7 @@ std::string explain_module(const Program& prog, const TargetSet& targets, const
                  if (!uses) continue;
                  rad_weight b = 0;
                  std::string no;
@@ -323,7 +329,7 @@ index 708784a..7f5f514 100644
                  reads += fmt("%sop %zu %s (%s)", reads.empty() ? "" : "; ", i, op.op.c_str(), no.c_str());
              }
              if (!reads.empty()) why = std::string("'") + m.declared + "' is read by " + reads;
-@@ -865,6 +909,14 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
+@@ -865,6 +910,14 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
                     cfg["use_rslora"].get<bool>();
      if (cfg.contains("base_model_name_or_path") && cfg["base_model_name_or_path"].is_string())
          info->base_model = cfg["base_model_name_or_path"].get<std::string>();
@@ -338,7 +344,29 @@ index 708784a..7f5f514 100644
      if (cfg.contains("target_modules")) {
          const ojson& t = cfg["target_modules"];
          if (t.is_string()) info->target_modules.push_back(t.get<std::string>());
-@@ -1234,13 +1286,32 @@ int pack_modules(const std::vector<Site>& sites, int max_rank,
+@@ -988,12 +1041,20 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
+         info->leaves.insert(d == std::string::npos ? am.name : am.name.substr(d + 1));
+     }
+ 
+-    return pack_modules(sites, max_rank, mods, info, packed, err);
++    /* A file's factors are in the basis its header declares, not the sites': pack_modules stamps
++     * the one a caller handing factors in memory means, so it is put back for check_placed. */
++    const std::string declared = info->input_basis;
++    const int packed_rc = pack_modules(sites, max_rank, mods, info, packed, err);
++    info->input_basis = declared;
++    return packed_rc;
+ }
+ 
+ int pack_modules(const std::vector<Site>& sites, int max_rank,
+                  const std::map<std::string, AdModule>& mods, AdapterInfo* info,
+                  std::vector<PackedSite>* packed, std::string* err, bool compact) {
++    /* Factors handed in memory arrive in the basis the sites are fed (load_adapter puts a file's
++     * own back): check_placed then reads one basis, not an undeclared natural one. */
++    if (info && !sites.empty()) info->input_basis = sites.front().input_basis;
+     /* ---- the sites, by pool: the representative of each pool and where its modules sit. */
+     int32_t n_pools = 0;
+     for (const Site& s : sites) {
+@@ -1234,13 +1295,32 @@ int pack_modules(const std::vector<Site>& sites, int max_rank,
  int check_placed(const std::vector<AdapterInfo>& per_rank, std::string* err, const Program* prog,
                   const TargetSet* targets) {
      if (per_rank.empty()) return RAD_OK;
@@ -373,10 +401,20 @@ index 708784a..7f5f514 100644
                      "adapter module " + m.name + " is not a LoRA site on any rank" +
                          (why.empty() ? std::string() : ": " + why));
 diff --git a/core/lora/lora.h b/core/lora/lora.h
-index 11156ce..ed5929b 100644
+index 11156ce..4d0265e 100644
 --- a/core/lora/lora.h
 +++ b/core/lora/lora.h
-@@ -101,6 +101,7 @@ struct AdapterInfo {
+@@ -67,6 +67,9 @@ struct Site {
+     std::vector<SitePart> parts;                /* empty while !parts_resolved */
+     int32_t     pool = -1;           /* index of the weight in build_sites' per-weight pool list */
+     std::string op;                  /* the gemm's op name */
++    /* The basis the gemm is fed (docs/ADAPTER.md, 4): "" natural, "fwht128" the rotated int8
++     * trunk. One container feeds every site, and factors handed in memory arrive in this basis. */
++    std::string input_basis;
+     int32_t     n_modules = 0;       /* targeted sources */
+     int32_t     max_rank = 0;
+     bool        parts_resolved = true;   /* false: the fused layout is decided by B rows at load */
+@@ -101,6 +104,7 @@ struct AdapterInfo {
      std::string dir;
      std::string base_model;        /* base_model_name_or_path */
      std::string peft_type;         /* "LORA" */
@@ -384,7 +422,7 @@ index 11156ce..ed5929b 100644
      int64_t     r = 0;             /* config r */
      double      alpha = 0.0;       /* config lora_alpha */
      bool        rslora = false;
-@@ -138,21 +139,40 @@ struct UnsupportedUse {
+@@ -138,21 +142,40 @@ struct UnsupportedUse {
   * A routed expert IS targeted when its leaf is (so its moe op is reported, never skipped). */
  bool weight_targeted(const Program& prog, rad_weight w, const TargetSet& targets);
  
@@ -429,7 +467,7 @@ index 11156ce..ed5929b 100644
  
  /* One adapter for one rank: `packed` gets one PackedSite per pool (index = Site::pool), in the
   * slot layout of the pool's sites. Refusals return a negative code and name module, expected and
-@@ -187,7 +207,8 @@ int check_placed(const std::vector<AdapterInfo>& per_rank, std::string* err,
+@@ -187,7 +210,8 @@ int check_placed(const std::vector<AdapterInfo>& per_rank, std::string* err,
                   const Program* prog = nullptr, const TargetSet* targets = nullptr);
  
  /* Why a module path is not a site on this Program, in one sentence ("" when it is one). */

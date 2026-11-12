@@ -1,14 +1,16 @@
-# The int8 activation quantiser: its f64 twin and its host adjoint
+# The activation quantisers: their f64 twins and their host adjoints
 
 Reference: radiance commit `451b136874084650992668bed9e8662deb58de88` —
-`libref/ref_quant.cpp` (`ref_quant_act_i8g`, `ref_had_quant_act_i8g` → `had_quant_act_q8`) and
-`libref/ref_common.h` (`fwht`, `q8_group`). The family is `src/adjoint/host/quant.cpp` and
-`tests/host/adjoint_quant.cpp` holds it to the numbers quoted below, through the contract of
-`include/r97/adjoint.h` and the checks of `tests/support/adjoint_check.h`.
+`libref/ref_quant.cpp` (`ref_quant_act_i8g`, `ref_had_quant_act_i8g` → `had_quant_act_q8`,
+`ref_rmsnorm_quant_fp8`, `ref_gated_quant_fp8`) and `libref/ref_common.h` (`fwht`, `q8_group`).
+The family is `src/adjoint/host/quant.cpp` and `tests/host/adjoint_quant.cpp` holds the int8
+quantiser to the numbers quoted below, through the contract of `include/r97/adjoint.h` and the
+checks of `tests/support/adjoint_check.h`; section 6 documents the fused E4M3 producers.
 
-Two ops, one quantiser: `quant_act_i8g` quantises groups of an activation, `had_quant_act_i8g`
-rotates each group first. Both write int8 codes and one f32 scale per group; the network then
-consumes `code * scale`, so that product — not the code — is what the adjoint is a function of.
+The int8 pair, one quantiser: `quant_act_i8g` quantises groups of an activation,
+`had_quant_act_i8g` rotates each group first. Both write int8 codes and one f32 scale per group;
+the network then consumes `code * scale`, so that product — not the code — is what the adjoint is
+a function of. `rmsnorm_quant_fp8` and `gated_quant_fp8` apply the same rule to their E4M3 codes.
 
 ## 1. The forward
 
@@ -229,7 +231,52 @@ every group of every layer, and would still leave a value just below the top of 
 at the next one. `clamp`'s own derivative does not zero at its boundary, and the estimator is the
 composition of the forward's two piecewise pieces, not a rule about the code.
 
-## 6. What this does not cover
+## 6. The fused producers
+
+The int8 trunk does not run `add`/`rmsnorm` and then `quant_act_fp8`: `rmsnorm_quant_fp8` writes
+the bf16 norm and its E4M3 codes in one op, and `gated_quant_fp8` writes the bf16 product and its
+codes. Their code cotangents follow section 3 -- divide by the group scale, keep only where the
+clamp did not engage, drop the scale's cotangent -- and the differentiable part around the round
+uses the same straight-through rule.
+
+`rmsnorm_quant_fp8` reads `x`, an in-place `residual`, and the gain `w`, and writes the new
+residual, `q`, the scale and `out_bf16`. With `r = bf16(x + residual)` and
+
+    y_mj = bf16( r_mj * rsqrt(mean_j(r_m)^2 + eps) * (w_j + wadd) ),
+
+the output cotangent `d = dout_bf16 + live ⊙ dq / s` gives
+
+    dw_j   = sum_m d_mj r_mj rs_m
+    dx_mj  = d_mj rs_m (w_j + wadd) - (sum_k d_mk r_mk (w_k + wadd)) rs_m^3 r_mj / n,
+    dres_mj = dx_mj + dresidual_out_mj,
+
+and the new residual's cotangent goes to both the old residual and `x`, because the op wrote it in
+place. The norm's `rs_m` is differentiated, not held constant: the `-drs rs^3 r/n` term is the
+difference between the norm's real derivative and the elementwise scaling.
+
+`gated_quant_fp8` reads a packed `[M, 2n]` `gate_up` plane, gate half first, and writes `q`, the
+scale and `out_bf16` (`p = bf16(act(g) * u)`). For `silu`, `act(g) = g sigmoid(g)` and
+`act'(g) = sigmoid(g) (1 + g (1 - sigmoid(g)))`; for `sigmoid`, `act(g) = sigmoid(g)` and
+`act'(g) = sigmoid(g) (1 - sigmoid(g))`. With `dp` the cotangent of `p`, the packed plane gets
+
+    dgate += dp * u * act'(g),      dup += dp * act(g).
+
+Both ops are registered in the `quant` family beside the int8 quantiser, and the host step walks
+them on the int8 trunk. Each also has the linearised twin the finite-difference harness needs, under
+`rmsnorm_quant_fp8_ste` and `gated_quant_fp8_ste`: the base point (the bf16 activation the
+quantiser saw) is appended to the schema after the activation's write, at position 6 and 4, which is
+where the frozen list names it, and the twin is then
+
+    codes(x) = c0 + live(x) * (v(x) - v0) / s0,     scale(x) = s0,
+
+with `v` the activation in f64 and no rounding step, so the finite differences see the norm's or the
+gate's Jacobian and the quantiser's slope rather than a bf16 step. `live(x)` is the clamp's mask at
+the point the adjoint reads, not the base point's, because the adjoint's mask comes from the
+activation in `fwd`. `tests/host/adjoint_quant.cpp` holds both ops to `check_kernel` against
+`ref_rmsnorm_quant_fp8` / `ref_gated_quant_fp8` and to `check_adjoint` through those twins, at the
+trunk's 128 columns and at two groups of 32.
+
+## 7. What this does not cover
 
 - **Only the host kernel is the reference**, as the issue says. The device kernels of these ops are
   not compared against the twin here; the GPU tier's own checks own that.
@@ -244,6 +291,10 @@ composition of the forward's two piecewise pieces, not a rule about the code.
   the clamp from the one the adjoint assumes. That is the last-bit arithmetic of section 1, and the
   adjoint does not chase it: making the mask depend on the storage precision of the scale would
   make it differ between a run that keeps the scale in f32 and one that rounds it.
+- **The fused producers' finite differences hold a linearised twin.** Their forward rounds the
+  residual and the bf16 activation, so the check compares the adjoint with a twin that has no
+  rounding step (section 6); the kernel check is where the rounding is compared, and it is exact at
+  every shape the tests take.
 - **The weight side.** `i8a8h`'s weight quantisation and the group factor of the rotation live on
   the other operand of the product and are another family's adjoint.
 - **Any op of this family that turns up later** in the op inventory belongs here, against the same
