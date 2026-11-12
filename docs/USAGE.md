@@ -70,9 +70,11 @@ host`.
 
 A row is either a flag this build has now, or a flag of an issue that has not merged. A **planned**
 row is not in `--help` and not accepted by the binary: it is here so that a reader knows which
-command the issue lands on and what the flag will be called. `--config <file>` and `--config-file
-<file>` are the same flag under two spellings; both are kept because a file path reads better as the
-last word of a long line.
+command the issue lands on and what the flag will be called. It carries the issue's title and the
+issue's tracker number, `(#<n>)` — a number on its own says nothing — and `docs/PLAN.md` cites its
+own list of positions as `R97 #<n>`, so the two cannot be mistaken for each other. `--config <file>`
+and `--config-file <file>` are the same flag under two spellings; both are kept because a file path
+reads better as the last word of a long line.
 
 ### `config`
 
@@ -221,8 +223,8 @@ usage: r97train train --model <file.rad> --out <dir> [--data <file.jsonl>] [--he
 | `--program <file>` | now | the op program a reference step replays |
 | `--config <file>` | now | read the configuration file first; a flag overrides it |
 | `--config-file <file>` | now | the same flag |
-| `--devices <N>` | planned: data-parallel on two cards (#55) | one sub-batch per card |
-| `--placement <spec>` | planned: layer split for containers that do not fit one card (#57) | which layers live on which card |
+| `--devices <N>` | planned: two cards, data-parallel (#57) | one sub-batch per card |
+| `--placement <spec>` | planned: layer split for containers that do not fit one card (#59) | which layers live on which card |
 
 ```sh
 build/r97train train --model <file.rad> --data <train.jsonl> --heldout <heldout.jsonl> \

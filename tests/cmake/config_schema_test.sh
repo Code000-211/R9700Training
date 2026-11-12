@@ -324,7 +324,9 @@ drill "$tmp/stale-usage" "train: the document says" "a usage line the binary no 
 sed '/^### `info`$/,/^### `loss`$/{/^### `loss`$/!d}' "$(usage_doc)" > "$tmp/no-info"
 drill "$tmp/no-info" "info: docs/USAGE.md has no" "a command missing from the document"
 
-# A planned flag with no issue: the reader cannot tell which issue it waits on.
-sed 's/^| `--devices <N>` | planned: data-parallel on two cards (#55) /| `--devices <N>` | planned: two cards /' \
+# A planned flag with no issue: the reader cannot tell which issue it waits on. A row carries the
+# issue's title and its tracker number; docs/PLAN.md cites its own positions as `R97 #<n>`, so the
+# two are not the same number and a row that drops them is what sends a reader to the wrong issue.
+sed 's/^| `--devices <N>` | planned: two cards, data-parallel (#57) /| `--devices <N>` | planned: two cards /' \
     "$(usage_doc)" > "$tmp/planned-without-issue"
 drill "$tmp/planned-without-issue" "--devices" "a planned flag with no issue"
