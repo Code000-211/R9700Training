@@ -301,14 +301,23 @@ boundary floors are 0.80/0.88/0.85/0.98/0.99 with the norm floors above, and the
 where the cotangent leaves the reference, and the case reports the count that miss it rather than
 pretending to hold it.
 
-Where the criterion *is* held is the half with an exact counterpart. The adapter gradients the walk
-produces are checked against the reference at the issue's own numbers by
-`reference_step_loss_and_gradients_match_the_oracle`, which walks the same `backward_block` through
-the f64 twins: the oracle's loss to 1.75e-8 and every `A` and `B` to 7.1e-5 of its largest value.
-The boundary cotangents have no such counterpart to be held against -- `make_reference_step`
-returns a `StepResult`, the loss and the gradients, and the boundary values and cotangents exist
-only in this join's `HostStepReport` -- so the cotangent half is measured against the criterion and
-attributed, not held.
+Where the criterion *is* held is the adapter gradients. The walk's `A` and `B` are checked against
+the reference by `reference_step_loss_and_gradients_match_the_oracle`, which walks the same
+`backward_block` through the f64 twins: the oracle's loss to 1.75e-8 and every `A` and `B` to
+7.1e-5 of its largest value. (The issue's 1e-3 finite-difference tolerance is held on the exact
+step's own difference, in the ten-direction case below.)
+
+The boundary cotangents have a counterpart too, though not through `make_reference_step`: it returns
+a `StepResult`, the loss and the gradients, and exposes no boundary values. Their counterpart is the
+oracle fixture itself, which `tools/oracle/make_reference.py` wrote from PyTorch in f64, with the
+residual `seq*/residual.<i>` and its cotangent `seq*/residual_grad.<i>` at every boundary and for
+every sequence. `host_step_matches_the_oracle_boundaries_and_adapter_gradient` compares every one of
+the join's boundary values and cotangents to those tensors: a residual value must match to a cosine
+of 0.99 and a norm within 1 %, and each cotangent is held to its boundary floor in `kBoundaryFloors`
+(which may be raised but never lowered). So the cotangent half is held against the reference at
+those floors. The issue's 0.999 / 2 % criterion is not held on it -- the forward is bf16 and the GDN
+recurrence amplifies the rounding with depth -- so the case prints `(miss)` beside every figure that
+fails the criterion and reports the count, which is what the decision asks of the comparison.
 
 Two things the criterion's wording forces and the case does check. The gradient set is compared
 whole: every parameter the delta hands the join must have a reference tensor and every reference
