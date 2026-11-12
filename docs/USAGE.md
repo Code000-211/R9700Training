@@ -51,7 +51,7 @@ there. A command that needs them says so, with the directory it looked in.
 | `data --model <file.rad> --data <file.jsonl> [--show N]` | the tokenisation statistics, and the first N conversations with their scored runs marked |
 | `loss --model <file.rad> --data <file.jsonl> [--lora <dir>] [--limit N] [--device N]` | the held-out loss, cross-checked against radiance's own KL record |
 | `grad --model <file.rad> --data <file.jsonl> [--delta lora] …` | one loss and its per-module gradient norms through the host adjoints |
-| `train --reference --model <file.rad> --out <dir> [flags]` | the training loop, with the reference step as the step function |
+| `train --model <file.rad> --out <dir> [--reference] [flags]` | the training loop, with the host step or, under `--reference`, the reference step |
 | `ops <file.rad>\|--registered [--device N]` | the op inventory of a container's forward pass, or the registry |
 | `deltas` | the registered trainable kinds, one per line |
 | `objectives` | the registered losses, one per line |
@@ -64,21 +64,24 @@ with no argument prints the command table with each command's argument hint.
 ### `train`
 
 ```sh
-build/r97train train --reference --model tiny.rad --data tests/fixtures/chat_small.jsonl \
-    --out runs/tiny --steps 200 --lr 1e-3 --token_budget 2048 --accumulation 1
+build/r97train train --model <file.rad> --data <train.jsonl> --heldout <heldout.jsonl> \
+    --out runs/lora-v1 --steps 1000 --lr 1e-4 --token_budget 4096 --eval_every 100
 ```
 
-`--reference` is the step function: the container's op graph replayed in `f64` from the engine's
-twins and the host adjoints, with the `libavx` and `libref` kernel libraries. It needs no card, and
-it is slow. The loop, the checkpoint and the resume are the same whatever the step function is; the
-ordinary host step is not wired in this build yet, so `train` without `--reference` stops and says
-so.
+The step is the ordinary host step: the engine's forward on the host kernels and the host adjoints
+(`docs/STEPS-HOST.md`). It needs no card, and it is the one a real run uses. `--reference` replaces
+it with the container's op graph replayed in `f64` from the engine's twins and the host adjoints,
+with the `libavx` and `libref` kernel libraries: no card, slower, and the same loop, checkpoint and
+resume. A build without radiance's forward tier has only the reference step, and `train` without
+`--reference` stops and says so.
 
 The command's own flags are `--reference`, `--resume <dir>`, `--program <file>` and `--config
 <file>`; every configuration key is accepted too, as `--key value`. The file is read first and a
 flag overrides it. Without `--data` the sequences are `tests/fixtures/chat_small.jsonl`, relative to
-the working directory — give a real run its own file. The loop logs to `<out>/train.jsonl` and to
-the terminal, writes checkpoints under `<out>/`, and its last line is `train: wrote <checkpoint>`.
+the working directory — give a real run its own file. `heldout` (or `--heldout <file>`) names the
+file `eval_every` evaluates on; `eval_every = 0` turns the evaluation off. The loop logs to
+`<out>/train.jsonl` and to the terminal, writes checkpoints under `<out>/`, and its last line is
+`train: wrote <checkpoint>`.
 
 `docs/TRAINING.md` says what the loop does with the log, the horizons and the evaluation;
 `docs/CHECKPOINT.md` says what the directory it wrote contains and what `--resume` needs.
@@ -98,9 +101,9 @@ alone keeps its `config.h` default, and an unknown key or an out-of-range value 
 key's name. It is the preflight `docs/RUNBOOK.md` runs before a long run.
 
 `config` applies no fallbacks of its own. `train` has four — `lr = 1e-3`, `steps = 1`,
-`token_budget = 2048`, `accumulation = 1` — so a run may leave those out of its file, while
-`r97train config --config` on the same file reports them as missing (their `config.h` default is
-outside the valid range). Write them in the file and the two agree.
+`token_budget = 2048`, `accumulation = 1` — so a run may leave those out of its file and still
+start, while `r97train config --config` on the same file refuses it: their `config.h` default is
+outside the valid range. Write them in the file and the two agree.
 
 ### The rest
 
@@ -182,55 +185,78 @@ checkpoint_every = 100
 ```
 
 `r97train config --config that-file` prints the same keys in schema order and validates them; the
-run is then `build/r97train train --reference --config that-file`.
+run is then `build/r97train train --config that-file`. `train` writes the container's SHA-256 into
+`base_id`, over whatever the file names; the key is for a caller that drives `Trainer` itself
+(`docs/TRAINING.md`).
 
 ## A first run, end to end
 
-Over the tiny fixture container — the one `ctest -L host` makes — every step below is a host test,
-and `docs/RUNBOOK.md` is the same sequence with the checks and the failure handling a real run
-needs.
-
-With the file above written as `runs/tiny.conf` and `out = runs/tiny`, `steps = 200`,
-`checkpoint_every = 100`:
+Over the tiny fixture container — no card and no data of your own. `docs/FIXTURES.md` owns the
+fixture: the host tests make it, and it lands in their temporary directory as
+`<tmpdir>/tiny_qwen35_bf16/tiny_qwen35_bf16.rad`. These commands find it and keep the path in
+`$tiny`:
 
 ```sh
-build/r97train info tiny.rad                                  # arch, quant, layers, hidden
-build/r97train data --model tiny.rad --data tests/fixtures/chat_small.jsonl --show 2
-build/r97train config --config runs/tiny.conf                 # the schema, resolved
-build/r97train train --reference --config runs/tiny.conf      # 200 steps; checkpoint-000000100, -000000200
-build/r97train train --reference --config runs/tiny.conf --resume runs/tiny/checkpoint-000000100
-build/r97train loss --model tiny.rad --data tests/fixtures/chat_small.jsonl \
-    --lora runs/tiny/checkpoint-000000200/adapter
+ctest --test-dir build -L host          # once: the host tests make the tiny container
+tiny=$(find "${RAD_TEST_TMPDIR:-${TMPDIR:-/tmp}}" \
+            -path '*tiny_qwen35_bf16/tiny_qwen35_bf16.rad' -printf '%T@ %p\n' \
+       | sort -rn | head -1 | cut -d' ' -f2-)
 ```
 
-The first `train` writes `checkpoint-000000100` and the one it stops on, `checkpoint-000000200`. The
-second resumes from the checkpoint of step 100 and stops at the file's horizon, 200 — `steps` is the
-whole run's, so the resumed run does steps 101 to 200 again and the log gets a second copy of them
-(`docs/CHECKPOINT.md`). `loss` prints `loss: <mean per scored token>` and the counts behind it.
+`$tiny` is the tiny run's `model`; the file below is its configuration, not the real one above:
 
-`train`'s terminal line is one per step. It prints its numbers at full double precision, so a real
-one is long; this one is from a run of the fixture with the walkthrough's flags and `--steps 3`:
+```sh
+mkdir -p runs
+cat > runs/tiny.conf <<CONF
+model = $tiny
+data = tests/fixtures/chat_small.jsonl
+out = runs/tiny
+objective = ce
+delta.kind = lora
+delta.rank = 4
+delta.alpha = 8
+delta.targets = q_proj, v_proj
+lr = 1e-3
+token_budget = 2048
+accumulation = 1
+steps = 20
+checkpoint_every = 10
+seed = 7
+CONF
 
+build/r97train info "$tiny"                                  # arch, quant, layers, hidden
+build/r97train data --model "$tiny" --data tests/fixtures/chat_small.jsonl --show 2
+build/r97train config --config runs/tiny.conf                # the schema, resolved
+build/r97train train --reference --config runs/tiny.conf     # 20 steps; checkpoint-000000010, -000000020
+build/r97train train --reference --config runs/tiny.conf --resume runs/tiny/checkpoint-000000010
+build/r97train loss --model "$tiny" --data tests/fixtures/chat_small.jsonl \
+    --lora runs/tiny/checkpoint-000000020/adapter
 ```
-step 2/3 epoch 0 loss 47.243417315629088 lr 0.0003250000299885869 |g| 31.531862258911133 53 tok 250.74407476257244 tok/s step 0.19507576099999999s update 0.016295136000000002s
-```
 
-`loss` is the step's mean per scored token, `|g|` its gradient norm, then the token count and the
-throughput, the step's time and the optimiser's share of it. `train.jsonl` holds the same numbers
-as fields; `docs/TRAINING.md` lists them.
+The first `train` writes `checkpoint-000000010` and the one it stops on,
+`checkpoint-000000020`, with `run.json` beside them. The second resumes from step 10 and stops at
+the file's horizon, 20 — `steps` is the whole run's, so the resumed run does steps 11 to 20 again
+and the log gets a second copy of them (`docs/CHECKPOINT.md`). `loss` prints `loss: <mean per
+scored token>` and the counts behind it.
+
+The terminal line is one per step and `train.jsonl` holds the same numbers as fields;
+`docs/TRAINING.md`'s Logging owns the line and what each field means.
 
 A checkpoint directory holds `trainer.state` and `adapter/`; the adapter directory is what `--lora`
 reads and what the serving side loads. `docs/CHECKPOINT.md` says what the state file holds and what
-`--resume` requires.
+`--resume` requires. `docs/RUNBOOK.md` takes the commands through a real run's checks and failures.
 
 ## What the host build can and cannot do
 
 - No card: everything in this file except `--device`, the `gpu` tests and the card's own inventory.
-  `train --reference`, `loss`, `grad`, `data`, `info`, `ops`, `config` are host commands.
-- `train` without `--reference` is not wired yet — it stops with `the host step is not wired in this
-  build; use --reference`. The device step is a later issue's; `docs/PLAN.md` says which.
+  `train` (the host step, or `--reference`), `loss`, `grad`, `data`, `info`, `ops`, `config` are
+  host commands.
+- A build without radiance's forward tier has no ordinary host step; `train` without `--reference`
+  stops with `train: this build has no forward driver; use --reference with the host step`. The
+  device step is a later issue's; `docs/PLAN.md` says which.
 - `loss` and `grad` need a build with radiance's forward tier, and a plugin home; a build without it
-  does not register them.
+  does not register them. `train` and `loss` find the plugin home from `RADIANCE_HOME` or the one
+  the build keeps beside the binary.
 - `--device N` selects the card through `ROCR_VISIBLE_DEVICES`; a `gpu` test takes `gpu_guard` so
   two runs never share the one card.
 
@@ -244,6 +270,7 @@ reads and what the serving side loads. `docs/CHECKPOINT.md` says what the state 
 | `info` and `data` on a container | `info_cli`, `data_cli` |
 | the schema, against `Config` and against this file | `tests/host/config_schema.cpp`, `config_schema` |
 | the file/flags/defaults order | `config_file_overrides_command_fallbacks` |
+| `train` (the host step), the held-out evaluation and the resume | `train_host_cli_overfits_and_resumes` |
 | `train --reference`, overfit and resume | `train_reference_cli_overfits_and_resumes` |
 | the log and the checkpoint directory | `trainer_log_and_checkpoint_files_match_the_document` |
 | resume identity and the non-finite stops | `trainer_resume_is_bit_identical`, `trainer_resume_refuses_a_different_base_id`, `trainer_non_finite_loss_stops_and_keeps_the_last_good_checkpoint` |

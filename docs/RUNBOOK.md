@@ -4,16 +4,20 @@ What an operator does, in order: check the inputs, launch, watch, stop and resum
 step names the command and what a healthy and an unhealthy result look like; the last section lists
 the host tests that run every command here, so the procedure is checked with the tree.
 
-Today the step function that exists is `--reference` (the engine's op graph replayed in `f64`, no
-card); `train` without it stops with `the host step is not wired in this build; use --reference`.
-Where this file says "card run", the procedure is what the run will do once the device step lands —
+Today's step is the ordinary host step (the engine's forward on the host kernels and the host
+adjoints, `docs/STEPS-HOST.md`); `--reference` replaces it with the engine's op graph replayed in
+`f64`, which is slower and needs no card. Each command's flags and output are `docs/USAGE.md`'s
+command table; this file is the order to run them in and what a bad result means. Where this file
+says "card run", the procedure is what the run will do once the device step lands —
 `docs/PLAN.md` says which issue — and the preflight commands in it already answer a card's questions
 (`ops --device`, `loss --device`).
 
 ## 0. What a run needs
 
 - `build/r97train` from a finished build (`docs/USAGE.md`).
-- A container `.rad`, and its id — the name you will put in `base_id`.
+- A container `.rad` — `train` names it by its SHA-256 in `base_id`, so a checkpoint cannot be
+  resumed against another container; a file's `base_id` is for a caller that drives `Trainer`
+  itself.
 - A training JSONL and a held-out JSONL, in the container's chat template.
 - An output directory with room for the adapters: one checkpoint every `checkpoint_every` steps,
   each holding a full copy of the adapter's weights plus the optimiser's moments. `du -sh` the
@@ -51,8 +55,8 @@ build/r97train config --config runs/lora-v1.conf
 This is the run's configuration resolved and validated: one `key = value` per line, in schema order,
 and a non-zero exit naming the first key that is unknown or out of range. `build/r97train config`
 with no arguments prints the schema the file has to fit. Check in what it prints: `out` names the
-run's directory, `base_id` names the container, `steps` (or `epochs`) is the horizon the operator
-wants, and `checkpoint_every` is not `0` for a run long enough to lose.
+run's directory, `steps` (or `epochs`) is the horizon the operator wants, and `checkpoint_every` is
+not `0` for a run long enough to lose.
 
 ```sh
 build/r97train loss --model /data/models/qwen3.8-27b-iq4r-s-v4.rad --data /data/chat/heldout.jsonl
@@ -76,7 +80,7 @@ what the build has at all. `docs/OPS-qwen35-device.md` is the reference inventor
 
 ```sh
 mkdir -p runs/lora-v1
-build/r97train train --reference --config runs/lora-v1.conf \
+build/r97train train --config runs/lora-v1.conf \
     2>&1 | tee -a runs/lora-v1/console.log
 ```
 
@@ -86,17 +90,10 @@ falls on, or when it stops.
 
 Before the first step the engine prints its own lines: with a container it can serve, the prefill
 count, and — in a host-only build — a `host-backend` warning that the engine is on the CPU, which is
-what `-DR97_WITH_HIP=OFF` means and not an error. Then one line per step:
-
-```
-step 2/3 epoch 0 loss 47.243417315629088 lr 0.0003250000299885869 |g| 31.531862258911133 53 tok 250.74407476257244 tok/s step 0.19507576099999999s update 0.016295136000000002s
-```
-
-(That line is the fixture's second step: the numbers and the horizon are the run's, and they print
-at full double precision, so `train.jsonl` and `jq` are how they are read in bulk.) `loss` is the
-step's mean per scored token, `|g|` the gradient norm before the update, `tok/s` the throughput, and
-`update` the optimiser's share of the step — a step time that is all `update` is a card that is not
-the bottleneck. A loss that is not finite ends the run at once (section 5).
+what `-DR97_WITH_HIP=OFF` means and not an error. Then one line per step, and `train.jsonl` the
+same numbers as fields; `docs/TRAINING.md`'s Logging owns the line and what each field means. The
+one thing to read here: a step time that is all `update` is a card that is not the bottleneck. A
+loss that is not finite ends the run at once (section 5).
 
 ## 3. Watch
 
@@ -106,10 +103,9 @@ jq -r 'select(.kind=="train") | [.step,.loss,.grad_norm,.tokens_per_s] | @tsv' r
 jq -r 'select(.kind=="eval") | [.step,.loss] | @tsv' runs/lora-v1/train.jsonl
 ```
 
-Every line is one flat JSON object: `train` records carry `step`, `epoch`, `loss`, `scored`, `lr`,
-`grad_norm`, `tokens`, `tokens_per_s`, `step_s`, `update_s`, `updated` (`updated` is `false` on the
-micro-steps an accumulation step has not completed); `eval` records carry `step`, `epoch`, `loss`,
-`scored`, `tokens`, `tokens_per_s`, `eval_s`, `batches`. `docs/TRAINING.md` owns the line.
+Every line is one flat JSON object; `docs/TRAINING.md`'s Logging names each record's fields and what
+they mean. An `eval` line appears every `eval_every` steps once `heldout` names a file, and none
+when it is `0`.
 
 What to look for: a loss that falls and then plateaus, a `grad_norm` that grows by an order of
 magnitude (lower `lr` or look at the data), `updated` `true` once per `accumulation` records, and an
@@ -127,12 +123,12 @@ gets a short `steps` horizon rather than a kill.
 
 ```sh
 ls runs/lora-v1                                  # the checkpoints that survived, newest last
-build/r97train train --reference --config runs/lora-v1.conf \
+build/r97train train --config runs/lora-v1.conf \
     --resume runs/lora-v1/checkpoint-000000400
 ```
 
 The log is opened for append and the step numbering continues from the checkpoint. Before resuming,
-check three things: `base_id` in the file still names the same container, the delta keys are the
+check three things: `base_id` in the run's `run.json` still matches the checkpoint's, the delta keys are the
 ones the checkpoint was written with, and `steps` is the whole run's horizon (the resumed run stops
 there, not at `400 + steps`). `docs/CHECKPOINT.md` has the rules the resume holds to and the
 bit-identical guarantee for a deterministic step.
@@ -143,16 +139,16 @@ The exit status is non-zero and the message on stderr names the thing at fault. 
 
 | what you see | what it means | what to do |
 | --- | --- | --- |
-| `r97: config: 'lr': must be > 0 (got 0)` | a key outside its valid range, or a required key left empty (`'out': must not be empty`) | `build/r97train config --config <file>`; the message names the key, `docs/USAGE.md` its range |
-| `r97: config: 'lr.rate': unknown key` | a typo, or a key this build does not have | run `build/r97train config` for the schema |
-| `train: the host step is not wired in this build; use --reference` | `train` without the reference step | add `--reference`; the device step is a later issue's |
+| `r97: config: 'lr': must be a finite value > 0 (got 0)` | a key outside its valid range, or a required key left empty (`'out': must not be empty`) | `build/r97train config --config <file>`; the message names the key, `docs/USAGE.md` its range |
+| `r97: config: 'lr.rate': unknown key in <file>:<line>` | a typo, or a key this build does not have | run `build/r97train config` for the schema |
+| `train: this build has no forward driver; use --reference with the host step` | `train` without `--reference` in a build without radiance's forward tier | add `--reference` (slow), or use a build with the forward tier; the device step is a later issue's |
 | `loss`/`data` exit `3` | the container did not open | the path, or the container was not converted for this engine |
 | `data` prints `skipped: <conversations>` | every conversation failed the template | `docs/CHATDATA.md`; check `info`'s `arch` against the template, and `--show 1` |
-| `r97: cannot resume checkpoint '<dir>': it was trained on base_id '<a>', this run's base_id is '<b>'` | the checkpoint belongs to another container | resume with the `base_id` it was written with, or pick another checkpoint |
+| `r97: cannot resume checkpoint '<dir>': it was trained on base_id '<a>', this run's base_id is '<b>'` | the checkpoint belongs to another container | resume it against the container it was trained on; `train` computes `base_id` from that container's SHA-256 |
 | `r97: non-finite gradient of '<param>' at step N; sequences: ...` | the step's gradient was not finite; the step changed nothing | the message names the sequences, by sub-batch and index, with lengths and first token ids: find them in the JSONL, fix or drop them, resume from the last checkpoint |
 | a write error on `checkpoint-<step>` | the disk filled, or the directory is not writable | free space, then resume; the last complete checkpoint is intact |
 | the run stops at a step it should have passed | the horizon: `steps` is the whole run's | set the horizon the operator means and resume |
-| `r97train loss: no radiance home: set RADIANCE_HOME to the directory holding architectures/, kernels/ and quantizers/` (`train --reference` fails with `reference step: live trace failed: …` instead) | the build's plugin directory was not found | `RADIANCE_HOME`, or build where the binary looks (`docs/FIXTURES.md`) |
+| `train: no radiance home: set RADIANCE_HOME to the directory holding architectures/, kernels/ and quantizers/` (`r97train loss: …` for `loss`; `--reference` fails with `reference step: live trace failed: …` instead) | the build's plugin directory was not found | `RADIANCE_HOME`, or build where the binary looks (`docs/FIXTURES.md`) |
 | the card is in use | one run per card | wait for it, or use another card; the read-only commands take `--device N` to pick one |
 
 The non-finite stop is the one failure that is not a mistake: the failing step changed no weight,
@@ -198,6 +194,8 @@ Then:
 | `build/r97train` and its command table | `usage_cli` |
 | `config` with no argument, and with a file and flags | `config_schema` |
 | `train --reference`, its log and its checkpoints, then `--resume` | `train_reference_cli_overfits_and_resumes` |
+| `train` (the host step), the held-out evaluation and the resume | `train_host_cli_overfits_and_resumes` |
+| serving the trained adapter | `train_host_cli_serves_the_int8_trunk` |
 | the terminal line and the JSON records | `trainer_log_and_checkpoint_files_match_the_document` |
 | the resume rules and the interrupted run | `trainer_resume_is_bit_identical`, `trainer_resume_keeps_a_pending_accumulation`, `trainer_resume_refuses_a_different_base_id` |
 | the non-finite stop that keeps the last good checkpoint | `trainer_non_finite_loss_stops_and_keeps_the_last_good_checkpoint` |

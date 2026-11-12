@@ -13,6 +13,7 @@ owns the loop that writes it (when, and what happens when a step is not finite);
 ```
 runs/lora-v1/
   train.jsonl                     the log, one JSON object per line (docs/TRAINING.md)
+  run.json                        the resolved configuration, once before the first step (docs/TRAINING.md)
   checkpoint-000000100/
     adapter/                      the adapter directory (docs/ADAPTER.md)
     trainer.state                 the trainer state (below)
@@ -24,6 +25,10 @@ runs/lora-v1/
 The step in the name is the number of completed loop steps, and it is also the `step` inside the
 state file. Checkpoints of one run sort by name in the order the loop wrote them, and a directory
 whose name has fewer than nine digits was not written by this loop.
+
+`run.json` sits beside the log rather than inside a checkpoint: the loop writes it once, before its
+first step, and a refused resume throws before that, so the directory keeps the configuration it
+already had. `docs/TRAINING.md` owns its fields.
 
 A checkpoint is assembled in `checkpoint-<step>.tmp` and renamed into place; `trainer.state` itself
 is written to `trainer.state.tmp` and renamed over. A failure while writing therefore leaves no

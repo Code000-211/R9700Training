@@ -11,21 +11,11 @@ writer (the adapter-files code). The loop only schedules them.
 
 ## Configuration
 
-One `key = value` per line. A line whose first non-space character is `#` is a comment, blank
-lines are ignored, and a value is everything after the first `=` with the ends trimmed (so a path
-may contain spaces; `#` is a comment only at the start of a line). Targets are a comma-separated
-list. `parse_config()` reads text, `read_config()` reads a file, and `load_config(path, flags)`
-reads the file, applies the flags over it and validates the result.
-
-A flag is `--key=value` or `--key value`, with the same key names. `--config` is the command
-line's own flag, not a configuration key.
-
-An unknown key, a malformed value and a value outside its range are all `ConfigError`s that name
-the key (`error.key()` and `error.what()`).
-
-The keys, their types, their defaults and their valid ranges are the configuration schema, and
-`docs/USAGE.md` owns it: that file's table is the schema, and `r97train config` prints it from the
-binary. A complete file is there too; this file is about what the loop does with the values.
+`docs/USAGE.md`'s Configuration owns the file format, the flags that override it, the keys with
+their defaults and ranges, and a complete file; this file is about what the loop does with the
+values. `parse_config()` reads text, `read_config()` a file, and `load_config(path, flags)` the file
+then the flags, validating the result; an unknown key, a malformed value and a value outside its
+range are `ConfigError`s that name the key (`error.key()`, `error.what()`).
 
 ## The run
 
