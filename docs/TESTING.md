@@ -156,7 +156,10 @@ hf download StillDeadcode/qwen3.8-27b-iqr-v4 qwen3.8-27b-iq4r-s-v4.rad
   (`tests/fixtures/chat_small.jsonl`), `tests/host/train_reference_cli.cpp` runs the command
   itself: 20 steps overfit them (every conversation's loss at least halves), and a 20-step run
   equals its own 10-step checkpoint resumed for 10 more, loss for loss and file for file, while
-  the loader's own log (`LD_DEBUG=libs`) names a host kernel library and never `libr4d`. This
-  proves the loop, the checkpoint, the batcher and the resume on the real graph shape, and it
+  the run's report names a host kernel selection and reports `libr4d` as left out, and the loader's
+  own log (`LD_DEBUG=libs`) names a host kernel library — that probe maps and unmaps every library
+  in the home while it reads their identity, so the loader's log alone names a device library a run
+  never selected. This proves the loop, the checkpoint, the batcher and the resume on the real
+  graph shape, and it
   proves the adjoints compose; it does **not** prove the int8 path, the GPU kernels or the device
   library, which it deliberately never loads.

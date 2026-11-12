@@ -85,11 +85,9 @@ same messages on `qwen3.8-27b-iq4r-s-v4.rad` and requires the ids to equal
 radiance's own `ChatTemplate::apply` output for that request, the mask to be
 non-empty, start unscored, and end before the render's trailing separator.
 
-Neither file brings a `main()` of its own: the tiers' entry points belong to other
-issues, so both run their checks from a static initializer through
-`tests/support/self_check.h` (`R97_SELF_CHECK`), like the loss tests. That is also
-the only safe place for them: loading a chat template compiles the vendored chat
-parser, whose namespace-scope tables are destroyed before any `atexit` handler
-runs, so a render from the exit-time runner fails with a
-`std::bad_array_new_length` from inside radiance. The host binary's own tests
-keep their own runner; nothing else in the tier is touched.
+Neither file brings a `main()` of its own: the tiers' entry points belong to other issues. The host
+file registers `R97_TEST`s, which `tests/host/main.cpp` runs with every static alive: a check that
+loads a chat template must not run from a static initialiser, because the vendored chat parser's
+namespace-scope tables are not built yet and the template analysis reads them as zeroed memory.
+`tests/model/chatdata_render.cpp` keeps its `R97_SELF_CHECK`, because the model tier is the tier
+that runs its checks from the at-exit handler (`tests/support/test.h`).

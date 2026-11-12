@@ -5,10 +5,9 @@
 // residual at every block boundary with a BoundaryRecorder.
 //
 // The fixture is written here, into a directory of the step's own, rather than through
-// r97::fixture(): that cache and radtest::tmpdir() are function-local statics that another test's
-// self-check creates during static initialisation, so they are destroyed before the exit-time
-// R97_TESTs run (docs/BLOCKS.md records the same failure). The plugin home and the converter are
-// found by asking the executable's directory each time, for the same reason.
+// r97::fixture(): a step that keeps its engine and its tape alive owns that directory, and removes
+// it with the step. The plugin home and the converter are found by asking the executable's
+// directory, so neither has to be passed in.
 #pragma once
 
 #include <cstdlib>

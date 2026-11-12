@@ -15,15 +15,10 @@
 
 #if defined(R97_REPLAY) && R97_FIXTURE_PREFILL
 
-// radiance's tests/rad_test.h, which the fixture header brings in, defines CHECK for its own
-// TEST() registry; this file checks with R97_CHECK only, so the alias is dropped rather than
-// warned about.
-#undef CHECK
-#include "support/self_check.h"
+#include "support/test.h"
 
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -54,7 +49,7 @@ void snap_residual(const std::vector<r97::OperandContent>& content, const void* 
 
 }  // namespace
 
-static void layer_replay_keeps_every_boundary_and_is_bit_identical() {
+R97_TEST(layer_replay_keeps_every_boundary_and_is_bit_identical) {
     r97::ReplayStep step;
     step.run(three_sequences());
 
@@ -104,7 +99,7 @@ static void layer_replay_keeps_every_boundary_and_is_bit_identical() {
     }
 }
 
-static void layer_replay_runs_in_reverse_order() {
+R97_TEST(layer_replay_runs_in_reverse_order) {
     r97::ReplayStep step;
     step.run(three_sequences());
 
@@ -129,28 +124,6 @@ static void layer_replay_runs_in_reverse_order() {
                               (size_t)step.store.boundary_bytes()) == 0);
     }
 }
-
-// Run before tests/support/test.h's runner and before the static destructors that the runner
-// comes after: this test drives a live engine, and the fixture that chatdata's self-check creates
-// during static initialisation is a function-local static whose contents are destroyed before an
-// exit-time R97_TEST can use them (docs/BLOCKS.md records the same failure). Registering this
-// handler after that static's own means it runs before the static goes away.
-namespace {
-
-void run_replay_tests() {
-    ::r97test::run("layer_replay_keeps_every_boundary_and_is_bit_identical",
-                   layer_replay_keeps_every_boundary_and_is_bit_identical);
-    ::r97test::run("layer_replay_runs_in_reverse_order", layer_replay_runs_in_reverse_order);
-}
-
-struct ReplayAtExit {
-    ReplayAtExit() {
-        if (std::atexit(&run_replay_tests) != 0)
-            std::fprintf(stderr, "replay: could not register the runner\n");
-    }
-} replay_at_exit;
-
-}  // namespace
 
 #else
 

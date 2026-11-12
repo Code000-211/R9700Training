@@ -143,24 +143,27 @@ that the test then joins.
 
 The test writes that checkpoint itself, with `r97::write_checkpoint` into a directory of its own,
 instead of calling `r97::fixture()`. Its sha256 is the manifest's `fixture.sha256`, so the bytes are
-the fixture's; what a `mkdtemp` buys is that the directory outlives the test. See the next section.
+the fixture's; what a `mkdtemp` buys is that the directory outlives the test.
 
-## Two failures this file met and did not fix
+## The two failures this file met
 
-Both are in the harness and predate this test; both are reported, not worked around in shared code.
+Both were in the harness rather than in this test, and both are fixed: the tier runs every check
+from `main` (`tests/host/main.cpp`) with every static alive, so nothing here needs a workaround or a
+local skip.
 
-- `tests/support/fixture.h`'s cache and `radtest::tmpdir()` are function-local statics, and on this
-  tree the first of them is created during static initialisation, by chatdata's `R97_SELF_CHECK`. A
-  `R97_TEST` runs from an exit-time handler (`tests/support/test.h`), which runs after those statics
-  have been destroyed, so every fixture-based test that runs there sees empty paths: on an untouched
-  tree the host binary reports 60 tests and 14 failures, all of them missing fixture, plugin or
-  oracle files. This test does not depend on them.
-- `test_loss_ce_objective_loss` fails two `CHECK`s: `tests/host/loss_ce_objective_loss.cpp:109`
-  (`got.loss == want.loss` for a window of the objective) and `:116` (the sum over the windows),
-  and `R97_SELF_CHECK`'s `CHECK` calls `std::abort()`. It runs during static initialisation, so the
-  whole host binary aborts there and no `R97_TEST` in it runs at all. Run by hand with that one
-  self-check skipped, this tree's host binary reports 64 tests and 14 failures, the same 14 as
-  above; the four block tests are among the 50 that pass.
+- `tests/support/fixture.h`'s cache and `radtest::tmpdir()` are function-local statics, and the
+  first of them used to be created during static initialisation, by chatdata's `R97_SELF_CHECK`. The
+  tier's checks then ran from the at-exit handler (`tests/support/test.h`), after those statics had
+  been destroyed, so every fixture-based test that ran there saw empty paths: 60 tests and 14
+  failures on an untouched tree, all of them missing fixture, plugin or oracle files.
+  `tests/host/chatdata_mask.cpp` registers `R97_TEST`s now, so no host file enters the fixture
+  before `main`.
+- `test_loss_ce_objective_loss` failed two `CHECK`s inside a `R97_SELF_CHECK`, whose `CHECK` calls
+  `std::abort()`, so the whole binary aborted during static initialisation and no `R97_TEST` in it
+  ran at all (64 tests and the same 14 failures with that one self-check skipped). It is an
+  `R97_TEST` now and both checks pass.
+
+The four block tests were among the 50 that passed either way.
 
 ## Reproducing
 
@@ -170,5 +173,4 @@ cmake --build build --target r97_host_tests
 ./build/r97_host_tests        # or: ctest --test-dir build -L host
 ```
 
-On this tree the binary aborts in a self-check before any `R97_TEST` runs, as the section above
-says, so the four tests are read out of it with that one self-check skipped locally.
+On this tree the binary runs every check the tier registers and reports `0 failed`.

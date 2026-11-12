@@ -5,9 +5,8 @@
 //
 // The tests run here, from main, rather than from the at-exit runner tests/support/test.h arms
 // from the first registration. That handler runs after the binary's static destructors, and the
-// statics a host test needs are gone by then: chatdata_mask.cpp builds the fixture
-// (support/fixture.h) from its own static initialiser, so the fixture, the temp directory behind
-// it and radiance's device layer are destroyed before an armed handler would call a test.
+// statics a host test needs are gone by then: the fixture (support/fixture.h), the temp directory
+// behind it and radiance's device layer are destroyed before an armed handler would call a test.
 // Running the tests inside main keeps every static alive for the whole run, whatever order the
 // translation units initialise in; _Exit then skips the rest of exit(), so no destructor and no
 // second run can hide the status. tests/gpu/main.cpp does the same, for the registry a plugin
