@@ -39,7 +39,7 @@ calls the join. See
 | --- | --- | --- | --- | --- | --- | --- |
 | `patches/serving/0201-lora-set-weights.patch` | serving | 75 | 0 | 85 | not-submitted | put an adapter slot in service from factors already in memory, not only from a directory |
 | `patches/serving/0201-narrow-head-gate.patch` | serving | 6 | 3 | 15 | not-submitted | an int8 attention gate on a head narrower than the 128-column quantiser group |
-| `patches/serving/0210-lora-int8-trunk-host.patch` | serving | 303 | 29 | 340 | not-submitted | a LoRA adapter on the rotated int8 trunk, through the host kernels |
+| `patches/serving/0210-lora-int8-trunk.patch` | serving | 383 | 37 | 440 | not-submitted | a LoRA adapter on the rotated int8 trunk, through the host and card kernels |
 | `patches/training/0101-issue-observer.patch` | training | 152 | 0 | 170 | not-submitted | an optional issue observer and layer block brackets on the runtime context |
 | `patches/training/0102-replay-block.patch` | training | 114 | 19 | 150 | not-submitted | re-running one block of a step from a restored residual, after its ops have run |
 | `patches/training/0103-prefill-logits.patch` | training | 201 | 20 | 240 | not-submitted | a training-fixture prefill that keeps every position's logits, driven through the engine |
@@ -80,6 +80,7 @@ what it removed from each patch, is in `docs/reports/2026-11-11-patch-audit.md`.
   returns, and `lora::load_adapter` keeps the basis a file's header declares. It is written that
   way, rather than as a copy out of the engine's config in `lora_set_weights`, because that
   function belongs to `0201`: a line inside it has no context on a bare radiance and so cannot stand
-  in a patch of its own, and every patch of this set applies on the pin by itself. That is why its
-  budget rises from 325 to 340 as well. `0211` is reserved in `docs/PLAN.md` for issue 51's
-  int8-code LoRA on the R9700 kernels.
+  in a patch of its own, and every patch of this set applies on the pin by itself. The budget is
+  440 because issue 51's int8-code LoRA on the R9700 kernels went in here instead of a patch of its
+  own (`0211`): the card rows' hunks of it replace lines the host hunks of `0210` first write, so
+  such a patch would never have applied on the pin by itself.

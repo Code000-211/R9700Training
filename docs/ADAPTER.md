@@ -84,9 +84,10 @@ exchanged" — the middle two dwords of each sixteen-byte step are exchanged, ho
 `libavx/avx_quant.cpp:53`). That order belongs to the per-row quantiser, **not** to
 `quant_act_i8g` / `had_quant_act_i8g`, which `qwen35_w8a8`'s sites use: their codes are plain
 column order. `lora_shrink` reads codes by column, so an adapter over a step-order site would be
-wrong — which is why radiance refuses it (see §3). The first patch lifts this refusal *by
-unexchanging the middle dwords when it builds `x`* for the step-order dtypes, and the
-`i8a8h` sites of this contract need only the column-order path above. What says which order a
+wrong — which is why radiance refused it (§3). Patch `0210` lifts that refusal everywhere by unexchanging the middle dwords: the host rows
+(`libref`, `libavx`) do it when they build a column-ordered `x`, the card rows (`libr4d`,
+`libhalo`) do it in the kernel; the `i8a8h` sites of this contract need only the column-order path
+above. What says which order a
 shrink's codes are in is the encoding of the GEMM whose activation it reads, so the patch has the
 core declare `lora_shrink` with a `gemm_dtype` parameter holding that GEMM's own `dtype` string
 (`i8a8h`, `w8a8`, ...). `dtype` alone cannot: it is the activation's element dtype, `i8` at every
@@ -174,9 +175,11 @@ The patch lifts them for sites that satisfy the conditions of §1 and §4: the a
 `"radiance_input_basis": "fwht128"` and every targeted site is an `i8a8h` (or, after patch 1,
 step-order) `gemm_nt_q`. Lifting refusal 1 is the shrink's business: what order a row's codes are in
 is the reading GEMM's encoding, so the patch declares `lora_shrink` with a `gemm_dtype` (§1.1) and
-the rows that can read the step order exchange it back. `libref`'s and `libavx`'s rows do;
-`libr4d`'s and `libhalo`'s rows read a row's codes by column, so they refuse a step-order reading by
-name (`RAD_E_UNSUPPORTED`) rather than fold the codes of the wrong columns. The `i8a8h` sites of
+every row reads the step order back: `libref`'s and `libavx`'s rows unexchange when they build a
+column-ordered copy, and `libr4d`'s and `libhalo`'s rows unexchange in the kernel — within each
+16-byte step the middle two dwords are exchanged, so the scalar row indexes byte `i8_step_pos(k)`
+and the tiled WMMA row gathers each fragment byte back. A step-order `i8` `a` must be whole
+16-byte steps, contiguous along the row (`RAD_E_SHAPE` / `RAD_E_STRIDE`). The `i8a8h` sites of
 this trunk read column order, and run on both. **Staying** (no patch touches these):
 
 - the rotated-parts refusal `lora.cpp:599-601` — `gemm_nt_q` over rotated parts (`pb1`/`pb2`),
