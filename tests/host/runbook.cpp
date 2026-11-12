@@ -12,8 +12,10 @@
 //     the served-loss comparison in it, so a fenced block that loses its `sh` tag does not turn the
 //     script into a shorter one that still passes;
 //   - the one-time inputs the script deliberately does not run are still named by the document: the
-//     data fetch (`tools/fetch_ultrachat.py`, `docs/DATA.md`) and the serving-only build
-//     (`-DR97_PATCH_SET=serving`), which is what "fetch the data, ..., serve" asks the file to say.
+//     data fetch (`tools/fetch_ultrachat.py`, `docs/DATA.md`), and the serving-only build
+//     (`-DR97_PATCH_SET=serving`) with the server that build builds, started on the adapter, and
+//     the record `tools/kld_loss.py` reads as the served loss -- which is what "fetch the data, ...,
+//     serve and check the served loss" asks the file to say.
 #include "../support/fixture.h"
 #include "../support/fixture_w8a8.h"
 #include "../support/test.h"
@@ -113,6 +115,16 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
     R97_CHECK(contains(document, "docs/DATA.md"));
     R97_CHECK(contains(document, "-DR97_PATCH_SET=serving"));
     R97_CHECK(contains(document, "stop a process you did not start"));
+
+    // Serving runs in the serving-only tree, not around it: its server, started on the adapter,
+    // and its own record of the loss, which is the number the trainer's is held to.
+    R97_CHECK(contains(document, "cmake --build build-serving/radiance-build --target radiance"));
+    R97_CHECK(contains(document, "build-serving/radiance-build/bin/radiance"));
+    R97_CHECK(contains(document, "--lora trained=\"$adapter\""));
+    R97_CHECK(contains(document, "/v1/chat/completions"));
+    R97_CHECK(contains(document, "--kld-corpus"));
+    R97_CHECK(contains(document, "--kld-lora trained"));
+    R97_CHECK(contains(document, "tools/kld_loss.py"));
 
     const std::string script = extract_script(document);
     // The script is the whole procedure, not a fragment of it that still exits 0.

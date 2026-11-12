@@ -237,17 +237,58 @@ resumed=$(horizon_loss "$R97_RUN-resumed/train.jsonl")
 
 The radiance a server runs is the serving patch set alone: `patches/serving/` applied to the pinned
 submodule, no training hook and no trainer anywhere in it. `-DR97_PATCH_SET=serving` is that build
-(`docs/UPSTREAM.md` says what the set must stand alone from), and it is the build a serving radiance
-is checked against. It costs a radiance build, so it is an input from section 0 rather than a step
-of the script. It holds no `r97train` — it is the engine, not the trainer — so the measurement below
-goes through the trainer build's `loss`, which loads the adapter with radiance's own loader
-(`lora/preload.h`) on the same host kernels the serving build compiles. That is why the number is
-the number a server would give.
+(`docs/UPSTREAM.md` says what the set must stand alone from), and section 0 built it once. Our own
+build lists the radiance targets it needs and the server is not one of them; the serving tree's own
+CMake has it, beside the architecture plugin the tiny int8 container needs, so the one-time step
+that turns the serving build into a server is:
 
-The checkpoint's `adapter/` is the directory a serving radiance loads (`docs/ADAPTER.md` has what it
-holds and what radiance reads); the run below serves the checkpoint the resumed run wrote, and
-compares its loss with the held-out loss the trainer reported for the same weights. 1e-4 relative is
-the tolerance the `train_host_cli` test holds the served number to, and the same one applies here.
+```text
+export RADIANCE_HOME=$PWD/build-serving/radiance-build/radiance_home
+cmake --build build-serving/radiance-build --target radiance qwen35_w8a8
+```
+
+The checkpoint's `adapter/` is the directory that build loads (`docs/ADAPTER.md` has what it holds
+and what radiance reads). The server holds the terminal it starts in; `--lora` gives the adapter the
+name a request asks for, and the run serves the checkpoint the resumed run wrote:
+
+```text
+adapter="$R97_RUN-resumed/checkpoint-$(printf %09d "$R97_STEPS")/adapter"
+build-serving/radiance-build/bin/radiance --model "$R97_MODEL" --radiance-home "$RADIANCE_HOME" \
+    --lora trained="$adapter" --host 127.0.0.1 --port 8080
+```
+
+A second terminal asks it for a completion, and an answer that is not empty is the proof that the
+serving-only build serves this adapter:
+
+```text
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
+    -d '{"model":"trained","messages":[{"role":"user","content":"Hi"}],"max_tokens":16}' \
+    | jq -r '.choices[0].message.content'
+```
+
+A server answers requests; it does not score one. The served loss is radiance's own measure of the
+same adapter over the same scored tokens: its KL mode records the adapter's next-token NLL at every
+scored position, and `tools/kld_loss.py` prints the mean and the count in the format `r97train
+loss` uses (`docs/EVAL.md`). The corpus is the held-out file in radiance's shape — one document per
+contiguous scored run — which `r97train data --kld-corpus` writes, so its rows are exactly the rows
+the trainer scores:
+
+```text
+mkdir -p "$R97_RUN-kld"
+"$r97" data --model "$R97_MODEL" --data "$R97_HELDOUT" --kld-corpus "$R97_RUN-kld/heldout.jsonl"
+build-serving/radiance-build/bin/radiance --model "$R97_MODEL" --radiance-home "$RADIANCE_HOME" \
+    --lora trained="$adapter" --kld-lora trained \
+    --kld-corpus "$R97_RUN-kld/heldout.jsonl" --kld-record "$R97_RUN-kld/served"
+python3 tools/kld_loss.py "$R97_RUN-kld/served"
+```
+
+`kld_loss.py` prints the loss of what was served; it must match the held-out loss the resumed run
+reported in section 6 (`$resumed`) to 1e-4 relative. 1e-4 is the tolerance
+`tests/host/train_host_cli.cpp` and `tests/host/loss_cli.cpp` hold these two numbers to, and the
+same one applies here. The number also comes from the trainer's `loss --lora`, which loads the
+adapter with radiance's own loader (`lora/preload.h`) on the same host kernels the serving build
+compiles, and the script below measures it and compares it with `$resumed`, so a host-only pass over
+this runbook still checks the loss against the trainer's:
 
 ```sh
 adapter="$R97_RUN-resumed/checkpoint-$(printf %09d "$R97_STEPS")/adapter"
@@ -346,8 +387,9 @@ the run can start at all:
 An op listed as missing is a kernel this build does not have and the run will stop on it;
 `--registered` prints what the build has at all, and `docs/OPS-qwen35-host.md` and
 `docs/OPS-qwen35-device.md` are the reference inventories. Picking the cards a run uses
-(`--devices`) and splitting a container across them (`--placement`) are the two-card issues'
-flags, listed as planned in `docs/USAGE.md`; until they land, one card is one run on one device.
+(`--devices`, tracker #57) and splitting a container across them (`--placement`, tracker #59) are
+the two-card issues' flags, listed as planned in `docs/USAGE.md`; until they land, one card is one
+run on one device.
 
 ## 11. What checks this file
 
@@ -355,7 +397,12 @@ flags, listed as planned in `docs/USAGE.md`; until they land, one card is one ru
 fixture with `build/r97train`: the extraction is the file's own procedure, so a flag that changes
 without the runbook, or a runbook command that stops working, fails `ctest --test-dir build -L
 host`. The one-time inputs in section 0 are not run — a radiance build, the network fetch, and
-`ctest` itself — and the serving build has no test of its own beyond `patch_sets` applying the
-patch set; run it once by hand before a serve. The flag tables in `docs/USAGE.md` are held to
-`r97train <command> --help` by `tests/cmake/config_schema_test.sh`, and the configuration table
-there to `Config` by the same test.
+`ctest` itself — and neither is section 7's serve, which needs the serving build and the server it
+builds; the host tier has neither. What the test does check is that section 7 keeps naming them: the
+target that builds the server out of the serving tree, the server started on the adapter, the corpus
+`--kld-corpus` writes, and the record `tools/kld_loss.py` reads as the served loss. Run those once
+by hand before a serve; the serving build has no test of its own beyond `patch_sets` applying the
+patch set. The flag tables in `docs/USAGE.md` are held to `r97train <command> --help` by
+`tests/cmake/config_schema_test.sh`, and the configuration table there is held to that same document
+by the same test and to `include/r97/config.h` by `tests/host/config_schema.cpp`, which counts the
+header's members against the schema's rows: a key added on either side of that pair fails.
