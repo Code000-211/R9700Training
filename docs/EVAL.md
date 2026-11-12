@@ -63,9 +63,10 @@ r97train data --model tiny_qwen35_bf16.rad --data tests/fixtures/chat_small.json
 `tests/host/loss_cli.cpp` builds the same corpus from `ChatData` for
 `tests/fixtures/chat_small.jsonl`, reads the record's NLL column itself (the host tier runs no
 Python), and checks the two losses agree to 1e-4 relative; `tests/host/data_cli.cpp` checks that
-what `--kld-corpus` writes has one row per scored token. `docs/RUNBOOK.md` §7 takes the served
-alternative further and scores a trained adapter through radiance's LoRA slot (`--lora` and
-`--kld-lora`), which is the served loss that document holds the trainer's to.
+what `--kld-corpus` writes has one row per scored token. `docs/RUNBOOK.md` §7 holds a trained
+adapter's served loss, measured through `r97train loss --lora`, to the trainer's held-out loss;
+radiance's LoRA slot (`--lora` and `--kld-lora`) is the serving-only build's version of the same
+cross-check, and issue #61's deployment path.
 
 `tools/kld_loss.py` reads the NLL column of `rows.f32` and prints it in the same format as
 `r97train loss`; it accepts full and `--kld-top` records.

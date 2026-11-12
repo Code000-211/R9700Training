@@ -6,22 +6,16 @@ ones you come back to. `docs/USAGE.md` has each command's flags, `docs/TRAINING.
 log, `docs/CHECKPOINT.md` the checkpoint and the resume, and `docs/ADAPTER.md` what a served
 adapter holds.
 
-**Every `sh` block in this file is one fragment of a single script.** In order the blocks are the
-whole procedure, and `tests/host/runbook.cpp` extracts them verbatim and runs them against the tiny
-fixture: a command here that stops working is a failing host test rather than a stale document. The
-blocks read `R97_BUILD`, `R97_STEPS` and the four inputs `R97_MODEL`, `R97_TRAIN`, `R97_HELDOUT`,
-`R97_RUN`; the inputs default to the fixture, so the file as it stands is the smoke run, and section
-10 sets them for a real one. A command in `backticks` in the prose is a one-time input (a build,
-the fetch) rather than a step of the script: it costs minutes or the network, and the test does not
-run it.
+**Every fenced block in this file is one fragment of a single script.** In order the blocks are the
+whole procedure, and `tests/host/runbook.cpp` extracts every block, requires its fence to be `sh`,
+and runs the fragments against the tiny fixture: a command here that stops working is a failing
+host test rather than a stale document. The blocks read `R97_BUILD`, `R97_STEPS` and the four
+inputs `R97_MODEL`, `R97_TRAIN`, `R97_HELDOUT`, `R97_RUN`; the inputs default to the fixture, so
+the file as it stands is the smoke run, and section 10 sets them for a real one. A command in
+`backticks` in the prose is a one-time input (a build, the fetch) rather than a step of the script:
+it costs minutes or the network, and the test does not run it.
 
-Save the blocks as one script and run it from the tree's top:
-
-```text
-mkdir -p runs
-sed -n '/^```sh$/,/^```$/p' docs/RUNBOOK.md | grep -v '^```' > runs/runbook.sh
-bash runs/runbook.sh
-```
+Save the fenced blocks as one script under `runs/` and run it from the tree's top.
 
 ## 0. What a run needs
 
@@ -30,13 +24,8 @@ bash runs/runbook.sh
 - **A container** `.rad`. `train` names it by its SHA-256 in `base_id`, so a checkpoint cannot be
   resumed against another container (`docs/CHECKPOINT.md` has the id and what a run writes).
 - **The data: two JSONL files in the container's chat template, fetched, not shipped.** The first
-  real run uses UltraChat 200k, which is not gated and needs no login:
-
-  ```text
-  python3 tools/fetch_ultrachat.py
-  ```
-
-  That writes `data/ultrachat/train.jsonl` (the `train_sft` split) and
+  real run uses UltraChat 200k, which is not gated and needs no login: `python3
+  tools/fetch_ultrachat.py` writes `data/ultrachat/train.jsonl` (the `train_sft` split) and
   `data/ultrachat/heldout.jsonl` (the `test_sft` split); `docs/DATA.md` owns the format, the
   licence, and what the script refuses. The fetch needs the `hf` CLI and the network, it is
   idempotent (it skips a split whose file exists), and `docs/CHATDATA.md` says what a file has to
@@ -48,8 +37,10 @@ bash runs/runbook.sh
 - **An output directory that does not exist yet.** A run makes it; one checkpoint every
   `checkpoint_every` steps holds a full copy of the adapter plus the optimiser's moments, so `du
   -sh` the first one before deciding the interval. The smoke run writes under `runs/`.
-- **The serving build** (for section 7): `cmake -B build-serving -G Ninja -DR97_PATCH_SET=serving`
-  and `cmake --build build-serving`. Once, before the first serve.
+- **No serving-only build for this script.** Section 7 measures the adapter with `r97train loss
+  --lora`, which loads it through radiance's own loader; the `-DR97_PATCH_SET=serving` build and
+  the server it builds are the deployment path of issue #61, and `docs/EVAL.md` has radiance's KL
+  record as the cross-check.
 - **Card discipline.** One training run at a time: the card to itself, one process, and `ctest -L
   gpu` takes `gpu_guard` for the same reason (only the issues marked for the two-card machine use
   both cards). **Never stop a process you did not start** — not another run, not someone else's
@@ -72,6 +63,7 @@ set -o pipefail
 : "${R97_TRAIN:=tests/fixtures/chat_small.jsonl}" # the training JSONL
 : "${R97_HELDOUT:=$R97_TRAIN}"                   # the held-out JSONL
 : "${R97_RUN:=runs/runbook}"                     # where the run writes; must not exist yet
+: "${RADIANCE_HOME:=$R97_BUILD/radiance-build/radiance_home}" # the build's plugins
 r97="$R97_BUILD/r97train"
 
 if [ -z "${R97_MODEL:-}" ]; then
@@ -85,7 +77,7 @@ fi
          "run 'ctest --test-dir $R97_BUILD -L host' once, or set R97_MODEL" >&2
     exit 1
 }
-export R97_MODEL R97_STEPS R97_TRAIN R97_HELDOUT R97_RUN
+export R97_MODEL R97_STEPS R97_TRAIN R97_HELDOUT R97_RUN RADIANCE_HOME
 echo "runbook: $R97_MODEL, $R97_STEPS steps, $R97_TRAIN -> $R97_RUN"
 ```
 
@@ -108,6 +100,13 @@ skipped=$("$r97" data --model "$R97_MODEL" --data "$R97_TRAIN" | sed -n 's/^skip
     echo "runbook: $skipped conversation(s) skipped; docs/CHATDATA.md says why" >&2
     exit 1
 }
+```
+
+The op inventory says whether this build can run the container at all. Its host kernels are the
+same check every run makes; on the card, `--device N` asks the device kernels the same question.
+
+```sh
+"$r97" ops "$R97_MODEL" --home "$RADIANCE_HOME" --kernels libavx,libref
 ```
 
 ## 3. The configuration
@@ -233,62 +232,14 @@ resumed=$(horizon_loss "$R97_RUN-resumed/train.jsonl")
 }
 ```
 
-## 7. Serve, and the served loss against the trainer's
+## 7. The adapter, and the served loss against the trainer's
 
-The radiance a server runs is the serving patch set alone: `patches/serving/` applied to the pinned
-submodule, no training hook and no trainer anywhere in it. `-DR97_PATCH_SET=serving` is that build
-(`docs/UPSTREAM.md` says what the set must stand alone from), and section 0 built it once. Our own
-build lists the radiance targets it needs and the server is not one of them; the serving tree's own
-CMake has it, beside the architecture plugin the tiny int8 container needs, so the one-time step
-that turns the serving build into a server is:
-
-```text
-export RADIANCE_HOME=$PWD/build-serving/radiance-build/radiance_home
-cmake --build build-serving/radiance-build --target radiance qwen35_w8a8
-```
-
-The checkpoint's `adapter/` is the directory that build loads (`docs/ADAPTER.md` has what it holds
-and what radiance reads). The server holds the terminal it starts in; `--lora` gives the adapter the
-name a request asks for, and the run serves the checkpoint the resumed run wrote:
-
-```text
-adapter="$R97_RUN-resumed/checkpoint-$(printf %09d "$R97_STEPS")/adapter"
-build-serving/radiance-build/bin/radiance --model "$R97_MODEL" --radiance-home "$RADIANCE_HOME" \
-    --lora trained="$adapter" --host 127.0.0.1 --port 8080
-```
-
-A second terminal asks it for a completion, and an answer that is not empty is the proof that the
-serving-only build serves this adapter:
-
-```text
-curl -s http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
-    -d '{"model":"trained","messages":[{"role":"user","content":"Hi"}],"max_tokens":16}' \
-    | jq -r '.choices[0].message.content'
-```
-
-A server answers requests; it does not score one. The served loss is radiance's own measure of the
-same adapter over the same scored tokens: its KL mode records the adapter's next-token NLL at every
-scored position, and `tools/kld_loss.py` prints the mean and the count in the format `r97train
-loss` uses (`docs/EVAL.md`). The corpus is the held-out file in radiance's shape — one document per
-contiguous scored run — which `r97train data --kld-corpus` writes, so its rows are exactly the rows
-the trainer scores:
-
-```text
-mkdir -p "$R97_RUN-kld"
-"$r97" data --model "$R97_MODEL" --data "$R97_HELDOUT" --kld-corpus "$R97_RUN-kld/heldout.jsonl"
-build-serving/radiance-build/bin/radiance --model "$R97_MODEL" --radiance-home "$RADIANCE_HOME" \
-    --lora trained="$adapter" --kld-lora trained \
-    --kld-corpus "$R97_RUN-kld/heldout.jsonl" --kld-record "$R97_RUN-kld/served"
-python3 tools/kld_loss.py "$R97_RUN-kld/served"
-```
-
-`kld_loss.py` prints the loss of what was served; it must match the held-out loss the resumed run
-reported in section 6 (`$resumed`) to 1e-4 relative. 1e-4 is the tolerance
-`tests/host/train_host_cli.cpp` and `tests/host/loss_cli.cpp` hold these two numbers to, and the
-same one applies here. The number also comes from the trainer's `loss --lora`, which loads the
-adapter with radiance's own loader (`lora/preload.h`) on the same host kernels the serving build
-compiles, and the script below measures it and compares it with `$resumed`, so a host-only pass over
-this runbook still checks the loss against the trainer's:
+The checkpoint's `adapter/` is the directory radiance loads (`docs/ADAPTER.md` has what it holds
+and what radiance reads), and the run serves the checkpoint the resumed run wrote. The served loss
+in this file is the trainer's `loss --lora`: it loads the adapter with radiance's own loader
+(`lora/preload.h`) on the same host kernels the serving build compiles, so a host-only pass over
+this runbook checks the loss against the trainer's. The script measures it and compares it with the
+held-out loss the resumed run reported in section 6 (`$resumed`):
 
 ```sh
 adapter="$R97_RUN-resumed/checkpoint-$(printf %09d "$R97_STEPS")/adapter"
@@ -312,20 +263,31 @@ awk -v trainer="$resumed" -v served="$served" 'BEGIN {
 }'
 ```
 
+`loss --lora` prints the loss of what was served; it must match the held-out loss the resumed run
+reported in section 6 (`$resumed`) to 1e-4 relative. 1e-4 is the tolerance
+`tests/host/train_host_cli.cpp` and `tests/host/loss_cli.cpp` hold these two numbers to, and the
+same one applies here.
+
 A checkpoint can be measured at any time without touching the run: `loss` on another `adapter/`
 answers whether it is worth keeping. Compare with the baseline of the same container and held-out
 file before the run — `"$r97" loss --model "$R97_MODEL" --data "$R97_HELDOUT"`, no `--lora` — and
 `docs/EVAL.md` says how the number is cross-checked.
 
+The serving-only build (`-DR97_PATCH_SET=serving`) and the server it builds are issue #61's
+deployment path, not this file's: that server answers requests, while this section holds the
+adapter's served loss. `docs/EVAL.md` has radiance's own KL record (`--kld-corpus`, `--kld-lora`)
+and `tools/kld_loss.py` as the cross-check when that build is at hand.
+
 ## 8. Watch
 
 Every line of `train.jsonl` is one flat JSON object; `docs/TRAINING.md`'s Logging names each
-record's fields. While the run is going:
+record's fields. While the run is going, follow the file with any JSONL reader; after it stops,
+this block prints the last five train records and every evaluation record, which is what to read
+when the run is over:
 
-```text
-tail -f "$R97_RUN/train.jsonl"
-jq -r 'select(.kind=="train") | [.step,.loss,.grad_norm,.tokens_per_s] | @tsv' "$R97_RUN/train.jsonl" | tail -5
-jq -r 'select(.kind=="eval") | [.step,.loss] | @tsv' "$R97_RUN/train.jsonl"
+```sh
+grep '"kind":"train"' "$R97_RUN/train.jsonl" | tail -5
+grep '"kind":"eval"' "$R97_RUN/train.jsonl"
 ```
 
 What to look for: a loss that falls and then plateaus; a `grad_norm` that grows by an order of
@@ -359,33 +321,29 @@ the whole diagnosis.
 
 ## 10. The real run
 
-The same script with four variables set, and the fetched data in place:
+The same script with five variables set, and the fetched data in place:
 
-```text
-R97_MODEL=/srv/models/qwen3.8-27b-iq4r-s-v4.rad
-R97_TRAIN=data/ultrachat/train.jsonl
-R97_HELDOUT=data/ultrachat/heldout.jsonl
-R97_RUN=runs/lora-v1
-R97_STEPS=1000
-```
+| variable | value |
+| --- | --- |
+| `R97_MODEL` | `/srv/models/qwen3.8-27b-iq4r-s-v4.rad` |
+| `R97_TRAIN` | `data/ultrachat/train.jsonl` |
+| `R97_HELDOUT` | `data/ultrachat/heldout.jsonl` |
+| `R97_RUN` | `runs/lora-v1` |
+| `R97_STEPS` | `1000` |
 
-Then the blocks of sections 1 to 7 run as they stand — the dry run on the container and the two
-files, the run to its horizon, the resume from whatever checkpoint survived, and the served loss
-against the trainer's. What changes with the size is the configuration, not the procedure: a longer
-`eval_every` and `checkpoint_every` (each checkpoint is a full adapter and its moments: `du -sh` the
-first), a `token_budget` and `accumulation` that fit the card, and an `lr` for the run's length.
+Then the blocks of sections 1 to 8 run as they stand — the dry run on the container and the two
+files, the run to its horizon, the resume from whatever checkpoint survived, the served loss
+against the trainer's, and the log the run wrote. What changes with the size is the configuration,
+not the procedure: a longer `eval_every` and `checkpoint_every` (each checkpoint is a full adapter
+and its moments: `du -sh` the first), a `token_budget` and `accumulation` that fit the card, and an
+`lr` for the run's length.
 `docs/TRAINING.md` has the loop's knobs, `docs/PLAN.md` the runs that are planned.
 
 For a card run, two things are added: the card is the run's alone (section 0's discipline — one
-run at a time, and never a process you did not start), and the pre-step inventory answers whether
-the run can start at all:
-
-```text
-"$r97" ops "$R97_MODEL" --device 0
-```
-
-An op listed as missing is a kernel this build does not have and the run will stop on it;
-`--registered` prints what the build has at all, and `docs/OPS-qwen35-host.md` and
+run at a time, and never a process you did not start), and the pre-step inventory of section 2
+answers whether the run can start at all; on the card, `--device N` asks the device kernels the
+same question. An op listed as missing is a kernel this build does not have and the run will stop
+on it; `--registered` prints what the build has at all, and `docs/OPS-qwen35-host.md` and
 `docs/OPS-qwen35-device.md` are the reference inventories. Picking the cards a run uses
 (`--devices`, tracker #57) and splitting a container across them (`--placement`, tracker #59) are
 the two-card issues' flags, listed as planned in `docs/USAGE.md`; until they land, one card is one
@@ -393,16 +351,14 @@ run on one device.
 
 ## 11. What checks this file
 
-`tests/host/runbook.cpp` takes every `sh` block above, in order, and runs it on the tiny int8
-fixture with `build/r97train`: the extraction is the file's own procedure, so a flag that changes
-without the runbook, or a runbook command that stops working, fails `ctest --test-dir build -L
-host`. The one-time inputs in section 0 are not run — a radiance build, the network fetch, and
-`ctest` itself — and neither is section 7's serve, which needs the serving build and the server it
-builds; the host tier has neither. What the test does check is that section 7 keeps naming them: the
-target that builds the server out of the serving tree, the server started on the adapter, the corpus
-`--kld-corpus` writes, and the record `tools/kld_loss.py` reads as the served loss. Run those once
-by hand before a serve; the serving build has no test of its own beyond `patch_sets` applying the
-patch set. The flag tables in `docs/USAGE.md` are held to `r97train <command> --help` by
+`tests/host/runbook.cpp` takes every fenced block above, requires its fence to be `sh`, and runs
+the blocks in order on the tiny int8 fixture with `build/r97train`: the extraction is the file's
+own procedure, so a flag that changes without the runbook, a runbook command that stops working, or
+a non-`sh` block added to the file fails `ctest --test-dir build -L host`. The one-time inputs in
+section 0 are inline prose, not blocks, and are not run — a radiance build, the network fetch, and
+`ctest` itself. The serving-only build and its server are the separate deployment path (issue
+#61); this file's served loss is the trainer's `loss --lora`, which the extracted script runs. The
+flag tables in `docs/USAGE.md` are held to `r97train <command> --help` by
 `tests/cmake/config_schema_test.sh`, and the configuration table there is held to that same document
 by the same test and to `include/r97/config.h` by `tests/host/config_schema.cpp`, which counts the
 header's members against the schema's rows: a key added on either side of that pair fails.

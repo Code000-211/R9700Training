@@ -414,7 +414,7 @@ reads and what the serving side loads. `docs/CHECKPOINT.md` says what the state 
 | the schema, against `Config` and against this file | `tests/host/config_schema.cpp`, `config_schema` |
 | every command's usage line and flags, against this file | `config_schema` |
 | `--dry-run`, the served loss and the serve's own flags | `train_host_cli_serves_the_int8_trunk`, `train_cli_dry_run_resolves_and_writes_nothing` |
-| the runbook's commands, extracted and run in order | `runbook_script_runs_as_the_document_orders_it` |
+| the runbook's fenced blocks, all `sh`, extracted and run in order | `runbook_script_runs_as_the_document_orders_it` |
 | the file/flags/defaults order | `config_file_overrides_command_fallbacks` |
 | `train` (the host step), the held-out evaluation and the resume | `train_host_cli_overfits_and_resumes` |
 | `train --reference`, overfit and resume | `train_reference_cli_overfits_and_resumes` |

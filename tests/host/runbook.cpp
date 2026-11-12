@@ -1,21 +1,21 @@
 // tests/host/runbook.cpp -- `docs/RUNBOOK.md`'s commands, extracted and run.
 //
-// The runbook says that every `sh` block in it is one fragment of a single script, and that this
-// test is what keeps the document honest. It is: the blocks between ```sh fences are taken in the
-// order the file has them, written out as one script, and run from the tree's top against the tiny
-// int8 fixture, with the binary of this build. A flag that changes without the document, a check
-// the document states that the tree no longer holds to, or a block that stops working fails here
-// rather than in front of an operator.
+// The runbook says that every fenced block in it is one fragment of a single script, and that this
+// test is what keeps the document honest. It is: every fenced block is taken in the order the file
+// has them, its fence must be ```sh (a `text` block of commands would be a part of the procedure
+// the test never runs), the blocks are written out as one script, and the script is run from the
+// tree's top against the tiny int8 fixture, with the binary of this build. A flag that changes
+// without the document, a check the document states that the tree no longer holds to, or a block
+// that stops working fails here rather than in front of an operator.
 //
 // What is checked beyond "the script exits 0":
-//   - the extracted script really is the procedure: it has the dry run, the run, the resume and
-//     the served-loss comparison in it, so a fenced block that loses its `sh` tag does not turn the
-//     script into a shorter one that still passes;
+//   - the extracted script really is the procedure: it has the preflight, the dry run, the run, the
+//     resume, the served-loss comparison and the log check in it, so a fenced block that loses its
+//     `sh` tag does not turn the script into a shorter one that still passes;
 //   - the one-time inputs the script deliberately does not run are still named by the document: the
-//     data fetch (`tools/fetch_ultrachat.py`, `docs/DATA.md`), and the serving-only build
-//     (`-DR97_PATCH_SET=serving`) with the server that build builds, started on the adapter, and
-//     the record `tools/kld_loss.py` reads as the served loss -- which is what "fetch the data, ...,
-//     serve and check the served loss" asks the file to say.
+//     data fetch (`tools/fetch_ultrachat.py`, `docs/DATA.md`), the serving-only build
+//     (`-DR97_PATCH_SET=serving`) whose server is the separate deployment path, and the rule that
+//     one run has the card to itself.
 #include "../support/fixture.h"
 #include "../support/fixture_w8a8.h"
 #include "../support/test.h"
@@ -58,8 +58,9 @@ std::string read_file(const fs::path& path) {
     return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
 }
 
-// The body of every ```sh block, in file order, as one script. A fenced block that is never closed
-// is an error: the file would otherwise lose its last commands silently.
+// The body of every fenced block, in file order, as one script. Every fence must be ```sh: a
+// `text` block of commands is a part of the procedure the test would never run. A fence that is
+// never closed, a stray close, or a non-`sh` opening is an error too.
 std::string extract_script(const std::string& document) {
     std::string script;
     bool open = false;
@@ -69,22 +70,31 @@ std::string extract_script(const std::string& document) {
         const std::size_t end = document.find('\n', at);
         const std::string text = document.substr(at, end == std::string::npos ? end : end - at);
         ++line;
-        if (text == "```sh") {
-            if (open) throw std::runtime_error("runbook: a ```sh block at line " +
-                                               std::to_string(line) + " opens inside another");
+        // A block may sit inside a list item, so the fence is the line without its indentation.
+        const std::size_t first = text.find_first_not_of(" \t");
+        const std::string fence = first == std::string::npos ? std::string() : text.substr(first);
+        if (open) {
+            if (fence == "```") {
+                open = false;
+            } else if (fence.rfind("```", 0) == 0) {
+                throw std::runtime_error("runbook: a fenced block at line " +
+                                         std::to_string(line) + " opens inside a ```sh block");
+            } else {
+                script += text;
+                script += '\n';
+            }
+        } else if (fence == "```sh") {
             open = true;
             ++blocks;
-        } else if (text == "```") {
-            if (open) open = false;
-        } else if (open) {
-            script += text;
-            script += '\n';
+        } else if (fence.rfind("```", 0) == 0) {
+            throw std::runtime_error("runbook: line " + std::to_string(line) +
+                                     " opens a fenced block that is not ```sh: " + fence);
         }
         if (end == std::string::npos) break;
         at = end + 1;
     }
     if (open) throw std::runtime_error("runbook: the last ```sh block is never closed");
-    if (blocks == 0) throw std::runtime_error("runbook: no ```sh block in the document");
+    if (blocks == 0) throw std::runtime_error("runbook: no fenced block in the document");
     return script;
 }
 
@@ -109,29 +119,21 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
     const std::string document = read_file(document_path);
 
     // The one-time inputs the script does not run are still the document's to name: a reader who
-    // has neither written nor read the code starts by fetching the data and ends by serving from
-    // the serving-only build.
+    // has neither written nor read the code starts by fetching the data, and the serving-only
+    // build's server is named as the separate deployment path rather than a command here.
     R97_CHECK(contains(document, "tools/fetch_ultrachat.py"));
     R97_CHECK(contains(document, "docs/DATA.md"));
     R97_CHECK(contains(document, "-DR97_PATCH_SET=serving"));
     R97_CHECK(contains(document, "stop a process you did not start"));
 
-    // Serving runs in the serving-only tree, not around it: its server, started on the adapter,
-    // and its own record of the loss, which is the number the trainer's is held to.
-    R97_CHECK(contains(document, "cmake --build build-serving/radiance-build --target radiance"));
-    R97_CHECK(contains(document, "build-serving/radiance-build/bin/radiance"));
-    R97_CHECK(contains(document, "--lora trained=\"$adapter\""));
-    R97_CHECK(contains(document, "/v1/chat/completions"));
-    R97_CHECK(contains(document, "--kld-corpus"));
-    R97_CHECK(contains(document, "--kld-lora trained"));
-    R97_CHECK(contains(document, "tools/kld_loss.py"));
-
     const std::string script = extract_script(document);
     // The script is the whole procedure, not a fragment of it that still exits 0.
+    R97_CHECK(contains(script, "\"$r97\" ops"));
     R97_CHECK(contains(script, "train --dry-run"));
     R97_CHECK(contains(script, "train --config"));
     R97_CHECK(contains(script, "--resume"));
     R97_CHECK(contains(script, "loss --model"));
+    R97_CHECK(contains(script, "\"kind\":\"train\""));
 
     const fs::path dir = fs::path(radtest::tmpdir());
     const fs::path run = dir / "runbook";
