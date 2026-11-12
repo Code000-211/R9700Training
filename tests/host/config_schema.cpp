@@ -2,16 +2,20 @@
 //
 // The schema is what `r97train config` prints and what docs/USAGE.md prints; the document side is
 // tests/cmake/config_schema_test.sh's, because it needs the binary and the doc. Here the schema is
-// checked against the two things the binary cannot check itself: every row's default is the value
-// config.h sets (a default lives there and nowhere else), and every row names a key the parser
-// accepts and sets the field the key is for.
+// checked against the three things the binary cannot check itself: every row's default is the value
+// config.h sets (a default lives there and nowhere else), every row names a key the parser accepts
+// and sets the field the key is for, and the rows are as many as config.h has members (a member
+// added to Config without its row fails here, as a row without its member does).
 // Label: host.
 #include "../support/test.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "r97/config.h"
@@ -35,6 +39,31 @@ bool same(const Config& a, const Config& b) {
 
 // The text a config file writes for a key whose shown default is `empty`: nothing after the '='.
 std::string file_value(const std::string& text) { return text == "empty" ? std::string() : text; }
+
+// A value an initialiser takes for any member: it converts to whatever the member's type is, so an
+// aggregate is probed without naming its members.
+struct AnyValue {
+    template <class T>
+    operator T() const {
+        return T{};
+    }
+};
+
+template <class T, std::size_t... I>
+consteval bool brace_fits(std::index_sequence<I...>) {
+    return requires { T{((void)I, AnyValue{})...}; };
+}
+
+// The number of members T's brace initialisation takes: one initialiser per member fits and one more
+// is "too many initializers", so the count is one past the last N that fits.
+template <class T, std::size_t N = 0>
+consteval std::size_t member_count() {
+    if constexpr (N < 64 && brace_fits<T>(std::make_index_sequence<N>{})) {
+        return member_count<T, N + 1>();
+    } else {
+        return N - 1;
+    }
+}
 
 }  // namespace
 
@@ -98,6 +127,14 @@ R97_TEST(config_schema_keys_set_their_field) {
     // new key must be given its row and its value here, which is where a key that parses but has
     // no schema row would be noticed.
     R97_CHECK(std::size(cases) == config_schema().size());
+
+    // config.h holds one member per key (`delta` counts as its five, in DeltaConfig), so the two
+    // counts together are the number of keys. A member added to either struct without its schema
+    // row, its case in the table above, and its row in docs/USAGE.md fails here rather than
+    // passing every test; a member that is removed or renamed no longer compiles in `same()`.
+    R97_CHECK(std::is_aggregate_v<Config>);
+    R97_CHECK(std::is_aggregate_v<DeltaConfig>);
+    R97_CHECK(member_count<Config>() + member_count<DeltaConfig>() - 1 == std::size(cases));
 
     for (const Case& c : cases) {
         const bool listed = std::any_of(config_schema().begin(), config_schema().end(),
