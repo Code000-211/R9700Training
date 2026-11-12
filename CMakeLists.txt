@@ -331,6 +331,11 @@ if(R97_BUILD_TESTS)
     target_compile_definitions(r97_host_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}"
       # the int8 fixture's recipe, the one docs/FIXTURES.md prints
       R97_FIXTURE_W8A8_RECIPE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/w8a8_fwht128.recipe")
+    if(TARGET r97train)
+      # The checks that run the binary in a child process have nothing to run in a serving build,
+      # so those sources compile away rather than look for a binary that was never built.
+      target_compile_definitions(r97_host_tests PRIVATE R97_HAS_R97TRAIN=1)
+    endif()
   endif()
 
   # gpu tests: need the card, run serially. One binary, its main in tests/gpu/main.cpp; every
@@ -398,10 +403,13 @@ if(R97_BUILD_TESTS)
   # The configuration schema: the table the binary prints and the one docs/USAGE.md prints, cell
   # for cell, and the resolved configuration the `config` command prints. The test drives the
   # failures on copies of the document, so the table's pass is checked with its reasons to fail.
-  add_test(NAME config_schema
-           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/config_schema_test.sh
-                   ${CMAKE_CURRENT_SOURCE_DIR} $<TARGET_FILE:r97train>)
-  set_tests_properties(config_schema PROPERTIES LABELS host)
+  # A serving build keeps no r97train to print the schema, so there is nothing for it to test.
+  if(TARGET r97train)
+    add_test(NAME config_schema
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/config_schema_test.sh
+                     ${CMAKE_CURRENT_SOURCE_DIR} $<TARGET_FILE:r97train>)
+    set_tests_properties(config_schema PROPERTIES LABELS host)
+  endif()
 
   if(TARGET r97_gpu_tests)
     # The gpu binary holds two kinds of test, and the labels promise different things: a `gpu` test

@@ -152,7 +152,7 @@ The exit status is non-zero and the message on stderr names the thing at fault. 
 | `r97: non-finite gradient of '<param>' at step N; sequences: ...` | the step's gradient was not finite; the step changed nothing | the message names the sequences, by sub-batch and index, with lengths and first token ids: find them in the JSONL, fix or drop them, resume from the last checkpoint |
 | a write error on `checkpoint-<step>` | the disk filled, or the directory is not writable | free space, then resume; the last complete checkpoint is intact |
 | the run stops at a step it should have passed | the horizon: `steps` is the whole run's | set the horizon the operator means and resume |
-| `radiance: no plugin home` | the build's plugin directory was not found | `RADIANCE_HOME`, or build where the binary looks (`docs/FIXTURES.md`) |
+| `r97train loss: no radiance home: set RADIANCE_HOME to the directory holding architectures/, kernels/ and quantizers/` (`train --reference` fails with `reference step: live trace failed: …` instead) | the build's plugin directory was not found | `RADIANCE_HOME`, or build where the binary looks (`docs/FIXTURES.md`) |
 | the card is in use | one run per card | wait for it, or use another card; the read-only commands take `--device N` to pick one |
 
 The non-finite stop is the one failure that is not a mistake: the failing step changed no weight,
@@ -195,7 +195,7 @@ Then:
 
 | command in this file | test (`ctest --test-dir build -L host`) |
 | --- | --- |
-| `build/r97train` and its command table | `listings` |
+| `build/r97train` and its command table | `usage_cli` |
 | `config` with no argument, and with a file and flags | `config_schema` |
 | `train --reference`, its log and its checkpoints, then `--resume` | `train_reference_cli_overfits_and_resumes` |
 | the terminal line and the JSON records | `trainer_log_and_checkpoint_files_match_the_document` |
