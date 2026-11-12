@@ -126,6 +126,21 @@ std::string slot_grad_name(const AdjointCall& call, const char* leaf, int64_t sl
     return grad_name(call.prefix, leaf);
 }
 
+bool join_record(const AdjointCall& call) {
+    for (const auto& p : call.rec.params) {
+        if (p.first != "r97join") continue;
+        if (const int64_t* on = std::get_if<int64_t>(&p.second)) return *on == 1;
+    }
+    return false;
+}
+
+// The reference step keeps a slot's factor under the module that owns it; the host step's fused
+// weight has one factor for a run of slots, and its shape splitter expects that fused name.
+std::string factor_grad_name(const AdjointCall& call, const char* leaf, int64_t slot) {
+    if (join_record(call)) return grad_name(call.prefix, leaf);
+    return slot_grad_name(call, leaf, slot);
+}
+
 /* bf16 rounding, which lora_expand_mm's twin needs and r97's own arithmetic never does. Ties go to
  * the even significand and a value below bf16's normal range flushes, as rad_f32_to_bf16 does. */
 double rounded_bf16(double v) {
@@ -273,7 +288,7 @@ void lora_shrink_host_adjoint(const AdjointCall& call) {
     std::vector<Param*> da_by_slot((size_t)sh.S, nullptr);
     const auto da_for = [&](int64_t s) -> Param* {
         Param*& p = da_by_slot[(size_t)s];
-        if (!p) p = &grad_entry(call.grads, slot_grad_name(call, "lora_A", s), {sh.R, sh.K});
+        if (!p) p = &grad_entry(call.grads, grad_name(call.prefix, "lora_A"), {sh.R, sh.K});
         return p;
     };
 
@@ -403,7 +418,7 @@ void lora_expand_host_adjoint(const AdjointCall& call) {
     std::vector<Param*> db_by_slot((size_t)ex.S, nullptr);
     const auto db_for = [&](int64_t s) -> Param* {
         Param*& p = db_by_slot[(size_t)s];
-        if (!p) p = &grad_entry(call.grads, slot_grad_name(call, "lora_B", s), {ex.N, ex.R});
+        if (!p) p = &grad_entry(call.grads, grad_name(call.prefix, "lora_B"), {ex.N, ex.R});
         return p;
     };
 
@@ -432,9 +447,23 @@ bool reference_coded_act(const std::vector<OpParam>& p) {
     return reference_record(p) && coded_act(p);
 }
 
+// The host step's live records can carry an activation split by head, which this row reads as
+// [rows][K] the way the reference step's composed graph does. The join tags its adapter records so
+// those rows, and only those, reach them; the family file keeps the ordinary graph.
+bool join_lora_record(const std::vector<OpParam>& p) {
+    for (const auto& param : p) {
+        if (param.first != "r97join") continue;
+        if (const int64_t* on = std::get_if<int64_t>(&param.second)) return *on == 1;
+    }
+    return false;
+}
+
 R97_REGISTER_TWIN_IF("lora_shrink", lora_shrink_twin, reference_record)
 R97_REGISTER_TWIN_IF("lora_expand", lora_expand_twin, reference_record)
 R97_REGISTER_TWIN_IF("lora_expand_mm", lora_expand_twin, reference_record)
+R97_REGISTER_TWIN_IF("lora_shrink", lora_shrink_twin, join_lora_record)
+R97_REGISTER_TWIN_IF("lora_expand", lora_expand_twin, join_lora_record)
+R97_REGISTER_TWIN_IF("lora_expand_mm", lora_expand_twin, join_lora_record)
 
 /* Two rows, because the a_scale position means different things in the two forms: a coded trunk
  * passes a real scale, and its cotangent is part of the int8 chain, so only slot (2) and lora_a (3)
@@ -445,6 +474,9 @@ R97_REGISTER_ADJOINT_IF_F("lora_shrink", host, lora_shrink_host_adjoint, referen
 
 R97_REGISTER_ADJOINT_IF_F("lora_expand", host, lora_expand_host_adjoint, reference_record, 1, 2, 3)
 R97_REGISTER_ADJOINT_IF_F("lora_expand_mm", host, lora_expand_host_adjoint, reference_record, 1, 2, 3)
+R97_REGISTER_ADJOINT_IF_F("lora_shrink", host, lora_shrink_host_adjoint, join_lora_record, 1, 2, 3)
+R97_REGISTER_ADJOINT_IF_F("lora_expand", host, lora_expand_host_adjoint, join_lora_record, 1, 2, 3)
+R97_REGISTER_ADJOINT_IF_F("lora_expand_mm", host, lora_expand_host_adjoint, join_lora_record, 1, 2, 3)
 
 }  // namespace reference_lora
 }  // namespace r97

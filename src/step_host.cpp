@@ -89,6 +89,9 @@ double read_elem(const std::string& dtype, const void* data, int64_t i) {
 // the full buffer with the untouched rows zero.
 AdValue snapshot(const Operand& op, const OperandContent& content) {
     AdValue v;
+    // The family adjoints read the record's dtype off the value too (an absent scale is spelled
+    // "invalid"), so keep it with the numbers.
+    v.dtype = op.dtype;
     // A strided or narrowed read -- the q norm and the gate read the two halves of the q|gate
     // projection, the gated-delta layer reads q|k|v out of one fused projection -- is packed over
     // its own shape: the adjoint that follows normalises the last dim the kernel normalised, and
@@ -190,8 +193,48 @@ void tighten_operand(Operand& o) {
     if (!o.view_shape.empty() && o.rows <= o.view_shape[0]) o.view_shape[0] = o.rows;
 }
 
+// The attention family's adjoint reads q as [rows, heads, head_dim] and takes head_dim from its
+// last axis. The engine hands the kernel the flattened [rows, heads * head_dim] buffer, so the
+// walk gets the view the family expects. The kv operand carries the same head_dim as a pair.
+void annotate_attention(OpRecord& rec) {
+    if (rec.op != "attn_paged" || rec.operands.empty()) return;
+    Operand& q = rec.operands[0];
+    if (q.shape.size() != 2 || !q.view_shape.empty()) return;
+    const Operand* kv = nullptr;
+    for (const Operand& o : rec.operands)
+        if (o.shape.size() == 4) {
+            kv = &o;
+            break;
+        }
+    if (kv == nullptr) return;
+    const int64_t head_dim = kv->shape[3] / 2;
+    if (head_dim <= 0 || q.shape[1] % head_dim != 0) return;
+    q.view_shape = {q.shape[0], q.shape[1] / head_dim, head_dim};
+    q.view_stride = {q.shape[1], head_dim, 1};
+    q.view_off = 0;
+}
+
 void tighten_rows(OpRecord& rec) {
     for (Operand& o : rec.operands) tighten_operand(o);
+    annotate_attention(rec);
+    // The engine applies an adapter to the activation it already wrote: the expand's last
+    // operand is both the value it replaces and the value it adds its branch to, but the tape
+    // does not mark that write in place. Say so, so the walk can pass the direct path on.
+    if (rec.op == "lora_expand" || rec.op == "lora_expand_mm")
+        for (Operand& o : rec.operands)
+            if (o.written) o.in_place = true;
+}
+
+// The family's shrink reads its activation as [rows][K]. The engine can hand it an activation
+// split by head ([rows][heads][width]); that one record takes the row that knows the reference
+// step's shape, and everything else stays on the family's own row.
+void mark_join_lora(OpRecord& rec) {
+    if (rec.op != "lora_shrink" && rec.op != "lora_shrink_mm") return;
+    for (const Operand& o : rec.operands)
+        if (!o.written && o.shape.size() > 2) {
+            rec.params.push_back({"r97join", int64_t{1}});
+            return;
+        }
 }
 
 // The objective reads the logits boundary in the batch's row space, L-1 rows a sequence. The
@@ -284,6 +327,7 @@ OpRecord own_raws(OpRecord rec) {
 struct SiteSlice {
     std::string module;
     int64_t rank = 0;
+    int64_t in = 0;
     int64_t out = 0;
     int64_t rank_off = 0;
     int64_t out_off = 0;
@@ -298,9 +342,13 @@ SiteGroups group_sites(const WireBuffers& wire) {
         if (site.b.size() % static_cast<size_t>(site.rank) != 0)
             throw std::runtime_error("host step: delta site '" + site.module +
                                      "' has a B whose size is not its rank times its rows");
+        if (site.a.size() % static_cast<size_t>(site.rank) != 0)
+            throw std::runtime_error("host step: delta site '" + site.module +
+                                     "' has an A whose size is not its rank times its columns");
         SiteSlice slice;
         slice.module = site.module;
         slice.rank = site.rank;
+        slice.in = static_cast<int64_t>(site.a.size()) / site.rank;
         slice.out = static_cast<int64_t>(site.b.size()) / site.rank;
         std::vector<SiteSlice>& group = groups[site.weight_name];
         if (!group.empty()) {
@@ -352,11 +400,34 @@ void fill_missing_grads(ParamSet* grads, const ParamSet& params) {
     }
 }
 
-// The delta's prefix is what every gradient name starts with; a lora site's own module comes after
-// it, so the split looks the walk's gradients up, and writes its per-site ones, under the same
-// prefix. `LoraDelta::grad_prefix()` is empty, but a delta need not be, and a step that names a
-// gradient the delta never asked for leaves that parameter with no gradient at all.
-void split_adapter_grads(ParamSet* grads, const SiteGroups& groups, const std::string& grad_prefix) {
+// A delta parameter's leaf under its module, found by the shape the split is about to write. The
+// adjoint's own leaf names are the engine's spelling, which the join must not repeat: a second
+// adapter kind names its factors differently and this still finds and writes them.
+std::string param_leaf(const ParamSet& params, const std::string& module,
+                       const std::vector<int64_t>& shape, const std::string& fallback) {
+    const std::string head = module + ".";
+    for (const Param& p : params)
+        if (p.name.size() > head.size() && p.name.compare(0, head.size(), head) == 0 &&
+            p.shape == shape)
+            return p.name.substr(head.size());
+    return fallback;
+}
+
+std::string leaf_of(const std::string& name) {
+    const size_t dot = name.find_last_of('.');
+    return dot == std::string::npos ? name : name.substr(dot + 1);
+}
+
+// The delta's prefix is what every gradient name starts with; a site's own module comes after it,
+// so the split finds the walk's gradients under the same prefix and writes the delta's per-site
+// ones. A delta need not use an empty prefix, and a step that names a gradient the delta never
+// asked for leaves that parameter with no gradient at all.
+//
+// The walk's fused gradient carries whatever leaf its family's adjoint gave it; find it by the
+// factor shapes the sites gave, not by an adapter's name, and write each module's factor under the
+// leaf the delta's own ParamSet uses.
+void split_adapter_grads(ParamSet* grads, const ParamSet& params, const SiteGroups& groups,
+                         const std::string& grad_prefix) {
     if (!grads) return;
     ParamSet split;
     std::vector<std::string> replaced;
@@ -365,22 +436,33 @@ void split_adapter_grads(ParamSet* grads, const SiteGroups& groups, const std::s
         const bool fused = slices.size() > 1;
         const std::string prefix =
             grad_prefix + (fused ? fused_prefix(weight) : slices.front().module);
-        const Param* a = find_grad(*grads, prefix + ".lora_A");
-        const Param* b = find_grad(*grads, prefix + ".lora_B");
-        if (!a && !b) continue;
-        // A live record can carry only one factor (the other path was skipped); the split then
-        // has nothing to do for that weight and leaves the factor it does have in place.
-        if (!a || !b) continue;
         int64_t rank_total = 0, out_total = 0;
+        const int64_t in = slices.front().in;
         for (const SiteSlice& slice : slices) {
             rank_total += slice.rank;
             out_total += slice.out;
+            if (slice.in != in)
+                throw std::runtime_error("host step: the delta sites of '" + weight +
+                                         "' disagree about their input width");
         }
-        if (rank_total <= 0 || static_cast<int64_t>(a->value.size()) % rank_total != 0 ||
-            static_cast<int64_t>(b->value.size()) % rank_total != 0)
-            throw std::runtime_error("host step: the gradient of '" + weight +
-                                     "' does not match its delta sites");
-        const int64_t in = static_cast<int64_t>(a->value.size()) / rank_total;
+        if (rank_total <= 0 || in <= 0) continue;
+        const Param* a = nullptr;
+        const Param* b = nullptr;
+        std::string a_name, b_name;
+        for (const Param& p : *grads) {
+            if (p.name.rfind(prefix + ".", 0) != 0) continue;
+            const int64_t elems = static_cast<int64_t>(p.value.size());
+            if (elems == rank_total * in) {
+                a = &p;
+                a_name = p.name;
+            } else if (elems % rank_total == 0) {
+                b = &p;
+                b_name = p.name;
+            }
+        }
+        // A live record can carry only one factor (the other path was skipped); the split then
+        // has nothing to do for that weight and leaves the factor it does have in place.
+        if (!a || !b) continue;
         const int64_t b_rows = static_cast<int64_t>(b->value.size()) / rank_total;
         // The kernel weight can have unadapted output rows after the adapter's own (a fused qkv
         // with a gate tail, say); the site's B is shorter than the weight and those rows are not
@@ -389,29 +471,42 @@ void split_adapter_grads(ParamSet* grads, const SiteGroups& groups, const std::s
             throw std::runtime_error("host step: the gradient of '" + weight +
                                      "' is shorter than its delta sites' B factors");
         for (const SiteSlice& slice : slices) {
+            const std::vector<int64_t> a_shape{slice.rank, in};
             std::vector<float> av(static_cast<size_t>(slice.rank * in));
             for (int64_t j = 0; j < slice.rank; ++j)
                 for (int64_t k = 0; k < in; ++k)
                     av[static_cast<size_t>(j * in + k)] =
                         a->value[static_cast<size_t>((slice.rank_off + j) * in + k)];
-            add_grad(&split, grad_prefix + slice.module + ".lora_A", {slice.rank, in}, av);
+            add_grad(&split, grad_prefix + slice.module + "." +
+                                  param_leaf(params, slice.module, a_shape, leaf_of(a_name)),
+                     a_shape, av);
 
+            const std::vector<int64_t> b_shape{slice.out, slice.rank};
             std::vector<float> bv(static_cast<size_t>(slice.out * slice.rank));
             for (int64_t n = 0; n < slice.out; ++n)
                 for (int64_t j = 0; j < slice.rank; ++j)
                     bv[static_cast<size_t>(n * slice.rank + j)] =
                         b->value[static_cast<size_t>((slice.out_off + n) * rank_total +
                                                      slice.rank_off + j)];
-            add_grad(&split, grad_prefix + slice.module + ".lora_B", {slice.out, slice.rank}, bv);
+            add_grad(&split, grad_prefix + slice.module + "." +
+                                  param_leaf(params, slice.module, b_shape, leaf_of(b_name)),
+                     b_shape, bv);
         }
-        replaced.push_back(prefix + ".lora_A");
-        replaced.push_back(prefix + ".lora_B");
+        replaced.push_back(a_name);
+        replaced.push_back(b_name);
     }
-    if (replaced.empty()) return;
-    grads->erase(std::remove_if(grads->begin(), grads->end(), [&](const Param& p) {
-                     return std::find(replaced.begin(), replaced.end(), p.name) !=
-                            replaced.end();
-                 }),
+    if (split.empty()) return;
+    // A parameter filled with zeros before the split may carry the same name the split writes;
+    // replace it rather than keep both.
+    for (const Param& p : split)
+        grads->erase(std::remove_if(grads->begin(), grads->end(),
+                                    [&](const Param& g) { return g.name == p.name; }),
+                     grads->end());
+    grads->erase(std::remove_if(grads->begin(), grads->end(),
+                                [&](const Param& p) {
+                                    return std::find(replaced.begin(), replaced.end(), p.name) !=
+                                           replaced.end();
+                                }),
                  grads->end());
     for (Param& p : split) grads->push_back(std::move(p));
 }
@@ -419,6 +514,46 @@ void split_adapter_grads(ParamSet* grads, const SiteGroups& groups, const std::s
 std::string module_leaf(const std::string& module) {
     const size_t dot = module.find_last_of('.');
     return dot == std::string::npos ? module : module.substr(dot + 1);
+}
+
+// The family adjoints for the linear ops find their operands by the schema's names, while the
+// live tape carries the engine's buffer names. They also take `M` from the schema's parameter,
+// which the tape records as the engine's row capacity, not the rows this step used. Hand the
+// adjoint the schema's names and the step's rows; the walk keeps the tape's record for versions,
+// boundaries and snapshots.
+std::string linear_schema_name(const OpRecord& rec, size_t j) {
+    if (rec.op == "gemm_nt") return j == 0 ? "a" : j == 1 ? "b" : "";
+    if (rec.op == "gemm_nt_q")
+        return j == 0 ? "a" : j == 1 ? "b" : j == 2 ? "a_scale" : j == 3 ? "b_scale" : "";
+    if (rec.op == "logits_gemm") return j == 0 ? "x" : j == 1 ? "lm_head" : "";
+    if (rec.op == "gather_rows") return j == 0 ? "x" : j == 1 ? "idx" : "";
+    if (rec.op == "embed_lookup") return j == 0 ? "tokens" : j == 1 ? "wte" : "";
+    return "";
+}
+
+void prepare_adjoint_record(const OpRecord& rec, OpRecord* out) {
+    *out = rec;
+    for (size_t j = 0; j < out->operands.size(); ++j) {
+        std::string name = linear_schema_name(rec, j);
+        if (!name.empty()) out->operands[j].buffer = std::move(name);
+    }
+    int64_t rows = 0;
+    for (const Operand& o : rec.operands)
+        if (o.written && !o.shape.empty()) {
+            rows = o.shape[0];
+            break;
+        }
+    if (rows <= 0)
+        for (const Operand& o : rec.operands)
+            if (!o.shape.empty()) {
+                rows = o.shape[0];
+                break;
+            }
+    if (rows > 0)
+        for (auto& [key, value] : out->params)
+            if (key == "M") {
+                if (int64_t* m = std::get_if<int64_t>(&value)) *m = rows;
+            }
 }
 
 // The weight a lora record belongs to, from the adapter factor it names: lora.<weight>.a or .b.
@@ -464,10 +599,8 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
         if (model.delta) model.delta->to_wire(params, &wire);
 
         std::set<std::string> target_set;
-        std::map<std::string, std::map<int64_t, std::string>> site_module;
         int64_t max_rank = 0;
         for (const WireBuffers::Site& site : wire.sites) {
-            site_module[site.weight_name][site.slot] = site.module;
             target_set.insert(module_leaf(site.module));
             max_rank = std::max(max_rank, site.rank);
         }
@@ -515,6 +648,7 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
         for (OpRecord& rec : head_records) {
             rec = own_raws(std::move(rec));
             tighten_rows(rec);
+            if (options.reference_head_split) mark_join_lora(rec);
         }
         StoredSnapshots head_snaps;
         for (const OpRecord& rec : head_records) {
@@ -525,24 +659,35 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
 
         BackwardOptions bo;
         bo.grads = grads;
-        bo.prefix = model.delta ? model.delta->grad_prefix() : "";
-        if (!site_module.empty()) {
-            const std::string grad_prefix = model.delta ? model.delta->grad_prefix() : "";
-            bo.slot_prefix = [site_module, groups, grad_prefix](const OpRecord& rec,
-                                                               int64_t slot) -> std::string {
+        const std::string grad_prefix = model.delta ? model.delta->grad_prefix() : "";
+        bo.prefix = grad_prefix.c_str();
+        bo.in_place_passthrough = true;
+        if (!groups.empty()) {
+            bo.record_prefix = [groups, grad_prefix](const OpRecord& rec) -> std::string {
                 const std::string weight = record_weight(rec);
+                if (weight.empty()) return grad_prefix;
                 const auto g = groups.find(weight);
-                if (g == groups.end())
-                    throw std::runtime_error("host step: no delta site for lora weight '" + weight + "'");
-                if (g->second.size() > 1) return grad_prefix + fused_prefix(weight);
-                const auto w = site_module.find(weight);
-                const auto s = w->second.find(slot);
-                if (s == w->second.end())
-                    throw std::runtime_error("host step: lora weight '" + weight +
-                                             "' has no delta site at slot " + std::to_string(slot));
-                return grad_prefix + s->second;
+                if (g == groups.end()) return grad_prefix;
+                // A fused pool is one record on the engine, so its gradient comes back once; the
+                // split below puts each module's factor under its own name.
+                return grad_prefix + (g->second.size() > 1 ? fused_prefix(weight)
+                                                           : g->second.front().module);
             };
         }
+        // A fused weight's slots are its delta sites in order; name each slot's factor after the
+        // module it belongs to, so an adapter row that knows how to read a head-split activation
+        // writes one gradient per module rather than one fused one.
+        bo.slot_prefix = [groups, grad_prefix](const OpRecord& rec, int64_t slot) -> std::string {
+            const std::string weight = record_weight(rec);
+            const auto g = groups.find(weight);
+            if (g == groups.end() || slot < 0 ||
+                slot >= static_cast<int64_t>(g->second.size()))
+                return grad_prefix;
+            return grad_prefix + g->second[static_cast<size_t>(slot)].module;
+        };
+        // The live tape names the engine's buffers; a family's adjoint finds a few operands by the
+        // schema's own names. The walk keeps the tape names for versions, boundaries and snapshots.
+        bo.prepare_record = prepare_adjoint_record;
 
         HostStepReport measured;
         measured.loss = result.loss;
@@ -619,20 +764,22 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
             // latter per buffer and give the in-place read that, or the adjoint differentiates
             // the op at its output instead of its input (the gated norm's gdn_o, above all).
             std::map<std::string, AdValue> before;
-            replay.replay(layer, [&snaps, &before](const OpRecord& op,
+            replay.replay(layer, [&snaps, &before, &options](const OpRecord& op,
                                                    const std::vector<OperandContent>& content) {
-                std::vector<AdValue> now(op.operands.size());
-                for (size_t j = 0; j < op.operands.size(); ++j) {
-                    Operand operand = op.operands[j];
-                    tighten_operand(operand);
-                    now[j] = snapshot(operand, content[j]);
-                }
-                for (size_t j = 0; j < op.operands.size(); ++j) {
-                    const Operand& read = op.operands[j];
+                // The adjoint sees the step's rows and, for attention, the q view its family
+                // reads; the snapshots must have the same shapes the walk will ask for.
+                OpRecord shaped = op;
+                tighten_rows(shaped);
+                if (options.reference_head_split) mark_join_lora(shaped);
+                std::vector<AdValue> now(shaped.operands.size());
+                for (size_t j = 0; j < shaped.operands.size(); ++j)
+                    now[j] = snapshot(shaped.operands[j], content[j]);
+                for (size_t j = 0; j < shaped.operands.size(); ++j) {
+                    const Operand& read = shaped.operands[j];
                     if (read.written) continue;
                     bool in_place = false;
-                    for (size_t k = 0; k < op.operands.size(); ++k) {
-                        const Operand& write = op.operands[k];
+                    for (size_t k = 0; k < shaped.operands.size(); ++k) {
+                        const Operand& write = shaped.operands[k];
                         if (write.written && write.buffer == read.buffer) in_place = true;
                     }
                     if (!in_place) continue;
@@ -645,9 +792,8 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
                         now[j].value.assign(now[j].value.size(), 0.0);
                     }
                 }
-                for (size_t j = 0; j < op.operands.size(); ++j) {
-                    Operand operand = op.operands[j];
-                    tighten_operand(operand);
+                for (size_t j = 0; j < shaped.operands.size(); ++j) {
+                    const Operand& operand = shaped.operands[j];
                     if (operand.written && operand.buffer.rfind("kv:", 0) == 0 &&
                         before.find(operand.buffer) == before.end()) {
                         // A carried state this block has not written yet enters cold; the op's
@@ -668,6 +814,7 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
             for (OpRecord& rec : records) {
                 rec = own_raws(std::move(rec));
                 tighten_rows(rec);
+                if (options.reference_head_split) mark_join_lora(rec);
             }
             BoundaryNames block_names;
             block_names.add(incoming.buffer, 0, tokens);
@@ -690,23 +837,13 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
         // The split runs first: a fused weight's engine gradient is named after the container's
         // weight ("@fused:..."), so filling the missing ones before splitting would add a zero
         // under every module name the split then adds the real gradient for.
-        split_adapter_grads(grads, groups, model.delta ? model.delta->grad_prefix() : "");
+        split_adapter_grads(grads, params, groups, grad_prefix);
         fill_missing_grads(grads, params);
         if (report) *report = std::move(measured);
         return result;
     };
 }
 
-}  // namespace r97
-
-#else
-
-#include <stdexcept>
-
-namespace r97 {
-StepFn host_step(ForwardDriver&, const Model&, const HostStepOptions&, HostStepReport*) {
-    throw std::runtime_error("host step: this build has no training patches");
-}
 }  // namespace r97
 
 #endif  // RAD_ISSUE_OBSERVER && RAD_REPLAY_BLOCK

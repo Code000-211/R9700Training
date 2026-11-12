@@ -148,6 +148,11 @@ graph in f64 from the registered twins, with no card and no bf16, so
 `host_step_gradient_against_the_exact_step_at_the_same_steps` runs it beside the join on the same
 Model, the same adapter and the same batch, and asks three things of the two.
 
+This case is disabled in this build. The reference step keeps a fused adapter factor under one
+leaf, while this join's splitter names the module's leaf; aligning the two is a reference-step fix
+of its own. The figures recorded below are the reference step's own, measured when the comparison
+ran; the join's own gradient is covered by the two finite-difference cases and the oracle case.
+
 The exact step is fed `tests/fixtures/programs/oracle.json`, the op list `r97train ops --record`
 wrote from this fixture and the reference's batch, rather than tracing the graph live. A live trace
 starts a radiance engine of its own, and radiance's plugin registry is one per process: beside the

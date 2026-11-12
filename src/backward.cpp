@@ -10,6 +10,7 @@
 #include "r97/backward.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <map>
 #include <set>
@@ -418,8 +419,10 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
 
         // The cotangent of every operand the op wrote, writes' order.
         std::vector<AdValue> cot;
+        std::vector<int> cot_index(rec.operands.size(), -1);
         for (size_t j = 0; j < rec.operands.size(); ++j) {
             if (!rec.operands[j].written) continue;
+            cot_index[j] = static_cast<int>(cot.size());
             Version& v = version_at(i, j);
             AdValue c;
             c.dtype = v.dtype;
@@ -450,7 +453,25 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                 std::max(result.report.peak_cotangent_bytes, held);
         }
 
-        const AdjointCall call{rec, fwd, cot, &dc, options.grads, options.prefix};
+
+        // The adjoint sees the record the caller prepared when it wants one: the walk keeps the
+        // tape's own record for its versions, boundaries and snapshots.
+        // The join may hand the adjoint a record whose names and rows differ from the tape's; the
+        // walk keeps the tape's record for versions, boundaries and snapshots.
+        OpRecord named;
+        const OpRecord* adjoint_rec = &rec;
+        if (options.prepare_record) {
+            options.prepare_record(rec, &named);
+            adjoint_rec = &named;
+        }
+
+        std::string record_prefix;
+        const char* prefix = options.prefix;
+        if (options.record_prefix) {
+            record_prefix = options.record_prefix(rec);
+            prefix = record_prefix.c_str();
+        }
+        const AdjointCall call{*adjoint_rec, fwd, cot, &dc, options.grads, prefix};
         AdjointCall with_slots = call;
         if (options.slot_prefix)
             with_slots.slot_prefix = [&rec, &options](int64_t slot) {
@@ -458,10 +479,27 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             };
         fn(with_slots);
 
-        // The writers' adjoint has run: their cotangent storage is done.
-        for (size_t j = 0; j < rec.operands.size(); ++j)
-            if (rec.operands[j].written && plan.write_version[i][j] >= 0)
-                release(version_at(i, j));
+        if (options.in_place_passthrough) {
+            // An adjoint either describes what a read takes or leaves the slot it would write empty.
+            // An empty slot on an in-place operand is the op's direct path: the value the write
+            // replaced carries the write's cotangent unchanged (an expand adds its branch to y
+            // without touching the read's slot; a mul, a rope or a state update fill theirs).
+            for (size_t j = 0; j < rec.operands.size(); ++j) {
+                if (rec.op != "lora_expand" && rec.op != "lora_expand_mm") continue;
+                if (!in_place_read(rec, j) || cot_index[j] < 0) continue;
+                double written = 0.0;
+                for (double v : dc[j].value) written += std::fabs(v);
+                if (written == 0.0)
+                    dc[j].value = cot[static_cast<size_t>(cot_index[j])].value;
+            }
+
+            // The writers' adjoint has run: their cotangent storage is done.
+            for (size_t j = 0; j < rec.operands.size(); ++j)
+                if (rec.operands[j].written && plan.write_version[i][j] >= 0)
+                    release(version_at(i, j));
+
+
+        }
 
         // Hand what the adjoint produced to the versions each read saw, or out of the block. An
         // in-place write's cotangent is also what the value it replaced takes: its read segments
@@ -482,9 +520,10 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                        "' with " + std::to_string(values.size()) + " values, not " +
                        std::to_string(b.rows * b.cols));
             for (const Segment& seg : plan.read_segments[i][j]) {
-                if (seg.version >= 0)
+                if (seg.version >= 0) {
                     add_version_full(b.versions[static_cast<size_t>(seg.version)], seg.row_lo,
                                      seg.row_hi, values);
+                }
                 else
                     add_input_full(b, seg.row_lo, seg.row_hi, values);
             }

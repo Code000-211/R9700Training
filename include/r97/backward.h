@@ -74,9 +74,22 @@ struct BackwardOptions {
     // record carries several modules in one pool and the caller needs the record's weight to say
     // which pool the slot belongs to. Empty for a delta with no fused slots.
     std::function<std::string(const OpRecord&, int64_t)> slot_prefix;
+    // Optional: the name a record's parameter gradients take, when one walk covers records whose
+    // parameters live in different places (a fused pool's modules, or a record that names none and
+    // keeps `prefix`). Empty keeps `prefix` for every record.
+    std::function<std::string(const OpRecord&)> record_prefix;
+    // Optional: the record the adjoint sees. A live tape names the engine's buffers and its op
+    // parameters can give the engine's capacity where the schema names the step's own rows; the
+    // walk's versions, boundaries and snapshots still use the record as recorded. The callback
+    // fills `out` from the record when it wants a different view.
+    std::function<void(const OpRecord&, OpRecord*)> prepare_record;
     // Op names whose path ends here: their adjoint never runs and no cotangent reaches their
     // reads. The record still consumes the cotangent of what it wrote.
     std::vector<std::string> stops;
+    // A write that replaces the value it read also carries that value's cotangent on the direct
+    // path. Set when the caller's adjoint row leaves the in-place read's slot empty; the walk then
+    // copies the write's cotangent into it, and the read travels to the version it saw.
+    bool in_place_passthrough = false;
 };
 
 // The cotangent of one of the block's inputs: a buffer the block read but never wrote. It is dense

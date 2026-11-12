@@ -211,15 +211,12 @@ adjoint and watching the tests fail.
 constant, so a central difference of it is the derivative of nothing. Its twin is checked against
 the kernel and its adjoint is the `lora_expand` one, which is checkable.
 
-## 5. The write's cotangent, and what this file does not do
+## 5. What this file does not do
 
-- **`y`'s base cotangent.** `lora_expand` writes `y` (an INOUT operand), so its adjoint puts
-  `cot y` into the write's slot in `call.dc`, and the walk passes that on to the version of the
-  buffer the write replaced. Both halves are needed together: a block's residual is written by
-  these rows on top of what the step above left there, so a cotangent that stopped at the write
-  would never reach the writer. The record's `in_place` mark is what tells the walk to carry it
-  (`include/r97/op.h`; patch `0121-issue-inout-mark`), and the family's own check
-  (`tests/support/adjoint_check.h`) leaves a write's slot alone, so the row fills it itself.
+- **`y`'s base cotangent.** `lora_expand` writes `y` (an INOUT operand), so the cotangent `y`'s
+  base value already holds is not among the read operands and not this op's to add: a write's slot
+  in `call.dc` is never filled by an adjoint (`tests/support/adjoint_check.h`). The walk passes it
+  on to whatever wrote that base value.
 - **The trainer's binding.** Turning a `Delta` plus a step into these records — which rows of the
   batch a site serves, the pool's `S`, the `scale` buffer, the quantiser that writes the codes and
   reads their cotangents — is the step's business, not the family's.

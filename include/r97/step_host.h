@@ -14,12 +14,18 @@
 #include "r97/forward.h"
 #include "r97/step.h"
 
+#if defined(RAD_ISSUE_OBSERVER) && defined(RAD_REPLAY_BLOCK)
+
 namespace r97 {
 
 struct HostStepOptions {
     // Keep the boundary values and cotangents in the report. A training loop may turn this off;
     // the issue's checks need them.
     bool keep_boundaries = true;
+    // Mark a head-split adapter activation so the join reads it as [rows][K] with the reference
+    // step's row. A check that compares against the reference step's own fused factors turns
+    // this off: there the family row keeps the factors fused and the comparison splits them.
+    bool reference_head_split = true;
 };
 
 // What one joined step measured. Boundary 0 is the input of block 0 and boundary `layers` is the
@@ -46,3 +52,5 @@ StepFn host_step(ForwardDriver& driver, const Model& model,
                  const HostStepOptions& options = {}, HostStepReport* report = nullptr);
 
 }  // namespace r97
+
+#endif  // RAD_ISSUE_OBSERVER && RAD_REPLAY_BLOCK
