@@ -5,8 +5,9 @@
 // a held-out set) another StepFn. It never reads the objective's or the delta's name: both live
 // inside the StepFn it is given.
 //
-// docs/TRAINING.md owns the configuration keys, the log line, the checkpoint layout and the
-// state file. This header only states the shapes.
+// docs/USAGE.md owns the configuration keys and their schema, docs/TRAINING.md the log line and
+// the loop, docs/CHECKPOINT.md the checkpoint layout and the state file. This header only states
+// the shapes.
 #pragma once
 
 #include <cstdint>
@@ -51,7 +52,7 @@ Config read_config(const std::string& path);
 void apply_config_flag(Config& config, const std::string& key, const std::string& value);
 void apply_config_flags(Config& config, const std::vector<std::string>& args);
 
-// Every range docs/TRAINING.md documents. Throws ConfigError naming the key that is wrong.
+// Every range the configuration schema documents. Throws ConfigError naming the key that is wrong.
 void validate_config(const Config& config);
 
 // Read the file (when `path` is not empty) over `defaults`, apply the flags over that, then
@@ -101,7 +102,7 @@ private:
     std::vector<std::string> sequences_;
 };
 
-// What a trainer state file holds, in memory. docs/TRAINING.md owns its on-disk encoding.
+// What a trainer state file holds, in memory. docs/CHECKPOINT.md owns its on-disk encoding.
 struct TrainerState {
     std::string base_id;                  // the caller's opaque base identifier
     int64_t step = 0;                     // completed loop steps

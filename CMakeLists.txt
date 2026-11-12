@@ -395,6 +395,14 @@ if(R97_BUILD_TESTS)
                    ${CMAKE_CURRENT_SOURCE_DIR})
   set_tests_properties(patch_audit PROPERTIES LABELS host)
 
+  # The configuration schema: the table the binary prints and the one docs/USAGE.md prints, cell
+  # for cell, and the resolved configuration the `config` command prints. The test drives the
+  # failures on copies of the document, so the table's pass is checked with its reasons to fail.
+  add_test(NAME config_schema
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/config_schema_test.sh
+                   ${CMAKE_CURRENT_SOURCE_DIR} $<TARGET_FILE:r97train>)
+  set_tests_properties(config_schema PROPERTIES LABELS host)
+
   if(TARGET r97_gpu_tests)
     # The gpu binary holds two kinds of test, and the labels promise different things: a `gpu` test
     # never skips, while a `model` test resolves the container first thing and skips with 77 when it

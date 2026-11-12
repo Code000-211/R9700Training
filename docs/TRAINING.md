@@ -23,54 +23,9 @@ line's own flag, not a configuration key.
 An unknown key, a malformed value and a value outside its range are all `ConfigError`s that name
 the key (`error.key()` and `error.what()`).
 
-| key | type | default (`config.h`) | valid range and meaning |
-| --- | --- | --- | --- |
-| `model` | string | empty | the container to train against; the loop does not read it |
-| `data` | string | empty | the training sequences; the loop does not read it |
-| `heldout` | string | empty | the held-out sequences; the caller turns them into `TrainerOptions::heldout` |
-| `out` | string | empty | **required**: the output directory for the log and checkpoints |
-| `objective` | string | `ce` | **non-empty**; the name is the `StepFn`'s business, the loop only carries it |
-| `base_id` | string | empty | opaque caller identifier stored in every checkpoint; `resume` refuses a different one |
-| `delta.kind` | string | `lora` | **non-empty**; the delta's name, not read by the loop |
-| `delta.rank` | integer | 16 | **> 0** |
-| `delta.alpha` | number | 32 | **finite, > 0** |
-| `delta.targets` | list | empty | comma-separated non-empty module names; empty means the delta's default |
-| `delta.gate` | boolean | false | `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`) |
-| `lr` | number | 0 | **finite, > 0**: the peak learning rate; must be set |
-| `weight_decay` | number | 0 | finite, >= 0 |
-| `warmup_steps` | integer | 0 | >= 0, counted in optimiser updates |
-| `token_budget` | integer | 0 | **> 0**: the batcher's tokens per sub-batch; must be set |
-| `accumulation` | integer | 0 | **>= 1**: micro-steps per optimiser update; must be set |
-| `steps` | integer | 0 | >= 0: the loop-step horizon |
-| `epochs` | integer | 0 | >= 0: the epoch horizon |
-| `seed` | integer | 0 | >= 0: the batcher shuffle and the loop's random state |
-| `eval_every` | integer | 0 | >= 0: evaluate after every N steps; 0 disables evaluation |
-| `checkpoint_every` | integer | 0 | >= 0: checkpoint after every N steps; 0 means only when a run stops |
-
-Exactly one of `steps` and `epochs` is positive. `out`, and the values marked **must be set**,
-are required because their `Config` default is outside the valid range.
-
-```
-model = /srv/models/qwen3.8-27b-iq4r-s-v4.rad
-data = /data/chat/train.jsonl
-heldout = /data/chat/heldout.jsonl
-out = runs/lora-v1
-objective = ce
-delta.kind = lora
-delta.rank = 16
-delta.alpha = 32
-delta.targets = q_proj, v_proj
-lr = 1e-4
-weight_decay = 0.0
-warmup_steps = 20
-token_budget = 4096
-accumulation = 1
-steps = 1000
-seed = 7
-eval_every = 100
-checkpoint_every = 100
-base_id = sha256:8f3a...
-```
+The keys, their types, their defaults and their valid ranges are the configuration schema, and
+`docs/USAGE.md` owns it: that file's table is the schema, and `r97train config` prints it from the
+binary. A complete file is there too; this file is about what the loop does with the values.
 
 ## The run
 
@@ -150,46 +105,20 @@ it.
 
 ## Checkpoints
 
-A checkpoint is a directory `<out>/checkpoint-<step>` with the step zero-padded to nine digits,
-holding:
-
-```
-checkpoint-000000100/
-  adapter/          the adapter directory, written by TrainerOptions::write_adapter
-  trainer.state     the trainer state (below)
-```
-
-The loop writes one after every `checkpoint_every` completed steps, and once when `run()` /
-`run_steps()` stops if the step it stopped on has not just been written. `checkpoint_every = 0`
-therefore still leaves the checkpoint a resumed run needs. A checkpoint is assembled in
-`checkpoint-<step>.tmp` and renamed into place, so a failure while writing leaves no half
-checkpoint; an interrupted run leaves the last complete one.
+The loop writes `<out>/checkpoint-<step>` — the adapter directory and `trainer.state` — after every
+`checkpoint_every` completed steps, and once when `run()` / `run_steps()` stops if the step it
+stopped on has not just been written. `checkpoint_every = 0` therefore still leaves the checkpoint
+a resumed run needs. A checkpoint is assembled in `checkpoint-<step>.tmp` and renamed into place,
+so a failure while writing leaves no half checkpoint; an interrupted run leaves the last complete
+one.
 
 The loop does not know the adapter format. It creates `<checkpoint>/adapter` and calls
 `TrainerOptions::write_adapter(params, dir)`; the adapter-files code writes the files the serving
 radiance reads. The callback is required.
 
-`trainer.state` is this trainer's private encoding (magic `R97TRN01`, a version, then lengths and
-values in the machine's byte order; only `read_trainer_state()` reads it):
-
-- `base_id`, the caller's opaque string;
-- `step`, the completed loop steps;
-- the batcher position (`epoch`, `step`) of the next batch to read;
-- `rng_state` after that step;
-- the master weights: for each parameter its name, shape and `float` values;
-- the optimiser's `serialise()` bytes (its moments, update count and pending accumulation).
-
-### Resume
-
-`Trainer::resume(checkpoint_dir)` reads `trainer.state`, compares its `base_id` with the run's
-`config.base_id`, and refuses before touching anything when they differ, with both ids in the
-message. Otherwise it restores the master weights, the optimiser bytes, the batcher position, the
-step and the random state. With a deterministic `StepFn`, a run of `2N` steps and a run of `N`
-steps resumed for `N` more give bit-identical parameters: the optimiser update count and its
-pending accumulation are part of the state, so the schedule continues rather than restarting.
-
-The checkpoint to resume is the one at `N`; both `run_steps()` stopping there and
-`checkpoint_every = N` produce it.
+`docs/CHECKPOINT.md` owns the artifact: the directory's layout, the bytes of `trainer.state`, what
+a checkpoint restores, and what `resume()` and `train --resume` require — the `base_id` rule, the
+adapter's identity, and the bit-identical guarantee for a deterministic `StepFn`.
 
 ## When a step is not finite
 
