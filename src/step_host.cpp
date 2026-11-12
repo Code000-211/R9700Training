@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "engine.h"  // the complete rad::Engine behind ForwardDriver's unique_ptr
+#include "rad_planes.h"  // the joined form a quantised lm_head reaches the tape in
 #include "rad_plugin.h"  // rad_fp8e4m3_to_f32, for the int8 trunk's fp8 cache operands
 #include "r97/step_host.h"
 #include "r97/adapter_io.h"
@@ -95,6 +96,52 @@ double read_elem(const std::string& dtype, const void* data, int64_t i) {
     throw std::runtime_error("host step: cannot snapshot operand dtype '" + dtype + "'");
 }
 
+// A quantised weight the engine joins from planes (abi/rad_planes.h) reaches the tape as one
+// buffer: the header, the entries, the codes, then the scales. The adjoints take the dequantised
+// weight, the product the GEMM's epilogue forms, so read the planes out by their roles. Only a
+// whole-buffer operand can be joined -- a ranged or viewed one is a slice of something else --
+// and the codes' extents have to be the operand's own, or this is not the weight the op read.
+bool joined_dense(const Operand& op, const OperandContent& content, std::vector<double>* out) {
+    if (content.data == nullptr || content.bytes < sizeof(RadPlanesHeader)) return false;
+    if (op.rows > 0 || op.shape.size() < 2) return false;
+    const RadPlanesEntry* codes = nullptr;
+    const RadPlanesEntry* scales = nullptr;
+    const void* code_data = rad_planes_find(content.data, "codes", &codes);
+    const void* scale_data = rad_planes_find(content.data, "scale", &scales);
+    if (code_data == nullptr || codes == nullptr) return false;
+    const int64_t rows = codes->rows;
+    const int64_t cols = codes->cols;
+    if (rows <= 0 || cols <= 0 || rows * cols != numel(op.shape)) return false;
+    if (scale_data != nullptr && (scales->rows <= 0 || scales->cols <= 0)) return false;
+
+    const char* code_name = rad_dtype_name(codes->dtype);
+    const int64_t code_es = rad_dtype_bytes(codes->dtype, 1);
+    const char* scale_name = scale_data != nullptr ? rad_dtype_name(scales->dtype) : nullptr;
+    const int64_t scale_es = scale_data != nullptr ? rad_dtype_bytes(scales->dtype, 1) : 0;
+    if (code_es <= 0 || (scale_data != nullptr && scale_es <= 0)) return false;
+    // The block is the dequantisation group: a scale per block[1] columns, block[0] rows.
+    const int64_t block_r = scales != nullptr ? std::max<int64_t>(scales->block[0], 1) : rows;
+    const int64_t block_c = scales != nullptr ? std::max<int64_t>(scales->block[1], 1) : cols;
+
+    const auto* code_bytes = static_cast<const uint8_t*>(code_data);
+    const auto* scale_bytes = static_cast<const uint8_t*>(scale_data);
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t c = 0; c < cols; ++c) {
+            const double code = read_elem(code_name, code_bytes + r * codes->row_bytes + c * code_es, 0);
+            double scale = 1.0;
+            if (scale_bytes != nullptr) {
+                const int64_t sr = r / block_r;
+                const int64_t sc = c / block_c;
+                if (sr >= scales->rows || sc >= scales->cols)
+                    throw std::runtime_error("host step: a joined weight's scale plane is short");
+                scale = read_elem(scale_name, scale_bytes + sr * scales->row_bytes + sc * scale_es, 0);
+            }
+            (*out)[static_cast<size_t>(r * cols + c)] = code * scale;
+        }
+    }
+    return true;
+}
+
 // One operand as the op saw it, dense over the operand's full declared shape. The tape keeps the
 // slice the kernel saw, which for a ranged operand starts at row_lo; the walk's adjoints expect
 // the full buffer with the untouched rows zero.
@@ -139,6 +186,7 @@ AdValue snapshot(const Operand& op, const OperandContent& content) {
     const int64_t total = numel(op.shape);
     v.value.assign(static_cast<size_t>(std::max<int64_t>(total, 0)), 0.0);
     if (!content.data || total == 0) return v;
+    if (joined_dense(op, content, &v.value)) return v;
     if (content.bytes == 0) return v;
 
     const int64_t es = elem_size(op.dtype);
