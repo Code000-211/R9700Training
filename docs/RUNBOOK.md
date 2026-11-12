@@ -10,10 +10,13 @@ adapter holds.
 whole procedure, and `tests/host/runbook.cpp` extracts every block, requires its fence to be `sh`,
 and runs the fragments against the tiny fixture: a command here that stops working is a failing
 host test rather than a stale document. The blocks read `R97_BUILD`, `R97_STEPS` and the four
-inputs `R97_MODEL`, `R97_TRAIN`, `R97_HELDOUT`, `R97_RUN`; the inputs default to the fixture, so
-the file as it stands is the smoke run, and section 10 sets them for a real one. A command in
-`backticks` in the prose is a one-time input (a build, the fetch) rather than a step of the script:
-it costs minutes or the network, and the test does not run it.
+inputs `R97_MODEL`, `R97_TRAIN`, `R97_HELDOUT`, `R97_RUN`, plus `R97_SERVING_BUILD` for section 7;
+the inputs default to the fixture, so the file as it stands is the smoke run, and section 10 sets
+them for a real one. A command in backticks in the prose is a one-time input (a build, the fetch)
+rather than a step of the script: it costs minutes or the network, and the test does not run it. A
+block whose step needs one of those inputs guards it and says so when it is absent (section 7's
+serve needs the serving build); the test runs the block's guard branch, so the document still says
+what it would have run.
 
 Save the fenced blocks as one script under `runs/` and run it from the tree's top.
 
@@ -37,10 +40,15 @@ Save the fenced blocks as one script under `runs/` and run it from the tree's to
 - **An output directory that does not exist yet.** A run makes it; one checkpoint every
   `checkpoint_every` steps holds a full copy of the adapter plus the optimiser's moments, so `du
   -sh` the first one before deciding the interval. The smoke run writes under `runs/`.
-- **No serving-only build for this script.** Section 7 measures the adapter with `r97train loss
-  --lora`, which loads it through radiance's own loader; the `-DR97_PATCH_SET=serving` build and
-  the server it builds are the deployment path of issue #61, and `docs/EVAL.md` has radiance's KL
-  record as the cross-check.
+- **A serving-only build of radiance, for section 7.** It is a one-time input, like the fetch:
+  `cmake -B build-serving -G Ninja -DR97_PATCH_SET=serving` applies the serving patches in
+  `patches/serving/`, and `cmake --build build-serving/radiance-build --target radiance` builds
+  the server (`build-serving/radiance-build/bin/radiance`; the serving tree has no `r97train`).
+  Section 7 serves the trained adapter with it and measures the loss radiance computes for that
+  adapter, through the same `--lora` / `--kld-lora` the deployment serves with (issue #61); that
+  step also needs `curl` for the completion and `python3` for `tools/kld_loss.py`. A run without
+  that build, such as the host-only smoke run, keeps the trainer's `loss --lora` measurement and
+  says in section 7 that the serve was skipped; `docs/EVAL.md` has both.
 - **Card discipline.** One training run at a time: the card to itself, one process, and `ctest -L
   gpu` takes `gpu_guard` for the same reason (only the issues marked for the two-card machine use
   both cards). **Never stop a process you did not start** — not another run, not someone else's
@@ -63,6 +71,7 @@ set -o pipefail
 : "${R97_TRAIN:=tests/fixtures/chat_small.jsonl}" # the training JSONL
 : "${R97_HELDOUT:=$R97_TRAIN}"                   # the held-out JSONL
 : "${R97_RUN:=runs/runbook}"                     # where the run writes; must not exist yet
+: "${R97_SERVING_BUILD:=$PWD/build-serving}"     # the serving-only build, section 7
 : "${RADIANCE_HOME:=$R97_BUILD/radiance-build/radiance_home}" # the build's plugins
 r97="$R97_BUILD/r97train"
 
@@ -77,8 +86,8 @@ fi
          "run 'ctest --test-dir $R97_BUILD -L host' once, or set R97_MODEL" >&2
     exit 1
 }
-export R97_MODEL R97_STEPS R97_TRAIN R97_HELDOUT R97_RUN RADIANCE_HOME
-echo "runbook: $R97_MODEL, $R97_STEPS steps, $R97_TRAIN -> $R97_RUN"
+export R97_MODEL R97_STEPS R97_TRAIN R97_HELDOUT R97_RUN R97_SERVING_BUILD RADIANCE_HOME
+echo "runbook: $R97_MODEL, $R97_STEPS steps, $R97_TRAIN -> $R97_RUN (serving build $R97_SERVING_BUILD)"
 ```
 
 ## 2. The container and the data, read before anything runs
@@ -235,48 +244,126 @@ resumed=$(horizon_loss "$R97_RUN-resumed/train.jsonl")
 ## 7. The adapter, and the served loss against the trainer's
 
 The checkpoint's `adapter/` is the directory radiance loads (`docs/ADAPTER.md` has what it holds
-and what radiance reads), and the run serves the checkpoint the resumed run wrote. The served loss
-in this file is the trainer's `loss --lora`: it loads the adapter with radiance's own loader
-(`lora/preload.h`) on the same host kernels the serving build compiles, so a host-only pass over
-this runbook checks the loss against the trainer's. The script measures it and compares it with the
-held-out loss the resumed run reported in section 6 (`$resumed`):
+and what radiance reads), and the run serves the checkpoint the resumed run wrote. The adapter's
+held-out loss is measured twice. First the trainer's, with `loss --lora`: it loads the adapter
+through radiance's own loader (`lora/preload.h`) and works in any build with the forward tier, so
+the smoke run checks it. It must be the held-out loss the resumed run reported in section 6
+(`$resumed`):
 
 ```sh
 adapter="$R97_RUN-resumed/checkpoint-$(printf %09d "$R97_STEPS")/adapter"
-served=$("$r97" loss --model "$R97_MODEL" --data "$R97_HELDOUT" --lora "$adapter" |
-         sed -n 's/^loss: //p')
-[ -n "$served" ] || {
+trainer_loss=$("$r97" loss --model "$R97_MODEL" --data "$R97_HELDOUT" --lora "$adapter" |
+               sed -n 's/^loss: //p')
+[ -n "$trainer_loss" ] || {
     echo "runbook: loss printed no loss line for $adapter" >&2
     exit 1
 }
-echo "served loss $served, the trainer's held-out loss $resumed"
+echo "the trainer's loss for the adapter $trainer_loss, the run's held-out loss $resumed"
 
-awk -v trainer="$resumed" -v served="$served" 'BEGIN {
-    d = served - trainer
+awk -v trainer="$resumed" -v measured="$trainer_loss" 'BEGIN {
+    d = measured - trainer
     if (d < 0) d = -d
     t = trainer < 0 ? -trainer : trainer
     if (t == 0) t = 1
     if (d > 1e-4 * t) {
-        printf "runbook: served %s, the trainer reported %s\n", served, trainer
+        printf "runbook: loss --lora %s, the trainer reported %s\n", measured, trainer
         exit 1
     }
 }'
 ```
 
-`loss --lora` prints the loss of what was served; it must match the held-out loss the resumed run
-reported in section 6 (`$resumed`) to 1e-4 relative. 1e-4 is the tolerance
-`tests/host/train_host_cli.cpp` and `tests/host/loss_cli.cpp` hold these two numbers to, and the
-same one applies here.
+Then the serving build's, from the server that serves the adapter. Section 0's serving-only build
+is a one-time input; when it is at hand (`$R97_SERVING_BUILD`), this block starts
+`build-serving/radiance-build/bin/radiance` on `127.0.0.1:8099` with the adapter loaded, asks for
+one chat completion, and stops it again. The smoke run of a host-only build has no serving tree and
+takes the `else` branch, which says so; the trainer's measurement above is what that run keeps.
+
+```sh
+serving="$R97_SERVING_BUILD"
+server="$serving/radiance-build/bin/radiance"
+serving_home="$serving/radiance-build/radiance_home"
+served=
+
+if [ -x "$server" ]; then
+    "$server" --model "$R97_MODEL" --radiance-home "$serving_home" \
+              --lora trained="$adapter" --host 127.0.0.1 --port 8099 \
+              > "$R97_RUN-resumed/serve.log" 2>&1 &
+    server_pid=$!
+    reply=
+    for attempt in $(seq 1 60); do
+        if curl -fsS http://127.0.0.1:8099/v1/chat/completions \
+                 -H 'Content-Type: application/json' \
+                 -d '{"model":"trained","messages":[{"role":"user","content":"Hello"}],"max_tokens":8}' \
+                 > "$R97_RUN-resumed/serve.json" 2>/dev/null; then
+            reply=1
+            break
+        fi
+        sleep 1
+    done
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    [ -n "$reply" ] || {
+        echo "runbook: the serving radiance did not answer;" \
+             "$R97_RUN-resumed/serve.log has its log" >&2
+        exit 1
+    }
+    grep -q '"content"[[:space:]]*:' "$R97_RUN-resumed/serve.json" || {
+        echo "runbook: the server answered no completion; see" \
+             "$R97_RUN-resumed/serve.json" >&2
+        exit 1
+    }
+    echo "the serving build served $adapter and answered one completion"
+else
+    echo "runbook: no $server; section 0's serving-only build is a one-time input," \
+         "so this run does not serve"
+fi
+```
+
+The served loss is the number the serving build computes for that same adapter, not the number the
+server prints: `data --kld-corpus` writes the held-out file in radiance's KL shape, the server run
+with `--kld-lora trained` records its per-position NLL over it, and `tools/kld_loss.py` prints the
+loss. It is held to the same `$resumed` at the same 1e-4 relative tolerance — the loss radiance
+serves is the loss the trainer reported.
+
+```sh
+kld="$R97_RUN-resumed/kld"
+mkdir -p "$kld"
+"$r97" data --model "$R97_MODEL" --data "$R97_HELDOUT" --kld-corpus "$kld/heldout.jsonl"
+
+if [ -x "$server" ]; then
+    "$server" --model "$R97_MODEL" --radiance-home "$serving_home" \
+              --lora trained="$adapter" --kld-lora trained \
+              --kld-corpus "$kld/heldout.jsonl" --kld-record "$kld/served"
+    served=$(python3 tools/kld_loss.py "$kld/served" | sed -n 's/^loss: //p')
+    [ -n "$served" ] || {
+        echo "runbook: tools/kld_loss.py printed no loss for $kld/served" >&2
+        exit 1
+    }
+    echo "the serving build's loss for the adapter $served, the trainer's held-out loss $resumed"
+
+    awk -v trainer="$resumed" -v measured="$served" 'BEGIN {
+        d = measured - trainer
+        if (d < 0) d = -d
+        t = trainer < 0 ? -trainer : trainer
+        if (t == 0) t = 1
+        if (d > 1e-4 * t) {
+            printf "runbook: the serving build %s, the trainer reported %s\n", measured, trainer
+            exit 1
+        }
+    }'
+else
+    echo "runbook: no $server; the serving build's loss is unchecked, the trainer's is above"
+fi
+```
+
+1e-4 is the tolerance `tests/host/loss_cli.cpp` holds the trainer's loss and radiance's KL record
+to, and the same one `tests/host/train_host_cli.cpp` holds the loss across a resume to; the same
+one applies to both measurements here. `docs/EVAL.md` says how the two agree in the host tier.
 
 A checkpoint can be measured at any time without touching the run: `loss` on another `adapter/`
 answers whether it is worth keeping. Compare with the baseline of the same container and held-out
 file before the run — `"$r97" loss --model "$R97_MODEL" --data "$R97_HELDOUT"`, no `--lora` — and
 `docs/EVAL.md` says how the number is cross-checked.
-
-The serving-only build (`-DR97_PATCH_SET=serving`) and the server it builds are issue #61's
-deployment path, not this file's: that server answers requests, while this section holds the
-adapter's served loss. `docs/EVAL.md` has radiance's own KL record (`--kld-corpus`, `--kld-lora`)
-and `tools/kld_loss.py` as the cross-check when that build is at hand.
 
 ## 8. Watch
 
@@ -321,7 +408,7 @@ the whole diagnosis.
 
 ## 10. The real run
 
-The same script with five variables set, and the fetched data in place:
+The same script with six variables set, and the fetched data in place:
 
 | variable | value |
 | --- | --- |
@@ -330,13 +417,14 @@ The same script with five variables set, and the fetched data in place:
 | `R97_HELDOUT` | `data/ultrachat/heldout.jsonl` |
 | `R97_RUN` | `runs/lora-v1` |
 | `R97_STEPS` | `1000` |
+| `R97_SERVING_BUILD` | `build-serving` (section 0's serving-only build, for section 7) |
 
 Then the blocks of sections 1 to 8 run as they stand — the dry run on the container and the two
-files, the run to its horizon, the resume from whatever checkpoint survived, the served loss
-against the trainer's, and the log the run wrote. What changes with the size is the configuration,
-not the procedure: a longer `eval_every` and `checkpoint_every` (each checkpoint is a full adapter
-and its moments: `du -sh` the first), a `token_budget` and `accumulation` that fit the card, and an
-`lr` for the run's length.
+files, the run to its horizon, the resume from whatever checkpoint survived, the serve and the
+served loss against the trainer's, and the log the run wrote. What changes with the size is the
+configuration, not the procedure: a longer `eval_every` and `checkpoint_every` (each checkpoint is a
+full adapter and its moments: `du -sh` the first), a `token_budget` and `accumulation` that fit the
+card, and an `lr` for the run's length.
 `docs/TRAINING.md` has the loop's knobs, `docs/PLAN.md` the runs that are planned.
 
 For a card run, two things are added: the card is the run's alone (section 0's discipline — one
@@ -355,10 +443,17 @@ run on one device.
 the blocks in order on the tiny int8 fixture with `build/r97train`: the extraction is the file's
 own procedure, so a flag that changes without the runbook, a runbook command that stops working, or
 a non-`sh` block added to the file fails `ctest --test-dir build -L host`. The one-time inputs in
-section 0 are inline prose, not blocks, and are not run — a radiance build, the network fetch, and
-`ctest` itself. The serving-only build and its server are the separate deployment path (issue
-#61); this file's served loss is the trainer's `loss --lora`, which the extracted script runs. The
-flag tables in `docs/USAGE.md` are held to `r97train <command> --help` by
-`tests/cmake/config_schema_test.sh`, and the configuration table there is held to that same document
-by the same test and to `include/r97/config.h` by `tests/host/config_schema.cpp`, which counts the
-header's members against the schema's rows: a key added on either side of that pair fails.
+section 0 are inline prose, not blocks, and are not run — the serving-only radiance build, the
+network fetch, and `ctest` itself. Section 7's serve and served-loss blocks are in the script and
+the test runs them; with no serving tree (`R97_SERVING_BUILD` is pointed at an absent directory)
+they take their `else` branch and say the serve was skipped, and the test holds the commands to the
+document so that removing them fails even though the branch did not execute. Building the serving
+tree and the server still costs minutes, so the test does not do that. The same script was run by
+hand with a serving tree built without HIP (`-DR97_PATCH_SET=serving -DR97_WITH_HIP=OFF`, section
+0's commands with the CPU backend): the server served the adapter and answered one completion, and
+the serving build's KL record gave `4.66220409289` against the trainer's `4.66220409013` —
+2.8e-9 apart, 6e-10 relative, well inside the 1e-4. The flag tables in `docs/USAGE.md` are held
+to `r97train <command> --help` by `tests/cmake/config_schema_test.sh`, and the configuration
+table there is held to that same document by the same test and to `include/r97/config.h` by
+`tests/host/config_schema.cpp`, which counts the header's members against the schema's rows: a key
+added on either side of that pair fails.

@@ -10,12 +10,13 @@
 //
 // What is checked beyond "the script exits 0":
 //   - the extracted script really is the procedure: it has the preflight, the dry run, the run, the
-//     resume, the served-loss comparison and the log check in it, so a fenced block that loses its
-//     `sh` tag does not turn the script into a shorter one that still passes;
+//     resume, the trainer's served-loss comparison, the serve from the serving-only build and that
+//     build's own served-loss comparison, and the log check in it, so a fenced block that loses
+//     its `sh` tag does not turn the script into a shorter one that still passes;
 //   - the one-time inputs the script deliberately does not run are still named by the document: the
 //     data fetch (`tools/fetch_ultrachat.py`, `docs/DATA.md`), the serving-only build
-//     (`-DR97_PATCH_SET=serving`) whose server is the separate deployment path, and the rule that
-//     one run has the card to itself.
+//     (`-DR97_PATCH_SET=serving`) whose tree section 7 serves from, and the rule that one run has
+//     the card to itself.
 #include "../support/fixture.h"
 #include "../support/fixture_w8a8.h"
 #include "../support/test.h"
@@ -119,8 +120,8 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
     const std::string document = read_file(document_path);
 
     // The one-time inputs the script does not run are still the document's to name: a reader who
-    // has neither written nor read the code starts by fetching the data, and the serving-only
-    // build's server is named as the separate deployment path rather than a command here.
+    // has neither written nor read the code starts by fetching the data, and section 7 serves
+    // from the serving-only build rather than from the trainer's build.
     R97_CHECK(contains(document, "tools/fetch_ultrachat.py"));
     R97_CHECK(contains(document, "docs/DATA.md"));
     R97_CHECK(contains(document, "-DR97_PATCH_SET=serving"));
@@ -134,6 +135,15 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
     R97_CHECK(contains(script, "--resume"));
     R97_CHECK(contains(script, "loss --model"));
     R97_CHECK(contains(script, "\"kind\":\"train\""));
+    // The serve and the served loss are commands of the script, not prose beside it: the serving
+    // build's server, the completion it answers, and radiance's KL record of the same adapter.
+    // The test runs them, but with no serving tree they take their documented `else` branch.
+    R97_CHECK(contains(script, "radiance-build/bin/radiance"));
+    R97_CHECK(contains(script, "--lora trained="));
+    R97_CHECK(contains(script, "/v1/chat/completions"));
+    R97_CHECK(contains(script, "--kld-corpus"));
+    R97_CHECK(contains(script, "--kld-lora trained"));
+    R97_CHECK(contains(script, "tools/kld_loss.py"));
 
     const fs::path dir = fs::path(radtest::tmpdir());
     const fs::path run = dir / "runbook";
@@ -159,13 +169,17 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
 
     // Run it the way the document says to: from the tree's top, with bash. The container is named
     // the way the document finds it -- the newest tiny_qwen35_w8a8.rad under the temporary
-    // directory -- so the settings block is exercised rather than bypassed.
+    // directory -- so the settings block is exercised rather than bypassed. The serving build is
+    // pointed at a directory that does not exist: building it costs minutes, so the host tier runs
+    // section 7's trainer measurement and the serve blocks' documented skip branch, not a serve.
+    const fs::path no_serving = dir / "no-serving-build";
     const std::string command =
         "cd " + r97::detail::shell_quote(root.string()) + " && " +
         "HIP_VISIBLE_DEVICES= ROCR_VISIBLE_DEVICES=99 " + "RAD_TEST_TMPDIR=" +
         r97::detail::shell_quote(dir.string()) + " " + "R97_BUILD=" +
         r97::detail::shell_quote(r97::detail::build_dir()) + " " + "R97_RUN=" +
-        r97::detail::shell_quote(run.string()) + " bash " +
+        r97::detail::shell_quote(run.string()) + " " + "R97_SERVING_BUILD=" +
+        r97::detail::shell_quote(no_serving.string()) + " bash " +
         r97::detail::shell_quote(script_path.string()) + " >" +
         r97::detail::shell_quote(log_path.string()) + " 2>&1";
     const int status = std::system(command.c_str());
@@ -177,9 +191,12 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
                                  log_path.string() + ")\n" + tail_of(log_path, 4000));
     }
 
-    // And it ran the run: the two checkpoints, the resumed one, and the served loss's line.
+    // And it ran the run: the two checkpoints, the resumed one, the trainer's measurement of the
+    // adapter, and the documented skip of the serve that needs the serving tree.
     const std::string log = read_file(log_path);
-    R97_CHECK(contains(log, "served loss"));
+    R97_CHECK(contains(log, "the trainer's loss for the adapter"));
+    R97_CHECK(contains(log, "section 0's serving-only build is a one-time input"));
+    R97_CHECK(contains(log, "the serving build's loss is unchecked"));
     R97_CHECK(contains(log, "# dry run:"));
     R97_CHECK(fs::exists(run / "checkpoint-000000005" / "adapter"));
     R97_CHECK(fs::exists(run / "checkpoint-000000010" / "adapter"));

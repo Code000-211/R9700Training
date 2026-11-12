@@ -175,10 +175,10 @@ usage: r97train loss --model <file.rad> --data <file.jsonl> [--lora <dir>] [--li
 | `--limit N` | now | stop after N sequences |
 | `--device N` | now | score on the card, through `ROCR_VISIBLE_DEVICES` |
 
-The held-out loss, and the one check a served adapter gets: `--lora` on a checkpoint's `adapter/`
-loads it the way a serving radiance does, so the number is the number a server gives.
-`docs/EVAL.md` says how it is cross-checked against radiance's own KL record, and
-`docs/RUNBOOK.md` section 7 holds it to the trainer's.
+The held-out loss: `--lora` on a checkpoint's `adapter/` loads it through the same radiance loader
+a serving radiance uses. `docs/RUNBOOK.md` section 7 holds it to the trainer's held-out loss and
+then serves the adapter with the serving-only build, whose own KL record of the same adapter is held
+to the same number; `docs/EVAL.md` has both measurements and how they agree.
 
 ### `objectives`
 
