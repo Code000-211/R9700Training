@@ -148,10 +148,9 @@ graph in f64 from the registered twins, with no card and no bf16, so
 `host_step_gradient_against_the_exact_step_at_the_same_steps` runs it beside the join on the same
 Model, the same adapter and the same batch, and asks three things of the two.
 
-This case is disabled in this build. The reference step keeps a fused adapter factor under one
-leaf, while this join's splitter names the module's leaf; aligning the two is a reference-step fix
-of its own. The figures recorded below are the reference step's own, measured when the comparison
-ran; the join's own gradient is covered by the two finite-difference cases and the oracle case.
+The reference step keeps each slot's factor under the module that owns it, as this join's
+splitter does, so the two gradients name the same leaves and the comparison is tensor for tensor.
+The case is enabled and is part of the suite.
 
 The exact step is fed `tests/fixtures/programs/oracle.json`, the op list `r97train ops --record`
 wrote from this fixture and the reference's batch, rather than tracing the graph live. A live trace
@@ -177,8 +176,8 @@ against the reference's 7.73519858105, 1.7e-8 of itself.
   whose own agreement the oracle case below measures per boundary and per adapted linear, so each
   direction is held to `kJoinGap` (2.0) of the exact gradient: a direction mixes fifty tensors and
   the trunk's rounding is not aligned with any one of them, so the ratio is not a cosine and this
-  is a guard, not a measurement. Measured 0.258, 0.318, 0.442, 0.467, 0.566, 0.704, 1.08, 1.09,
-  1.21, 1.44.
+  is a guard, not a measurement. Measured 0.72, 0.66, 0.94, 1.06, 0.90, 1.13, 1.16, 1.27, 1.47 and
+  1.48.
 
 The line it prints per direction is `exact g`, `fd(2^-18)`, `fd(2^-19)`, `fd16`, `fd32`, the join's
 `g`, `fd(2^-18)`, `fd(2^-19)` and `fd16`, then the exact error, the exact secant's bias, and how

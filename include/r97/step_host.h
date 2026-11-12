@@ -23,8 +23,7 @@ struct HostStepOptions {
     // the issue's checks need them.
     bool keep_boundaries = true;
     // Mark a head-split adapter activation so the join reads it as [rows][K] with the reference
-    // step's row. A check that compares against the reference step's own fused factors turns
-    // this off: there the family row keeps the factors fused and the comparison splits them.
+    // step's row. A check that wants the family row's reading of the live trace turns this off.
     bool reference_head_split = true;
 };
 

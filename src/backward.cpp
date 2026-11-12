@@ -471,7 +471,8 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             record_prefix = options.record_prefix(rec);
             prefix = record_prefix.c_str();
         }
-        const AdjointCall call{*adjoint_rec, fwd, cot, &dc, options.grads, prefix};
+        AdjointCall call{*adjoint_rec, fwd, cot, &dc, options.grads, prefix};
+        call.fused_slots = options.fused_slots;
         AdjointCall with_slots = call;
         if (options.slot_prefix)
             with_slots.slot_prefix = [&rec, &options](int64_t slot) {
@@ -492,14 +493,13 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                 if (written == 0.0)
                     dc[j].value = cot[static_cast<size_t>(cot_index[j])].value;
             }
-
-            // The writers' adjoint has run: their cotangent storage is done.
-            for (size_t j = 0; j < rec.operands.size(); ++j)
-                if (rec.operands[j].written && plan.write_version[i][j] >= 0)
-                    release(version_at(i, j));
-
-
         }
+
+        // The writers' adjoint has run: their cotangent storage is done. This is every walk's,
+        // not only the passthrough one: nothing below reads a written version's cotangent again.
+        for (size_t j = 0; j < rec.operands.size(); ++j)
+            if (rec.operands[j].written && plan.write_version[i][j] >= 0)
+                release(version_at(i, j));
 
         // Hand what the adjoint produced to the versions each read saw, or out of the block. An
         // in-place write's cotangent is also what the value it replaced takes: its read segments

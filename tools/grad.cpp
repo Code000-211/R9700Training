@@ -6,9 +6,7 @@
 
 #include "r97/adapter_io.h"
 #include "r97/chatdata.h"
-#include "r97/forward.h"
 #include "r97/model.h"
-#include "r97/step_host.h"
 
 #include <algorithm>
 #include <cmath>
@@ -21,9 +19,13 @@
 #include <string>
 #include <system_error>
 
-#if R97_FORWARD
-
 #include "engine.h"  // the complete rad::Engine behind ForwardDriver's unique_ptr
+#include "rad_runtime.h"
+#include "r97/forward.h"
+
+#if R97_FORWARD && defined(RAD_ISSUE_OBSERVER) && defined(RAD_REPLAY_BLOCK)
+
+#include "r97/step_host.h"
 
 namespace r97tool {
 namespace {
@@ -203,4 +205,4 @@ R97_REGISTER_COMMAND("grad", "--model <file.rad> --data <file.jsonl> [--delta lo
 }  // namespace
 }  // namespace r97tool
 
-#endif  // R97_FORWARD
+#endif  // R97_FORWARD && RAD_ISSUE_OBSERVER && RAD_REPLAY_BLOCK

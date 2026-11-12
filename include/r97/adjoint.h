@@ -69,6 +69,10 @@ struct AdjointCall {
     // sites of a fused weight: the lora rows ask it for a slot, and only the record's `slot`
     // operand tells the modules in its pool apart. Empty means every slot uses `prefix`.
     std::function<std::string(int64_t slot)> slot_prefix;
+    // A record whose slots share one factor: the lora rows write their slot's rows into one
+    // `[S*R, K]` (A) / `[N, S*R]` (B) gradient under `prefix`, for a caller that splits the fused
+    // factor afterwards. False keeps each slot's factor under its own name.
+    bool fused_slots = false;
 };
 
 // A twin: the forward in f64. `operands` are the op's read operands in schema order; `out` receives

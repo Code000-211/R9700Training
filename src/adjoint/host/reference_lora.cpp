@@ -1,6 +1,7 @@
 // The reference step's f64 variant of this family: the same rows under the same op names,
-// registered behind `reference_record` so only the fixture's composed graph reaches them.
-// The family file and its doc page stay the ones every other walk uses.
+// registered behind `reference_record` for the fixture's composed graph and behind `r97join` for
+// the host join's head-split records. The family file and its doc page stay the ones every other
+// walk uses.
 // src/adjoint/host/reference_lora.cpp -- the adapter path of docs/ADAPTER.md: y += (alpha / r) * B * (A * x),
 // in the two ops radiance serves for it, and the mm variant of the second.
 //
@@ -15,7 +16,9 @@
 //
 // The gradients are the first trainable leaves in the tree: A under `<prefix>.lora_A` [r, K] and B
 // under `<prefix>.lora_B` [N, r], f32, added to and never overwritten, so a step that reaches one
-// module through two ops sums them the way a ParamSet wants.
+// module through two ops sums them the way a ParamSet wants. A `fused_slots` record writes the
+// slots into one `[S*R, K]` / `[N, S*R]` factor under `prefix` instead, for a caller that splits
+// it; otherwise `slot_prefix` names each module's own factor.
 //
 // The shrink's schema is five operands in both forms -- a, a_scale, slot, lora_a, t
 // (ref_registry.cpp: OPD("a"), OPD_O("a_scale"), OPD("slot"), OPD("lora_a"), OUT("t")). A float
@@ -26,10 +29,10 @@
 // at 1 is the one that differs: a float trunk leaves it absent, with no tensor and so no cotangent,
 // and the row that serves a float record freezes it; a coded trunk passes a real scale, whose
 // cotangent the adjoint gives, because the quantiser that made the codes reads both of its outputs'
-// cotangents back. So the shrink registers two rows -- `R97_REGISTER_ADJOINT_IF_F` for the coded
-// form with 2 and 3 frozen, `_F` for the float one with 1, 2 and 3 -- and the coded row comes
-// first, because lookup applies the first row whose predicate accepts the record and the float row
-// accepts every record. The expand's only cotangent is
+// cotangents back. So the shrink registers two predicated rows -- one for the coded form with 2
+// and 3 frozen, one for the float form with 1, 2 and 3 -- and the coded row comes first, because
+// lookup applies the first row whose predicate accepts the record and the float row accepts every
+// record. The expand's only cotangent is
 // t's: `scale` is the adapter's alpha/r, a hyperparameter from the adapter file, and `lora_b` is a
 // leaf whose gradient goes to the ParamSet.
 //
@@ -126,18 +129,10 @@ std::string slot_grad_name(const AdjointCall& call, const char* leaf, int64_t sl
     return grad_name(call.prefix, leaf);
 }
 
-bool join_record(const AdjointCall& call) {
-    for (const auto& p : call.rec.params) {
-        if (p.first != "r97join") continue;
-        if (const int64_t* on = std::get_if<int64_t>(&p.second)) return *on == 1;
-    }
-    return false;
-}
-
 // The reference step keeps a slot's factor under the module that owns it; the host step's fused
 // weight has one factor for a run of slots, and its shape splitter expects that fused name.
 std::string factor_grad_name(const AdjointCall& call, const char* leaf, int64_t slot) {
-    if (join_record(call)) return grad_name(call.prefix, leaf);
+    if (call.fused_slots) return grad_name(call.prefix, leaf);
     return slot_grad_name(call, leaf, slot);
 }
 
@@ -285,11 +280,13 @@ void lora_shrink_host_adjoint(const AdjointCall& call) {
         if ((int64_t)s_cot->value.size() != sh.M * sh.groups) return;
     }
 
-    std::vector<Param*> da_by_slot((size_t)sh.S, nullptr);
+    // `grad_entry` hands a reference into the ParamSet, which a later entry may move: ask again
+    // for each slot and use the reference before the next entry is made.
     const auto da_for = [&](int64_t s) -> Param* {
-        Param*& p = da_by_slot[(size_t)s];
-        if (!p) p = &grad_entry(call.grads, grad_name(call.prefix, "lora_A"), {sh.R, sh.K});
-        return p;
+        const std::vector<int64_t> shape =
+            call.fused_slots ? std::vector<int64_t>{sh.S * sh.R, sh.K}
+                             : std::vector<int64_t>{sh.R, sh.K};
+        return &grad_entry(call.grads, factor_grad_name(call, "lora_A", s), shape);
     };
 
     std::vector<double> g((size_t)sh.K, 0.0);
@@ -314,13 +311,16 @@ void lora_shrink_host_adjoint(const AdjointCall& call) {
             a_cot.value[e] += g[(size_t)k] * scale;
             s_cot->value[ge] += g[(size_t)k] * sh.a->value[e];
         }
-        if (da)
+        if (da) {
+            const int64_t row0 = call.fused_slots ? s * sh.R : 0;
             for (int64_t j = 0; j < sh.R; ++j) {
                 const double c = t_cot.value[(size_t)(m * sh.R + j)];
                 if (c == 0.0) continue;
                 for (int64_t k = 0; k < sh.K; ++k)
-                    da->value[(size_t)(j * sh.K + k)] += (float)(c * x_at(sh, m, k));
+                    da->value[(size_t)((row0 + j) * sh.K + k)] +=
+                        (float)(c * x_at(sh, m, k));
             }
+        }
     }
 }
 
@@ -415,11 +415,11 @@ void lora_expand_host_adjoint(const AdjointCall& call) {
     AdValue& t_cot = call.dc->at(0);
     if ((int64_t)t_cot.value.size() != ex.M * ex.R) return;
 
-    std::vector<Param*> db_by_slot((size_t)ex.S, nullptr);
     const auto db_for = [&](int64_t s) -> Param* {
-        Param*& p = db_by_slot[(size_t)s];
-        if (!p) p = &grad_entry(call.grads, grad_name(call.prefix, "lora_B"), {ex.N, ex.R});
-        return p;
+        const std::vector<int64_t> shape =
+            call.fused_slots ? std::vector<int64_t>{ex.N, ex.S * ex.R}
+                             : std::vector<int64_t>{ex.N, ex.R};
+        return &grad_entry(call.grads, factor_grad_name(call, "lora_B", s), shape);
     };
 
     for (int64_t m = 0; m < ex.M; ++m) {
@@ -433,23 +433,22 @@ void lora_expand_host_adjoint(const AdjointCall& call) {
             const size_t b0 = (size_t)((s * ex.N + n) * ex.R);
             for (int64_t j = 0; j < ex.R; ++j)
                 t_cot.value[(size_t)(m * ex.R + j)] += cs * ex.lb->value[b0 + (size_t)j];
-            if (db)
+            if (db) {
+                const int64_t cols = call.fused_slots ? ex.S * ex.R : ex.R;
+                const int64_t col0 = call.fused_slots ? s * ex.R : 0;
                 for (int64_t j = 0; j < ex.R; ++j)
-                    db->value[(size_t)(n * ex.R + j)] +=
+                    db->value[(size_t)(n * cols + col0 + j)] +=
                         (float)(cs * ex.t->value[(size_t)(m * ex.R + j)]);
+            }
         }
     }
 }
 
 }  // namespace
 
-bool reference_coded_act(const std::vector<OpParam>& p) {
-    return reference_record(p) && coded_act(p);
-}
-
 // The host step's live records can carry an activation split by head, which this row reads as
-// [rows][K] the way the reference step's composed graph does. The join tags its adapter records so
-// those rows, and only those, reach them; the family file keeps the ordinary graph.
+// [rows][K] the way the reference step's composed graph does. Those records and the reference
+// step's own both reach the reference-shaped rows; the family file keeps the ordinary graph.
 bool join_lora_record(const std::vector<OpParam>& p) {
     for (const auto& param : p) {
         if (param.first != "r97join") continue;
@@ -458,25 +457,28 @@ bool join_lora_record(const std::vector<OpParam>& p) {
     return false;
 }
 
-R97_REGISTER_TWIN_IF("lora_shrink", lora_shrink_twin, reference_record)
-R97_REGISTER_TWIN_IF("lora_expand", lora_expand_twin, reference_record)
-R97_REGISTER_TWIN_IF("lora_expand_mm", lora_expand_twin, reference_record)
-R97_REGISTER_TWIN_IF("lora_shrink", lora_shrink_twin, join_lora_record)
-R97_REGISTER_TWIN_IF("lora_expand", lora_expand_twin, join_lora_record)
-R97_REGISTER_TWIN_IF("lora_expand_mm", lora_expand_twin, join_lora_record)
+bool walk_lora_record(const std::vector<OpParam>& p) {
+    return reference_record(p) || join_lora_record(p);
+}
+
+bool walk_coded_act(const std::vector<OpParam>& p) {
+    return walk_lora_record(p) && coded_act(p);
+}
+
+R97_REGISTER_TWIN_IF("lora_shrink", lora_shrink_twin, walk_lora_record)
+R97_REGISTER_TWIN_IF("lora_expand", lora_expand_twin, walk_lora_record)
+R97_REGISTER_TWIN_IF("lora_expand_mm", lora_expand_twin, walk_lora_record)
 
 /* Two rows, because the a_scale position means different things in the two forms: a coded trunk
  * passes a real scale, and its cotangent is part of the int8 chain, so only slot (2) and lora_a (3)
  * are frozen there; a float trunk leaves the position absent -- no tensor, no cotangent -- so 1 is
- * frozen with them. The coded row goes first, and both predicated rows are reference-only. */
-R97_REGISTER_ADJOINT_IF_F("lora_shrink", host, lora_shrink_host_adjoint, reference_coded_act, 2, 3)
-R97_REGISTER_ADJOINT_IF_F("lora_shrink", host, lora_shrink_host_adjoint, reference_record, 1, 2, 3)
+ * frozen with them. The coded row goes first, and both predicated rows serve the reference step
+ * and the host join. */
+R97_REGISTER_ADJOINT_IF_F("lora_shrink", host, lora_shrink_host_adjoint, walk_coded_act, 2, 3)
+R97_REGISTER_ADJOINT_IF_F("lora_shrink", host, lora_shrink_host_adjoint, walk_lora_record, 1, 2, 3)
 
-R97_REGISTER_ADJOINT_IF_F("lora_expand", host, lora_expand_host_adjoint, reference_record, 1, 2, 3)
-R97_REGISTER_ADJOINT_IF_F("lora_expand_mm", host, lora_expand_host_adjoint, reference_record, 1, 2, 3)
-R97_REGISTER_ADJOINT_IF_F("lora_shrink", host, lora_shrink_host_adjoint, join_lora_record, 1, 2, 3)
-R97_REGISTER_ADJOINT_IF_F("lora_expand", host, lora_expand_host_adjoint, join_lora_record, 1, 2, 3)
-R97_REGISTER_ADJOINT_IF_F("lora_expand_mm", host, lora_expand_host_adjoint, join_lora_record, 1, 2, 3)
+R97_REGISTER_ADJOINT_IF_F("lora_expand", host, lora_expand_host_adjoint, walk_lora_record, 1, 2, 3)
+R97_REGISTER_ADJOINT_IF_F("lora_expand_mm", host, lora_expand_host_adjoint, walk_lora_record, 1, 2, 3)
 
 }  // namespace reference_lora
 }  // namespace r97

@@ -35,10 +35,10 @@
 #include "r97/model.h"
 #include "r97/reference_step.h"
 #include "r97/step_host.h"
-#include "support/fixture.h"
-#include "support/late_fixture.h"
-#include "support/oracle.h"
-#include "support/test.h"
+#include "../support/fixture.h"
+#include "../support/late_fixture.h"
+#include "../support/oracle.h"
+#include "../support/test.h"
 
 #include <algorithm>
 #include <cmath>
@@ -683,10 +683,9 @@ R97_TEST(host_step_memory_does_not_grow_with_layers) {
 //
 // The direction seeds are the ten-direction case's, so trial 6 here is trial 6 there.
 // `docs/STEPS-HOST.md` records the figures and what they settle.
-// Disabled: the reference step keeps a fused adapter factor under one leaf while this join's
-// splitter names the module's leaf; aligning the two is a reference-step fix of its own. The
-// join's own gradient is covered by the two finite-difference cases and the oracle case.
-#if 0
+//
+// The reference step keeps each slot's factor under the module that owns it, as this join's
+// splitter does, so the two gradients name the same leaves and the comparison is tensor for tensor.
 R97_TEST(host_step_gradient_against_the_exact_step_at_the_same_steps) {
 #if !R97_FIXTURE_PREFILL
     return;  // the op list was recorded from the training patch's forward
@@ -722,7 +721,7 @@ R97_TEST(host_step_gradient_against_the_exact_step_at_the_same_steps) {
     std::unique_ptr<r97::ForwardDriver> driver = open_forward(container);
     r97::HostStepReport report;
     r97::HostStepOptions join_opts;
-    join_opts.reference_head_split = false;  // keep the factors fused, as the reference step has them
+    join_opts.reference_head_split = false;  // the family row, not the reference-shaped head split
     const r97::StepFn step = r97::host_step(*driver, model, join_opts, &report);
 
     // The reference's adapter in the delta's own ParamSet.
@@ -856,5 +855,3 @@ R97_TEST(host_step_gradient_against_the_exact_step_at_the_same_steps) {
 }
 
 #endif  // R97_FORWARD
-
-#endif  // exact step, disabled

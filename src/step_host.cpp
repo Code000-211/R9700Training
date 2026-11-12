@@ -1,5 +1,5 @@
 // src/step_host.cpp -- the host join. See include/r97/step_host.h and docs/STEPS-HOST.md.
-#include "r97/step_host.h"
+#include "rad_runtime.h"  // RAD_ISSUE_OBSERVER / RAD_REPLAY_BLOCK, before the guard
 
 #if defined(RAD_ISSUE_OBSERVER) && defined(RAD_REPLAY_BLOCK)
 
@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "engine.h"  // the complete rad::Engine behind ForwardDriver's unique_ptr
+#include "r97/step_host.h"
 #include "r97/adapter_io.h"
 #include "r97/adjoint.h"
 #include "r97/backward.h"
@@ -662,6 +663,9 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
         const std::string grad_prefix = model.delta ? model.delta->grad_prefix() : "";
         bo.prefix = grad_prefix.c_str();
         bo.in_place_passthrough = true;
+        // The engine pools a fused weight's modules into one lora record; write one fused factor
+        // and let split_adapter_grads put each module's rows under its own name.
+        bo.fused_slots = true;
         if (!groups.empty()) {
             bo.record_prefix = [groups, grad_prefix](const OpRecord& rec) -> std::string {
                 const std::string weight = record_weight(rec);

@@ -64,6 +64,12 @@ leaf's suffix is appended as it is for `prefix`. The record is part of the call 
 weight in it says which pool the slot belongs to, and several fused weights have overlapping slot
 numbers. Empty means every slot uses `prefix`.
 
+`BackwardOptions::fused_slots` says the opposite arrangement: a record's slots share one factor,
+and their rows go into one gradient under `prefix` (A is `[S * R, K]`, B is `[N, S * R]`, a slot
+at its `s * R` offset) for a caller that splits the fused factor after the walk. The join uses it
+for the engine's pooled lora records; the reference step leaves it false and names each slot's
+module through `slot_prefix`.
+
 ## Stops
 
 `BackwardOptions::stops` names the ops whose path ends: their adjoint is not asked for, their

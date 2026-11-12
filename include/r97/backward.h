@@ -90,6 +90,10 @@ struct BackwardOptions {
     // path. Set when the caller's adjoint row leaves the in-place read's slot empty; the walk then
     // copies the write's cotangent into it, and the read travels to the version it saw.
     bool in_place_passthrough = false;
+    // A record's slots share one fused factor: the lora rows write a slot's rows into one
+    // [S*R, K] (A) / [N, S*R] (B) gradient under the record's prefix, for a caller that splits it
+    // afterwards. False keeps each slot under `prefix` or `slot_prefix`.
+    bool fused_slots = false;
 };
 
 // The cotangent of one of the block's inputs: a buffer the block read but never wrote. It is dense
