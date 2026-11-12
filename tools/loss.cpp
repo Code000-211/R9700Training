@@ -31,6 +31,7 @@ struct Args {
     std::string data;
     std::string lora;    // empty: the base model
     int64_t limit = -1;  // < 0: every conversation in the file
+    int device = -1;     // < 0: the host tier; >= 0: ROCR_VISIBLE_DEVICES and the device kernel tier
 };
 
 bool parse(int argc, char** argv, Args* a) {
@@ -56,6 +57,15 @@ bool parse(int argc, char** argv, Args* a) {
                 return false;
             }
             if (a->limit < 0) return false;
+        } else if (arg == "--device") {
+            std::string n;
+            if (!next(&n)) return false;
+            try {
+                a->device = std::stoi(n);
+            } catch (...) {
+                return false;
+            }
+            if (a->device < 0) return false;
         } else {
             std::cerr << "r97train loss: unknown argument " << arg << "\n";
             return false;
@@ -92,8 +102,16 @@ int loss_main(int argc, char** argv) {
     Args args;
     if (!parse(argc, argv, &args)) {
         std::cerr << "usage: r97train loss --model <file.rad> --data <file.jsonl> "
-                     "[--lora <dir>] [--limit N]\n";
+                     "[--lora <dir>] [--limit N] [--device N]\n";
         return 2;
+    }
+
+    // --device N: ROCR_VISIBLE_DEVICES is read only at ROCR init, so it is set before the model
+    // or any engine opens, and it selects the device kernel tier over the host one.
+    const std::string dev = std::to_string(args.device);
+    if (args.device >= 0 && ::setenv("ROCR_VISIBLE_DEVICES", dev.c_str(), 1) != 0) {
+        std::cerr << "r97train loss: cannot set ROCR_VISIBLE_DEVICES=" << args.device << "\n";
+        return 3;
     }
 
     r97::ChatData chat;
@@ -133,6 +151,7 @@ int loss_main(int argc, char** argv) {
     cfg.max_tok = token_budget;
     cfg.max_ctx = context;
     cfg.max_seqs = 8;
+    if (args.device >= 0) cfg.kernels = {"libr4d", "libavx", "libref"};  // --device: device tier
 
     // The forward config carries no adapter -- the driver is the base model's -- so the run names
     // it to radiance, which loads it with everything --lora loads and keeps it for the prefill
@@ -184,7 +203,7 @@ int loss_main(int argc, char** argv) {
     return 0;
 }
 
-R97_REGISTER_COMMAND("loss", "--model <file.rad> --data <file.jsonl> [--lora <dir>] [--limit N]",
+R97_REGISTER_COMMAND("loss", "--model <file.rad> --data <file.jsonl> [--lora <dir>] [--limit N] [--device N]",
                      loss_main);
 
 }  // namespace
