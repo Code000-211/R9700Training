@@ -1,7 +1,7 @@
 // tests/host/usage_cli.cpp -- `r97train` with no command: the usage table it prints.
 //
-// docs/RUNBOOK.md opens on `build/r97train` and its command table, and its last section promises
-// that command is a host test. This runs the binary the build produced with no argument and reads
+// docs/RUNBOOK.md's section 0 opens on `build/r97train`. This runs the binary the build produced
+// with no argument and reads
 // stderr, the stream it prints to: the exit status is 2, the first line is the usage line, and
 // under `commands:` one `  <name> <usage>` line per registered subcommand, sorted by name. The
 // subcommands the host binary itself registers (commands, objectives, deltas) must appear with the

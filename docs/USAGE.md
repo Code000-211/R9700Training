@@ -47,51 +47,47 @@ there. A command that needs them says so, with the directory it looked in.
 
 | command | what it does |
 | --- | --- |
-| `info <file.rad>` | architecture, quantisation, layers, hidden size |
-| `data --model <file.rad> --data <file.jsonl> [--show N]` | the tokenisation statistics, and the first N conversations with their scored runs marked |
-| `loss --model <file.rad> --data <file.jsonl> [--lora <dir>] [--limit N] [--device N]` | the held-out loss, cross-checked against radiance's own KL record |
-| `grad --model <file.rad> --data <file.jsonl> [--delta lora] …` | one loss and its per-module gradient norms through the host adjoints |
-| `train --model <file.rad> --out <dir> [--reference] [flags]` | the training loop, with the host step or, under `--reference`, the reference step |
-| `ops <file.rad>\|--registered [--device N]` | the op inventory of a container's forward pass, or the registry |
+| `config` | the configuration schema, or the configuration those arguments resolve to |
+| `data` | the tokenisation statistics, and the first N conversations with their scored runs marked |
 | `deltas` | the registered trainable kinds, one per line |
+| `grad` | one loss and its per-module gradient norms through the host adjoints |
+| `info` | architecture, quantisation, layers, hidden size |
+| `loss` | the held-out loss, cross-checked against radiance's own KL record |
 | `objectives` | the registered losses, one per line |
-| `config [--config <file>] [flags]` | the configuration schema, or the configuration those arguments resolve to |
+| `ops` | the op inventory of a container's forward pass, or the registry |
+| `train` | the training loop, with the host step or, under `--reference`, the reference step |
 
 A command returns `0` on success, `2` for a usage error, and something other than `0` for a check
 it could not complete; the message names the file, the key or the parameters at fault. `r97train`
-with no argument prints the command table with each command's argument hint.
+with no argument prints the command table above; `r97train --help` prints it as an answer rather
+than an error; `r97train <command> --help` prints that command's usage line — every flag it takes —
+and points here. The sections below open with that same line, so the document and the binary carry
+one string: `tests/cmake/config_schema_test.sh` compares them, and every flag listed under them,
+with what the binary prints. A flag on one side and not the other fails `ctest --test-dir build -L
+host`.
 
-### `train`
+## Every command's flags
 
-```sh
-build/r97train train --model <file.rad> --data <train.jsonl> --heldout <heldout.jsonl> \
-    --out runs/lora-v1 --steps 1000 --lr 1e-4 --token_budget 4096 --eval_every 100
-```
-
-The step is the ordinary host step: the engine's forward on the host kernels and the host adjoints
-(`docs/STEPS-HOST.md`). It needs no card, and it is the one a real run uses. `--reference` replaces
-it with the container's op graph replayed in `f64` from the engine's twins and the host adjoints,
-with the `libavx` and `libref` kernel libraries: no card, slower, and the same loop, checkpoint and
-resume. A build without radiance's forward tier has only the reference step, and `train` without
-`--reference` stops and says so.
-
-The command's own flags are `--reference`, `--resume <dir>`, `--program <file>` and `--config
-<file>`; every configuration key is accepted too, as `--key value`. The file is read first and a
-flag overrides it. Without `--data` the sequences are `tests/fixtures/chat_small.jsonl`, relative to
-the working directory — give a real run its own file. `heldout` (or `--heldout <file>`) names the
-file `eval_every` evaluates on; `eval_every = 0` turns the evaluation off. The loop logs to
-`<out>/train.jsonl` and to the terminal, writes checkpoints under `<out>/`, and its last line is
-`train: wrote <checkpoint>`.
-
-`docs/TRAINING.md` says what the loop does with the log, the horizons and the evaluation;
-`docs/CHECKPOINT.md` says what the directory it wrote contains and what `--resume` needs.
+A row is either a flag this build has now, or a flag of an issue that has not merged. A **planned**
+row is not in `--help` and not accepted by the binary: it is here so that a reader knows which
+command the issue lands on and what the flag will be called. `--config <file>` and `--config-file
+<file>` are the same flag under two spellings; both are kept because a file path reads better as the
+last word of a long line.
 
 ### `config`
 
-```sh
-build/r97train config                              # the schema, one line per key
-build/r97train config --config runs/lora-v1.conf --steps 500   # resolved, validated
+```text
+usage: r97train config [--config <file>] [--config-file <file>] [configuration keys as flags]
 ```
+
+| flag | state | what it does |
+| --- | --- | --- |
+| `--config <file>` | now | read the file's `key = value` lines before anything else |
+| `--config-file <file>` | now | the same flag |
+
+Every key of the table under [Configuration](#configuration) is a flag too, `--<key> <value>` —
+`--lr 1e-4` — which is what the usage line's `[configuration keys as flags]` says; the table, not
+this one, is where they are listed.
 
 With no argument the command prints the configuration schema — the table below, from the binary, so
 a reader can check the document against what the build accepts. With `--config` or any
@@ -105,17 +101,157 @@ key's name. It is the preflight `docs/RUNBOOK.md` runs before a long run.
 start, while `r97train config --config` on the same file refuses it: their `config.h` default is
 outside the valid range. Write them in the file and the two agree.
 
-### The rest
+### `data`
 
-- `info` and `data` are the two cheap reads of a run's inputs. `data` prints the counts the batcher
-  will see (kept, shortened, skipped, tokens, scored) and marks the scored runs in the first
-  `--show` conversations with `[[…]]`.
-- `loss` and `grad` are the held-out and the gradient check: `docs/EVAL.md` and
-  `docs/STEPS-HOST.md` own what they print and how the numbers are cross-checked.
-- `ops` answers "can this build run this container, on the host and on the card": the inventory
-  the host tier prints is `docs/OPS-qwen35-host.md`, the card's is `docs/OPS-qwen35-device.md`.
-- `deltas` and `objectives` print what is registered — `docs/OBJECTIVES.md` says what a new one is
-  and where it registers.
+```text
+usage: r97train data --model <file.rad> --data <file.jsonl> [--show N]
+```
+
+| flag | state | what it does |
+| --- | --- | --- |
+| `--model <file.rad>` | now | the container whose chat template and vocabulary tokenise the file |
+| `--data <file.jsonl>` | now | the chat-format file to read |
+| `--show N` | now | print the first N conversations, the scored runs marked `[[…]]`; default 0 |
+
+The cheap read of a run's input, beside `info`. It prints the counts the batcher will see —
+`conversations`, `kept`, `shortened`, `skipped`, `tokens`, `scored` — and `--show` prints the
+conversations with what the loss is taken over marked. A `skipped` count above zero is a template or
+format problem, not something to train through: `docs/CHATDATA.md` says which.
+
+### `deltas`
+
+```text
+usage: r97train deltas
+```
+
+Takes no flags. Prints one line per registered trainable kind, sorted; `docs/OBJECTIVES.md` and the
+`include/r97/delta.h` contract say what a new one is and where it registers.
+
+### `grad`
+
+```text
+usage: r97train grad --model <file.rad> --data <file.jsonl> [--delta lora] [--rank N] [--alpha A] [--limit N]
+```
+
+| flag | state | what it does |
+| --- | --- | --- |
+| `--model <file.rad>` | now | the container |
+| `--data <file.jsonl>` | now | the sequences the loss is taken over |
+| `--delta lora` | now | the trainable kind to attach; `deltas` lists them |
+| `--rank N` | now | the factors' rank |
+| `--alpha A` | now | the LoRA scale, applied as `alpha / rank` |
+| `--limit N` | now | stop after N sequences |
+
+One loss and its per-module gradient norms through the host adjoints — the check that a step's
+backward is wired where it should be. `docs/STEPS-HOST.md` owns what it prints.
+
+### `info`
+
+```text
+usage: r97train info <file.rad>
+```
+
+Takes no flags. Prints the container's `arch`, `quant`, `layers` and `hidden` and exits `3` when it
+does not open: the one command that needs neither data nor a card, and the first one to run on a new
+container.
+
+### `loss`
+
+```text
+usage: r97train loss --model <file.rad> --data <file.jsonl> [--lora <dir>] [--limit N] [--device N]
+```
+
+| flag | state | what it does |
+| --- | --- | --- |
+| `--model <file.rad>` | now | the container |
+| `--data <file.jsonl>` | now | the held-out sequences to score |
+| `--lora <dir>` | now | an `adapter/` directory, served through radiance's own loader |
+| `--limit N` | now | stop after N sequences |
+| `--device N` | now | score on the card, through `ROCR_VISIBLE_DEVICES` |
+
+The held-out loss, and the one check a served adapter gets: `--lora` on a checkpoint's `adapter/`
+loads it the way a serving radiance does, so the number is the number a server gives.
+`docs/EVAL.md` says how it is cross-checked against radiance's own KL record, and
+`docs/RUNBOOK.md` section 7 holds it to the trainer's.
+
+### `objectives`
+
+```text
+usage: r97train objectives
+```
+
+Takes no flags. Prints one line per registered loss, sorted; `docs/OBJECTIVES.md` says what a new
+one is and where it registers.
+
+### `ops`
+
+```text
+usage: r97train ops <file.rad> or --registered [--home <dir>] [--kernels <list>] [--record <file>] [--batch <file>] [--device N]
+```
+
+| flag | state | what it does |
+| --- | --- | --- |
+| `--registered` | now | print the registry instead of a container's op graph |
+| `--home <dir>` | now | the radiance home to take the kernel libraries from |
+| `--kernels <list>` | now | the kernel libraries to try, in the order given |
+| `--record <file>` | now | record the pass's inputs and outputs to `<file>` |
+| `--batch <file>` | now | replay a recorded pass instead of fresh inputs |
+| `--device N` | now | take the inventory on the card |
+
+Answers "can this build run this container, on the host and on the card": the inventory the host
+tier prints is `docs/OPS-qwen35-host.md`, the card's is `docs/OPS-qwen35-device.md`, and
+`docs/RUNBOOK.md` section 10 says when to ask it.
+
+### `train`
+
+```text
+usage: r97train train --model <file.rad> --out <dir> [--data <file.jsonl>] [--heldout <file.jsonl>] [--steps N] [--reference] [--dry-run] [--resume <dir>] [--program <file>] [--config <file>] [--config-file <file>] [configuration keys as flags]
+```
+
+| flag | state | what it does |
+| --- | --- | --- |
+| `--model <file.rad>` | now | the `model` key: the container to train against |
+| `--out <dir>` | now | the `out` key: where the log and the checkpoints go |
+| `--data <file.jsonl>` | now | the `data` key: the training sequences |
+| `--heldout <file.jsonl>` | now | the `heldout` key: what `eval_every` scores |
+| `--steps N` | now | the `steps` key: the run's horizon |
+| `--reference` | now | the reference step instead of the host step: the op graph in `f64`, no card, slower |
+| `--dry-run` | now | resolve everything to the first step, print the settings and the first step's shape, write nothing |
+| `--resume <dir>` | now | continue from a checkpoint directory, at the horizon the configuration names |
+| `--program <file>` | now | the op program a reference step replays |
+| `--config <file>` | now | read the configuration file first; a flag overrides it |
+| `--config-file <file>` | now | the same flag |
+| `--devices <N>` | planned: data-parallel on two cards (#55) | one sub-batch per card |
+| `--placement <spec>` | planned: layer split for containers that do not fit one card (#57) | which layers live on which card |
+
+```sh
+build/r97train train --model <file.rad> --data <train.jsonl> --heldout <heldout.jsonl> \
+    --out runs/lora-v1 --steps 1000 --lr 1e-4 --token_budget 4096 --eval_every 100
+```
+
+The step is the ordinary host step: the engine's forward on the host kernels and the host adjoints
+(`docs/STEPS-HOST.md`). It needs no card, and it is the one a real run uses. `--reference` replaces
+it with the container's op graph replayed in `f64` from the engine's twins and the host adjoints,
+with the `libavx` and `libref` kernel libraries: no card, slower, and the same loop, checkpoint and
+resume. A build without radiance's forward tier has only the reference step, and `train` without
+`--reference` stops and says so.
+
+Every configuration key is accepted as a flag too, as `--key value`. The file is read first and a
+flag overrides it. Without `--data` the sequences are `tests/fixtures/chat_small.jsonl`, relative to
+the working directory — give a real run its own file. `heldout` (or `--heldout <file>`) names the
+file `eval_every` evaluates on; `eval_every = 0` turns the evaluation off. The loop logs to
+`<out>/train.jsonl` and to the terminal, writes checkpoints under `<out>/`, and its last line is
+`train: wrote <checkpoint>`.
+
+`--dry-run` is the preflight a long run gets: it opens the tokenizer, reads both files, builds the
+delta and the step's engine, prints the resolved configuration and one line saying what the first
+step would read, and stops before the step. It writes nothing — `<out>` is made by the run — so a
+mistyped path or a key out of range costs seconds instead of a night. It refuses `--resume`: a
+resume starts a run, and a dry run does not.
+
+`docs/TRAINING.md` says what the loop does with the log, the horizons and the evaluation;
+`docs/CHECKPOINT.md` says what the directory it wrote contains and what `--resume` needs;
+`docs/RUNBOOK.md` runs the whole procedure this section's flags serve.
 
 ## Configuration
 
@@ -191,7 +327,8 @@ run is then `build/r97train train --config that-file`. `train` writes the contai
 
 ## A first run, end to end
 
-Over the tiny fixture container — no card and no data of your own. `docs/FIXTURES.md` owns the
+The smallest run there is, over the tiny fixture container — no card and no data of your own; the
+checks a run needs around the commands are `docs/RUNBOOK.md`'s. `docs/FIXTURES.md` owns the
 fixture: the host tests make it, and it lands in their temporary directory as
 `<tmpdir>/tiny_qwen35_bf16/tiny_qwen35_bf16.rad`. These commands find it and keep the path in
 `$tiny`:
@@ -269,6 +406,9 @@ reads and what the serving side loads. `docs/CHECKPOINT.md` says what the state 
 | every command's listing and registration | `listings`, `tests/host/test_registrations.cpp` |
 | `info` and `data` on a container | `info_cli`, `data_cli` |
 | the schema, against `Config` and against this file | `tests/host/config_schema.cpp`, `config_schema` |
+| every command's usage line and flags, against this file | `config_schema` |
+| `--dry-run`, the served loss and the serve's own flags | `train_host_cli_serves_the_int8_trunk`, `train_cli_dry_run_resolves_and_writes_nothing` |
+| the runbook's commands, extracted and run in order | `runbook_script_runs_as_the_document_orders_it` |
 | the file/flags/defaults order | `config_file_overrides_command_fallbacks` |
 | `train` (the host step), the held-out evaluation and the resume | `train_host_cli_overfits_and_resumes` |
 | `train --reference`, overfit and resume | `train_reference_cli_overfits_and_resumes` |

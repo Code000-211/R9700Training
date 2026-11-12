@@ -3,10 +3,15 @@
 //   r97train train --model tiny.rad --out DIR [--data chat.jsonl] [--heldout eval.jsonl]
 //                   [--steps N]
 //   r97train train --reference --model tiny.rad --out DIR
+//   r97train train --dry-run --config runs/run.conf
 //
 // The run's base_id is the container's SHA-256, so a resume against a different container is
 // refused by both hashes. With --heldout the loop's evaluation step scores that file and reports a
-// held-out loss beside the training one.
+// held-out loss beside the training one. With --dry-run the run is resolved as far as the first
+// step and then stops: the configuration, the data, the tokenizer, the step's engine, and the
+// output directory is never created. The Trainer creates it, so the dry run is what tells an
+// operator a long run's settings and files are right without touching where it will write
+// (docs/RUNBOOK.md's preflight).
 //
 // This is the ordinary training loop over the host step: ForwardDriver and the live adapter on
 // radiance's host kernels. With --reference the step is make_reference_step(): the fixture's op
@@ -18,6 +23,7 @@
 #include "r97/batcher.h"
 #include "r97/chatdata.h"
 #include "r97/config.h"
+#include "r97/config_schema.h"
 #include "r97/delta.h"
 #include "r97/forward.h"
 #include "r97/model.h"
@@ -57,31 +63,41 @@ std::string radiance_home() {
     return {};
 }
 
+// The argument hint: the command table's entry and the usage line the parser prints are one
+// string, so `r97train train --help` and a bad argument cannot disagree.
+constexpr const char* kUsage =
+    "--model <file.rad> --out <dir> [--data <file.jsonl>] [--heldout <file.jsonl>] [--steps N] "
+    "[--reference] [--dry-run] [--resume <dir>] [--program <file>] [--config <file>] "
+    "[--config-file <file>] [configuration keys as flags]";
+
 int train_main(int argc, char** argv) {
     std::string config_path;
     std::vector<std::string> flags;
     bool reference = false;
     std::string resume;
     std::string program;
+    bool dry_run = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--reference") {
             reference = true;
+        } else if (arg == "--dry-run") {
+            dry_run = true;
         } else if (arg == "--program") {
             if (++i >= argc) {
-                std::cerr << "usage: r97train train --model <file.rad> --out <dir> [--reference]\n";
+                std::cerr << "usage: r97train train " << kUsage << "\n";
                 return 2;
             }
             program = argv[i];
         } else if (arg == "--resume") {
             if (++i >= argc) {
-                std::cerr << "usage: r97train train --model <file.rad> --out <dir> [--reference]\n";
+                std::cerr << "usage: r97train train " << kUsage << "\n";
                 return 2;
             }
             resume = argv[i];
         } else if (arg == "--config" || arg == "--config-file") {
             if (++i >= argc) {
-                std::cerr << "usage: r97train train --model <file.rad> --out <dir> [--reference]\n";
+                std::cerr << "usage: r97train train " << kUsage << "\n";
                 return 2;
             }
             config_path = argv[i];
@@ -91,6 +107,12 @@ int train_main(int argc, char** argv) {
     }
 
     try {
+        // A dry run stops before the Trainer, and it is the Trainer that reads the checkpoint: a
+        // run that would have resumed is not the run a dry run describes, so say so rather than
+        // report a configuration whose first step this flag will not take.
+        if (dry_run && !resume.empty())
+            throw std::runtime_error("--dry-run does not start a resume; drop --resume");
+
         // The command's fallbacks sit under --config and the other flags: load_config() reads the
         // file over them and applies the flags last, so a file's lr, steps, accumulation and
         // token_budget are used and a flag still wins over both.
@@ -212,6 +234,17 @@ int train_main(int argc, char** argv) {
         // The evaluation step is the training step with the gradients dropped; a held-out set
         // without one is a caller's error, so only pass it when the file was given.
         r97::StepFn eval = options.heldout.empty() ? r97::StepFn{} : step;
+
+        // Everything a run checks before its first step has now been checked; print the settings it
+        // resolved and stop, before the Trainer makes the output directory.
+        if (dry_run) {
+            std::cout << r97::config_values_text(cfg)
+                      << "# dry run: " << batcher.sequences().size() << " sequences, "
+                      << options.heldout.size() << " held-out batches, "
+                      << (reference ? "reference" : "host") << " step, nothing written\n";
+            return 0;
+        }
+
         r97::Trainer trainer(step, std::move(eval), params, optimiser, batcher, std::move(options));
         if (!resume.empty()) trainer.resume(resume);
         trainer.run();
@@ -223,10 +256,7 @@ int train_main(int argc, char** argv) {
     }
 }
 
-R97_REGISTER_COMMAND("train",
-                     "--model <file.rad> --out <dir> [--data <file.jsonl>] "
-                     "[--heldout <file.jsonl>] [--steps N] [--reference]",
-                     train_main);
+R97_REGISTER_COMMAND("train", kUsage, train_main);
 
 }  // namespace
 }  // namespace r97tool

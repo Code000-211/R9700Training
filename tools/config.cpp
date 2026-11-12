@@ -51,7 +51,9 @@ int config_main(int argc, char** argv) {
     }
 }
 
-R97_REGISTER_COMMAND("config", "[--config <file>] [flags]", config_main);
+R97_REGISTER_COMMAND("config",
+                     "[--config <file>] [--config-file <file>] [configuration keys as flags]",
+                     config_main);
 
 }  // namespace
 }  // namespace r97tool
