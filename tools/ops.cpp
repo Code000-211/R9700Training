@@ -15,6 +15,7 @@
 
 #include "../include/r97/adjoint.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -192,6 +193,7 @@ static int ops_main(int argc, char** argv) {
     bool registered = false;
     std::string container, home, record, batch_path;
     std::vector<std::string> kernels;
+    int device = -1;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--registered") {
@@ -204,11 +206,23 @@ static int ops_main(int argc, char** argv) {
             record = argv[++i];
         } else if (arg == "--batch" && i + 1 < argc) {
             batch_path = argv[++i];
+        } else if (arg == "--device" && i + 1 < argc) {
+            std::string n = argv[++i];
+            try {
+                device = std::stoi(n);
+            } catch (...) {
+                std::cerr << "r97train ops: --device takes a card ordinal\n";
+                return 2;
+            }
+            if (device < 0) {
+                std::cerr << "r97train ops: --device takes a card ordinal\n";
+                return 2;
+            }
         } else if (arg.rfind("--", 0) != 0 && container.empty()) {
             container = arg;
         } else {
             std::cerr << "usage: r97train ops <file.rad> [--home DIR] [--kernels LIST]\n"
-                         "       [--record FILE] [--batch FILE]\n"
+                         "       [--record FILE] [--batch FILE] [--device N]\n"
                          "       r97train ops --registered\n";
             return 2;
         }
@@ -222,12 +236,24 @@ static int ops_main(int argc, char** argv) {
     }
     if (container.empty()) {
         std::cerr << "usage: r97train ops <file.rad> [--home DIR] [--kernels LIST]\n"
+                     "       [--record FILE] [--batch FILE] [--device N]\n"
                      "       r97train ops --registered\n";
         return 2;
+    }
+
+    // --device names the card: ROCR_VISIBLE_DEVICES is read only at ROCR init, so it is set before
+    // the step opens its engine, and the device kernel tier is selected unless --kernels named one.
+    if (device >= 0) {
+        const std::string dev = std::to_string(device);
+        if (::setenv("ROCR_VISIBLE_DEVICES", dev.c_str(), 1) != 0) {
+            std::cerr << "r97train ops: cannot set ROCR_VISIBLE_DEVICES=" << device << "\n";
+            return 2;
+        }
+        if (kernels.empty()) kernels = {"libr4d", "libavx", "libref"};
     }
     return inventory_main(container, home, kernels, record, batch_path);
 }
 
-R97_REGISTER_COMMAND("ops", "<file.rad>|--registered", ops_main);
+R97_REGISTER_COMMAND("ops", "<file.rad>|--registered [--device N]", ops_main);
 
 }  // namespace r97tool

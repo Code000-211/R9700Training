@@ -249,6 +249,11 @@ void ForwardDriver::run_engine(const Batch& batch) {
     // built, and every sequence runs from position 0 in this one step.
     cfg.n_spec = 0;
     cfg.mm_max_patches = 0;
+    // The step is one prefill piece (forward.h:3-8), and radiance's linear-state checkpoint interval
+    // also caps a prefill chunk at that many tokens (core/sched/geometry.cpp:209), so there is none
+    // here: its own default (2048, core/rad_core.h:942) would split a longer prompt into pieces the
+    // driver must then refuse. Training never resumes from a checkpoint.
+    cfg.checkpoint_interval = 0;
     cfg.prefill_prompts.clear();
     cfg.prefill_prompts.reserve(batch.size());
     for (const TokenSeq& s : batch) cfg.prefill_prompts.push_back(s.ids);
