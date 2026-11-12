@@ -153,9 +153,12 @@ should know where the difference is:
 - Everything else in the table has a bf16 counterpart of the same shape and the same operand
   order, so per-boundary values and cotangents are comparable between the two.
 
-The consequence for a gradient check is that the adapter's *parameter* gradients of the two
-containers are not comparable -- the walks differentiate different records -- while the
-*boundaries* are. `tests/host/step_host_int8.cpp` compares the boundaries for that reason.
+These are layout differences, not differences of the function being differentiated: the tape
+gathers each operand by its own view, the walk sums a buffer's cotangent over every reader, and
+the fused site's pooled gradient is split back into the two modules by the row and rank windows of
+its slices (`split_adapter_grads`). The adapter's parameter gradients of the two containers are
+therefore comparable element for element, and `tests/host/step_host_int8.cpp` compares them; what
+it measures is recorded in `docs/STEPS-HOST.md`.
 
 ### The attention gate on a narrow head
 

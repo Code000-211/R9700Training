@@ -360,27 +360,51 @@ scale, at the block the scale plane declares, is the bf16 weight the GEMM's epil
 formed. The head cotangent that enters the trunk is therefore the dequantised one, and its factor
 is comparable with the bf16 model's.
 
-`host_step_int8` checks the two properties a quantised trunk can give: the straight-through
-gradient is finite and nonzero, and a small step along it lowers the driver's scored loss.
-`host_step_int8_head_points_the_way_bf16_does` runs the same adapter on the same batch through
-both containers and compares the cotangents at the two boundaries where the difference is
-measurable: the head's input (cosine 0.9999) and the top block's input, after a whole block of int8
-linears (0.9777). The two losses have to agree to within a percent first, which is what the
-adapter's basis mapping gives: the int8 trunk rotates its activations into the Hadamard basis, so
-the bf16 side runs the same `lora_A` mapped through `R = H/sqrt(128)`.
+`host_step_int8` checks the property a quantised trunk can give: the straight-through gradient is
+finite and nonzero, and a step along it lowers the driver's scored loss, while a step of the same
+length against it raises the loss -- so the check cannot be passed by a direction that merely has
+a negative projection.
+
+`host_step_int8_gradient_points_the_way_bf16_does` runs the same adapter on the same batch through
+both containers and compares the adapter's gradients, per site, per layer and whole. Both sides
+start from the same adapter, which takes two things. `init` leaves `lora_B` at zero, and at `B = 0`
+neither the loss nor the `lora_A` gradient depends on the adapter at all, so the test seeds a
+deterministic nonzero `B`. And the int8 trunk rotates each 128-wide group of the activation before
+the GEMM, so what `lora_A` is applied to there is `H*x`, the container's dequantised activation
+with `H` the *unnormalised* Sylvester transform (as `docs/ADAPTER.md` records it and the kernels
+build it): the bf16 side runs `A_i8 * H`, and the int8 gradient comes back through `H/128`. The
+two losses agreeing to within a percent is what that mapping gets, and it is the check the mapping
+has to pass: the wrong normalisation (`H/sqrt(128)`, or no mapping at all) moves the same loss by
+five percent.
+
+What the walk measures on this tree, with that mapping and a nonzero `B`: the two losses agree to
+0.7 %; the gradients agree with a cosine of 0.67 whole and 0.66 over the top block; the top block's
+magnitude is 0.84 of the bf16 one. The per-site cosines run from -0.63 to 0.96 and the per-site
+magnitudes from 0.37 to 1.84.
 
 ## What is left open
 
-- **The two containers' parameter gradients are not comparable, so the issue's cosine over the
-  whole gradient is not measurable in the form it asks.** The int8 container fuses the delta net's
-  input projection with its gate (`ssm_inz`) and hands `gdn_conv_prep` the AB projection as an
-  operand of its own, where the bf16 container gives that op one 136-wide `gdn_in` and reads the AB
-  operand as slices of the same buffer. From the delta net's scan on the two walks differentiate
-  different records, and the adapter gradients differ by more than the quantiser (measured: a
-  cosine of 0.38 over the nine targets, with the per-block diffs localised to `gdn_chunk_scan` and
-  `attn_paged`). The issue's direction check is therefore taken at the boundaries above, which the
-  fusion does not affect. A pair of containers that lay the delta net out the same way would make
-  the whole-gradient cosine measurable.
+- **The issue's direction check does not reach its 0.9 on this fixture.** The adapter gradients
+  are comparable -- the two containers' fused and unfused layouts are layouts, and the walk and the
+  split make the nine targets match element for element (see `docs/FIXTURES.md`) -- and with the
+  basis mapping right and the adapter exercised they agree to a cosine of 0.67. The gap is inside
+  the blocks, not at their edges or in the join: the boundaries the two containers share agree to
+  0.9999 at the head and 0.978 at the top block's input, and the losses to a percent, yet every
+  site's gradient disagrees by more than its block's boundaries do -- cosines from -0.63 to 0.96,
+  magnitudes from 0.37 to 1.84 of the bf16 ones. An int8 trunk's own codes and internal cotangents
+  account for a disagreement of that size and the bf16 container, which keeps no codes, does not.
+  What the codes do not account for is the *sign*: the first block's three `mlp` sites and its
+  `in_proj_z` come out anti-correlated with the bf16 ones (-0.63 to -0.13) while the same block's
+  `in_proj_qkv` agrees at 0.96. That is the place to look next, and it is one block of the delta
+  net, not the walk. The test asserts a floor of 0.6 on both cosines to keep a regression visible;
+  the issue's 0.9 stays open.
+
+*The 10-12x magnitude the last round measured was the test's, not the walk's.* The committed test
+mapped `lora_A` through `H/sqrt(128)`, which is the normalisation the transform does not carry in
+this container: `H` is its own inverse up to 128, so `A_i8 * H` maps into the natural basis and
+`H/128` maps a gradient back. With the wrong normalisation the top block's gradients came out
+11-12 times the bf16 ones; with the right one they come out between 0.4 and 1.8, which is why the
+comparison above is on magnitudes and not only on directions.
 
 *The join is the bf16 forward, by decision.* An earlier round of this card made `host_step`
 delegate to `make_reference_step`, so that the checks could be met at the issue's tolerance; the
