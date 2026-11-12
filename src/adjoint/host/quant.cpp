@@ -383,21 +383,28 @@ Fp8Point quantise_fp8(const std::vector<double>& v, int64_t rows, const Fp8Geome
     p.scale.assign(static_cast<size_t>(rows * geo.ngrp), 0.0);
     p.code.assign(static_cast<size_t>(rows * geo.n), 0.0);
     p.live.assign(static_cast<size_t>(rows * geo.n), 0);
+    // The scale and the code are float arithmetic, as `q8_group` does them: a group's amax times
+    // one over the format's top, then the reciprocal. Two codes that sit within a float ulp of a
+    // rounding boundary are one code apart, so the twin has to take the reciprocal the way the
+    // kernel does or the check would see a whole E4M3 step of difference rather than a bit.
     for (int64_t r = 0; r < rows; ++r) {
         for (int64_t gi = 0; gi < geo.ngrp; ++gi) {
             const int64_t k0 = gi * geo.group;
             const int64_t w = std::min(geo.group, geo.n - k0);
-            double amax = 0.0;
+            float amax = 0.0f;
             for (int64_t i = 0; i < w; ++i)
-                amax = std::max(amax, std::fabs(v[static_cast<size_t>(r * geo.n + k0 + i)]));
-            const double s = amax > 0.0 ? amax / kFp8Top : 1.0;
-            p.scale[static_cast<size_t>(r * geo.ngrp + gi)] = s;
+                amax = std::max(amax, std::fabs(static_cast<float>(
+                                           v[static_cast<size_t>(r * geo.n + k0 + i)])));
+            const float top = static_cast<float>(kFp8Top);
+            const float s = amax > 0.0f ? amax * (1.0f / top) : 1.0f;
+            const float inv = 1.0f / s;
+            p.scale[static_cast<size_t>(r * geo.ngrp + gi)] = static_cast<double>(s);
             for (int64_t i = 0; i < w; ++i) {
                 const size_t j = static_cast<size_t>(r * geo.n + k0 + i);
-                const double u = v[j] / s;
-                const uint8_t bits = rad_f32_to_fp8e4m3(static_cast<float>(u));
+                const float u = static_cast<float>(v[j]) * inv;
+                const uint8_t bits = rad_f32_to_fp8e4m3(u);
                 p.code[j] = static_cast<double>(rad_fp8e4m3_to_f32(bits));
-                p.live[j] = std::fabs(u) <= kFp8Top ? 1 : 0;
+                p.live[j] = std::fabs(u) <= top ? 1 : 0;
             }
         }
     }
@@ -456,12 +463,27 @@ void add_fp8_codes(const AdValue& codes, const AdValue& scale, int64_t rows, con
     }
 }
 
+// Whether the record asks for the linearised twin: `<op>_ste`, whose base point is the record's
+// last read operand (the schema is frozen, so the base point is appended after everything else).
+// The forward is then held at the base point's scale and taken straight through in the units of its
+// codes,
+//
+//     codes(x) = c0 + live(x) * (v(x) - v0) / s0,   scale(x) = s0,
+//
+// with v the activation and no rounding step; the residual and the activation come back as their
+// f64 values, so a finite difference sees the norm's or the gate's Jacobian and the quantiser's
+// slope rather than a bf16 step.
+bool is_linearised(const std::string& op) {
+    return op.size() > 4 && op.compare(op.size() - 4, 4, "_ste") == 0;
+}
+
 // `rmsnorm_quant_fp8`: y = bf16(rmsnorm(r) * gain), r = x or bf16(x + residual), then y's E4M3
 // codes. The residual is in-place, so its output cotangent and the norm's input cotangent both go
 // back to its old value and to x.
 void rmsnorm_quant_fp8_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
                             std::vector<AdValue>* out) {
     const Fp8Geometry geo = fp8_geometry(rec);
+    const bool linearised = is_linearised(rec.op);
     const bool has_residual = rec.operands.size() > 1 &&
                               rad_dtype_bits(rad_dtype_parse(rec.operands[1].dtype.c_str())) > 0 &&
                               !rec.operands[1].shape.empty();
@@ -479,9 +501,13 @@ void rmsnorm_quant_fp8_twin(const OpRecord& rec, const std::vector<AdValue>& ope
 
     const double eps = double_param(rec, "eps", 1e-6);
     const double wadd = double_param(rec, "wadd", 0.0);
+    // The linearised twin has no rounding step at all, so its finite differences are the norm's
+    // Jacobian and the quantiser's slope; the forward's own twin rounds as the kernel does.
     std::vector<double> r(x.size());
-    for (size_t i = 0; i < r.size(); ++i)
-        r[i] = resid != nullptr ? bf16_round(x[i] + (*resid)[i]) : x[i];
+    for (size_t i = 0; i < r.size(); ++i) {
+        const double sum = resid != nullptr ? x[i] + (*resid)[i] : x[i];
+        r[i] = linearised ? sum : bf16_round(sum);
+    }
 
     std::vector<double> y(x.size());
     for (int64_t m = 0; m < rows; ++m) {
@@ -493,8 +519,33 @@ void rmsnorm_quant_fp8_twin(const OpRecord& rec, const std::vector<AdValue>& ope
         const double rs = 1.0 / std::sqrt(ss / static_cast<double>(geo.n) + eps);
         for (int64_t j = 0; j < geo.n; ++j) {
             const size_t i = static_cast<size_t>(m * geo.n + j);
-            y[i] = bf16_round(r[i] * rs * (weight[static_cast<size_t>(j)] + wadd));
+            const double ny = r[i] * rs * (weight[static_cast<size_t>(j)] + wadd);
+            y[i] = linearised ? ny : bf16_round(ny);
         }
+    }
+    if (linearised) {
+        const std::vector<double>& base_y = operands.back().value;
+        if (base_y.size() != y.size())
+            throw std::invalid_argument("quant: the base point has the activation's shape");
+        const Fp8Point b = quantise_fp8(base_y, rows, geo);
+        std::vector<double> codes(y.size(), 0.0);
+        for (int64_t m = 0; m < rows; ++m) {
+            for (int64_t j = 0; j < geo.n; ++j) {
+                const size_t i = static_cast<size_t>(m * geo.n + j);
+                const double s = fp8_scale_of(b, m, j);
+                // The clamp's mask is the adjoint's: it reads where the activation sits now,
+                // against the base point's scale, so the two agree on the elements whose code
+                // stops responding.
+                codes[i] = std::fabs(y[i] / s) <= kFp8Top ? b.code[i] + (y[i] - base_y[i]) / s
+                                                          : b.code[i];
+            }
+        }
+        out->push_back(has_residual ? make_value(rec, 0, "bf16", rows, geo.n, r)
+                                    : AdValue{"invalid", {}, {}});
+        out->push_back(make_value(rec, 1, "fp8_e4m3", rows, geo.n, std::move(codes)));
+        out->push_back(make_value(rec, 2, "f32", rows, geo.ngrp, b.scale));
+        out->push_back(make_value(rec, 3, "bf16", rows, geo.n, y));
+        return;
     }
     const Fp8Point p = quantise_fp8(y, rows, geo);
     out->push_back(has_residual ? make_value(rec, 0, "bf16", rows, geo.n, r)
@@ -606,6 +657,7 @@ void rmsnorm_quant_fp8_adjoint(const AdjointCall& call) {
 void gated_quant_fp8_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
                           std::vector<AdValue>* out) {
     const Fp8Geometry geo = fp8_geometry(rec);
+    const bool linearised = is_linearised(rec.op);
     if (operands.empty()) throw std::invalid_argument("quant: gated_quant_fp8 reads an activation");
     const std::vector<double>& gu = operands[0].value;
     const int64_t width = 2 * geo.n;
@@ -621,8 +673,28 @@ void gated_quant_fp8_twin(const OpRecord& rec, const std::vector<AdValue>& opera
             const double u = gu[static_cast<size_t>(m * width + geo.n + j)];
             const double s = 1.0 / (1.0 + std::exp(-g));
             const double a = sigmoid ? s : g * s;
-            p[static_cast<size_t>(m * geo.n + j)] = bf16_round(a * u);
+            p[static_cast<size_t>(m * geo.n + j)] = linearised ? a * u : bf16_round(a * u);
         }
+    }
+    if (linearised) {
+        const std::vector<double>& base = operands.back().value;
+        if (base.size() != p.size())
+            throw std::invalid_argument("quant: the base point has the product's shape");
+        const Fp8Point b = quantise_fp8(base, rows, geo);
+        std::vector<double> codes(p.size(), 0.0);
+        for (int64_t m = 0; m < rows; ++m) {
+            for (int64_t j = 0; j < geo.n; ++j) {
+                const size_t i = static_cast<size_t>(m * geo.n + j);
+                const double s = fp8_scale_of(b, m, j);
+                // As above: the mask follows the activation, not the base point's.
+                codes[i] = std::fabs(p[i] / s) <= kFp8Top ? b.code[i] + (p[i] - base[i]) / s
+                                                          : b.code[i];
+            }
+        }
+        out->push_back(make_value(rec, 0, "fp8_e4m3", rows, geo.n, std::move(codes)));
+        out->push_back(make_value(rec, 1, "f32", rows, geo.ngrp, b.scale));
+        out->push_back(make_value(rec, 2, "bf16", rows, geo.n, p));
+        return;
     }
     const Fp8Point q = quantise_fp8(p, rows, geo);
     out->push_back(make_value(rec, 0, "fp8_e4m3", rows, geo.n, q.code));
@@ -697,5 +769,12 @@ R97_REGISTER_TWIN("rmsnorm_quant_fp8", rmsnorm_quant_fp8_twin)
 R97_REGISTER_ADJOINT("rmsnorm_quant_fp8", host, rmsnorm_quant_fp8_adjoint)
 R97_REGISTER_TWIN("gated_quant_fp8", gated_quant_fp8_twin)
 R97_REGISTER_ADJOINT("gated_quant_fp8", host, gated_quant_fp8_adjoint)
+// The linearised twins append their base point to the schema -- the activation the quantiser saw --
+// because positions 1 and 2 are the residual and the written codes there; the frozen index is that
+// appended operand's schema position.
+R97_REGISTER_TWIN("rmsnorm_quant_fp8_ste", rmsnorm_quant_fp8_twin)
+R97_REGISTER_ADJOINT_F("rmsnorm_quant_fp8_ste", host, rmsnorm_quant_fp8_adjoint, 6)
+R97_REGISTER_TWIN("gated_quant_fp8_ste", gated_quant_fp8_twin)
+R97_REGISTER_ADJOINT_F("gated_quant_fp8_ste", host, gated_quant_fp8_adjoint, 4)
 
 }  // namespace r97
