@@ -276,6 +276,27 @@ activation in `fwd`. `tests/host/adjoint_quant.cpp` holds both ops to `check_ker
 `ref_rmsnorm_quant_fp8` / `ref_gated_quant_fp8` and to `check_adjoint` through those twins, at the
 trunk's 128 columns and at two groups of 32.
 
+The standalone `quant_act_fp8` that the container also issues gets the same rule without a fused
+producer around it: its twin recomputes the per-group amax, scale and code from the activation,
+and its host adjoint passes `dq / s` where the code is inside the clamp and drops the scale's
+cotangent. Nothing on the walk from the loss back to a trunk linear reads its codes, so the host
+step never asks it for one; the twin and the row are registered beside the fused producers'
+(`src/adjoint/host/quant_fp8.cpp`).
+
+It also carries the linearised row, `quant_act_fp8_ste`: since positions 1 and 2 are written (the
+codes and the scale), the base point is appended after them, at position 3, and the frozen list
+names that one. With `x` the activation the trunk's record carries, its twin is
+
+    codes(x) = c0 + live(x) * (x - x0) / s0,     scale(x) = s0,
+
+with `c0`, `s0` the base point's own codes and scale, and `live(x)` the clamp's mask read at the
+base point and held there. A moving mask would flip for the group's amax element, whose `|u|` *is*
+the top, and then the difference quotient would average the two sides of a step rather than measure
+a slope; holding it where the adjoint reads it keeps the row affine and the check exact.
+`tests/host/adjoint_quant.cpp` holds it to `check_kernel` against `ref_quant_act_fp8` at the trunk's
+128 columns and at two groups of 32, to `check_adjoint` through that row, and to the two records it
+must refuse (an activation, or a base point, that is not `rows * n` values).
+
 ## 7. What this does not cover
 
 - **Only the host kernel is the reference**, as the issue says. The device kernels of these ops are

@@ -60,9 +60,10 @@ for bit. So the row exists and is never read: no token, no end-of-text test, no 
   the multiples of the layer count.
 - **twin / host / device** -- whether `r97train ops --registered` holds a forward twin, a host
   adjoint or a device adjoint for the op. The family issues merged so far give a twin and a host
-  adjoint to every op here except `rope_table` and `quant_act_fp8`; `rope` and `kv_store` get
-  their twin and their host row from `src/adjoint/host/rope.cpp` and `src/adjoint/host/kv_store.cpp`,
-  which the qk family registered,
+  adjoint to every op here except `rope_table`; `rmsnorm_quant_fp8` and `gated_quant_fp8` get
+  theirs from the fused producers of `src/adjoint/host/quant.cpp`, `quant_act_fp8` from
+  `src/adjoint/host/quant_fp8.cpp`. `rope` and `kv_store` get their twin and their host row from
+  `src/adjoint/host/rope.cpp` and `src/adjoint/host/kv_store.cpp`, which the qk family registered,
   not from the join. The device column is read by a host-only run with
   `--kernels libavx,libref`, which never loads the device plugin: `src/adjoint/device/add.hip`
   registers `add`'s device adjoint when that plugin loads, but every `device` cell below is `-`
@@ -131,7 +132,7 @@ One prefill step: 78 issues, 29 op forms.
 | `gdn_kkt_solve` | gated-delta-net | - | 3 | yes | yes | - | - | yes | gdn_kkt |
 | `gdn_chunk_scan` | gated-delta-net | - | 3 | yes | yes | - | - | yes | gdn_scan |
 | `gdn_gated_rmsnorm` | gated-delta-net | act=silu | 3 | yes | yes | - | - | yes | gdn_prep |
-| `quant_act_fp8` | gated-delta-net | dtype=bf16 | 3 | - | - | - | - | no: nothing it writes is read on the walk from the loss back to the trunk linears | quant |
+| `quant_act_fp8` | gated-delta-net | dtype=bf16 | 3 | yes | yes | - | - | no: nothing it writes is read on the walk from the loss back to the trunk linears | quant |
 | `rmsnorm_quant_fp8` | mlp | dtype=bf16 | 4 | yes | yes | - | - | yes | quant |
 | `had_quant_act_i8g` | mlp | dtype=bf16 | 8 | yes | yes | - | - | yes | quant |
 | `gemm_nt_q` | mlp | dtype=i8a8h | 8 | yes | yes | - | - | yes | linear |
@@ -145,7 +146,7 @@ One prefill step: 78 issues, 29 op forms.
 | `attn_paged` | full-attention | q_dtype=bf16 kv_dtype=bf16 | 1 | yes | yes | - | - | yes | attention |
 | `sigmoid` | full-attention | dtype=bf16 | 1 | yes | yes | - | - | yes | elementwise |
 | `mul` | full-attention | dtype=bf16 | 1 | yes | yes | - | - | yes | elementwise |
-| `quant_act_fp8` | full-attention | dtype=bf16 | 1 | - | - | - | - | no: nothing it writes is read on the walk from the loss back to the trunk linears | quant |
+| `quant_act_fp8` | full-attention | dtype=bf16 | 1 | yes | yes | - | - | no: nothing it writes is read on the walk from the loss back to the trunk linears | quant |
 | `add` | mlp | dtype=bf16 | 1 | yes | yes | - | - | yes | elementwise |
 | `rmsnorm` | head | dtype=bf16 | 1 | yes | yes | - | - | yes | elementwise |
 | `gather_rows` | head | dtype=bf16 | 1 | yes | yes | - | - | yes | linear |

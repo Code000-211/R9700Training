@@ -431,7 +431,68 @@ R97_TEST(adjoint_quant_zero_group_passes_through) {
     }
 }
 
-/* -- (5) the registry, and the records the family refuses ------------------- */
+/* -- (5) the standalone E4M3 producer -------------------------------------- */
+
+/* The trunk's `quant_act_fp8` without a fused norm in front of it: `x` in bf16,
+ * the E4M3 codes and one scale per group out. Its linearised twin appends the
+ * base point after the scale, at schema position 3: positions 1 and 2 are
+ * written, so the adjoint keeps them and the base point is the record's last
+ * operand. */
+struct ActShape {
+    const char* name;
+    int64_t rows, n, group;
+};
+
+std::vector<ActShape> act_shapes() {
+    return {{"trunk-128", 5, 128, 128}, {"two-groups", 3, 64, 32}};
+}
+
+int64_t act_groups(const ActShape& s) {
+    const int64_t g = (s.group <= 0 || s.group > s.n) ? s.n : s.group;
+    return (s.n + g - 1) / g;
+}
+
+OpRecord act_rec(const ActShape& s, bool linearised) {
+    const int64_t ngrp = act_groups(s);
+    OpRecord rec;
+    rec.op = linearised ? "quant_act_fp8_ste" : "quant_act_fp8";
+    rec.n = s.rows;
+    rec.params = {{"M", s.rows}, {"n", s.n}, {"group", s.group}, {"dtype", "bf16"}};
+    rec.operands = {{"x", "bf16", {s.rows, s.n}, 0, s.rows, false},
+                    {"codes", "fp8_e4m3", {s.rows, s.n}, 0, s.rows, true},
+                    {"scale", "f32", {s.rows, ngrp}, 0, s.rows, true}};
+    if (linearised) rec.operands.push_back({"base", "bf16", {s.rows, s.n}, 0, s.rows, false});
+    return rec;
+}
+
+std::vector<AdValue> act_written(const ActShape& s) {
+    const int64_t ngrp = act_groups(s);
+    return {values("fp8_e4m3", {s.rows, s.n}, std::vector<double>((size_t)(s.rows * s.n), 0.0)),
+            values("f32", {s.rows, ngrp}, std::vector<double>((size_t)(s.rows * ngrp), 0.0))};
+}
+
+void act_kernel_check(const ActShape& s) {
+    const OpRecord rec = act_rec(s, false);
+    const std::vector<double> x = activation(Shape{s.name, s.rows, s.n, s.group}, 0x9e3779b9ull);
+    const std::vector<AdValue> in = {values("bf16", {s.rows, s.n}, x)};
+    const KernelReport k = check_kernel(rec, in, act_written(s), bf16_tol);
+    std::printf("%-20s %-28s kernel max err %.6g\n", rec.op.c_str(), s.name, k.max_err);
+    require(k);
+}
+
+void act_fd_check(const ActShape& s) {
+    const OpRecord rec = act_rec(s, true);
+    const std::vector<double> x = activation(Shape{s.name, s.rows, s.n, s.group}, 0x5deece66dull);
+    /* The base point is the activation itself: the quantiser is linearised where
+     * the trunk's record sits. */
+    const std::vector<AdValue> in = {values("bf16", {s.rows, s.n}, x),
+                                     values("bf16", {s.rows, s.n}, x)};
+    const FdReport fd = check_adjoint(rec, in, act_written(s), fd_tol);
+    std::printf("%-20s %-28s adjoint rel err %.3g\n", rec.op.c_str(), s.name, fd.rel);
+    require(fd);
+}
+
+/* -- (6) the registry, and the records the family refuses ------------------- */
 
 void refuses(const OpRecord& rec, const std::vector<AdValue>& in, const char* what) {
     bool threw = false;
@@ -464,6 +525,14 @@ R97_TEST(adjoint_quant_serves_both_ops) {
         R97_CHECK(rows.host_adjoint);
     }
 
+    /* The standalone producer's linearised row: the base point after the scale. */
+    R97_CHECK(adjoint_frozen("quant_act_fp8_ste", Side::host, params) == std::vector<int>{3});
+    for (const char* op : {"quant_act_fp8", "quant_act_fp8_ste"}) {
+        const OpRows rows = op_rows(op);
+        R97_CHECK(rows.twin);
+        R97_CHECK(rows.host_adjoint);
+    }
+
     /* A record no kernel of the family takes is refused by name, not silently
      * computed. */
     const std::vector<double> x((size_t)96, 0.5);
@@ -477,9 +546,26 @@ R97_TEST(adjoint_quant_serves_both_ops) {
     OpRecord missing = quant_rec(false, {"1 x 4, one group", 1, 4, 4}, false);
     missing.params = {{"M", 1}, {"group", 4}};
     refuses(missing, {values("bf16", {1, 4}, {1.0, 0.5, 0.25, 0.125})}, "has no 'n'");
+
+    /* The standalone producer refuses an activation that is not 'rows * n'
+     * values, and its linearised row refuses a base point of another shape. */
+    refuses(act_rec({"1 x 128", 1, 128, 128}, false), {values("bf16", {1, 128}, {})},
+            "is shorter than 'rows * n'");
+    refuses(act_rec({"1 x 128", 1, 128, 128}, true),
+            {values("bf16", {1, 128}, std::vector<double>(128, 1.0)),
+             values("bf16", {1, 64}, std::vector<double>(64, 1.0))},
+            "has a base point of another shape");
 }
 
-/* -- (6) the int8 trunk's fused producers ---------------------------------- */
+R97_TEST(adjoint_quant_act_fp8_twin_matches_the_host_kernel) {
+    for (const ActShape& s : act_shapes()) act_kernel_check(s);
+}
+
+R97_TEST(adjoint_quant_act_fp8_agrees_with_finite_differences) {
+    for (const ActShape& s : act_shapes()) act_fd_check(s);
+}
+
+/* -- (7) the int8 trunk's fused producers ---------------------------------- */
 
 /* The trunk replaces a residual add, a norm and an E4M3 quantiser with one
  * record, `rmsnorm_quant_fp8`, and a gate, its product and the same quantiser
