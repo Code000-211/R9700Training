@@ -206,6 +206,12 @@ const AdValue* StoredSnapshots::at(int64_t position, size_t operand) const {
     return it == values_.end() ? nullptr : &it->second;
 }
 
+int64_t StoredSnapshots::bytes() const {
+    int64_t total = 0;
+    for (const auto& entry : values_) total += payload_bytes(entry.second);
+    return total;
+}
+
 // ---------------------------------------------------------------- the walk
 
 BackwardResult backward_block(const std::vector<OpRecord>& records,

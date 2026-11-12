@@ -37,8 +37,24 @@ struct HostStepReport {
     int64_t hidden = 0;
     int64_t layers = 0;
     int64_t residual_store_bytes = 0;    // the boundary residuals (grows with layers)
-    int64_t peak_snapshot_bytes = 0;     // the largest op snapshot the walk held
-    int64_t peak_cotangent_bytes = 0;    // the largest cotangent set one walk held
+    // The most forward-value payload the join and the walks held at once: one chunk's snapshots
+    // (the head's, or one block's) plus the copies of the one op the walk was adjointing. One
+    // chunk's worth, so it does not grow with the number of layers. `peak_snapshot_store_bytes`
+    // and `peak_snapshot_op_bytes` are its two parts at the chunk that peaked: the store, which is
+    // held whole from the start of the walk, and the one op copied out of it.
+    int64_t peak_snapshot_bytes = 0;
+    int64_t peak_snapshot_store_bytes = 0;
+    int64_t peak_snapshot_op_bytes = 0;
+    // What every chunk's store adds up to, which is what holding them all at once would have cost
+    // and what the join does not do; it grows with the number of layers, unlike the peak.
+    int64_t all_snapshot_store_bytes = 0;
+    // The most cotangent payload held at once: the walk's live versions, its cot/dc vectors and
+    // input accumulators, plus the boundary cotangent the join keeps for the next block. Also one
+    // chunk's worth.
+    int64_t peak_cotangent_bytes = 0;
+    // The report's own copies of the boundary values and cotangents, which do grow with the number
+    // of layers and are zero unless keep_boundaries is set. The two peaks above leave them out.
+    int64_t kept_boundary_bytes = 0;
     std::vector<std::string> boundary_name;           // the tape buffer of each boundary
     std::vector<std::vector<double>> boundary_value;  // boundary forward values, bf16 widened
     std::vector<std::vector<double>> boundary_cotangent;

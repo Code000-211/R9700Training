@@ -84,17 +84,40 @@ gradient to the buffer the view came from.
 
 ## Memory
 
-The join keeps the boundary residuals (`HostStepReport::residual_store_bytes`), which grow with the
-number of layers, and one replay at a time, so neither `peak_snapshot_bytes` nor
-`peak_cotangent_bytes` grows with the number of layers. The report carries the two peaks, the
-residual store, the loss and the boundary values and cotangents when
-`HostStepOptions::keep_boundaries` is set.
+The join walks one chunk at a time: the head, then one block from the last to the first, each with
+its own `StoredSnapshots`. The store is filled before the walk starts and is held whole for the
+whole walk, while the backward core copies out the operands of the one op it is adjointing. So what
+the step holds at one moment is
+
+- `peak_snapshot_bytes`: one chunk's store plus that one op. Its two parts are reported beside it,
+  `peak_snapshot_store_bytes` and `peak_snapshot_op_bytes`, at the chunk that peaked. This is a
+  chunk's worth, so it does not grow with the number of layers;
+- `peak_cotangent_bytes`: the walk's live versions, its cot/dc vectors and input accumulators, plus
+  the boundary cotangent the join hands in and the final hidden's cotangent it keeps. Also one
+  chunk's worth.
+
+Two stores do grow with the number of layers, and each is reported under its own name rather than
+folded into the peaks: the forward's bf16 residuals (`residual_store_bytes`) and, only when
+`HostStepOptions::keep_boundaries` is set, the report's own f64 copies of the boundary values and
+cotangents (`kept_boundary_bytes`). `all_snapshot_store_bytes` is the sum of every chunk's store --
+what keeping them all at once would have cost, and what the join does not do -- so a store that grew
+with the layers would show up against it.
 
 Measured on the tiny fixture with a two-sequence batch of six and three tokens (nine tokens, 128
-hidden): peak snapshots 7 916 104 B, peak cotangents 23 737 416 B, one block's own operands in f64
-50 201 776 B, the residual store `(layers + 1) * tokens * hidden * 2` = 11 520 B. The
-`host_step_memory_does_not_grow_with_layers` case holds each peak under one block's worth and the
-store to that formula.
+hidden): peak snapshots 25 811 992 B, which is a store of 17 895 888 B plus an op of 7 916 104 B;
+every chunk's store 24 012 016 B; peak cotangents 23 755 848 B; one boundary 9 216 B; the residual
+store `(layers + 1) * tokens * hidden * 2` = 11 520 B; the kept boundaries `(layers + 1) * 2`
+boundaries = 92 160 B.
+
+The last block's store (17 895 888 B) is some nine times another block's (1 903 000 B) because two
+of its ops, `kv_store` and `attn_paged`, carry operands whose `rows` is 0: the whole declared
+buffer rather than the step's rows, which the snapshot takes dense (a 7.9 MB `kv` and a 7.9 MB
+`k`/`v` pair). The head's store is 407 128 B, and every block also keeps the last write of each
+buffer an op replaced in place (121 824 B, 129 888 B in the last). That is why the sum over all
+chunks is only 1.3 times one chunk's store: with uniform blocks it would be one store per layer.
+The `host_step_memory_does_not_grow_with_layers` case checks the peak against its own two parts (an
+op alone cannot pass for the store), holds the peak store under the sum over all chunks, and holds
+the residual store and the kept boundaries to their formulas.
 
 ## Finite differences
 

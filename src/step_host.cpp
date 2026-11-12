@@ -33,6 +33,11 @@ int64_t numel(const std::vector<int64_t>& shape) {
     return n;
 }
 
+// The payload of a stored value or cotangent: what the join's memory figures count.
+int64_t value_bytes(const std::vector<double>& v) {
+    return static_cast<int64_t>(v.size()) * static_cast<int64_t>(sizeof(double));
+}
+
 int64_t elem_size(const std::string& dtype) {
     if (dtype == "bf16" || dtype == "f16") return 2;
     if (dtype == "f32" || dtype == "i32" || dtype == "u32") return 4;
@@ -718,8 +723,22 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
         names.add("logits", 0, head_logits_rows);
         const std::vector<Seed> seeds = head_seeds(driver.last(), batch, head_records, tokens);
         const BackwardResult head = backward_block(head_records, head_snaps, names, seeds, {}, bo);
-        measured.peak_snapshot_bytes = head.report.peak_snapshot_bytes;
+        // What the join held while the head walked: its whole store, which is held up front, plus
+        // the copies of the one op being adjointed. The walk's own figure counts the latter only.
+        measured.peak_snapshot_store_bytes = head_snaps.bytes();
+        measured.peak_snapshot_op_bytes = head.report.peak_snapshot_bytes;
+        measured.peak_snapshot_bytes =
+            measured.peak_snapshot_store_bytes + measured.peak_snapshot_op_bytes;
+        measured.all_snapshot_store_bytes = measured.peak_snapshot_store_bytes;
         measured.peak_cotangent_bytes = head.report.peak_cotangent_bytes;
+        // The head's snapshots are spent once its walk has run and the layer walks build their own,
+        // so free them: the peak stays one chunk's worth rather than the head's store added to a
+        // block's.
+        head_snaps = StoredSnapshots{};
+        // The head's input cotangents stay alive with `head` for the whole layer loop, so they are
+        // part of what the join holds during every block walk.
+        int64_t head_input_bytes = 0;
+        for (const InputCotangent& in : head.inputs) head_input_bytes += value_bytes(in.value);
 
         const InputCotangent* above = pick_boundary(head.inputs, tokens, meta.hidden);
         if (!above) {
@@ -824,10 +843,24 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
             block_names.add(incoming.buffer, 0, tokens);
             const BackwardResult walked = backward_block(records, snaps, block_names, {},
                                                          {incoming}, bo);
-            measured.peak_snapshot_bytes =
-                std::max(measured.peak_snapshot_bytes, walked.report.peak_snapshot_bytes);
-            measured.peak_cotangent_bytes =
-                std::max(measured.peak_cotangent_bytes, walked.report.peak_cotangent_bytes);
+            // The join holds the whole block's snapshots while the walk copies one op out of them,
+            // so what it holds at once is the store plus that one op, not the walk's figure alone.
+            // `before` holds the last write of every buffer an op replaced in place, a second copy
+            // of what the store already keeps, and is part of what the replay holds.
+            int64_t before_bytes = 0;
+            for (const auto& entry : before) before_bytes += value_bytes(entry.second.value);
+            const int64_t store_bytes = snaps.bytes() + before_bytes;
+            const int64_t op_bytes = walked.report.peak_snapshot_bytes;
+            if (store_bytes + op_bytes > measured.peak_snapshot_bytes) {
+                measured.peak_snapshot_bytes = store_bytes + op_bytes;
+                measured.peak_snapshot_store_bytes = store_bytes;
+                measured.peak_snapshot_op_bytes = op_bytes;
+            }
+            measured.all_snapshot_store_bytes += store_bytes;
+            measured.peak_cotangent_bytes = std::max(
+                measured.peak_cotangent_bytes,
+                head_input_bytes + value_bytes(incoming.value) +
+                    walked.report.peak_cotangent_bytes);
 
             const InputCotangent* below = pick_boundary(walked.inputs, tokens, meta.hidden);
             if (!below)
@@ -843,6 +876,12 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
         // under every module name the split then adds the real gradient for.
         split_adapter_grads(grads, params, groups, grad_prefix);
         fill_missing_grads(grads, params);
+        // The report's own boundary copies grow with the number of layers; name them rather than
+        // fold them into the peaks, which describe the join's working set.
+        for (const std::vector<double>& v : measured.boundary_value)
+            measured.kept_boundary_bytes += value_bytes(v);
+        for (const std::vector<double>& v : measured.boundary_cotangent)
+            measured.kept_boundary_bytes += value_bytes(v);
         if (report) *report = std::move(measured);
         return result;
     };

@@ -50,6 +50,9 @@ public:
     void set(int64_t position, size_t operand, AdValue value);
     const AdValue* at(int64_t position, size_t operand) const override;
     size_t size() const { return values_.size(); }
+    // The payload the store holds, in bytes of values (not shapes or names), so a caller that
+    // keeps a whole block's snapshots can say what it holds.
+    int64_t bytes() const;
 
 private:
     std::map<std::pair<int64_t, size_t>, AdValue> values_;
@@ -107,9 +110,9 @@ struct InputCotangent {
 };
 
 // What the walk held at once, in bytes of tensor payload (values, not shapes or names): the
-// forward values of one op (the only snapshots the core holds itself), and the cotangents -- the
-// live version store, the block-input accumulators, and the cot/dc vectors of the op being
-// adjointed.
+// forward values of one op (the only snapshots the core holds itself, beside the provider the
+// caller holds), and the cotangents -- the live version store, the block-input accumulators, and
+// the cot/dc vectors of the op being adjointed.
 struct BackwardReport {
     int64_t peak_snapshot_bytes = 0;
     int64_t peak_cotangent_bytes = 0;

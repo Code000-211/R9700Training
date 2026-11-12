@@ -624,42 +624,57 @@ R97_TEST(host_step_memory_does_not_grow_with_layers) {
     pin_to_grid(&params, 0x94d049bb133111ebULL);
 
     std::unique_ptr<r97::ForwardDriver> driver = open_forward(container);
+
     r97::HostStepReport report;
     const r97::StepFn step = r97::host_step(*driver, model, {}, &report);
     r97::ParamSet grads;
     step(batch, params, &grads);
     R97_CHECK(report.layers > 0);
 
-    // The walk snapshots one block's forward values and holds one block's cotangents, so its peak
-    // is bounded by a block and not by the number of layers. The forward keeps one residual per
-    // boundary, which is the part that does grow.
-    int64_t block_bytes = 0;
-    const auto& tape = driver->last().tape();
-    for (const r97::Tape::Block& block : tape.blocks()) {
-        int64_t values = 0;
-        for (size_t i = block.begin; i < block.end; ++i) {
-            const r97::OpRecord& rec = tape.ops()[i];
-            for (const r97::Operand& o : rec.operands) {
-                int64_t n = 1;
-                for (int64_t d : o.shape) n *= std::max<int64_t>(d, 0);
-                values += n;
-            }
-        }
-        block_bytes = std::max(block_bytes, values * int64_t(sizeof(double)));
-    }
+    // The join snapshots one chunk at a time -- the head, then one block -- holds that whole store
+    // while the walk copies one op out of it, and frees it before the next chunk. What it reports
+    // is therefore that store plus that one op, one chunk's worth, and it cannot grow with the
+    // number of layers. The forward keeps one residual per boundary and the report keeps the
+    // boundaries themselves when asked to; those are the parts that do grow.
+    //
+    // The figures the report gives back are checked for what they claim to be. The reported peak is
+    // its own two parts, and the store part is several ops' worth, so a figure that counted only
+    // the walk's op -- what the join would hold if it did not store the block -- cannot pass. The
+    // peak store is also under every chunk's store added together, which is what a join that kept
+    // the layers' snapshots would hold.
     const int64_t boundary = report.tokens * report.hidden * int64_t(sizeof(double));
-    std::printf("  host memory: %lld layers, peak snapshots %lld, peak cotangents %lld,"
-                " one block %lld, one boundary %lld, residual store %lld\n",
+    std::printf("  host memory: %lld layers, peak snapshots %lld = store %lld + one op %lld,"
+                " every chunk's store %lld, peak cotangents %lld, one boundary %lld,"
+                " residual store %lld, kept boundaries %lld\n",
                 (long long)report.layers, (long long)report.peak_snapshot_bytes,
-                (long long)report.peak_cotangent_bytes, (long long)block_bytes,
-                (long long)boundary, (long long)report.residual_store_bytes);
-    R97_CHECK(block_bytes > 0);
-    R97_CHECK(report.peak_snapshot_bytes <= block_bytes);
-    // Two versions of every operand in the block: the one live at each row and the write it makes.
-    R97_CHECK(report.peak_cotangent_bytes <= 2 * block_bytes);
-    // The one part that does grow with the number of layers, and exactly so.
+                (long long)report.peak_snapshot_store_bytes,
+                (long long)report.peak_snapshot_op_bytes,
+                (long long)report.all_snapshot_store_bytes,
+                (long long)report.peak_cotangent_bytes, (long long)boundary,
+                (long long)report.residual_store_bytes,
+                (long long)report.kept_boundary_bytes);
+    R97_CHECK(report.peak_snapshot_op_bytes > 0);
+    R97_CHECK(report.peak_snapshot_bytes ==
+              report.peak_snapshot_store_bytes + report.peak_snapshot_op_bytes);
+    // The store is a whole chunk's operands, held up front, not one op out of it: even the largest
+    // block here stores more than an op and a half, and the one op alone is what the join would
+    // report if it did not hold the store at all.
+    R97_CHECK(report.peak_snapshot_store_bytes >= 3 * report.peak_snapshot_op_bytes / 2);
+    // One chunk at a time, not all of them: the chunks' stores add up to more than the peak store.
+    // The margin is small here because the last block snaps up whole KV buffers (operands whose
+    // `rows` is 0) and so stores some ten times a block's few operands; on uniform blocks the
+    // growth would be one store per layer.
+    R97_CHECK(report.all_snapshot_store_bytes > report.peak_snapshot_store_bytes);
+    // The cotangents of a block: the live version and the write of every operand, plus the
+    // boundary cotangents the join carries -- the final hidden's and the one it hands in.
+    R97_CHECK(report.peak_cotangent_bytes >= boundary);
+    R97_CHECK(report.peak_cotangent_bytes <=
+              2 * report.peak_snapshot_store_bytes + 4 * boundary);
+    // The two stores that do grow with the number of layers, and exactly so: the forward's bf16
+    // residuals, and the report's own f64 copies of the boundaries.
     R97_CHECK(report.residual_store_bytes ==
               (report.layers + 1) * report.tokens * report.hidden * 2);
+    R97_CHECK(report.kept_boundary_bytes == (report.layers + 1) * 2 * boundary);
 }
 
 // The issue's finite-difference acceptance, asked of the forward that can answer it, and the
