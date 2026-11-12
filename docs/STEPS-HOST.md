@@ -335,7 +335,39 @@ the prefix in the walk's slot names and in the split, that case fails on the val
 tensor -- the parameter would be left for the zero fill.
 
 
+## The int8 trunk
+
+The same join walks the w8a8 container. Its op graph differs in three places: the residual add
+and norm are fused into `rmsnorm_quant_fp8`, the MLP's product and its rounding into
+`gated_quant_fp8`, and every trunk linear reads `had_quant_act_i8g`'s int8 codes through
+`gemm_nt_q`. The quantisers' adjoints hand back the **codes'** cotangent (section 3 of
+`docs/adjoints/quant.md`), while `gemm_nt_q`'s family adjoint is documented in the dequantised
+activation basis. The host step therefore tags its records and selects a code-basis wrapper for
+`gemm_nt_q` (`src/adjoint/host/host_step_record.h`); the family row and its finite-difference
+check are unchanged.
+
+The adapter is initialised in the basis the container names. `Engine::lora_set_weights` now copies
+`cfg_.lora.input_basis` into every in-memory factor, as a file adapter already did from its own
+header, so a live adapter on the rotated trunk is read in the same basis as the container's int8
+rows.
+
+`host_step_int8` checks the two properties a quantised trunk can give: the straight-through
+gradient is finite and nonzero, and a small step along it lowers the driver's scored loss. The
+step is normalised, because the head's int8 weight has a dequantisation scale that the
+`logits_gemm` record does not carry: the tape hands the host the codes and no scale operand, so
+the head cotangent carries the codes' magnitude rather than the dequantised weights'. The check
+therefore tests the descent direction on a step whose size does not depend on that factor; the
+missing head scale is a container/tape gap, not a property of the trunk adjoints, and is left
+open below.
+
 ## What is left open
+
+- **The int8 head's dequantisation scale.** `logits_gemm` reads `output.weight`'s codes but the
+  tape record has no scale operand, so the host walk cannot reconstruct the bf16 head weight. The
+  factor that reaches the trunk through the head is therefore the codes' factor, not the
+  dequantised one; the int8 step check normalises its step so it tests the trunk adjoints rather
+  than that missing scale. A record that carried `output.weight.scale`, or a `logits_gemm` adjoint
+  that read it from the container, would close the gap.
 
 *The join is the bf16 forward, by decision.* An earlier round of this card made `host_step`
 delegate to `make_reference_step`, so that the checks could be met at the issue's tolerance; the

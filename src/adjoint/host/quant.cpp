@@ -1,6 +1,7 @@
-// src/adjoint/host/quant.cpp -- the quant family's host twin and host adjoint: quant_act_i8g
-// (groups of an activation to int8 codes, one scale per group) and had_quant_act_i8g (the same
-// after a width-group Hadamard rotation).
+// src/adjoint/host/quant.cpp -- the quant family's host twins and host adjoints. quant_act_i8g
+// turns groups of an activation into int8 codes and had_quant_act_i8g does the same after a
+// width-group Hadamard rotation; rmsnorm_quant_fp8 and gated_quant_fp8 are the int8 trunk's fused
+// E4M3 producers, which carry the residual add and the norm or the gated product in the same op.
 //
 // Rounding has zero derivative almost everywhere, so the adjoint is a definition rather than a
 // derivative of the forward: the straight-through estimator of docs/adjoints/quant.md. What that
@@ -15,6 +16,8 @@
 // operand. Its slope is the adjoint above, which is what makes the check of docs/adjoints/README.md
 // possible; no walk appends a `<op>_ste` record.
 #include "r97/adjoint.h"
+
+#include "rad_plugin.h"  // bf16 and fp8 e4m3, the fused quantiser's two grids
 
 #include <algorithm>
 #include <cmath>
@@ -302,6 +305,380 @@ void quant_adjoint(const AdjointCall& call) {
     for (size_t i = 0; i < dx.value.size() && i < d.size(); ++i) dx.value[i] += d[i];
 }
 
+// -- the fused fp8 producers -------------------------------------------------
+//
+// The int8 trunk's norms and its gated MLP do their rounding inside the producer:
+// `rmsnorm_quant_fp8` writes the normalised bf16 activation and its E4M3 codes, and
+// `gated_quant_fp8` writes the bf16 product and its codes. Both quantise per 128 columns with the
+// same scale the int8 rows use above, so the straight-through rule is the same too; what is new is
+// the differentiable part around it, a norm or an activation gate. The code cotangent is divided
+// by the group's scale because the tape hands back the codes' own cotangent, not `s * codes`.
+constexpr double kFp8Top = 448.0;  // E4M3's largest finite magnitude
+
+double bf16_round(double x) {
+    return static_cast<double>(rad_bf16_to_f32(rad_f32_to_bf16(static_cast<float>(x))));
+}
+
+std::string string_param(const OpRecord& rec, const char* key, const char* fallback) {
+    for (const OpParam& p : rec.params)
+        if (p.first == key) {
+            if (const std::string* s = std::get_if<std::string>(&p.second)) return *s;
+            throw std::invalid_argument("quant: parameter '" + std::string(key) +
+                                        "' is not a string");
+        }
+    return fallback;
+}
+
+double double_param(const OpRecord& rec, const char* key, double fallback) {
+    for (const OpParam& p : rec.params) {
+        if (p.first != key) continue;
+        if (const int64_t* i = std::get_if<int64_t>(&p.second)) return static_cast<double>(*i);
+        if (const std::string* s = std::get_if<std::string>(&p.second)) {
+            try {
+                return std::stod(*s);
+            } catch (const std::exception&) {
+                break;
+            }
+        }
+        throw std::invalid_argument("quant: parameter '" + std::string(key) +
+                                    "' is not a number");
+    }
+    return fallback;
+}
+
+struct Fp8Geometry {
+    int64_t n = 0;
+    int64_t group = 0;
+    int64_t ngrp = 0;
+};
+
+Fp8Geometry fp8_geometry(const OpRecord& rec) {
+    Fp8Geometry g;
+    g.n = required(rec, "n");
+    if (g.n <= 0) throw std::invalid_argument("quant: 'n' must be positive");
+    const int64_t t = optional(rec, "group", 0);
+    g.group = (t <= 0 || t > g.n) ? g.n : t;
+    g.ngrp = (g.n + g.group - 1) / g.group;
+    return g;
+}
+
+struct Fp8Point {
+    int64_t rows = 0;
+    int64_t n = 0;
+    int64_t group = 0;
+    int64_t ngrp = 0;
+    std::vector<double> value;  // what the quantiser saw, bf16-rounded
+    std::vector<double> scale;  // [rows, ngrp]
+    std::vector<double> code;   // [rows, n], E4M3 values (not the raw bytes)
+    std::vector<uint8_t> live;  // 1 where the clamp did not engage
+};
+
+Fp8Point quantise_fp8(const std::vector<double>& v, int64_t rows, const Fp8Geometry& geo) {
+    Fp8Point p;
+    p.rows = rows;
+    p.n = geo.n;
+    p.group = geo.group;
+    p.ngrp = geo.ngrp;
+    p.value = v;
+    p.scale.assign(static_cast<size_t>(rows * geo.ngrp), 0.0);
+    p.code.assign(static_cast<size_t>(rows * geo.n), 0.0);
+    p.live.assign(static_cast<size_t>(rows * geo.n), 0);
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t gi = 0; gi < geo.ngrp; ++gi) {
+            const int64_t k0 = gi * geo.group;
+            const int64_t w = std::min(geo.group, geo.n - k0);
+            double amax = 0.0;
+            for (int64_t i = 0; i < w; ++i)
+                amax = std::max(amax, std::fabs(v[static_cast<size_t>(r * geo.n + k0 + i)]));
+            const double s = amax > 0.0 ? amax / kFp8Top : 1.0;
+            p.scale[static_cast<size_t>(r * geo.ngrp + gi)] = s;
+            for (int64_t i = 0; i < w; ++i) {
+                const size_t j = static_cast<size_t>(r * geo.n + k0 + i);
+                const double u = v[j] / s;
+                const uint8_t bits = rad_f32_to_fp8e4m3(static_cast<float>(u));
+                p.code[j] = static_cast<double>(rad_fp8e4m3_to_f32(bits));
+                p.live[j] = std::fabs(u) <= kFp8Top ? 1 : 0;
+            }
+        }
+    }
+    return p;
+}
+
+double fp8_scale_of(const Fp8Point& p, int64_t r, int64_t col) {
+    return p.scale[static_cast<size_t>(r * p.ngrp + col / p.group)];
+}
+
+int schema_index(const OpRecord& rec, const char* name) {
+    for (size_t i = 0; i < rec.operands.size(); ++i)
+        if (rec.operands[i].buffer == name) return static_cast<int>(i);
+    return -1;
+}
+
+int write_index(const OpRecord& rec, int at) {
+    int w = 0;
+    for (const Operand& o : rec.operands)
+        if (o.written && w++ == at) return w - 1;
+    return -1;
+}
+
+const AdValue* cot_of(const AdjointCall& call, int write) {
+    if (write < 0 || static_cast<size_t>(write) >= call.cot.size()) return nullptr;
+    return &call.cot[static_cast<size_t>(write)];
+}
+
+// The bf16 activation the norm or the gate produced, and the fp8 point around it.
+struct Fp8Activation {
+    Fp8Point point;
+    std::vector<double> value;  // [rows, n], in the bf16 activation's own units
+};
+
+// The scale and the clamp mask are the only parts of the quantiser the adjoint reads; they are
+// properties of the forward, so they come back from the written scale and the activation.
+void add_fp8_codes(const AdValue& codes, const AdValue& scale, int64_t rows, const Fp8Geometry& geo,
+                   const std::vector<double>& activation, std::vector<double>* d) {
+    if (codes.value.size() != static_cast<size_t>(rows * geo.n))
+        throw std::invalid_argument("quant: the fp8 codes do not have the activation's shape");
+    if (scale.value.size() != static_cast<size_t>(rows * geo.ngrp))
+        throw std::invalid_argument("quant: the fp8 scale does not have one value per (row, group)");
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t gi = 0; gi < geo.ngrp; ++gi) {
+            const int64_t k0 = gi * geo.group;
+            const int64_t w = std::min(geo.group, geo.n - k0);
+            const double s = scale.value[static_cast<size_t>(r * geo.ngrp + gi)];
+            if (!(s > 0.0))
+                throw std::invalid_argument("quant: the scale of a group must be positive");
+            for (int64_t i = 0; i < w; ++i) {
+                const size_t j = static_cast<size_t>(r * geo.n + k0 + i);
+                if (std::fabs(activation[j] / s) <= kFp8Top)
+                    (*d)[j] += codes.value[j] / s;
+            }
+        }
+    }
+}
+
+// `rmsnorm_quant_fp8`: y = bf16(rmsnorm(r) * gain), r = x or bf16(x + residual), then y's E4M3
+// codes. The residual is in-place, so its output cotangent and the norm's input cotangent both go
+// back to its old value and to x.
+void rmsnorm_quant_fp8_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
+                            std::vector<AdValue>* out) {
+    const Fp8Geometry geo = fp8_geometry(rec);
+    const bool has_residual = rec.operands.size() > 1 &&
+                              rad_dtype_bits(rad_dtype_parse(rec.operands[1].dtype.c_str())) > 0 &&
+                              !rec.operands[1].shape.empty();
+    if (operands.empty()) throw std::invalid_argument("quant: rmsnorm_quant_fp8 reads an activation");
+    const std::vector<double>& x = operands[0].value;
+    if (x.size() % static_cast<size_t>(geo.n) != 0)
+        throw std::invalid_argument("quant: the activation is not a whole number of rows of 'n'");
+    const int64_t rows = static_cast<int64_t>(x.size()) / geo.n;
+    const std::vector<double>* resid = has_residual ? &operands[1].value : nullptr;
+    const std::vector<double>& weight = operands[has_residual ? 2 : 1].value;
+    if (weight.size() != static_cast<size_t>(geo.n))
+        throw std::invalid_argument("quant: the norm gain does not have 'n' values");
+    if (resid != nullptr && resid->size() != x.size())
+        throw std::invalid_argument("quant: the residual and the activation have different sizes");
+
+    const double eps = double_param(rec, "eps", 1e-6);
+    const double wadd = double_param(rec, "wadd", 0.0);
+    std::vector<double> r(x.size());
+    for (size_t i = 0; i < r.size(); ++i)
+        r[i] = resid != nullptr ? bf16_round(x[i] + (*resid)[i]) : x[i];
+
+    std::vector<double> y(x.size());
+    for (int64_t m = 0; m < rows; ++m) {
+        double ss = 0.0;
+        for (int64_t j = 0; j < geo.n; ++j) {
+            const double v = r[static_cast<size_t>(m * geo.n + j)];
+            ss += v * v;
+        }
+        const double rs = 1.0 / std::sqrt(ss / static_cast<double>(geo.n) + eps);
+        for (int64_t j = 0; j < geo.n; ++j) {
+            const size_t i = static_cast<size_t>(m * geo.n + j);
+            y[i] = bf16_round(r[i] * rs * (weight[static_cast<size_t>(j)] + wadd));
+        }
+    }
+    const Fp8Point p = quantise_fp8(y, rows, geo);
+    out->push_back(has_residual ? make_value(rec, 0, "bf16", rows, geo.n, r)
+                                : AdValue{"invalid", {}, {}});
+    out->push_back(make_value(rec, 1, "fp8_e4m3", rows, geo.n, p.code));
+    out->push_back(make_value(rec, 2, "f32", rows, geo.ngrp, p.scale));
+    out->push_back(make_value(rec, 3, "bf16", rows, geo.n, y));
+}
+
+void rmsnorm_quant_fp8_adjoint(const AdjointCall& call) {
+    const Fp8Geometry geo = fp8_geometry(call.rec);
+    // The schema is x, residual, weight, codes, scale, y: the read activation's buffer is the
+    // residual stream's name (`h`), not `x`, which is the residual operand it is added into.
+    const int ix = 0;
+    const int ires = 1;
+    const int iw = 2;
+    if (call.fwd.size() <= static_cast<size_t>(iw) || call.dc == nullptr ||
+        call.dc->size() <= static_cast<size_t>(iw))
+        throw std::invalid_argument("quant: rmsnorm_quant_fp8 needs its activation and gain");
+    const AdValue& x = call.fwd[static_cast<size_t>(ix)];
+    const AdValue& weight = call.fwd[static_cast<size_t>(iw)];
+    if (x.value.size() % static_cast<size_t>(geo.n) != 0)
+        throw std::invalid_argument("quant: the activation is not a whole number of rows of 'n'");
+    const int64_t rows = static_cast<int64_t>(x.value.size()) / geo.n;
+    if (weight.value.size() != static_cast<size_t>(geo.n))
+        throw std::invalid_argument("quant: the norm gain does not have 'n' values");
+
+    const bool has_residual = call.rec.operands.size() > static_cast<size_t>(ires) &&
+                              rad_dtype_bits(rad_dtype_parse(call.rec.operands[ires].dtype.c_str())) > 0 &&
+                              !call.rec.operands[ires].shape.empty();
+    const AdValue& residual_out = call.fwd[static_cast<size_t>(ires)];
+    std::vector<double> r(x.value);
+    if (has_residual) {
+        if (residual_out.value.size() != r.size())
+            throw std::invalid_argument("quant: the residual output has the activation's shape");
+        r = residual_out.value;
+    }
+    const AdValue& y = call.fwd[5];
+    if (y.value.size() != r.size())
+        throw std::invalid_argument("quant: the normalised activation has the activation's shape");
+
+    const double eps = double_param(call.rec, "eps", 1e-6);
+    const double wadd = double_param(call.rec, "wadd", 0.0);
+    std::vector<double> rs(static_cast<size_t>(rows), 0.0);
+    std::vector<double> d(r.size(), 0.0);
+    for (int64_t m = 0; m < rows; ++m) {
+        double ss = 0.0;
+        for (int64_t j = 0; j < geo.n; ++j) {
+            const double v = r[static_cast<size_t>(m * geo.n + j)];
+            ss += v * v;
+        }
+        rs[static_cast<size_t>(m)] =
+            1.0 / std::sqrt(ss / static_cast<double>(geo.n) + eps);
+    }
+
+    // The output activation's cotangent is already in y's units; the codes' is divided by their
+    // scale and kept only where the fp8 clamp did not engage.
+    const AdValue* dy = cot_of(call, 3);
+    const AdValue* dq = cot_of(call, 1);
+    if (dy != nullptr) {
+        if (dy->value.size() != d.size())
+            throw std::invalid_argument("quant: the activation's cotangent has y's shape");
+        for (size_t i = 0; i < d.size(); ++i) d[i] += dy->value[i];
+    }
+    if (dq != nullptr) add_fp8_codes(*dq, call.fwd[4], rows, geo, y.value, &d);
+
+    const AdValue* dres = cot_of(call, 0);
+    std::vector<double> dres_out;
+    if (has_residual && dres != nullptr) {
+        if (dres->value.size() != d.size())
+            throw std::invalid_argument("quant: the residual cotangent has the activation's shape");
+        dres_out = dres->value;
+    }
+
+    std::vector<double> dx(d.size(), 0.0);
+    std::vector<double> dw(static_cast<size_t>(geo.n), 0.0);
+    for (int64_t m = 0; m < rows; ++m) {
+        const double scale = rs[static_cast<size_t>(m)];
+        double drs = 0.0;
+        for (int64_t j = 0; j < geo.n; ++j) {
+            const size_t i = static_cast<size_t>(m * geo.n + j);
+            const double gain = weight.value[static_cast<size_t>(j)] + wadd;
+            drs += d[i] * r[i] * gain;
+            dx[i] += d[i] * scale * gain;
+            dw[static_cast<size_t>(j)] += d[i] * r[i] * scale;
+        }
+        const double rs3 = scale * scale * scale;
+        for (int64_t j = 0; j < geo.n; ++j) {
+            const size_t i = static_cast<size_t>(m * geo.n + j);
+            dx[i] -= drs * rs3 * r[i] / static_cast<double>(geo.n);
+        }
+    }
+    for (size_t i = 0; i < dx.size(); ++i) {
+        call.dc->at(static_cast<size_t>(ix)).value[i] += dx[i];
+        if (has_residual) {
+            call.dc->at(static_cast<size_t>(ires)).value[i] += dx[i];
+            if (!dres_out.empty()) {
+                call.dc->at(static_cast<size_t>(ix)).value[i] += dres_out[i];
+                call.dc->at(static_cast<size_t>(ires)).value[i] += dres_out[i];
+            }
+        }
+    }
+    for (size_t j = 0; j < dw.size(); ++j)
+        call.dc->at(static_cast<size_t>(iw)).value[j] += dw[j];
+}
+
+// `gated_quant_fp8`: p = bf16(act(gate) * up), then p's E4M3 codes. The activation is two halves
+// of one row, so both cotangents go back into the same buffer.
+void gated_quant_fp8_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
+                          std::vector<AdValue>* out) {
+    const Fp8Geometry geo = fp8_geometry(rec);
+    if (operands.empty()) throw std::invalid_argument("quant: gated_quant_fp8 reads an activation");
+    const std::vector<double>& gu = operands[0].value;
+    const int64_t width = 2 * geo.n;
+    if (gu.size() % static_cast<size_t>(width) != 0)
+        throw std::invalid_argument("quant: the gate|up activation is not a whole number of rows");
+    const int64_t rows = static_cast<int64_t>(gu.size()) / width;
+    const bool sigmoid = string_param(rec, "act", "silu") == "sigmoid";
+
+    std::vector<double> p(static_cast<size_t>(rows * geo.n), 0.0);
+    for (int64_t m = 0; m < rows; ++m) {
+        for (int64_t j = 0; j < geo.n; ++j) {
+            const double g = gu[static_cast<size_t>(m * width + j)];
+            const double u = gu[static_cast<size_t>(m * width + geo.n + j)];
+            const double s = 1.0 / (1.0 + std::exp(-g));
+            const double a = sigmoid ? s : g * s;
+            p[static_cast<size_t>(m * geo.n + j)] = bf16_round(a * u);
+        }
+    }
+    const Fp8Point q = quantise_fp8(p, rows, geo);
+    out->push_back(make_value(rec, 0, "fp8_e4m3", rows, geo.n, q.code));
+    out->push_back(make_value(rec, 1, "f32", rows, geo.ngrp, q.scale));
+    out->push_back(make_value(rec, 2, "bf16", rows, geo.n, p));
+}
+
+void gated_quant_fp8_adjoint(const AdjointCall& call) {
+    const Fp8Geometry geo = fp8_geometry(call.rec);
+    if (call.fwd.empty() || call.dc == nullptr || call.dc->empty())
+        throw std::invalid_argument("quant: gated_quant_fp8 needs its activation");
+    const AdValue& gu = call.fwd[0];
+    const int64_t width = 2 * geo.n;
+    if (gu.value.size() % static_cast<size_t>(width) != 0)
+        throw std::invalid_argument("quant: the gate|up activation is not a whole number of rows");
+    const int64_t rows = static_cast<int64_t>(gu.value.size()) / width;
+    const bool sigmoid = string_param(call.rec, "act", "silu") == "sigmoid";
+
+    std::vector<double> p(static_cast<size_t>(rows * geo.n), 0.0);
+    for (int64_t m = 0; m < rows; ++m) {
+        for (int64_t j = 0; j < geo.n; ++j) {
+            const double g = gu.value[static_cast<size_t>(m * width + j)];
+            const double u = gu.value[static_cast<size_t>(m * width + geo.n + j)];
+            const double s = 1.0 / (1.0 + std::exp(-g));
+            p[static_cast<size_t>(m * geo.n + j)] = bf16_round((sigmoid ? s : g * s) * u);
+        }
+    }
+    const AdValue& ffn = call.fwd[3];
+    if (ffn.value.size() != p.size())
+        throw std::invalid_argument("quant: the gated product does not have the activation's shape");
+
+    std::vector<double> dp(p.size(), 0.0);
+    const AdValue* dy = cot_of(call, 2);
+    if (dy != nullptr) {
+        if (dy->value.size() != dp.size())
+            throw std::invalid_argument("quant: the product cotangent has the product's shape");
+        dp = dy->value;
+    }
+    const AdValue* dq = cot_of(call, 0);
+    if (dq != nullptr) add_fp8_codes(*dq, call.fwd[2], rows, geo, ffn.value, &dp);
+
+    AdValue& dgu = call.dc->at(0);
+    for (int64_t m = 0; m < rows; ++m) {
+        for (int64_t j = 0; j < geo.n; ++j) {
+            const size_t i = static_cast<size_t>(m * geo.n + j);
+            const double g = gu.value[static_cast<size_t>(m * width + j)];
+            const double u = gu.value[static_cast<size_t>(m * width + geo.n + j)];
+            const double s = 1.0 / (1.0 + std::exp(-g));
+            const double a = sigmoid ? s : g * s;
+            const double da = sigmoid ? s * (1.0 - s) : s * (1.0 + g * (1.0 - s));
+            dgu.value[static_cast<size_t>(m * width + j)] += dp[i] * u * da;
+            dgu.value[static_cast<size_t>(m * width + geo.n + j)] += dp[i] * a;
+        }
+    }
+}
+
 }  // namespace
 
 // The family registers one twin and one adjoint function under each op's name, and the linearised
@@ -315,5 +692,10 @@ R97_REGISTER_TWIN("quant_act_i8g", quant_twin)
 R97_REGISTER_ADJOINT("quant_act_i8g", host, quant_adjoint)
 R97_REGISTER_TWIN("had_quant_act_i8g", quant_twin)
 R97_REGISTER_ADJOINT("had_quant_act_i8g", host, quant_adjoint)
+
+R97_REGISTER_TWIN("rmsnorm_quant_fp8", rmsnorm_quant_fp8_twin)
+R97_REGISTER_ADJOINT("rmsnorm_quant_fp8", host, rmsnorm_quant_fp8_adjoint)
+R97_REGISTER_TWIN("gated_quant_fp8", gated_quant_fp8_twin)
+R97_REGISTER_ADJOINT("gated_quant_fp8", host, gated_quant_fp8_adjoint)
 
 }  // namespace r97

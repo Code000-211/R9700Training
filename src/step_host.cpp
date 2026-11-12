@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "engine.h"  // the complete rad::Engine behind ForwardDriver's unique_ptr
+#include "rad_plugin.h"  // rad_fp8e4m3_to_f32, for the int8 trunk's fp8 cache operands
 #include "r97/step_host.h"
 #include "r97/adapter_io.h"
 #include "r97/adjoint.h"
@@ -42,7 +43,9 @@ int64_t elem_size(const std::string& dtype) {
     if (dtype == "bf16" || dtype == "f16") return 2;
     if (dtype == "f32" || dtype == "i32" || dtype == "u32") return 4;
     if (dtype == "f64" || dtype == "i64" || dtype == "u64") return 8;
-    if (dtype == "i8" || dtype == "u8" || dtype == "f8") return 1;
+    if (dtype == "i8" || dtype == "u8" || dtype == "f8" || dtype == "fp8_e4m3" ||
+        dtype == "fp8_e5m2")
+        return 1;
     return 0;
 }
 
@@ -55,6 +58,8 @@ double read_elem(const std::string& dtype, const void* data, int64_t i) {
     if (dtype == "u64") return static_cast<double>(static_cast<const uint64_t*>(data)[i]);
     if (dtype == "i8") return static_cast<const int8_t*>(data)[i];
     if (dtype == "u8") return static_cast<const uint8_t*>(data)[i];
+    if (dtype == "fp8_e4m3") return rad_fp8e4m3_to_f32(static_cast<const uint8_t*>(data)[i]);
+    if (dtype == "fp8_e5m2") return rad_fp8e5m2_to_f32(static_cast<const uint8_t*>(data)[i]);
     if (dtype == "bf16") {
         const uint32_t u = static_cast<uint32_t>(static_cast<const uint16_t*>(data)[i]) << 16;
         float f;
@@ -529,8 +534,10 @@ std::string module_leaf(const std::string& module) {
 // boundaries and snapshots.
 std::string linear_schema_name(const OpRecord& rec, size_t j) {
     if (rec.op == "gemm_nt") return j == 0 ? "a" : j == 1 ? "b" : "";
+    // gemm_nt_q's schema is a, a_scale, b, b_scale: the activation's quantisation sits between
+    // the two matrix operands, unlike gemm_nt's plain a, b.
     if (rec.op == "gemm_nt_q")
-        return j == 0 ? "a" : j == 1 ? "b" : j == 2 ? "a_scale" : j == 3 ? "b_scale" : "";
+        return j == 0 ? "a" : j == 1 ? "a_scale" : j == 2 ? "b" : j == 3 ? "b_scale" : "";
     if (rec.op == "logits_gemm") return j == 0 ? "x" : j == 1 ? "lm_head" : "";
     if (rec.op == "gather_rows") return j == 0 ? "x" : j == 1 ? "idx" : "";
     if (rec.op == "embed_lookup") return j == 0 ? "tokens" : j == 1 ? "wte" : "";
@@ -560,6 +567,7 @@ void prepare_adjoint_record(const OpRecord& rec, OpRecord* out) {
             if (key == "M") {
                 if (int64_t* m = std::get_if<int64_t>(&value)) *m = rows;
             }
+    if (out->op == "gemm_nt_q") out->params.push_back({"r97host", int64_t{1}});
 }
 
 // The weight a lora record belongs to, from the adapter factor it names: lora.<weight>.a or .b.
@@ -614,7 +622,7 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
         std::vector<std::string> targets(target_set.begin(), target_set.end());
         const bool live = model.delta && !wire.sites.empty();
         driver.set_lora(live ? 1 : 0, live ? std::max<int64_t>(max_rank, 1) : 0, targets,
-                        live ? "train" : std::string());
+                        live ? "train" : std::string(), live ? meta.input_basis : std::string());
 
         std::shared_ptr<BoundaryRecorder> recorder;
         driver.set_engine_hook([&driver, &recorder, &wire, live, targets, max_rank, tokens,
