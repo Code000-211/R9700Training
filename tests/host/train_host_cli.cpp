@@ -7,16 +7,21 @@
 // stored in, or radiance refuses the slot before a single step runs.
 //
 // What it checks:
-//   - the run overfits the three conversations: grouped by their scored-token count, each
+//   - both runs overfit the three conversations: grouped by their scored-token count, each
 //     conversation's loss at its last step is at most half its loss at its first;
 //   - a run of 2N steps and a run of the same 2N-step configuration resumed from its own N-step
 //     checkpoint give the same losses, bit for bit, and the same checkpoint files byte for byte;
+//   - the run's base_id is the container's SHA-256: resuming its checkpoint against the other
+//     fixture is refused, and the error names both hashes;
+//   - the run's configuration in the output directory (`run.json`) names the objective and the
+//     delta and carries that base_id;
 //   - the adapter the run wrote is served by radiance itself: `r97train loss --lora <adapter>`,
-//     which preloads the directory through lora/preload.h, scores the conversations at less than
-//     half the base model's loss. The adapter's adapter_config.json names the trunk's basis, which
-//     is what lets radiance ride the rotated weights.
+//     which preloads the directory through lora/preload.h, agrees with the held-out loss the
+//     trainer reported on the same file to 1e-4 relative. The adapter's adapter_config.json names
+//     the trunk's basis, which is what lets radiance ride the rotated weights.
 #include "../support/fixture_w8a8.h"
 #include "../support/test.h"
+#include "r97/sha256.h"
 
 #include <algorithm>
 #include <cmath>
@@ -42,9 +47,11 @@ namespace fs = std::filesystem;
 constexpr int64_t kSteps = 20;
 constexpr int64_t kHalf = kSteps / 2;
 
-// The int8 run's horizon: its trunk's gradient falls more slowly, and this test is about the
-// rotated adapter reaching radiance's loader, not about the loss.
-constexpr int64_t kInt8Steps = 10;
+// The int8 run's horizon. Its trunk's straight-through gradient is noisier than the bf16 run's, so
+// it takes more steps to bring the longest conversation (the one that costs 119 tokens a step)
+// below half; 48 steps at 1e-2 do it with room to spare.
+constexpr int64_t kInt8Steps = 48;
+constexpr const char* kInt8Lr = "1e-2";
 
 // The modules this recipe leaves in the rotated trunk. `linear_attn.out_proj` (blk.<l>.ssm_out) is
 // the one line the w8a8 recipe stores unrotated, so an adapter in the fwht128 basis cannot ride
@@ -138,8 +145,8 @@ std::vector<Step> read_log(const fs::path& out) {
 
 // Every conversation's last loss is at most half its first. A conversation is identified by the
 // scored tokens one step of it costs, which separates these three (29, 53 and 119).
-void check_overfits(const std::vector<Step>& steps) {
-    R97_CHECK(steps.size() == std::size_t(kSteps));
+void check_overfits(const std::vector<Step>& steps, int64_t horizon) {
+    R97_CHECK(steps.size() == std::size_t(horizon));
     std::map<int64_t, std::vector<double>> by_conversation;
     for (const Step& s : steps) by_conversation[s.tokens].push_back(s.loss);
     if (by_conversation.size() != 3)
@@ -190,6 +197,46 @@ double read_loss(const Outcome& out, const std::string& what) {
     return std::stod(out.output.substr(at + key.size()));
 }
 
+// The last held-out line the loop logged: the loss it reports for the file `--heldout` named, and
+// the tokens it covered.
+struct Eval {
+    int64_t step = 0;
+    double  loss = 0.0;
+    int64_t scored = 0;
+};
+
+Eval read_last_eval(const fs::path& out) {
+    std::ifstream in(out / "train.jsonl");
+    if (!in) throw std::runtime_error("train: no train.jsonl in " + out.string());
+    bool found = false;
+    Eval last;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        const nlohmann::json row = nlohmann::json::parse(line);
+        if (row.value("kind", std::string()) != "eval") continue;
+        last.step = row.at("step").get<int64_t>();
+        last.loss = row.at("loss").get<double>();
+        last.scored = row.at("scored").get<int64_t>();
+        found = true;
+    }
+    if (!found)
+        throw std::runtime_error("train: the run logged no held-out loss in " + out.string());
+    return last;
+}
+
+nlohmann::json read_run_config(const fs::path& out) {
+    std::ifstream in(out / "run.json");
+    if (!in) throw std::runtime_error("train: no run.json in " + out.string());
+    nlohmann::json config;
+    in >> config;
+    return config;
+}
+
+std::string container_base_id(const std::string& path) {
+    return "sha256:" + r97::sha256_file_hex(path);
+}
+
 // The adapter's own declaration of the basis its A factors are stored in. It is what lets
 // radiance's loader ride the rotated weights, and the run is refused at engine start without it.
 void check_adapter_names_the_basis(const fs::path& adapter) {
@@ -221,7 +268,15 @@ R97_TEST(train_host_cli_overfits_and_resumes) {
     require_ok(one, "the run of " + std::to_string(kSteps) + " steps");
     const std::vector<Step> steps = read_log(straight);
     for (std::size_t i = 0; i < steps.size(); ++i) R97_CHECK(steps[i].step == int64_t(i) + 1);
-    check_overfits(steps);
+    check_overfits(steps, kSteps);
+
+    // The configuration the run left in the output directory names what it trained: the
+    // objective, the delta, and the container it rides, by hash.
+    const nlohmann::json config = read_run_config(straight);
+    R97_CHECK(config.at("objective").get<std::string>() == "ce");
+    R97_CHECK(config.at("delta.kind").get<std::string>() == "lora");
+    const std::string base_id = container_base_id(fixture.container);
+    R97_CHECK(config.at("base_id").get<std::string>() == base_id);
 
     const fs::path checkpoint_half = straight / checkpoint_name(kHalf);
     if (!fs::exists(checkpoint_half / "trainer.state"))
@@ -250,6 +305,7 @@ R97_TEST(train_host_cli_overfits_and_resumes) {
                                      " differs between the run and its resume");
     }
     check_same_checkpoint(straight / checkpoint_name(kSteps), resumed / checkpoint_name(kSteps));
+    R97_CHECK(read_run_config(resumed).at("base_id").get<std::string>() == base_id);
 
     // Serve the adapter with radiance: `loss --lora` preloads the directory through
     // radiance's own loader, so the measurement runs on what the run wrote, not on the trainer's
@@ -284,14 +340,19 @@ R97_TEST(train_host_cli_serves_the_int8_trunk) {
     fs::create_directories(root, ec);
 
     // The rotated trunk's run: 2N steps, a checkpoint at N, and the same horizon resumed from it.
+    // The held-out file is scored at the horizon, so the last eval line and the last checkpoint
+    // are the same weights -- the comparison below is against the adapter radiance will load.
     const fs::path straight = root / "straight";
     const Outcome one =
         run_train(fixture.container, straight,
                   "--steps " + std::to_string(kInt8Steps) + " --checkpoint_every " +
-                      std::to_string(kInt8Steps / 2) + " --lr 1e-4");
+                      std::to_string(kInt8Steps / 2) + " --lr " + std::string(kInt8Lr) +
+                      " --heldout " + r97::detail::shell_quote(chat_small().string()) +
+                      " --eval_every " + std::to_string(kInt8Steps));
     require_ok(one, "the int8 run of " + std::to_string(kInt8Steps) + " steps");
     const std::vector<Step> steps = read_log(straight);
     R97_CHECK(steps.size() == std::size_t(kInt8Steps));
+    check_overfits(steps, kInt8Steps);
 
     const fs::path checkpoint_half = straight / checkpoint_name(kInt8Steps / 2);
     if (!fs::exists(checkpoint_half / "trainer.state"))
@@ -299,7 +360,8 @@ R97_TEST(train_host_cli_serves_the_int8_trunk) {
     const fs::path resumed = root / "resumed";
     const Outcome two =
         run_train(fixture.container, resumed,
-                  "--steps " + std::to_string(kInt8Steps) + " --lr 1e-4 --resume " +
+                  "--steps " + std::to_string(kInt8Steps) + " --lr " + std::string(kInt8Lr) +
+                      " --resume " +
                       r97::detail::shell_quote(checkpoint_half.string()));
     require_ok(two, "the int8 resume from step " + std::to_string(kInt8Steps / 2));
 
@@ -318,19 +380,49 @@ R97_TEST(train_host_cli_serves_the_int8_trunk) {
                           resumed / checkpoint_name(kInt8Steps));
 
     // The adapter declares the trunk's basis -- radiance refuses the slot at engine start without
-    // it -- and radiance's own loader then serves it: `loss --lora` scores the conversations
-    // through preload.h, on the written directory.
+    // it -- and radiance's own loader then serves it: `loss --lora` scores the held-out file
+    // through preload.h, on the written directory, and must report what the trainer's held-out
+    // pass reported on the same weights. 1e-4 relative is the acceptance's tolerance.
     const fs::path adapter = straight / checkpoint_name(kInt8Steps) / "adapter";
     check_adapter_names_the_basis(adapter);
+    const Eval held = read_last_eval(straight);
+    R97_CHECK(held.step == kInt8Steps);
+    if (!(held.loss > 0.0) || !std::isfinite(held.loss))
+        throw std::runtime_error("train: the train reported a held-out loss of " +
+                                 std::to_string(held.loss));
     const double served =
         read_loss(run("loss --model " + r97::detail::shell_quote(fixture.container) +
                           " --data " + r97::detail::shell_quote(chat_small().string()) +
                           " --lora " + r97::detail::shell_quote(adapter.string()),
                       root / "loss"),
                   "the int8 adapter's loss");
-    if (!(served > 0.0) || !std::isfinite(served))
-        throw std::runtime_error("train: radiance scores the int8 adapter at " +
-                                 std::to_string(served));
+    const double relative = std::fabs(served - held.loss) / std::fabs(held.loss);
+    if (!(relative <= 1e-4))
+        throw std::runtime_error("train: the trainer reported a held-out loss of " +
+                                 std::to_string(held.loss) + " and radiance serves it at " +
+                                 std::to_string(served) + " (relative " +
+                                 std::to_string(relative) + ")");
+
+    // The checkpoint carries the container's hash as its base_id: resuming it against the other
+    // fixture is refused, and the error names both ids. It is refused before the loop starts, so
+    // no run.json is written into the refused run's directory.
+    const r97::Fixture& bf16 = r97::fixture();
+    const Outcome refused =
+        run_train(bf16.container, root / "refused",
+                  "--steps " + std::to_string(kInt8Steps) + " --lr " + std::string(kInt8Lr) +
+                      " --resume " +
+                      r97::detail::shell_quote((straight / checkpoint_name(kInt8Steps)).string()));
+    if (refused.status == 0)
+        throw std::runtime_error("train: resuming an int8 checkpoint against the bf16 container "
+                                 "was allowed");
+    const std::string int8_id = container_base_id(fixture.container);
+    const std::string bf16_id = container_base_id(bf16.container);
+    if (refused.error.find(int8_id) == std::string::npos ||
+        refused.error.find(bf16_id) == std::string::npos)
+        throw std::runtime_error("train: the refused resume does not name both base ids (" +
+                                 int8_id + ", " + bf16_id + ")\n" + refused.error);
+    if (fs::exists(root / "refused" / "run.json"))
+        throw std::runtime_error("train: the refused resume wrote run.json");
 }
 
 #endif  // R97_FIXTURE_PREFILL
