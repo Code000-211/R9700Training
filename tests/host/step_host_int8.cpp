@@ -160,23 +160,6 @@ Run walk(const r97::Fixture& fixture, const r97::Model& model, const r97::Batch&
     return run;
 }
 
-std::vector<double> flatten_all(const r97::ParamSet& set) {
-    std::vector<double> out;
-    for (const r97::Param& p : set)
-        for (float v : p.value) out.push_back(double(v));
-    return out;
-}
-
-std::vector<double> flatten(const r97::ParamSet& set, const std::string& layer) {
-    std::vector<double> out;
-    for (const r97::Param& p : set) {
-        const std::string* here = layer_of(p.name);
-        if (here == nullptr || *here != layer) continue;
-        for (float v : p.value) out.push_back(double(v));
-    }
-    return out;
-}
-
 double cosine(const std::vector<double>& a, const std::vector<double>& b) {
     double dot = 0.0, na = 0.0, nb = 0.0;
     for (size_t i = 0; i < a.size(); ++i) {
@@ -315,31 +298,55 @@ R97_TEST(host_step_int8_gradient_points_the_way_bf16_does) {
     std::printf("loss int8=%.9g bf16=%.9g\n", int8.report.loss, f32.report.loss);
     R97_CHECK(std::fabs(int8.report.loss - f32.report.loss) < 0.02 * std::fabs(f32.report.loss));
 
+    // The two containers do not carry the same targets -- the int8 one fuses `in_proj_qkv` with
+    // `in_proj_z`, and `ffn_gate_up`, where the bf16 one keeps them apart -- so a concatenation in
+    // each set's own order compares one site's gradient with another's. Every comparison here is
+    // therefore made between gradients the two sets name the same, in one fixed order.
+    struct Pair {
+        const r97::Param* a;
+        const r97::Param* b;
+    };
+    std::vector<Pair> pairs;
+    for (const r97::Param& g : back) {
+        const r97::Param* q = find_param(f32.grads, g.name);
+        if (q && q->value.size() == g.value.size()) pairs.push_back({&g, q});
+    }
+    R97_CHECK(pairs.size() >= back.size() / 2);
+    auto joined = [&](const char* layer) {
+        std::vector<double> a, b;
+        for (const Pair& pair : pairs) {
+            if (layer != nullptr) {
+                const std::string* here = layer_of(pair.a->name);
+                if (here == nullptr || *here != layer) continue;
+            }
+            for (size_t i = 0; i < pair.a->value.size(); ++i) {
+                a.push_back(double(pair.a->value[i]));
+                b.push_back(double(pair.b->value[i]));
+            }
+        }
+        return std::make_pair(a, b);
+    };
+
     // Per layer and per site: a layer whose block input and output the two containers share can be
     // compared on its own, and a site is where a scale error in the basis mapping would show.
     for (const char* layer : {"layers.3.", "layers.2.", "layers.1.", "layers.0."}) {
-        const std::vector<double> a = flatten(back, layer);
-        const std::vector<double> b = flatten(f32.grads, layer);
+        const auto [a, b] = joined(layer);
         R97_CHECK(!a.empty() && a.size() == b.size());
         std::printf("  %s cosine %.6f\n", layer, cosine(a, b));
     }
 
-    for (const r97::Param& g : back) {
-        const r97::Param* q = find_param(f32.grads, g.name);
-        if (!q) continue;
+    for (const Pair& pair : pairs) {
         double na2 = 0.0, nb2 = 0.0;
-        for (float v : g.value) na2 += double(v) * double(v);
-        for (float v : q->value) nb2 += double(v) * double(v);
-        std::printf("  %-44s cos %7.4f  ratio %6.3f\n", g.name.c_str(),
-                    cosine(std::vector<double>(g.value.begin(), g.value.end()),
-                           std::vector<double>(q->value.begin(), q->value.end())),
+        for (float v : pair.a->value) na2 += double(v) * double(v);
+        for (float v : pair.b->value) nb2 += double(v) * double(v);
+        std::printf("  %-44s cos %7.4f  ratio %6.3f\n", pair.a->name.c_str(),
+                    cosine(std::vector<double>(pair.a->value.begin(), pair.a->value.end()),
+                           std::vector<double>(pair.b->value.begin(), pair.b->value.end())),
                     nb2 > 0.0 ? std::sqrt(na2 / nb2) : 0.0);
     }
 
-    const std::vector<double> top_a = flatten(back, "layers.3.");
-    const std::vector<double> top_b = flatten(f32.grads, "layers.3.");
-    const std::vector<double> all_a = flatten_all(back);
-    const std::vector<double> all_b = flatten_all(f32.grads);
+    const auto [top_a, top_b] = joined("layers.3.");
+    const auto [all_a, all_b] = joined(nullptr);
     const double top_cosine = cosine(top_a, top_b);
     std::printf("cosine: whole %.6f, top block %.6f\n", cosine(all_a, all_b), top_cosine);
 
@@ -355,16 +362,12 @@ R97_TEST(host_step_int8_gradient_points_the_way_bf16_does) {
     R97_CHECK(ratio > 0.7 && ratio < 1.4);
 
     // The issue asks for a cosine above 0.9 over the gradient. It is not met: with the adapter
-    // exercised and the basis right, the walk over the int8 trunk scores 0.66-0.67 here, and the
-    // figures above say why. The boundaries the two containers share agree to 0.9999 at the head
-    // and 0.978 at the top block's input, and the losses to a percent, but every site's gradient
-    // disagrees by more than its block's boundaries do: the per-site cosines run from -0.63 to
-    // 0.96 and their magnitudes from 0.37 to 1.84 of the bf16 ones; see the paragraph in
-    // docs/STEPS-HOST.md for what the spread does and does not account for.
-    // The disagreement is therefore inside each block -- in the int8 path's own internal
-    // cotangents and codes -- and not in the join's graph, which is the same walk over the same
-    // nine sites. A floor, not the issue's number: it is here to catch a regression in the walk,
-    // and docs/STEPS-HOST.md records what is left open.
+    // exercised and the basis right, the walk over the int8 trunk scores 0.66-0.67 here. The
+    // per-site figures above are the evidence that this is the int8 path's own activation
+    // quantisation and not the join's graph: the boundaries the two containers share agree to
+    // 0.9999 at the head and 0.978 at the top block's input, and the losses to a percent, while
+    // every site's gradient runs from -0.63 to 0.96 of the bf16 one. docs/STEPS-HOST.md records
+    // what is left open; the floor is a regression guard, not the issue's number.
     R97_CHECK(top_cosine > 0.6);
     R97_CHECK(cosine(all_a, all_b) > 0.6);
 }
