@@ -136,6 +136,43 @@ grep -qx 'model = /srv/models/tiny.rad' <<< "$resolved" || {
     exit 1
 }
 
+# What the command prints is itself a config file, and `empty` is the table's word for an empty
+# value, not a placeholder the printer strips: a directory or an opaque `base_id` named `empty`
+# survives the round trip.
+cat > "$tmp/empty.conf" <<'EOF'
+model = /srv/models/tiny.rad
+out = empty
+base_id = empty
+delta.targets = empty
+lr = 1e-3
+token_budget = 8
+accumulation = 1
+steps = 3
+EOF
+empty_run=$("$bin" config --config "$tmp/empty.conf") || {
+    printf '%s\n' "$empty_run"
+    printf 'FAIL: the command rejected a configuration that names the word empty\n' >&2
+    exit 1
+}
+for line in 'out = empty' 'base_id = empty' 'delta.targets = empty'; do
+    grep -qx "$line" <<< "$empty_run" || {
+        printf '%s\n' "$empty_run"
+        printf 'FAIL: the resolved configuration lost `%s`\n' "$line" >&2
+        exit 1
+    }
+done
+printf '%s\n' "$empty_run" > "$tmp/printed.conf"
+round_trip=$("$bin" config --config "$tmp/printed.conf") || {
+    printf '%s\n' "$round_trip"
+    printf 'FAIL: the configuration the command printed does not read back\n' >&2
+    exit 1
+}
+if [[ $round_trip != "$empty_run" ]]; then
+    diff -u <(printf '%s\n' "$empty_run") <(printf '%s\n' "$round_trip") || true
+    printf 'FAIL: the configuration the command printed reads back changed\n' >&2
+    exit 1
+fi
+
 set +e
 refused=$("$bin" config --config "$tmp/run.conf" --no_such_key 1 2>&1)
 rc=$?

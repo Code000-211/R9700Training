@@ -25,7 +25,9 @@ std::string number_text(double value) {
     return std::string(buffer, result.ptr);
 }
 
-std::string text_text(const std::string& value) { return value.empty() ? "empty" : value; }
+// The value as a config file writes it. An empty string is written as nothing after the '=', so
+// the word `empty` is a value like any other here; the schema table spells the empty one out.
+std::string text_text(const std::string& value) { return value; }
 
 std::string integer_text(int64_t value) { return std::to_string(value); }
 
@@ -37,7 +39,7 @@ std::string list_text(const std::vector<std::string>& values) {
         if (!text.empty()) text += ", ";
         text += value;
     }
-    return text.empty() ? "empty" : text;
+    return text;
 }
 
 // The rows, in the document's order. The last column is the document's own sentence, markup
@@ -131,6 +133,9 @@ std::string config_schema_text() {
         name_width = std::max(name_width, key.name.size());
         type_width = std::max(type_width, config_type_name(key.type).size());
         texts.push_back(config_key_text(key, defaults));
+        // The table's default column names an empty string or list `empty`; a config file writes
+        // it as nothing, which is what config_values_text does and the parser reads back.
+        if (texts.back().empty()) texts.back() = "empty";
         default_width = std::max(default_width, texts.back().size());
     }
 
@@ -154,9 +159,8 @@ std::string config_values_text(const Config& config) {
     std::ostringstream out;
     for (const ConfigKey& key : rows()) {
         out << key.name << " = ";
-        const std::string text = config_key_text(key, config);
         // An empty value is an empty string or an empty list; write it as nothing after the '='.
-        out << (text == "empty" ? std::string() : text) << "\n";
+        out << config_key_text(key, config) << "\n";
     }
     return out.str();
 }

@@ -37,9 +37,6 @@ bool same(const Config& a, const Config& b) {
            a.eval_every == b.eval_every && a.checkpoint_every == b.checkpoint_every;
 }
 
-// The text a config file writes for a key whose shown default is `empty`: nothing after the '='.
-std::string file_value(const std::string& text) { return text == "empty" ? std::string() : text; }
-
 // A value an initialiser takes for any member: it converts to whatever the member's type is, so an
 // aggregate is probed without naming its members.
 struct AnyValue {
@@ -77,9 +74,9 @@ R97_TEST(config_schema_defaults_are_config_h) {
         R97_CHECK(!key.range_and_meaning.empty());
 
         // Writing the row's own default back through the parser gives the default Config: the
-        // shown value is the one config.h sets, for every key.
-        const std::string text =
-            std::string(key.name) + " = " + file_value(config_key_text(key, defaults));
+        // shown value is the one config.h sets, for every key. The table's `empty` word is the
+        // table's, not the value's, so the value itself is what goes into the file.
+        const std::string text = std::string(key.name) + " = " + config_key_text(key, defaults);
         const Config parsed = parse_config(text);
         if (!same(parsed, defaults))
             throw std::runtime_error("default drifted for " + std::string(key.name));
@@ -144,6 +141,34 @@ R97_TEST(config_schema_keys_set_their_field) {
         const Config config = parse_config(std::string(c.key) + " = " + c.value);
         if (!c.landed(config)) throw std::runtime_error(std::string("key did not land: ") + c.key);
     }
+}
+
+R97_TEST(config_values_text_keeps_the_word_empty) {
+    // `empty` is the schema's word for an empty value, but a directory, an opaque `base_id` or a
+    // module name may be that word too: what the command prints must read back unchanged in both
+    // cases (include/r97/config_schema.h: `a configuration the parser reads back to the same
+    // Config`).
+    Config config;
+    config.model = "m.rad";
+    config.out = "empty";
+    config.base_id = "empty";
+    config.delta.targets = {"empty"};
+    config.lr = 1e-3;
+    config.token_budget = 8;
+    config.accumulation = 1;
+    config.steps = 3;
+
+    const std::string text = config_values_text(config);
+    R97_CHECK(text.find("out = empty") != std::string::npos);
+    R97_CHECK(text.find("delta.targets = empty") != std::string::npos);
+    R97_CHECK(same(parse_config(text), config));
+
+    // An empty value is an empty value, not the word: the schema table is the only place the
+    // placeholder is written.
+    Config blank;
+    blank.model = "m.rad";
+    R97_CHECK(config_values_text(blank).find("out = \n") != std::string::npos);
+    R97_CHECK(parse_config(config_values_text(blank)).out.empty());
 }
 
 R97_TEST(config_values_text_round_trips) {

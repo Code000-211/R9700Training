@@ -40,10 +40,14 @@ Save the fenced blocks as one script under `runs/` and run it from the tree's to
 - **An output directory that does not exist yet.** A run makes it; one checkpoint every
   `checkpoint_every` steps holds a full copy of the adapter plus the optimiser's moments, so `du
   -sh` the first one before deciding the interval. The smoke run writes under `runs/`.
-- **A serving-only build of radiance, for section 7.** It is a one-time input, like the fetch:
-  `cmake -B build-serving -G Ninja -DR97_PATCH_SET=serving` applies the serving patches in
-  `patches/serving/`, and `cmake --build build-serving/radiance-build --target radiance` builds
-  the server (`build-serving/radiance-build/bin/radiance`; the serving tree has no `r97train`).
+- **A serving-only build of radiance, for section 7.** It is a one-time input, like the fetch,
+  and it takes three steps in this order. `cmake -B build-serving -G Ninja -DR97_PATCH_SET=serving`
+  applies the serving patches in `patches/serving/`. `cmake --build build-serving --target
+  radiance_core` then configures radiance's own build tree, `build-serving/radiance-build`, and
+  builds the engine libraries in it; the parent's configure only makes that directory, so the
+  sub-build has no cache before this step and nothing can be built there. `cmake --build
+  build-serving/radiance-build --target radiance` builds the server from that cache
+  (`build-serving/radiance-build/bin/radiance`; the serving tree has no `r97train`).
   Section 7 serves the trained adapter with it and measures the loss radiance computes for that
   adapter, through the same `--lora` / `--kld-lora` the deployment serves with (issue #61); that
   step also needs `curl` for the completion and `python3` for `tools/kld_loss.py`. A run without

@@ -296,6 +296,11 @@ line's own flag, not a configuration key.
 Exactly one of `steps` and `epochs` is positive. `out`, and the values marked **must be set**,
 are required because their `Config` default is outside the valid range.
 
+The `empty` in the default column is the table's word for an empty string or an empty list; a file
+writes an empty value as nothing after the `=`. So `out = ` is empty — refused, since `out` is
+required — while `out = empty` is the directory named `empty`, like any other value: what
+`r97train config` prints reads back to the same `Config`, the word included.
+
 The default column is `include/r97/config.h`: a default lives there and nowhere else, and
 `r97train config` prints it from a default-constructed `Config`. `tests/cmake/config_schema_test.sh`
 keeps this table and the binary's schema equal — a key, a type, a default or a range edited here is
