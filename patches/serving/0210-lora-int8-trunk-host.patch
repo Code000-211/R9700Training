@@ -74,16 +74,6 @@ index 353a637..4623465 100644
      lora_table_.reset(cfg_.lora.slots(), &lora_epoch_);
      return RAD_OK;
  }
-@@ -303,6 +359,9 @@
-             return s;
-         }
-     }
-+    /* In-memory factors are read in the container's configured input basis, as a file adapter
-+     * reads its own; the trainer's Delta hands the values the engine will use. */
-+    for (lora::AdapterInfo& info : infos) info.input_basis = cfg_.lora.input_basis;
-     {
-         const int s = lora::check_placed(infos, err, &ranks_[0]->program, &lora_targets_);
-         if (s < 0) return s;
 diff --git a/core/lora/config.h b/core/lora/config.h
 index bf08120..2680a35 100644
 --- a/core/lora/config.h

@@ -1,0 +1,30 @@
+Concern: in-memory adapter factors read the container's configured basis (applies on 0201 and 0210)
+Upstream: not-submitted
+diff --git a/core/engine_lora.cpp b/core/engine_lora.cpp
+index 4623465..20226ad 100644
+--- a/core/engine_lora.cpp
++++ b/core/engine_lora.cpp
+@@ -352,20 +352,23 @@ int Engine::lora_set_weights(const std::string& name,
+     std::vector<lora::AdapterInfo> infos(ranks_.size());
+     std::vector<std::vector<lora::PackedSite>> packed(ranks_.size());
+     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+         const int s = lora::pack_modules(ranks_[ri]->lora_sites, (int)cfg_.lora.rank(false), mods,
+                                          &infos[ri], &packed[ri], err);
+         if (s < 0) {
+             if (ranks_.size() > 1 && err) *err = fmt("rank %zu: ", ri) + *err;
+             return s;
+         }
+     }
++    /* In-memory factors are read in the container's configured input basis, as a file adapter
++     * reads its own; the trainer's Delta hands the values the engine will use. */
++    for (lora::AdapterInfo& info : infos) info.input_basis = cfg_.lora.input_basis;
+     {
+         const int s = lora::check_placed(infos, err, &ranks_[0]->program, &lora_targets_);
+         if (s < 0) return s;
+     }
+ 
+     const int copied = lora_copy(slot, packed, err);
+     if (copied < 0) return copied;
+     if (!loaded) lora_table_.publish(slot, name, "memory");
+     if (slot_out) *slot_out = slot;
+     if (!infos.empty()) {
