@@ -39,8 +39,7 @@ calls the join. See
 | --- | --- | --- | --- | --- | --- | --- |
 | `patches/serving/0201-lora-set-weights.patch` | serving | 75 | 0 | 85 | not-submitted | put an adapter slot in service from factors already in memory, not only from a directory |
 | `patches/serving/0201-narrow-head-gate.patch` | serving | 6 | 3 | 15 | not-submitted | an int8 attention gate on a head narrower than the 128-column quantiser group |
-| `patches/serving/0210-lora-int8-trunk-host.patch` | serving | 290 | 28 | 325 | not-submitted | a LoRA adapter on the rotated int8 trunk, through the host kernels |
-| `patches/serving/0212-lora-set-weights-basis.patch` | serving | 3 | 0 | 10 | not-submitted | in-memory adapter factors read the container's configured basis (applies on 0201 and 0210) |
+| `patches/serving/0210-lora-int8-trunk-host.patch` | serving | 303 | 29 | 340 | not-submitted | a LoRA adapter on the rotated int8 trunk, through the host kernels |
 | `patches/training/0101-issue-observer.patch` | training | 152 | 0 | 170 | not-submitted | an optional issue observer and layer block brackets on the runtime context |
 | `patches/training/0102-replay-block.patch` | training | 114 | 19 | 150 | not-submitted | re-running one block of a step from a restored residual, after its ops have run |
 | `patches/training/0103-prefill-logits.patch` | training | 201 | 20 | 240 | not-submitted | a training-fixture prefill that keeps every position's logits, driven through the engine |
@@ -74,11 +73,13 @@ what it removed from each patch, is in `docs/reports/2026-11-11-patch-audit.md`.
 - `0201` is serving: radiance's service API loads an adapter from a directory, so a slot from
   factors already in memory needs an entry point. It reuses the slot and the swap the engine
   already has.
-- `0212` is three lines and only three: `Engine::lora_set_weights` builds its factors from the
-  caller's map, so the basis the container was configured for (`0210`'s `cfg_.lora.input_basis`)
-  has to be copied into each of them, as a file adapter reads its own from its header. It edits the
-  function `0201` introduces and names the container field `0210` adds, so it is written against
-  that pair and applies only on it: it is the one patch of the three that cannot be upstreamed
-  alone, it says so in its `Concern` line, and its ten lines of context are what makes it fail to
-  apply anywhere but inside that function. `0211` is reserved in `docs/PLAN.md` for issue 51's
+- `0210` carries the int8 trunk end to end, and with it one step of the in-memory path: the
+  factors `0201`'s `Engine::lora_set_weights` builds arrive in the basis the sites are fed, as a
+  file adapter's do from their own header (`docs/ADAPTER.md` §4). `build_sites` records
+  `cfg_.lora.input_basis` on each site, `lora::pack_modules` puts it in the `AdapterInfo` it
+  returns, and `lora::load_adapter` keeps the basis a file's header declares. It is written that
+  way, rather than as a copy out of the engine's config in `lora_set_weights`, because that
+  function belongs to `0201`: a line inside it has no context on a bare radiance and so cannot stand
+  in a patch of its own, and every patch of this set applies on the pin by itself. That is why its
+  budget rises from 325 to 340 as well. `0211` is reserved in `docs/PLAN.md` for issue 51's
   int8-code LoRA on the R9700 kernels.

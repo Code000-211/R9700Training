@@ -346,10 +346,13 @@ activation basis. The host step therefore tags its records and selects a code-ba
 `gemm_nt_q` (`src/adjoint/host/host_step_record.h`); the family row and its finite-difference
 check are unchanged.
 
-The adapter is initialised in the basis the container names. `Engine::lora_set_weights` copies
-`cfg_.lora.input_basis` into every in-memory factor (patch `0212`, which applies on `0201` and
-`0210`), as a file adapter already did from its own header, so a live adapter on the rotated trunk
-is read in the same basis as the container's int8 rows.
+The adapter is initialised in the basis the container names. `Engine::lora_set_weights` builds its
+factors from the caller's map, so the basis the container was configured for has to reach them, as
+a file adapter reads its own from its header: `build_sites` records `cfg_.lora.input_basis` on
+every site and `lora::pack_modules` copies it into the `AdapterInfo` it returns (patch `0210`).
+Reading it from the sites rather than from the engine's config keeps that out of `0201`'s function,
+so `0210` still applies on a bare radiance. A live adapter on the rotated trunk is thus read in the
+same basis as the container's int8 rows.
 
 The head's int8 weight is joined into one buffer by the engine: a `RadPlanesHeader`, then the codes,
 then a scale per group. The ABI's byte count for the operand is the codes' declared elements, so a
