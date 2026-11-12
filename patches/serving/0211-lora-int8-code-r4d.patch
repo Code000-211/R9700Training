@@ -22,7 +22,7 @@ index e796bfd..87a4140 100644
  - `lora_expand`: `y[m, n] = y[m, n] + scale[s, n] · Σ_j t[m, j] · lora_b[s, n, j]`, f32
    accumulate, one rounding to `y`'s dtype (`bf16`/`f16`/`f32`, named by `dtype`). `lora_b` is
 diff --git a/libhalo/halo_lora_bf16.hip b/libhalo/halo_lora_bf16.hip
-index 74e8904..86f8231 100644
+index 74e8904..d843be3 100644
 --- a/libhalo/halo_lora_bf16.hip
 +++ b/libhalo/halo_lora_bf16.hip
 @@ -67,6 +67,15 @@ namespace halo_lora {
@@ -96,17 +96,18 @@ index 74e8904..86f8231 100644
      if (!on) return zero_frag();
      if (ADT == kBF16) {
          const uint16_t* p = (const uint16_t*)a + row;
-@@ -595,6 +614,21 @@ __device__ __forceinline__ v16bf ld_act_frag(const void* a, long long row, int k
+@@ -595,6 +614,22 @@ __device__ __forceinline__ v16bf ld_act_frag(const void* a, long long row, int k
      }
      const uint8_t* p = (const uint8_t*)a + row;
      union { uint16_t h[16]; uint4 w[1]; v16bf f; } u;
 +    if (ADT == kI8 && step) {
 +        if (V && k0 + 16 <= K) {
 +            u.w[0] = *(const uint4*)(p + k0);
-+            const uint8_t* b = (const uint8_t*)&u.w[0];
++            uint16_t h[16];
 +#pragma unroll
-+            for (int e = 0; e < 16; ++e)
-+                u.h[e] = (uint16_t)code_bf16<ADT>(b[i8_step_pos(e)]);
++            for (int e = 0; e < 16; ++e) h[e] = (uint16_t)code_bf16<ADT>(((const uint8_t*)&u.w[0])[i8_step_pos(e)]);
++#pragma unroll
++            for (int e = 0; e < 16; ++e) u.h[e] = h[e];
 +            return u.f;
 +        }
 +#pragma unroll
@@ -118,7 +119,7 @@ index 74e8904..86f8231 100644
      if (V && k0 + 16 <= K) {
          u.w[0] = *(const uint4*)(p + k0);
          uint16_t h[16];
-@@ -668,8 +702,8 @@ __global__ __launch_bounds__(kShThreads) void lora_shrink_wmma_kernel(ShrinkTArg
+@@ -668,8 +703,8 @@ __global__ __launch_bounds__(kShThreads) void lora_shrink_wmma_kernel(ShrinkTArg
                  const int k = su * kShStep;
                  af[u][0] = ld_pool_frag<VA>(ap, k, A.K, A.la_s2, aon && in);
                  af[u][1] = ld_pool_frag<VA>(ap, k + 16, A.K, A.la_s2, aon && in);
