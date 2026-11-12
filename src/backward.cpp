@@ -10,6 +10,7 @@
 #include "r97/backward.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <map>
 #include <set>
@@ -40,6 +41,15 @@ int64_t cols_of(const std::vector<int64_t>& shape) {
 
 std::string rows_text(int64_t lo, int64_t hi) {
     return "[" + std::to_string(lo) + ", " + std::to_string(hi) + ")";
+}
+
+std::string shape_text(const std::vector<int64_t>& shape) {
+    std::string out = "[";
+    for (size_t d = 0; d < shape.size(); ++d) {
+        if (d) out += ", ";
+        out += std::to_string(shape[d]);
+    }
+    return out + "]";
 }
 
 int64_t payload_bytes(const AdValue& v) {
@@ -78,10 +88,14 @@ struct Segment {
 };
 
 // A written operand that is also the op's input, though no separate read names it: rope's
-// in-place write and the recurrent/conv state buffers. The prior version is the read.
+// in-place write and the recurrent/conv state buffers. The prior version is the read. The issue
+// record marks such an operand (`Operand::in_place`, a RAD_OPD_INOUT operand); a record built from
+// a program instead of the live tape may not carry the mark, so the two shapes the ops always
+// have -- rope's operand 0, and a `kv:` buffer no separate read names -- are recognised here too.
 bool in_place_read(const OpRecord& rec, size_t j) {
     const Operand& o = rec.operands[j];
     if (!o.written) return false;
+    if (o.in_place) return true;
     if (rec.op == "rope" && j == 0) return true;
     if (o.buffer.rfind("kv:", 0) != 0) return false;
     for (size_t k = 0; k < rec.operands.size(); ++k)
@@ -148,7 +162,7 @@ Plan make_plan(const std::vector<OpRecord>& records) {
         plan.read_segments[i].resize(rec.operands.size());
         // Reads first: an op that writes the buffer it reads sees the version before its own.
         // rope is recorded with only its in-place write, so operand 0 is also its read: name that
-        // prior version here and hand its adjoint's cotangent back to it below.
+        // prior version here, and the walk hands its adjoint's cotangent back to it below.
         for (size_t j = 0; j < rec.operands.size(); ++j) {
             const bool in_place = in_place_read(rec, j);
             if (rec.operands[j].written && !in_place) continue;
@@ -192,6 +206,12 @@ const AdValue* StoredSnapshots::at(int64_t position, size_t operand) const {
     return it == values_.end() ? nullptr : &it->second;
 }
 
+int64_t StoredSnapshots::bytes() const {
+    int64_t total = 0;
+    for (const auto& entry : values_) total += payload_bytes(entry.second);
+    return total;
+}
+
 // ---------------------------------------------------------------- the walk
 
 BackwardResult backward_block(const std::vector<OpRecord>& records,
@@ -230,6 +250,28 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         v.cot.clear();
         v.cot.shrink_to_fit();
         v.live = false;
+    };
+
+    // A view operand is snapped packed over its own shape (see snapshot in step_host.cpp); its
+    // cotangent comes back the same way. Scatter it into the layout the buffer's other readers and
+    // writers add up in, so the projection that wrote the buffer sees what it contributed.
+    const auto dense_view = [](const Operand& op, const std::vector<double>& view,
+                               int64_t rows, int64_t cols) {
+        if (op.view_shape.empty() || cols <= 0) return std::vector<double>();
+        std::vector<double> full(static_cast<size_t>(std::max<int64_t>(rows * cols, 0)), 0.0);
+        const size_t rank = op.view_shape.size();
+        std::vector<int64_t> idx(rank, 0);
+        for (size_t e = 0; e < view.size(); ++e) {
+            int64_t flat = op.view_off;
+            for (size_t d = 0; d < rank; ++d) flat += idx[d] * op.view_stride[d];
+            if (flat >= 0 && flat < static_cast<int64_t>(full.size()))
+                full[static_cast<size_t>(flat)] += view[e];
+            for (size_t d = rank; d-- > 0;) {
+                if (++idx[d] < op.view_shape[d]) break;
+                idx[d] = 0;
+            }
+        }
+        return full;
     };
 
     // Add the rows [lo, hi) of a full-buffer, row-major tensor into a version's written rows.
@@ -363,9 +405,14 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             if (!v)
                 refuse("op '" + rec.op + "' at position " + std::to_string(rec.position) +
                        " has no snapshot for operand '" + rec.operands[j].buffer + "'");
-            if (v->shape != rec.operands[j].shape)
+            // A view operand is snapped as the kernel saw it: its own shape, not the buffer's.
+            const std::vector<int64_t>& want = rec.operands[j].view_shape.empty()
+                                                   ? rec.operands[j].shape
+                                                   : rec.operands[j].view_shape;
+            if (v->shape != want)
                 refuse("op '" + rec.op + "' at position " + std::to_string(rec.position) +
-                       ": operand '" + rec.operands[j].buffer + "' is snapped with another shape");
+                       ": operand '" + rec.operands[j].buffer + "' is snapped with shape " +
+                       shape_text(v->shape) + ", not " + shape_text(want));
             if (v->value.size() != static_cast<size_t>(numel(v->shape)))
                 refuse("op '" + rec.op + "' at position " + std::to_string(rec.position) +
                        ": operand '" + rec.operands[j].buffer + "' is snapped with " +
@@ -378,8 +425,10 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
 
         // The cotangent of every operand the op wrote, writes' order.
         std::vector<AdValue> cot;
+        std::vector<int> cot_index(rec.operands.size(), -1);
         for (size_t j = 0; j < rec.operands.size(); ++j) {
             if (!rec.operands[j].written) continue;
+            cot_index[j] = static_cast<int>(cot.size());
             Version& v = version_at(i, j);
             AdValue c;
             c.dtype = v.dtype;
@@ -411,15 +460,55 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         }
 
 
-        const AdjointCall call{rec, fwd, cot, &dc, options.grads, options.prefix, options.slot_prefix};
-        fn(call);
+        // The adjoint sees the record the caller prepared when it wants one: the walk keeps the
+        // tape's own record for its versions, boundaries and snapshots.
+        // The join may hand the adjoint a record whose names and rows differ from the tape's; the
+        // walk keeps the tape's record for versions, boundaries and snapshots.
+        OpRecord named;
+        const OpRecord* adjoint_rec = &rec;
+        if (options.prepare_record) {
+            options.prepare_record(rec, &named);
+            adjoint_rec = &named;
+        }
 
-        // The writers' adjoint has run: their cotangent storage is done.
+        std::string record_prefix;
+        const char* prefix = options.prefix;
+        if (options.record_prefix) {
+            record_prefix = options.record_prefix(rec);
+            prefix = record_prefix.c_str();
+        }
+        AdjointCall call{*adjoint_rec, fwd, cot, &dc, options.grads, prefix};
+        call.fused_slots = options.fused_slots;
+        AdjointCall with_slots = call;
+        if (options.slot_prefix)
+            with_slots.slot_prefix = [&rec, &options](int64_t slot) {
+                return options.slot_prefix(rec, slot);
+            };
+        fn(with_slots);
+
+        if (options.in_place_passthrough) {
+            // An adjoint either describes what a read takes or leaves the slot it would write empty.
+            // An empty slot on an in-place operand is the op's direct path: the value the write
+            // replaced carries the write's cotangent unchanged (an expand adds its branch to y
+            // without touching the read's slot; a mul, a rope or a state update fill theirs).
+            for (size_t j = 0; j < rec.operands.size(); ++j) {
+                if (!in_place_read(rec, j) || cot_index[j] < 0) continue;
+                double written = 0.0;
+                for (double v : dc[j].value) written += std::fabs(v);
+                if (written == 0.0)
+                    dc[j].value = cot[static_cast<size_t>(cot_index[j])].value;
+            }
+        }
+
+        // The writers' adjoint has run: their cotangent storage is done. Nothing below reads a
+        // written version's cotangent again.
         for (size_t j = 0; j < rec.operands.size(); ++j)
             if (rec.operands[j].written && plan.write_version[i][j] >= 0)
                 release(version_at(i, j));
 
-        // Hand what the adjoint produced to the versions each read saw, or out of the block.
+        // Hand what the adjoint produced to the versions each read saw, or out of the block. An
+        // in-place write's cotangent is also what the value it replaced takes: its read segments
+        // name that prior version, so it travels the same way a read's does.
         const std::vector<int> frozen = adjoint_frozen(rec.op, options.side, rec.params);
         const std::set<size_t> frozen_at(frozen.begin(), frozen.end());
         for (size_t j = 0; j < rec.operands.size(); ++j) {
@@ -428,16 +517,20 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             if (frozen_at.count(j)) continue;
             const int64_t bi = plan.by_name.at(rec.operands[j].buffer);
             Buffer& b = plan.buffers[static_cast<size_t>(bi)];
-            if (dc[j].value.size() != static_cast<size_t>(b.rows * b.cols))
+            const std::vector<double> dense = dense_view(rec.operands[j], dc[j].value, b.rows,
+                                                         b.cols);
+            const std::vector<double>& values = dense.empty() ? dc[j].value : dense;
+            if (values.size() != static_cast<size_t>(b.rows * b.cols))
                 refuse("op '" + rec.op + "': adjoint left operand '" + rec.operands[j].buffer +
-                       "' with " + std::to_string(dc[j].value.size()) + " values, not " +
+                       "' with " + std::to_string(values.size()) + " values, not " +
                        std::to_string(b.rows * b.cols));
             for (const Segment& seg : plan.read_segments[i][j]) {
-                if (seg.version >= 0)
+                if (seg.version >= 0) {
                     add_version_full(b.versions[static_cast<size_t>(seg.version)], seg.row_lo,
-                                     seg.row_hi, dc[j].value);
+                                     seg.row_hi, values);
+                }
                 else
-                    add_input_full(b, seg.row_lo, seg.row_hi, dc[j].value);
+                    add_input_full(b, seg.row_lo, seg.row_hi, values);
             }
         }
     }

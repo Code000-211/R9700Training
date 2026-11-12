@@ -29,7 +29,9 @@ two header lines and any explanation) is free; only the diff counts.
 `-DR97_PATCH_SKIP=<number>` leaves out every patch whose number (the leading digits of its file
 name) is `<number>`, which is how a build proves that a patch is optional. A build with
 `-DR97_PATCH_SKIP=0102` has the issue observer but no layer replay; the host tier skips the two
-replay tests by name. See `docs/reports/2026-11-11-patch-audit.md`.
+replay tests and the ten host-join cases by name, and `r97train grad` is not registered because it
+calls the join. See
+`docs/reports/2026-11-11-patch-audit.md`.
 
 ## The patches
 
@@ -44,6 +46,8 @@ replay tests by name. See `docs/reports/2026-11-11-patch-audit.md`.
 | `patches/training/0104-prefill-lora.patch` | training | 16 | 0 | 25 | not-submitted | let the fixture prefill run one named adapter slot, so an in-memory update is one step away |
 | `patches/training/0105-prefill-not-sampled.patch` | training | 38 | 8 | 55 | not-submitted | a prefill that draws no token -- no sampler op, and a prompt of exactly the context fits |
 | `patches/training/0119-issue-observer-hook.patch` | training | 12 | 0 | 20 | not-submitted | the training tape attaches to a RadCtx, and the Engine is the only owner of it |
+| `patches/training/0120-view-operands.patch` | training | 21 | 0 | 25 | not-submitted | the issue record names a narrowing view but not where its values are |
+| `patches/training/0121-issue-inout-mark.patch` | training | 2 | 0 | 8 | not-submitted | an operand whose kernel also reads the value it replaces is marked as such |
 
 Every patch is `not-submitted` at this pin. None is `merged`: none is in radiance's `origin/main`.
 Moving one to `open` or `merged` changes only its own row and `Upstream:` line, in the pull request
