@@ -81,13 +81,6 @@ const r97::Param* find_param(const r97::ParamSet& set, const std::string& name) 
     return nullptr;
 }
 
-double norm(const r97::ParamSet& set) {
-    double sum = 0.0;
-    for (const r97::Param& p : set)
-        for (float v : p.value) sum += double(v) * double(v);
-    return std::sqrt(sum);
-}
-
 bool ends_with(const std::string& s, const char* suffix) {
     const std::string tail(suffix);
     return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
