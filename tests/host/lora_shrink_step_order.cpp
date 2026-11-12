@@ -7,7 +7,7 @@
 // codes are stored: quant_act_i8 writes them in the int8 WMMA's step order at w4a8/w8a8/w2a8 (the
 // middle dwords of every 16-byte step exchanged) and the rotated producers write column order.
 //
-// patches/serving/0210-lora-int8-trunk-host.patch makes libref's lora_shrink unexchange the step
+// patches/serving/0210-lora-int8-trunk.patch makes libref's lora_shrink unexchange the step
 // order when `gemm_dtype` names one of those. The int8 fixture's trunk is i8a8h, whose codes are
 // already in column order, so the fixture test exercises only the column-order reading; this runs
 // the reference kernel directly, with the parameter set radiance declares at such a site: the

@@ -84,10 +84,10 @@ exchanged" — the middle two dwords of each sixteen-byte step are exchanged, ho
 `libavx/avx_quant.cpp:53`). That order belongs to the per-row quantiser, **not** to
 `quant_act_i8g` / `had_quant_act_i8g`, which `qwen35_w8a8`'s sites use: their codes are plain
 column order. `lora_shrink` reads codes by column, so an adapter over a step-order site would be
-wrong — which is why radiance refused it (§3). Patch `0210` lifts that refusal on the host kernels
-(`libref`, `libavx`) by unexchanging the middle dwords when it builds a column-ordered `x`, and
-patch `0211` does the same on the card (`libr4d`, `libhalo`); the `i8a8h` sites of this contract
-need only the column-order path above. What says which order a
+wrong — which is why radiance refused it (§3). Patch `0210` lifts that refusal everywhere by unexchanging the middle dwords: the host rows
+(`libref`, `libavx`) do it when they build a column-ordered `x`, the card rows (`libr4d`,
+`libhalo`) do it in the kernel; the `i8a8h` sites of this contract need only the column-order path
+above. What says which order a
 shrink's codes are in is the encoding of the GEMM whose activation it reads, so the patch has the
 core declare `lora_shrink` with a `gemm_dtype` parameter holding that GEMM's own `dtype` string
 (`i8a8h`, `w8a8`, ...). `dtype` alone cannot: it is the activation's element dtype, `i8` at every

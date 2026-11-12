@@ -1,6 +1,6 @@
 // tests/host/lora_w8a8.cpp -- a LoRA adapter on the rotated int8 trunk, through the host kernels.
 //
-// patches/serving/0210-lora-int8-trunk-host.patch lifts, for an adapter that declares
+// patches/serving/0210-lora-int8-trunk.patch lifts, for an adapter that declares
 // `"radiance_input_basis": "fwht128"` (the key docs/ADAPTER.md defines), both refusals in
 // core/lora/lora.cpp: the weight "stored in the 'fwht128' transform basis" one and the step-order
 // dtype one (w4a8/w8a8/w2a8), because the host lora_shrink form now unexchanges quant_act_i8's

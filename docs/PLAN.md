@@ -54,7 +54,7 @@ No speed target is set; the issues ask for measurements next to the forward's ti
 | Loss and trainable kind | Not built into the engine. An `Objective` owns the loss and names, as `Seed`s, the forward buffers where its gradient enters the tape. A `Delta` owns the trainable parameters, their initialisation and how they cross to radiance. A `Model` is one of each. First pair: `CeObjective` with `LoraDelta`. |
 | Contracts from the start (Q1) | `objective.h`, `delta.h` and `config.h` are contract headers of issue 0. The reference loss, the adapter, the forward driver, the backward core and the joins are written against them; nothing is hardcoded and migrated later. Issue 59 lands beside issue 0. |
 | Two milestones (Q2) | The first stays plain assistant-turn cross-entropy (issues 54 and 56). The ALoDLM objective is the second (issues 62 to 65), separate, on the same base. |
-| Patch sets | `patches/serving/` (`0201`, `0210`, `0211`) is what a radiance needs to serve an adapter trained here; it must stand alone and is what goes upstream. `patches/training/` (`0101`, `0102`) is what only the trainer needs. `-DR97_PATCH_SET=serving` builds the serving radiance. |
+| Patch sets | `patches/serving/` (`0201`, `0210`) is what a radiance needs to serve an adapter trained here; it must stand alone and is what goes upstream. `patches/training/` (`0101`, `0102`) is what only the trainer needs. `-DR97_PATCH_SET=serving` builds the serving radiance. |
 | Training and serving | They share the card and never run at once. The trainer exits, then the serving-only radiance loads the adapter directory. |
 | A step without a card | `ReferenceStepFn`: the tiny fixture's op graph in f64 from the twins and the host adjoints. No value comes from a radiance kernel, no kernel library is loaded on the `--program` path, no Python, no card; the default path runs the host kernel chain once per batch and keeps only its `OpRecord`s, and both paths read the weights through `rad_core`'s reader. The loop, the checkpoint and the resume are tested on it. |
 | Seam to radiance | As small as possible: kernels and adjoints stay behind radiance's plugin ABI; every patch has one concern, a size budget and an upstream status in `docs/UPSTREAM.md`. |
@@ -207,7 +207,7 @@ backward core wait for it. It is small and needs no model.
 |---|---|---|---|---|
 | 35 | 5 | Host backward on the bf16 trunk, checked end to end by finite differences and against the PyTorch reference | 15, 17, 18, 23, 29 to 33 | none |
 | 39 | 5 | Device forward on the real container at 4096 tokens | 5, 17 to 19 | one |
-| 51 | 5 | radiance patch `0211`: int8-code LoRA on the R9700 kernels | 5, 16 | one |
+| 51 | 5 | radiance patch `0210`, card side: int8-code LoRA on the R9700 kernels | 5, 16 | one |
 | 60 | 5 | `ReferenceStepFn`: the tiny fixture in f64 from the twins, `train --reference` | 6, 11, 12, 17, 20 to 29, 33, 34 | none |
 | 66 | 5 | Patch-surface audit, size budgets, `docs/UPSTREAM.md` | 0, 8, 15, 32 | none |
 | 36 | 6 | Host backward on the int8 trunk, checked by descent | 13, 16, 22, 35 | none |

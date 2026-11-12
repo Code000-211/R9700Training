@@ -1,8 +1,8 @@
 // tests/gpu/lora_shrink_step_order_r4d.cpp -- libr4d's lora_shrink reads a step-order
 // activation, on the card.
 //
-// patches/serving/0211-lora-int8-code-r4d.patch replaces the RAD_E_UNSUPPORTED refusal that
-// 0210 left in libr4d's (and libhalo's) lora_shrink with the read itself: when `gemm_dtype`
+// the serving patch `0210` replaces the RAD_E_UNSUPPORTED refusal that libr4d's (and
+// libhalo's) lora_shrink once raised with the read itself: when `gemm_dtype`
 // names a GEMM whose `quant_act_i8` wrote the codes in the int8 WMMA's step order (w4a8/w8a8/
 // w2a8), each column's codes are multiplied by the lora_a factor of that column. The i8a8h
 // trunk -- codes in column order -- keeps the plain reading: the gate is the GEMM's encoding,
