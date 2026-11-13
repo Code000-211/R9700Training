@@ -31,10 +31,13 @@ half is:
 | `0201-narrow-head-gate.patch` | an int8 attention gate on a head narrower than the 128-column quantiser group | the `w8a8_fwht128` container's gated attention |
 | `0210-lora-int8-trunk.patch` | a LoRA adapter on the rotated int8 trunk, through the host and card kernels | the adapter this deployment serves, on `libavx`/`libref` and on `libr4d` |
 
-`0201-lora-set-weights.patch` is the trainer's half of the same hook, and it stays in the serving
-set because radiance's own loader and the trainer's live slot go through one code path: the
-serving set is what a radiance needs to serve an adapter trained here, and it stands alone. The
-prefill half, `0202` to `0205`, is described in section 5.
+`0201-lora-set-weights.patch` is in the serving set because radiance's own loader puts an adapter
+in service through it, and the trainer's live slot goes through the same code path: the serving
+set is what a radiance needs to serve an adapter trained here, and it stands alone. The
+trainer's prefill mode is not in it: `run_prefill`, its adapter slot (`0104`) and its adapter
+lookup (`0106`) exist for `r97train loss`'s pass and no serving process calls them. What a
+deployment answers a prefill with is radiance's own server and KL mode, which stand in the pinned
+engine, and section 5 is the measured serve.
 
 ## 2. The build
 
@@ -99,11 +102,20 @@ names it. The server has no `--device` of its own; `ROCR_VISIBLE_DEVICES` is wha
 reads, before anything opens the engine:
 
 ```sh
-ROCR_VISIBLE_DEVICES=0 bin/radiance --model tiny_qwen35_w8a8.rad \
+ROCR_VISIBLE_DEVICES=0 bin/radiance --model qwen3.8-27b-iq4r-s-v4.rad \
              --radiance-home radiance_home \
-             --lora trained=/runs/runbook/checkpoint-000000010/adapter \
+             --lora trained=/runs/run-real/checkpoint-000000010/adapter \
              --kernels libr4d,libavx,libref
 ```
+
+The container matters on this side: the int8 fixture's geometry (`head_dim 32`, `head_k 16`)
+has no `libr4d` kernel (`tests/gpu/device_forward.cpp` records why), so the card's serve is the
+real container with the adapter a real run trained, not the fixture the host's checks use. A
+serving build still has to accept an adapter shaped for that container, and that is what
+`tests/gpu/serving_container.cpp` takes on the card. Until a real run has handed one over,
+the card test writes a rank-4 `down_proj` adapter for the container's own targetable linears
+through `write_adapter` (the writer `tools/train.cpp` uses) and holds the serve to the base
+model's own loss: the adapter must be accepted and must move the number.
 
 `--kernels` names the libraries the serve runs on, and on the card that list matters: the trainer's
 `loss --device` runs on `libr4d,libavx,libref` (`tools/loss.cpp`), a HIP serving home also holds
@@ -129,13 +141,16 @@ claims the card has to show the first of them. What runs under it is libr4d's `l
 
 ## 5. What makes a serve a checked one
 
-The first check is exact: the serving build's logits for a prompt with a trained adapter are the
-default build's, bit for bit. `tests/host/serving_prefill.cpp` runs the int8 fixture's prefill
-with `tests/fixtures/serving_adapter` — an adapter `r97train` wrote — and compares every float
-to `tests/fixtures/serving_prefill_logits.bin`, which the same test wrote in the default build.
-Both trees run it: the prefill is serving's (`patches/serving/0202`, `0203`), so neither test
-needs the observer or the replay patch. A serving build that rounded differently, or dropped the adapter,
-fails on the bytes before any loss is computed.
+The first check is exact: the serving build's answer for a corpus with a trained adapter is the
+default build's, bit for bit. `tests/host/serving_prefill.cpp` serves the int8 fixture through
+`tests/fixtures/serving_adapter` — an adapter `r97train` wrote — with radiance's own KL-scored
+prefill (`--kld-record`, `--kld-lora trained`), and compares every recorded row (the next-token
+NLL and the row's entropy) to `tests/fixtures/serving_rows.f32`, which the same test wrote in the
+default build. Both trees run it: the prefill is the server's and the KL mode is in the pinned
+engine, so the test needs neither the observer nor the replay patch nor anything else in
+`patches/training/`. It also serves the same corpus with no adapter and requires the loss to
+differ, so an adapter a build silently dropped cannot pass on the bytes. That exact check is what
+holds the adapter path to the number a training run measured.
 
 The second check is the trainer's own number, at `1e-4` relative (`docs/EVAL.md`). Radiance's KL
 mode scores the run's held-out corpus for the
@@ -151,7 +166,7 @@ python3 tools/kld_loss.py /runs/runbook-resumed/kld/served
 ```
 
 On the fixture, with the runbook's ten-step run and a host-only serving build, the trainer's
-`loss --lora` is `4.66220409013` and the serving build's record is `4.66220409289`: `6e-10`
+`loss --lora` is `4.2615519630392633` and the serving build's record is `4.26155194807`: `3.5e-9`
 relative, so what the deployment computes is the trainer's number to the digits it prints. That
 measurement is `tests/host/runbook.cpp`'s when it is given the serving tree (`R97_SERVING_BUILD`,
 `docs/TESTING.md`): the test serves the adapter, answers one completion, and prints the two losses
@@ -161,19 +176,23 @@ card number (`loss --device`) and to the host's, both at `1e-4`, with the serve 
 the AQL backend; those numbers belong to the card, so the script is where they are, not this
 document, and no card has taken them yet.
 
-A serve that was not measured is not a checked deployment: the host's exact prefill and its loss
-are measured here, the card's is `tests/gpu/serving_container.cpp`'s under the model label, and
-`tests/model/serving_container.cpp` checks the real container's serving handshake on the host. No
-card has taken the serve yet. Section 7's blocks say in their output which measurement they took and which
-they skipped, and a run without a serving build keeps the trainer's `loss --lora` number alone.
+A serve that was not measured is not a checked deployment: the host's exact served rows and its
+loss are measured here, and the card's adapter path is `tests/gpu/serving_container.cpp`'s under
+the model label (the base container's prefill, then the same prefill through the adapter, and the
+two must differ). `tests/model/serving_container.cpp` checks the real container's serving
+handshake on the host: its arch, its basis, and that the adapter's targets are among its
+targetable linears. The card's *trained* number is the real run's (`docs/RUNBOOK.md` section 7's
+second block, `loss --device` against the served record), and no card has taken it yet: it needs
+the adapter a short real run writes, which is that run's, not a fixture's. Section 7's blocks say
+in their output which measurement they took and which they skipped, and a run without a serving
+build keeps the trainer's `loss --lora` number alone.
 
 ## 6. Upstreaming
 
 Each patch of the serving set carries `Concern:` and `Upstream: not-submitted`, one concern each,
 and is written self-contained so it can go upstream alone. A fresh radiance plus
 `patches/serving/` is a server that loads an adapter trained here; `patches/training/` is the
-trainer's and never enters a deployment. Radiance's prefill and the adapter it runs through are
-serving's:
-`0202-prefill-logits.patch`, `0203-prefill-lora.patch`, `0204-prefill-not-sampled.patch` and
-`0205-preload-adapter.patch`, none of which the observer or replay patch touches.
-`docs/UPSTREAM.md` has the rules for the patch sets and what upstream has answered.
+trainer's and never enters a deployment — its prefill mode and adapter lookup included. A serving
+patch that will not apply or will not build without one of them is a defect to cut in that patch,
+not a reason to move the training patch into this set. `docs/UPSTREAM.md` has the rules for the
+patch sets and what upstream has answered.

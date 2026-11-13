@@ -35,7 +35,7 @@
 #include "r97/step.h"
 #include "r97/tape.h"
 
-// The driver runs radiance's engine, its prefill mode (patches/serving/0202) and the issue
+// The driver runs radiance's engine, its prefill mode (patches/training/0103) and the issue
 // observer (patches/training/0101); it needs the rank's context on the engine (0101, 0119) to
 // record a step. A serving build applies none of the training set, so there is no driver there
 // rather than one that cannot record a step -- the same rule tape.h follows.

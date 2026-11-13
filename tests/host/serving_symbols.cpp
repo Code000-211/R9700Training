@@ -22,13 +22,17 @@
 
 namespace {
 
-// The observer (0101) and the replay entry (0102). The block brackets are the observer patch's,
-// and the replay block is the entry point 0102 adds.
+// The observer (0101) and the replay entry (0102), and the two the trainer's loss pass has and no
+// serving process calls: its prefill driver (0103, Engine::run_prefill) and the adapter lookup it
+// preloads by name (0106, lora::preload_adapter). The block brackets are the observer patch's, and
+// the replay block is the entry point 0102 adds.
 constexpr const char* kTrainingSymbols[] = {
     "rad_set_issue_observer",
     "rad_block_begin",
     "rad_block_end",
     "rad_replay_block",
+    "run_prefill",
+    "preload_adapter",
 };
 
 std::string archive_bytes() {

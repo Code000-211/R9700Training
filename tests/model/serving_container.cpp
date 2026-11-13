@@ -7,14 +7,20 @@
 // read_model_meta). The serving prefill itself is on the card: tests/gpu/serving_container.cpp
 // runs it under the model label, with the card guard.
 //
-// The adapter half is the fixture the trainer wrote (tests/fixtures/serving_adapter, its README
-// has the run). Its factors are the tiny fixture's shapes, so this test checks names and basis,
-// not dimensions; a dimension mismatch is radiance's to refuse when the slot is set.
+// The adapter the *trained* run is served with is the fixture the trainer wrote
+// (tests/fixtures/serving_adapter, its README has the run). Its factors are the tiny fixture's
+// shapes, so this test checks names and basis, not dimensions. The card's serve has no trained
+// 27B adapter to load in the tree, so tests/gpu/serving_container.cpp writes a rank-4 `down_proj`
+// adapter for the linears read here and loads it: radiance accepts it only if its shapes are the
+// container's, which is the dimension check, and the served loss differing from the base's is
+// what says the factors reached the trunk.
 //
 // Label: model. Skipped (exit 77) when the container is absent; docs/DEPLOYMENT.md §4 says where
 // the container and the card sit.
 #include "../support/model_dir.h"
 #include "../support/self_check.h"
+
+#include <algorithm>
 
 #include "r97/adapter_io.h"
 
@@ -59,6 +65,23 @@ void serving_container_can_take_the_trainers_adapter() {
     R97_CHECK(!adapter.config.targets.empty());
     for (const std::string& target : adapter.config.targets)
         R97_CHECK(declares(meta, target));
+    // The card test's adapter targets `down_proj`, and the container must give it a shape: a
+    // linear with both dimensions set, and at most one per layer so the adapter's names are the
+    // container's own modules.
+    std::vector<std::string> layers;
+    int64_t                  down_proj = 0;
+    for (const r97::ModelMeta::Linear& linear : meta.targetable) {
+        const std::string& module = linear.module;
+        if (module.size() < 10 || module.compare(module.size() - 10, 10, ".down_proj") != 0)
+            continue;
+        R97_CHECK(linear.in > 0);
+        R97_CHECK(linear.out > 0);
+        layers.push_back(module.substr(0, module.size() - 10));
+        ++down_proj;
+    }
+    R97_CHECK(down_proj > 0);
+    std::sort(layers.begin(), layers.end());
+    R97_CHECK(std::adjacent_find(layers.begin(), layers.end()) == layers.end());
     std::printf("  model: %lld layers, %zu targetable linears, basis %s;"
                 " adapter targets %zu modules\n",
                 (long long)meta.layers, meta.targetable.size(), meta.input_basis.c_str(),

@@ -17,7 +17,7 @@
 #include "support/fixture_w8a8.h"
 #include "support/test.h"
 
-#if R97_FIXTURE_PREFILL && defined(R97_HAS_R97TRAIN)
+#if R97_FIXTURE_PREFILL
 
 #include <cstdio>
 #include <cstdlib>
@@ -196,7 +196,7 @@ void check_one(const std::string& container, const std::string& which) {
             throw std::runtime_error(what + "op '" + row.op + "' has no count");
         counted += count;
         // The sampler is absent because the prefill driver asks for no token
-        // (patches/serving/0204), not because a filter here drops its ops: every issue the step
+        // (patches/training/0105), not because a filter here drops its ops: every issue the step
         // made has a row, so an op the inventory forgets fails the count above rather than going
         // unnoticed.
         if (row.path != "yes" && row.path.rfind("no: ", 0) != 0)
@@ -230,4 +230,4 @@ R97_TEST(ops_inventory_w8a8_fixture) { check_one(fixtures().w8a8, "w8a8 fixture"
 
 }  // namespace
 
-#endif  // R97_FIXTURE_PREFILL && R97_HAS_R97TRAIN
+#endif  // R97_FIXTURE_PREFILL

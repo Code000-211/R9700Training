@@ -39,7 +39,7 @@
 #include <sys/wait.h>
 #include <vector>
 
-#if R97_FIXTURE_PREFILL && defined(R97_HAS_R97TRAIN)
+#if R97_FIXTURE_PREFILL
 
 namespace {
 
@@ -457,4 +457,4 @@ R97_TEST(train_cli_dry_run_resolves_and_writes_nothing) {
     R97_CHECK(!fs::exists(root / "out2"));
 }
 
-#endif  // R97_FIXTURE_PREFILL && R97_HAS_R97TRAIN
+#endif  // R97_FIXTURE_PREFILL

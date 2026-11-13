@@ -39,18 +39,23 @@ A serving build (`cmake -B build-serving -G Ninja -DR97_PATCH_SET=serving`) appl
 `patches/training/`, and the tests that describe a deployment have to pass there: the same sources
 are globbed in either build, so a check that compiles away in the serving build has to say so (with
 `R97_FIXTURE_PREFILL`, or the `R97_HAS_R97TRAIN` guard) rather than be named by a build rule.
-`tests/host/serving_prefill.cpp` answers an int8-fixture prefill with an adapter and holds the
-logits to `tests/fixtures/serving_prefill_logits.bin` bit for bit; `tests/host/serving_symbols.cpp`
-reads the built `rad_core` archive and fails when a serving build carries the observer or replay
-symbols (in the default build it requires them). `ci/serving_build.sh` configures and builds both
-trees and runs each tree's labels, and that script is what a CI with a card runs.
+`tests/host/serving_prefill.cpp` serves an int8-fixture corpus through an adapter with radiance's
+own KL-scored prefill and holds the recorded rows to `tests/fixtures/serving_rows.f32` bit for bit;
+`tests/gpu/serving_container.cpp` serves the real container on the card with an adapter written for
+its linears; `tests/host/serving_symbols.cpp` reads the built `rad_core` archive and fails when a
+serving build carries a trainer-only symbol -- the observer, the replay entry, the prefill driver
+or the adapter lookup -- and in the default build it requires them, so neither set can quietly grow
+the other's code. `ci/serving_build.sh` configures and builds both trees, runs each tree's labels,
+and then -- in the host-only run -- builds the serving tree's `radiance` server and runs the default
+tree's host tests with `R97_SERVING_BUILD` naming it, so `docs/RUNBOOK.md` section 7's serve takes
+its measured branch in CI rather than its skip branch. That script is what a CI with a card runs.
 
-The adapter and logits fixtures were written in the default build: `r97train train` on the int8
-fixture wrote `tests/fixtures/serving_adapter` (the run is in that directory's `README.md`), and
-`R97_WRITE_SERVING_GOLDEN=<path>` with
+The adapter and served-rows fixtures were written in the default build: `r97train train` on the
+int8 fixture wrote `tests/fixtures/serving_adapter` (the run is in that directory's `README.md`),
+and `R97_WRITE_SERVING_GOLDEN=<path>` with
 `R97_TEST_ONLY=serving_prefill_with_the_fixture_adapter_matches_the_reference ./build/r97_host_tests`
-wrote the logits from the same test. Regenerating them means running both again in the default
-build and copying the results under `tests/fixtures/`.
+wrote the rows from the same test. Regenerating them means running both again in the default build
+and copying the results under `tests/fixtures/`.
 
 ## The GPU test guard
 

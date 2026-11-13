@@ -12,8 +12,8 @@
 #
 # Build trees are ${R97_CI_ROOT:-build-ci}/{training,serving}; a re-run reuses them, and a patch
 # set change rebuilds radiance's copy (CMakeLists.txt's patch stamp does that). The default tree is
-# built first because the reference logits in tests/fixtures/ are the default build's, and the
-# serving tree's prefill must reproduce them byte for byte.
+# built first because the reference rows in tests/fixtures/ are the default build's, and the serving
+# tree's serve must reproduce them byte for byte.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -57,5 +57,18 @@ build_and_test() {
 
 build_and_test "$out/training"
 build_and_test "$out/serving" -DR97_PATCH_SET=serving
+
+# The serve itself, not only the rows beside it: docs/RUNBOOK.md section 7's block starts the
+# serving build's server with a trained adapter and holds its loss to the trainer's. The server is
+# not a target of this project's build (docs/RUNBOOK.md section 0's third step); section 7's block
+# skips unless R97_SERVING_BUILD names a serving tree that has it, so build it there first and name
+# the tree for the default tree's host tests. A HIP tree is not the tree to name here: its home
+# offers libr4d, which declares nothing without a device, so the serve is the host-only tree's.
+if [[ "${R97_CI_HIP:-0}" != "1" ]]; then
+  echo "== the server in $out/serving"
+  cmake --build "$out/serving/radiance-build" --target radiance
+  echo "== host tests with the serving tree named (section 7's serve)"
+  R97_SERVING_BUILD="$out/serving" ctest --test-dir "$out/training" -L host --output-on-failure
+fi
 
 echo "ci: serving build passed the same labels as the default build"

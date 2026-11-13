@@ -237,7 +237,13 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
     const std::string log = read_file(log_path);
     R97_CHECK(contains(log, "the trainer's loss for the adapter"));
     if (served) {
-        R97_CHECK(contains(log, "the serving build served"));
+        if (!contains(log, "the serving build served")) {
+            // The tree is named but nothing served from it: the likeliest reason is that its server
+            // was never built, which `docs/RUNBOOK.md` section 0 makes a step of its own.
+            throw std::runtime_error(
+                "R97_SERVING_BUILD names '" + named_serving + "', which served nothing: build that "
+                "tree's server (docs/RUNBOOK.md section 0), log " + log_path.string());
+        }
         R97_CHECK(contains(log, "the serving build's loss for the adapter"));
         // The number this run took is the run's own evidence (`docs/RUNBOOK.md` section 11 cites
         // it), so the test that served prints it rather than keeping it to itself.

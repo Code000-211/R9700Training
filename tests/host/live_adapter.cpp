@@ -1,5 +1,5 @@
 // tests/host/live_adapter.cpp -- a delta's WireBuffers in radiance's LoRA slot on the bf16 fixture.
-// Label: host; needs the fixture's prefill (patch 0202) and the live-slot entry point
+// Label: host; needs the fixture's prefill (patch 0103) and the live-slot entry point
 // (patch 0201).
 //
 // A test registered with R97_TEST runs from an atexit handler, after namespace-scope objects have

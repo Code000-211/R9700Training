@@ -327,8 +327,7 @@ StepValues read_step_values(const std::string& path) {
 }  // namespace
 
 R97_TEST(reference_step_program_matches_the_live_trace_without_kernels) {
-#if !R97_FIXTURE_PREFILL || !defined(RAD_ISSUE_OBSERVER)
-    // A serving build has no observer, so there is no live trace to compare the program with.
+#if !R97_FIXTURE_PREFILL
     return;
 #else
     if (const char* child_result = std::getenv("R97_REFERENCE_STEP_CHILD")) {

@@ -27,7 +27,7 @@ architecture on the host kernels, a bf16 key-value pool, speculation off.
 `--lora <dir>` loads an adapter directory through radiance's own loader and scores through it.
 The forward config has no adapter field -- the driver is the base model's -- so the run names the
 directory to radiance before the driver's first engine starts
-(`patches/serving/0205-preload-adapter.patch`): every engine after that loads it the way
+(`patches/training/0106-preload-adapter.patch`): every engine after that loads it the way
 `--lora` does and runs its prefill steps through it. A directory radiance cannot load ends the
 run non-zero rather than aborting: radiance logs its own error (`lora: adapter 'forward': cannot
 read .../adapter_config.json`) and the trainer reports that the step could not start.

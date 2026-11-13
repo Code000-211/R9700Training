@@ -101,6 +101,6 @@ trains is the model's business.
 ## What the driver needs from radiance
 
 The training patch set, and only there: prefill mode without a sampled token
-(`patches/serving/0202`, `0204`) and the issue observer with the rank's context
+(`patches/training/0103`, `0105`) and the issue observer with the rank's context
 (`patches/training/0101`, `0119`). A serving build applies none of them, so `R97_FORWARD` is 0
 there and the driver does not exist — the same rule `include/r97/tape.h` follows.

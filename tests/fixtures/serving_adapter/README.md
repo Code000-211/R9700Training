@@ -1,7 +1,8 @@
 # serving_adapter: one adapter, written by r97train, that the serving test loads.
 
-`tests/host/serving_prefill.cpp` answers a prefill with these weights, so the directory is a
-committed fixture and not a build product. The weights are the tiny int8 fixture's, trained for 48
+`tests/host/serving_prefill.cpp` serves one corpus through these weights (radiance's own
+`--kld-record` prefill, scored through the adapter slot) and holds the served rows to the default
+build, so the directory is a committed fixture and not a build product. The weights are the tiny int8 fixture's, trained for 48
 steps by the default build's `r97train`; nothing here is hand-written.
 
 To regenerate (from a worktree with the default tree built, `cmake -B build -G Ninja
@@ -25,14 +26,16 @@ cp /tmp/serving_fixture/run/checkpoint-000000048/adapter/* tests/fixtures/servin
 `tiny_qwen35_w8a8.rad`: it names the fixture container, and no loader validates it. Everything
 else, including `r` and `lora_alpha`, is what the writer wrote.
 
-The reference logits beside this directory, `serving_prefill_logits.bin`, are written by the same
-test in the default build:
+The reference rows beside this directory, `serving_rows.f32`, are written by the same test in the
+default build:
 
 ```sh
-R97_WRITE_SERVING_GOLDEN=tests/fixtures/serving_prefill_logits.bin \
+R97_WRITE_SERVING_GOLDEN=tests/fixtures/serving_rows.f32 \
 R97_TEST_ONLY=serving_prefill_with_the_fixture_adapter_matches_the_reference \
     build/r97_host_tests
 ```
 
-The serving build runs the same test and must reproduce the file byte for byte. `docs/TESTING.md`
-has the two-build check, and `docs/FIXTURES.md` the fixture the adapter was trained on.
+They are the NLL and entropy radiance recorded for the test's two prompts (`rows.f32`), with the
+adapter named by `--kld-lora`. The serving build runs the same test and must reproduce the file
+byte for byte. `docs/TESTING.md` has the two-build check, and `docs/FIXTURES.md` the fixture the
+adapter was trained on.

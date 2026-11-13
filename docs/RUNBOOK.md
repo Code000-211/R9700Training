@@ -547,8 +547,8 @@ no tree they take their `else` branch and say the serve was skipped, and either 
 the commands to the document, so removing them fails even when the branch did not execute. Building
 the serving tree and the server still costs minutes, so the test does not do that; name a host-only
 one (section 0's commands with `-DR97_WITH_HIP=OFF`) and it serves the fixture. That run took
-`4.66220409289` from the serving build's KL record against the trainer's `4.6622040901259272` —
-`3e-9` apart, `6e-10` relative, well inside the `1e-4`. Section 7's card blocks are untouched by
+`4.26155194807` from the serving build's KL record against the trainer's `4.2615519630392633` —
+`1.5e-8` apart, `3.5e-9` relative, well inside the `1e-4`. Section 7's card blocks are untouched by
 that run: with no `R97_DEVICE` they take their skip branch and say so, and the card's serve and its
 number are taken on the card, where the command names `libr4d` and the log has to show the AQL
 backend. Section 2's card inventory is held to this file

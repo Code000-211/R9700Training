@@ -14,8 +14,8 @@
 //
 // run_prefill() drives that container through rad_core in-process -- no HTTP server -- with the
 // host kernel libraries, one prefill step from position 0 and speculation off, and returns every
-// position's logits. The mode it drives is patches/serving/'s, so a serving build runs this
-// helper as well; the observer it does not use is the training set's (R97_FIXTURE_PREFILL below).
+// position's logits. The mode it drives is patches/training/'s, so a serving build offers no
+// run_prefill() here (R97_FIXTURE_PREFILL below says why).
 //
 // The converter and the plugin home are found beside this test binary, where the build keeps
 // radiance-build/; R97_RAD_CONVERT and RADIANCE_HOME in the environment still win.
@@ -40,10 +40,11 @@
 #include "tiny_model.h"       // radiance's tests/; tiny::Qwen35, tiny::write_qwen35
 #include "util/stallwatch.h"  // radiance's core/; the watch serve() takes
 
-// The prefill mode the fixture drives is patches/serving/0202-prefill-logits.patch: it adds the
-// driver (core/train_prefill.cpp) and its marker header to the copy the build compiles. The mode
-// is asked for over the same include path the compiler reads, so neither build rule has to know a
-// test's name; a build that skips the serving set gets no run_prefill().
+// The prefill mode the fixture drives is patches/training/0103-prefill-logits.patch: it adds the
+// driver (core/train_prefill.cpp) and its marker header to the copy the build compiles. The
+// serving patch set adds neither, so the mode is asked for over the same include path the
+// compiler reads, and a serving build gets no run_prefill() -- no build rule has to know a test's
+// name to leave one out.
 #if __has_include("train_prefill.h")
 #define R97_FIXTURE_PREFILL 1
 #elif __has_include("train_prefill.cpp")

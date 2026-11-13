@@ -34,7 +34,7 @@ index 8a62857..e1e9c22 100644
       * it. */
      bool                 score = false;
  
-+    /* A prefill request that draws no token. The fixture asks for the forward over a
++    /* A prefill request that draws no token. The training fixture asks for the forward over a
 +     * prompt and reads its logits at every position, so nothing is sampled and no sampler op is
 +     * issued. The step keeps the request's sampler row: the batch's out rows are the scored rows
 +     * plus one per sampled sequence, and moving the scored rows changes the lm_head's row count,

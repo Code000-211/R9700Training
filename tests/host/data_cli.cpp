@@ -9,7 +9,7 @@
 #include "../support/fixture.h"
 #include "../support/test.h"
 
-#if R97_FIXTURE_PREFILL && defined(R97_HAS_R97TRAIN)
+#if R97_FIXTURE_PREFILL
 
 #include <cstdio>
 #include <filesystem>
@@ -136,4 +136,4 @@ R97_TEST(data_cli_kld_corpus) {
     R97_CHECK(lines == documents);
 }
 
-#endif  // R97_FIXTURE_PREFILL && R97_HAS_R97TRAIN
+#endif  // R97_FIXTURE_PREFILL
