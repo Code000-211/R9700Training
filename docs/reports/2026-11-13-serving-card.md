@@ -20,7 +20,7 @@ cmake --build build-serving/radiance-build --target radiance      # the server
 Both against the pinned submodule (`451b136`, v1.17.0-58), HIP from `/opt/rocm`, and
 `-DRAD_GPU_TARGETS=gfx1201` (that build's default). The host tiers pass in both:
 `ctest --test-dir build -L host` 23/23 (282 s), `ctest --test-dir build-serving -L host` 22/22
-(5.7 s). The serving tree carries no `r97train`; its server is
+(8 s). The serving tree carries no `r97train`; its server is
 `build-serving/radiance-build/bin/radiance`, which starts the engine with `libr4d`, `libavx` and
 `libref` and says what it left alone:
 
@@ -112,3 +112,11 @@ host reference), and nothing in this change touches them.
 The card opens `/dev/kfd` only for a process in the `render` group here, so every card command
 above ran under `sg render -c`. The engine warns that card 0's power cap is 210 W against the
 card's 300 W default; the numbers above are losses, not timings, and do not depend on the clock.
+
+Three of the eight full runs of `build/r97_host_tests` made here failed on a non-finite int8 step:
+twice `host_step_int8` threw `the gradient at model.layers.0.linear_attn.in_proj_qkv.lora_A[0] is
+not finite` (and the case after it then missed its cosine), and once
+`train_host_cli_serves_the_int8_trunk` saw its 48-step run exit 1. The same binary passes the same
+cases in the other five runs, and the two cases pass when they are run alone, so this is the int8
+host step on this machine flaking, not this build failing; `tests/host/step_host_int8.cpp` is
+unchanged on this branch and the flake is not chased here.
