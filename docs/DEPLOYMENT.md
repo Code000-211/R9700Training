@@ -58,9 +58,19 @@ The adapter directory is the one `r97train train --out <run>` leaves at
 `<run>/checkpoint-<n>/adapter`: `adapter_config.json` — PEFT's `base_model_name_or_path`, `r`,
 `lora_alpha`, `target_modules`, `bias: "none"` and `use_rslora: false` — and
 `adapter_model.safetensors` with the factors under PEFT's names, each tensor's `dtype` in the
-safetensors header. Radiance reads those keys and refuses the ones it could not honour: a bias
-adapter, rsLoRA (the site's scale is `alpha/r`), and a per-module `rank_pattern` or
-`alpha_pattern`. On a transformed trunk — the `w8a8_fwht128` container's rotated int8 trunk is one
+safetensors header. `r97train loss --lora` reads back only what the trainer writes: it refuses a
+bias adapter, rsLoRA and a per-module `rank_pattern` or `alpha_pattern`, because its scale is
+`alpha/r` and it has one rank per site (`src/adapter_io.cpp`). A deployment has no `r97train` in it
+and reads more than the trainer wrote: radiance's loader honours what a PEFT config asks for —
+`use_rslora: true` scales each site `alpha/sqrt(r)`, and `rank_pattern`/`alpha_pattern` give a
+module its own rank and its own scale by PEFT's first-matching-key rule, up to a per-module rank of
+`--max-lora-rank` — and refuses only what it could not serve: a bias adapter, DoRA,
+`modules_to_save`, `fan_in_fan_out`, `target_parameters`, `trainable_token_indices`,
+`layer_replication`, `use_qalora`, `alora_invocation_tokens`, a per-module rank above
+`--max-lora-rank` (16 by default), a pickle `adapter_model.bin`, and a tensor that is neither
+`lora_A` nor `lora_B` (`core/lora/lora.cpp`, `docs/ADAPTER.md` section 4). An adapter trained
+elsewhere therefore serves here even though the trainer could not read it back, at the scales its
+config asks for. On a transformed trunk — the `w8a8_fwht128` container's rotated int8 trunk is one
 — the config also carries `radiance_input_basis`, the basis the factors are written in; radiance
 refuses that key on a bf16 trunk, and without it refuses an adapter on a transformed trunk
 (`docs/ADAPTER.md` section 4). A deployment serves the directory by name:
