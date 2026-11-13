@@ -33,6 +33,25 @@ so nothing there reports a case it did not start. One consequence: on a machine 
 container and no card, `ctest -L model` fails in that entry, because a `model` run promises the
 container and not the card; exclude it there (`ctest -L model -E gpu_model_tests`).
 
+## The serving build
+
+A serving build (`cmake -B build-serving -G Ninja -DR97_PATCH_SET=serving`) applies none of
+`patches/training/`, and the tests that describe a deployment have to pass there: the same sources
+are globbed in either build, so a check that compiles away in the serving build has to say so (with
+`R97_FIXTURE_PREFILL`, or the `R97_HAS_R97TRAIN` guard) rather than be named by a build rule.
+`tests/host/serving_prefill.cpp` answers an int8-fixture prefill with an adapter and holds the
+logits to `tests/fixtures/serving_prefill_logits.bin` bit for bit; `tests/host/serving_symbols.cpp`
+reads the built `rad_core` archive and fails when a serving build carries the observer or replay
+symbols (in the default build it requires them). `ci/serving_build.sh` configures and builds both
+trees and runs each tree's labels, and that script is what a CI with a card runs.
+
+The adapter and logits fixtures were written in the default build: `r97train train` on the int8
+fixture wrote `tests/fixtures/serving_adapter` (the run is in that directory's `README.md`), and
+`R97_WRITE_SERVING_GOLDEN=<path>` with
+`R97_TEST_ONLY=serving_prefill_with_the_fixture_adapter_matches_the_reference ./build/r97_host_tests`
+wrote the logits from the same test. Regenerating them means running both again in the default
+build and copying the results under `tests/fixtures/`.
+
 ## The GPU test guard
 
 Several people and several agents run GPU tests on one machine. Every `gpu` test takes the guard

@@ -3,8 +3,9 @@
 // bf16 fixture it came from. The fixture itself, and the shuffled-weight control, are
 // tests/support/fixture_w8a8.h; docs/FIXTURES.md has the recipe and the ops the host issues.
 //
-// Like tests/host/fixture_prefill.cpp this is the prefill patch's mode: a serving build has no
-// run_prefill(), and the file compiles to nothing rather than being named by a build rule.
+// Like tests/host/fixture_prefill.cpp this is the serving prefill patch's mode, so it runs in a
+// serving build too; a build that skips the serving set compiles the file to nothing rather than
+// naming it by a build rule.
 #include "format/radfile.h"
 #include "support/fixture_w8a8.h"
 #include "support/test.h"

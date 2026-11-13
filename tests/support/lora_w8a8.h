@@ -28,11 +28,11 @@
 #include "fixture_w8a8.h"  // the int8 fixture, and through it fixture.h (run_prefill, tiny)
 #include "r97/tape.h"
 
-// The prefill is patches/training/'s: 0103-prefill-logits.patch adds run_prefill(),
-// 0104-prefill-lora.patch lets that prefill run a named adapter, 0101-issue-observer.patch the
-// tape, and 0119-issue-observer-hook.patch the Engine accessor it attaches through. A serving
-// build applies none of the set, so the body compiles to nothing there (docs/FIXTURES.md) and an
-// includer needs no guard of its own.
+// The prefill is patches/serving/'s: 0202-prefill-logits.patch adds run_prefill(),
+// 0203-prefill-lora.patch lets that prefill run a named adapter. The tape is
+// patches/training/'s: 0101-issue-observer.patch adds it, and 0119-issue-observer-hook.patch the
+// Engine accessor it attaches through. A serving build applies none of the training set, so the
+// body compiles to nothing there (docs/FIXTURES.md) and an includer needs no guard of its own.
 #if R97_FIXTURE_PREFILL && defined(RAD_ISSUE_OBSERVER)
 
 namespace r97 {

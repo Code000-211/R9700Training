@@ -7,7 +7,7 @@
 #include "../support/fixture.h"
 #include "../support/test.h"
 
-#if R97_FIXTURE_PREFILL
+#if R97_FIXTURE_PREFILL && defined(R97_HAS_R97TRAIN)
 
 #include <cstdio>
 #include <stdexcept>
@@ -72,4 +72,4 @@ R97_TEST(info_cli) {
     R97_CHECK(bare.status == 2);
 }
 
-#endif  // R97_FIXTURE_PREFILL
+#endif  // R97_FIXTURE_PREFILL && R97_HAS_R97TRAIN

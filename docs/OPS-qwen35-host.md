@@ -30,7 +30,7 @@ tower, and `mm_max_patches = 0` keeps one off the card even if a container has i
 
 The engine's sampler tail is not in that list -- and it is absent because the step asks for none,
 not because the inventory leaves it out. The prefill driver's requests are prefill-only
-(`Request::prefill_only`, `patches/training/0105-prefill-not-sampled.patch`): a prefill-only
+(`Request::prefill_only`, `patches/serving/0204-prefill-not-sampled.patch`): a prefill-only
 request draws no token, so the engine hands it to no sampler, the step issues no `sample_*` op, and
 the request finishes at the commit of the step that places its last position. What the step reads
 is the request's scored rows: the logits at every prompt position. `docs/FIXTURES.md` names that
@@ -39,7 +39,7 @@ training forward does not reach it; so the tape ends at the logits gemm and the 
 every issue the step made, nothing filtered out by name.
 
 The step's logits buffer still carries the row such a sequence would sample from: the batch sizes
-its out rows as the scored rows plus one per sampled sequence, and 0105 says why the row is kept.
+its out rows as the scored rows plus one per sampled sequence, and 0204 says why the row is kept.
 Moving the scored rows changes the head gemm's row count, which moves its split-K rounding, and
 `tests/host/fixture_prefill.cpp` checks that a prompt in a batch reads the rows it reads alone bit
 for bit. So the row exists and is never read: no token, no end-of-text test, no grammar step.

@@ -2,8 +2,9 @@
 // batch gives each sequence the rows that sequence gives alone. The fixture itself, and what it
 // holds, is tests/support/fixture.h; docs/FIXTURES.md says how a test obtains it.
 //
-// The prefill mode is patches/training/'s. A serving build has no run_prefill(), and this file
-// then compiles to nothing rather than being named by a build rule of its own.
+// The prefill mode is patches/serving/'s, so this test runs in either build; a build that skips
+// the serving set has no run_prefill(), and this file then compiles to nothing rather than being
+// named by a build rule of its own.
 #include "format/radfile.h"
 #include "support/fixture.h"
 #include "support/test.h"

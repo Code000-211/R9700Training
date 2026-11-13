@@ -45,6 +45,7 @@ git submodule update --init
 ctest --test-dir build -L host    # needs no card
 ctest --test-dir build -L gpu     # needs the card, runs serially
 ctest --test-dir build -L model   # needs the real container under data/, skipped when absent
+ci/serving_build.sh               # default and serving host-only builds, both host labels
 ```
 
 ## Layout

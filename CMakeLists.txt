@@ -330,7 +330,13 @@ if(R97_BUILD_TESTS)
       ${R97_RADIANCE_COPY}/tests)   # radiance's write_qwen35, the fixture's checkpoint writer
     target_compile_definitions(r97_host_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}"
       # the int8 fixture's recipe, the one docs/FIXTURES.md prints
-      R97_FIXTURE_W8A8_RECIPE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/w8a8_fwht128.recipe")
+      R97_FIXTURE_W8A8_RECIPE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/w8a8_fwht128.recipe"
+      # what the serving-only checks read: the archive whose symbols they count, and which set
+      # built it (tests/host/serving_symbols.cpp)
+      R97_RAD_CORE_ARCHIVE="${R97_RADIANCE_LIB}")
+    if(R97_PATCH_SET STREQUAL "serving")
+      target_compile_definitions(r97_host_tests PRIVATE R97_PATCH_SET_SERVING=1)
+    endif()
     if(TARGET r97train)
       # The checks that run the binary in a child process have nothing to run in a serving build,
       # so those sources compile away rather than look for a binary that was never built.

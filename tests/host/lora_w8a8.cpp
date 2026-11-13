@@ -25,8 +25,9 @@
 //   the encoding    every declared shrink carries the encoding of the GEMM whose activation it
 //                   reads (`gemm_dtype`), the only thing that says how its codes are stored
 //
-// The prefill, the observer and the tape are patches/training/'s; a serving build applies none of
-// that set, so this file registers no test there. The include sits above the guard, the way
+// The prefill is patches/serving/'s; the observer and the tape are patches/training/'s. A serving
+// build applies the prefill but none of the observer or tape, so this file registers no test
+// there. The include sits above the guard, the way
 // tests/host/fixture_w8a8.cpp includes the fixture: it is what defines R97_FIXTURE_PREFILL (through
 // tests/support/fixture.h), and the header's own body compiles to nothing when the set is absent.
 #include "support/lora_w8a8.h"
@@ -312,7 +313,7 @@ R97_TEST(lora_w8a8_refuses_what_it_cannot_serve) {
 
 #else  // R97_FIXTURE_PREFILL && RAD_ISSUE_OBSERVER
 
-// A serving build applies neither the tape nor the prefill driver, so there is no step to record
-// and this file registers no test there.
+// A serving build applies the prefill driver (0202) but neither the tape nor its hook, so there is
+// no step to record and this file registers no test there.
 
 #endif

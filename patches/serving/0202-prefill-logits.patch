@@ -1,4 +1,4 @@
-Concern: a training-fixture prefill that keeps every position's logits, driven through the engine
+Concern: a fixture prefill that keeps every position's logits, driven through the engine
 Upstream: not-submitted
 diff --git a/core/engine.cpp b/core/engine.cpp
 index 3170856..c15b3a5 100644
@@ -38,7 +38,7 @@ index c913d1c..b2a0168 100644
       * requests and hands every step's scored rows, copied to the host, to `kld_`. One pinned
       * block per rank, holding a step's tokens of that rank's logits columns. */
      int  run_kld();
-+    /* The training fixture's prefill (core/train_prefill.cpp), replacing run_server: submits
++    /* The fixture's prefill (core/train_prefill.cpp), replacing run_server: submits
 +     * Config::prefill_prompts as scoring requests in one hold, speculation off, and keeps every
 +     * step's scored rows in Config::prefill_logits. */
 +    int  run_prefill();
@@ -260,7 +260,7 @@ index 0000000..d546e72
 --- /dev/null
 +++ b/core/train_prefill.cpp
 @@ -0,0 +1,98 @@
-+/* train_prefill.cpp -- the training fixture's prefill on the Engine: a driver that replaces the
++/* train_prefill.cpp -- the fixture's prefill on the Engine: a driver that replaces the
 + * HTTP server, as the KL mode does (core/engine_kld.cpp), but keeps the logits of every prompt
 + * position instead of scoring them. Config::prefill_prompts names the prompts and
 + * Config::prefill_logits receives them; the requests are scoring requests, so the batch builder
@@ -364,11 +364,11 @@ index 0000000..aef78d4
 --- /dev/null
 +++ b/core/train_prefill.h
 @@ -0,0 +1,11 @@
-+/* train_prefill.h -- the training fixture's prefill mode is in this copy of radiance: the driver
++/* train_prefill.h -- the fixture's prefill mode is in this copy of radiance: the driver
 + * in core/train_prefill.cpp that Config::prefill_prompts/prefill_logits feed.
 + *
 + * The header exists so that code outside radiance can ask whether the mode is there without the
-+ * build telling it: patches/training/0103-prefill-logits.patch adds this file and the serving
++ * build telling it: patches/serving/0202-prefill-logits.patch adds this file and the
 + * patch set does not, so `__has_include("train_prefill.h")` over the copy's include path answers
 + * for the same build the compiler is reading. r97's tests/support/fixture.h asks that way and
 + * offers no run_prefill() in a serving build. */

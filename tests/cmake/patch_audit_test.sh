@@ -73,18 +73,33 @@ mv "$tmp/headerless" "$small"
 check fail "line 1 is not 'Concern:" "a patch with no Concern line"
 
 # A serving patch that touches a file a training patch introduces fails: the serving set stands
-# alone on a radiance that carries no training patch.
+# alone on a radiance that carries no training patch. The tree's training set introduces no file
+# of its own (the prefill that used to be training's is serving's, 0202), so the copy gets a
+# training patch that does, and its row, before the serving patch is made to touch it.
 prepare
+cat > "$tree/patches/training/0199-ci-fixture.patch" <<'PATCH'
+Concern: a training-side file for the audit's overlap rule
+Upstream: not-submitted
+diff --git a/core/ci-fixture.txt b/core/ci-fixture.txt
+new file mode 100644
+--- /dev/null
++++ b/core/ci-fixture.txt
+@@ -0,0 +1,1 @@
++// the file the overlap check pairs with
+PATCH
+cat >> "$tree/docs/UPSTREAM.md" <<'ROW'
+| `patches/training/0199-ci-fixture.patch` | training | 1 | 0 | 4 | not-submitted | a training-side file for the audit's overlap rule |
+ROW
 small=$tree/patches/serving/0201-narrow-head-gate.patch
 {
     head -2 "$small"
     tail -n +3 "$small"
-    printf 'diff --git a/core/train_prefill.cpp b/core/train_prefill.cpp\n'
-    printf -- '--- a/core/train_prefill.cpp\n+++ b/core/train_prefill.cpp\n'
+    printf 'diff --git a/core/ci-fixture.txt b/core/ci-fixture.txt\n'
+    printf -- '--- a/core/ci-fixture.txt\n+++ b/core/ci-fixture.txt\n'
     printf '@@ -1,1 +1,1 @@\n-// old\n+// new\n'
 } > "$tmp/overlap"
 mv "$tmp/overlap" "$small"
-check fail "train_prefill.cpp" "a serving patch touching a training patch's file"
+check fail "ci-fixture.txt" "a serving patch touching a training patch's file"
 
 # A row in the document without a patch, or a patch without a row, fails.
 prepare

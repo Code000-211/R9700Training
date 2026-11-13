@@ -22,18 +22,19 @@ patch of `patches/training/` is applied). One thing such a build does make and a
 out is `kernels/libr97.so`, the trainer's own device plugin: the build makes it in any HIP tree,
 and section 4 is where a serve says not to load it.
 `tests/cmake/patch_sets_test.cmake` holds the mechanism to the set: with `-DR97_PATCH_SET=serving`
-only `patches/serving/` is applied, and the three patches that are the whole of what a deployment
-adds to the pinned engine are:
+only `patches/serving/` is applied. Of what a deployment adds to the pinned engine, the adapter's
+half is:
 
 | Patch | `Concern:` | What it serves |
 | --- | --- | --- |
-| `0201-lora-set-weights.patch` | put an adapter slot in service from factors already in memory, not only from a directory | the trainer's live adapter during training |
+| `0201-lora-set-weights.patch` | put an adapter slot in service from factors already in memory, not only from a directory | an adapter handed over in memory, the trainer's live slot or a serve's |
 | `0201-narrow-head-gate.patch` | an int8 attention gate on a head narrower than the 128-column quantiser group | the `w8a8_fwht128` container's gated attention |
 | `0210-lora-int8-trunk.patch` | a LoRA adapter on the rotated int8 trunk, through the host and card kernels | the adapter this deployment serves, on `libavx`/`libref` and on `libr4d` |
 
 `0201-lora-set-weights.patch` is the trainer's half of the same hook, and it stays in the serving
 set because radiance's own loader and the trainer's live slot go through one code path: the
-serving set is what a radiance needs to serve an adapter trained here, and it stands alone.
+serving set is what a radiance needs to serve an adapter trained here, and it stands alone. The
+prefill half, `0202` to `0205`, is described in section 5.
 
 ## 2. The build
 
@@ -51,6 +52,11 @@ build of different sets can live side by side. The parent build's own configure 
 libraries and the plugins, and the server is the third step, from that sub-build's cache. The
 first two flavours differ only in `R97_WITH_HIP` (which sets radiance's `RAD_WITH_HIP`): a HIP build
 produces `libr4d.so`, which is the card's kernels, and a `-DR97_WITH_HIP=OFF` build does not.
+
+CI builds this serving tree beside the default one and runs the serving tests against it
+(`ci/serving_build.sh`): both trees run the host tests, and a machine with the card runs the `gpu`
+and `model` ones in the serving tree too. The default build is what runs `r97train` and writes the
+adapter; the serving tree only reads it.
 
 ## 3. The adapter it serves
 
@@ -105,6 +111,15 @@ ROCR_VISIBLE_DEVICES=0 bin/radiance --model tiny_qwen35_w8a8.rad \
 when `--kernels` does not name them. A card serve that leaves the list out can answer from the
 trainer's kernels, and then the served number is not the number it is held to.
 
+The trainer and the server share the card and are never run at once: a run takes the card for the
+whole of its training, and the serve is started after it has exited, on the same
+`ROCR_VISIBLE_DEVICES`.
+Starting a serve beside a training run would put two engines on one allocation and neither number
+would be the one the deployment is held to. `tests/gpu/serving_container.cpp` holds the container's
+serve to the card and is a model case: it skips when the container is absent and takes the card
+when it is present. `tests/model/serving_container.cpp` reads the same container on the host
+tier: its arch, its basis and its targetable linears, and the adapter's targets against them.
+
 The server's log also says which backend it took: `device: AQL backend, 1 device(s)` is the card,
 `device: host backend` (or `built with HIP but no device is visible`) is not, and a serve that
 claims the card has to show the first of them. What runs under it is libr4d's `lora_shrink` and
@@ -114,8 +129,16 @@ claims the card has to show the first of them. What runs under it is libr4d's `l
 
 ## 5. What makes a serve a checked one
 
-Serving is checked the way every number in this repository is: against the trainer's own, at
-`1e-4` relative (`docs/EVAL.md`). Radiance's KL mode scores the run's held-out corpus for the
+The first check is exact: the serving build's logits for a prompt with a trained adapter are the
+default build's, bit for bit. `tests/host/serving_prefill.cpp` runs the int8 fixture's prefill
+with `tests/fixtures/serving_adapter` — an adapter `r97train` wrote — and compares every float
+to `tests/fixtures/serving_prefill_logits.bin`, which the same test wrote in the default build.
+Both trees run it: the prefill is serving's (`patches/serving/0202`, `0203`), so neither test
+needs the observer or the replay patch. A serving build that rounded differently, or dropped the adapter,
+fails on the bytes before any loss is computed.
+
+The second check is the trainer's own number, at `1e-4` relative (`docs/EVAL.md`). Radiance's KL
+mode scores the run's held-out corpus for the
 adapter it was given and records the reference's next-token NLL per position; `tools/kld_loss.py`
 turns that record into the same loss `r97train loss` prints.
 
@@ -138,14 +161,19 @@ card number (`loss --device`) and to the host's, both at `1e-4`, with the serve 
 the AQL backend; those numbers belong to the card, so the script is where they are, not this
 document, and no card has taken them yet.
 
-A serve that was not measured is not a checked deployment: the host's is measured, the card's is
-not, so the deployment is checked on the host alone. Section 7's blocks say in their output which
-measurement they took and which they skipped, and a run without a serving build keeps the
-trainer's `loss --lora` number alone.
+A serve that was not measured is not a checked deployment: the host's exact prefill and its loss
+are measured here, the card's is `tests/gpu/serving_container.cpp`'s under the model label, and
+`tests/model/serving_container.cpp` checks the real container's serving handshake on the host. No
+card has taken the serve yet. Section 7's blocks say in their output which measurement they took and which
+they skipped, and a run without a serving build keeps the trainer's `loss --lora` number alone.
 
 ## 6. Upstreaming
 
-Each of the three patches carries `Concern:` and `Upstream: not-submitted`, one concern each, and
-is written self-contained so it can go upstream alone. A fresh radiance plus `patches/serving/` is
-a server that loads an adapter trained here; `patches/training/` is the trainer's and never enters
-a deployment. `docs/UPSTREAM.md` has the rules for the patch sets and what upstream has answered.
+Each patch of the serving set carries `Concern:` and `Upstream: not-submitted`, one concern each,
+and is written self-contained so it can go upstream alone. A fresh radiance plus
+`patches/serving/` is a server that loads an adapter trained here; `patches/training/` is the
+trainer's and never enters a deployment. Radiance's prefill and the adapter it runs through are
+serving's:
+`0202-prefill-logits.patch`, `0203-prefill-lora.patch`, `0204-prefill-not-sampled.patch` and
+`0205-preload-adapter.patch`, none of which the observer or replay patch touches.
+`docs/UPSTREAM.md` has the rules for the patch sets and what upstream has answered.

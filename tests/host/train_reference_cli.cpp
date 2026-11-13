@@ -251,7 +251,8 @@ void check_same_checkpoint(const fs::path& a, const fs::path& b) {
 }  // namespace
 
 R97_TEST(train_reference_cli_overfits_and_resumes) {
-#if !R97_FIXTURE_PREFILL
+#if !R97_FIXTURE_PREFILL || !defined(R97_HAS_R97TRAIN)
+    // A serving build has no r97train to run.
     return;
 #else
     const fs::path root = fs::path(late.tmpdir) / "train-reference-cli";

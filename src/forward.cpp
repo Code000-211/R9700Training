@@ -1,6 +1,6 @@
 // forward.cpp -- the training forward's driver: one engine run per batch, one recorded step out.
 //
-// The step is radiance's own prefill mode (patches/training/0103): the batch's sequences are
+// The step is radiance's own prefill mode (patches/serving/0202): the batch's sequences are
 // submitted together as scoring requests, so the engine's batch builder gives each of them a row
 // per position, and the mode copies each position's logits off by prompt. The engine is the one
 // the fixture's run_prefill drives -- a fresh engine per step, so the key-value pool, the

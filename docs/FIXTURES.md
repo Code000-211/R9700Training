@@ -197,7 +197,7 @@ std::vector<r97::Prefill> all = r97::run_prefill(f, prompts);  // a batch
 `run_prefill` starts an `Engine` on the container with the host kernel libraries (`libavx`, then
 `libref` for the rows `libavx` does not cover), speculation off, and submits the prompts as
 scoring requests that are prefill-only (`Request::prefill_only`, patch
-`patches/training/0105-prefill-not-sampled.patch`): one prefill step each, from position 0, no
+`patches/serving/0204-prefill-not-sampled.patch`): one prefill step each, from position 0, no
 decode, and no sampler -- the step draws no token, so it issues no sampler op, and the request
 finishes once its prompt is placed. Every position's logits are kept, so
 
@@ -214,15 +214,16 @@ gives each sequence the logits that sequence gives alone, and two runs of the sa
 bit-identical.
 
 The mode is radiance's `core/train_prefill.cpp`, added by
-`patches/training/0103-prefill-logits.patch`: `Config::prefill_prompts` names the prompts,
+`patches/serving/0202-prefill-logits.patch`: `Config::prefill_prompts` names the prompts,
 `Config::prefill_logits` receives the rows, and `Engine::serve()` runs the prefill instead of the
 server, as the KL mode (`core/engine_kld.cpp`) does. The host test binary must export the plugin
 ABI (`ENABLE_EXPORTS`), because the plugins are `dlopen`ed and call back into `rad_core`.
 
 `run_prefill` exists only in a build whose copy of radiance carries that patch, which the header
 asks with `__has_include("train_prefill.h")` — the patch's marker header — and reports as
-`R97_FIXTURE_PREFILL`. A test file that uses the helper wraps its contents in that macro, so a
-serving build compiles it to nothing without a build rule naming it.
+`R97_FIXTURE_PREFILL`. A test file that uses the helper wraps its contents in that macro. The
+prefill is a serving patch, because a serving-only build has to answer a prefill with an adapter to
+be checked; a build without the serving set compiles the helper to nothing.
 
 ## Notes
 
@@ -239,11 +240,12 @@ serving build compiles it to nothing without a build rule naming it.
   14 takes it. The configure builds the radiance subproject with `gcc-14`/`g++-14` (or newer) when
   the compiler it was configured with is older, and stops with a message naming the requirement
   when none is installed; the rest of the project keeps the configured compiler.
-- A serving build (`-DR97_PATCH_SET=serving`) applies no training patch, so it has no prefill mode
-  and `tests/host/fixture_prefill.cpp` compiles to nothing: the mode the helper drives is a training
-  hook, and the fixture's prefill exists only in the `all` build.
+- A serving build (`-DR97_PATCH_SET=serving`) applies no training patch, so it has no issue observer
+  and no replay hook; the prefill is serving's (`0202`..`0205`), so `tests/host/fixture_prefill.cpp`
+  and the serving prefill parity test run in either build.
 - A host-only build (`-DR97_WITH_HIP=OFF`) serves on the CPU and prints a startup warning when the
   machine has a card; that is expected, and the fixture runs the same either way.
 - The fixture is deterministic but not small in time: each `run_prefill` starts and stops an
-  engine (a few hundred milliseconds for this shape). Compare against a reference captured in the
-  same test rather than a stored one.
+  engine (a few hundred milliseconds for this shape). A test that compares two prefills compares
+  them in the same process; `tests/host/serving_prefill.cpp` is the one that compares across builds
+  and so reads the reference logits in `tests/fixtures/` (see `docs/DEPLOYMENT.md`).

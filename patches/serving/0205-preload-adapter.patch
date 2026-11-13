@@ -1,12 +1,12 @@
 Concern: a run with no command line names the adapter its prefill steps load, before any engine exists
 Upstream: not-submitted
-A trainer that drives radiance through an interface of its own -- r97train's loss pass -- has no
+A run that drives radiance through an interface of its own -- r97train's loss pass -- has no
 command line for radiance to parse and no Engine to load an adapter into: it opens a forward
 driver, and the driver opens the engines. lora/preload.h is how such a run reaches the loader: it
 names the adapter at startup, every engine started afterwards joins it to its startup adapters, and
 its prefill steps run through it. Everything after that is --lora's own path: read_targets(),
 lora_start() and the slot table. The named adapter fills cfg_.prefill_lora, the field the earlier
-training patch 0104-prefill-lora.patch adds, so this patch is applied after it.
+serving patch 0203-prefill-lora.patch adds, so this patch is applied after it.
 
 diff --git a/core/engine_lora.cpp b/core/engine_lora.cpp
 --- a/core/engine_lora.cpp
@@ -23,7 +23,7 @@ diff --git a/core/engine_lora.cpp b/core/engine_lora.cpp
  }  /* namespace */
  
  int Engine::lora_targets() {
-+    /* A run with no command line of its own -- the trainer's loss pass -- names its adapter before
++    /* A run with no command line of its own names its adapter before
 +     * the first engine exists (lora/preload.h). It joins the startup adapters, so the loader reads
 +     * it like a --lora one, and every prefill step of this engine runs through it. */
 +    const lora::PreloadedAdapter pre = lora::preloaded_adapter();
@@ -79,7 +79,7 @@ new file mode 100644
 @@ -0,0 +1,30 @@
 +/* preload.h -- the adapter a run's next engines start with, named before any engine exists.
 + *
-+ * A trainer that drives radiance through an interface of its own (r97train loss) has no command
++ * A run that drives radiance through an interface of its own (r97train loss) has no command
 + * line for the engine to parse and no Engine to load an adapter into: it opens a driver and the
 + * driver opens engines. Naming the adapter here, at startup, is how such a run reaches the loader
 + * -- every engine started afterwards loads it the way --lora would, and runs its prefill steps

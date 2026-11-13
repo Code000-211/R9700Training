@@ -7,7 +7,7 @@
 // measurement. They must agree in relative L2 norm, per sequence, within bf16 tolerance. A failure
 // here is a finding about the fixture, radiance or transformers, not a reference to adjust.
 //
-// The prefill mode is patches/training/'s, so a serving build compiles this file to nothing.
+// The prefill mode is patches/serving/'s, so this test runs in a serving build too.
 #include "support/fixture.h"
 #include "support/oracle.h"
 #include "support/test.h"

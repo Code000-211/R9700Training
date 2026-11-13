@@ -268,6 +268,12 @@ resumed=$(horizon_loss "$R97_RUN-resumed/train.jsonl")
 
 ## 7. The adapter, and the served loss against the trainer's
 
+`tests/gpu/serving_container.cpp` serves the container on the card's tier and
+`tests/model/serving_container.cpp` checks its serving handshake -- basis and targetable linears
+-- on the host tier; `ctest -L model` runs both when the container is present (the gpu case also
+takes the card). The blocks below are the hand-run form of the same serve, with the numbers
+printed.
+
 The checkpoint's `adapter/` is the directory radiance loads (`docs/ADAPTER.md` has what it holds
 and what radiance reads), and the run serves the checkpoint the resumed run wrote. The adapter's
 held-out loss is measured twice. First the trainer's, with `loss --lora`: it loads the adapter
