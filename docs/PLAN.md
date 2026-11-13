@@ -45,7 +45,7 @@ No speed target is set; the issues ask for measurements next to the forward's ti
 | Base model | Containers of `StillDeadcode/qwen3.8-27b-iqr-v4`. First target `qwen3.8-27b-iq4r-s-v4.rad` (15.4 GiB, fits one card). |
 | Adapter | LoRA whose `A` reads the rotated int8 activation the base GEMM reads. PEFT file layout plus one key, `"radiance_input_basis": "fwht128"`. Default rank 16, alpha 32. |
 | Data | Chat JSONL, one `{"messages": [...]}` a line, rendered with the container's chat template. Loss on assistant turns only, up to 4096 tokens. Placeholder dataset: UltraChat 200k (MIT). |
-| Memory | The forward keeps only the residual at the 65 layer boundaries (about 2.5 GiB at 4096 tokens). The backward replays one layer at a time. |
+| Memory | The forward keeps the residual at the 65 layer boundaries, plus a second copy at each of the 63 boundaries whose int8 block fuses the residual add into its first norm and so reads two buffers: 128 copies, exactly 5 GiB at 4096 tokens. The backward replays one layer at a time. |
 | Two cards | Data-parallel first (whole container on each card), then a layer split for containers that do not fit one card, then a measurement against tensor-parallel. |
 | Verification | Finite differences on the host in f64; functional checks where rounding is involved; radiance itself as the final check. In addition, one independent reference for the bf16 trunk: transformers' own Qwen3.5 with PyTorch autograd on the tiny fixture. |
 | PyTorch | A reference, not a dependency. A script generates the reference files once; they are checked in under `tests/fixtures/oracle/`. The build and the tests never import Python. |
