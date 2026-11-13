@@ -15,6 +15,9 @@
 //     fixture is refused, and the error names both hashes;
 //   - the run's configuration in the output directory (`run.json`) names the objective and the
 //     delta and carries that base_id;
+//   - `train --dry-run` resolves the same configuration and stops before the first step: it prints
+//     the settings and the first step's shape, and writes nothing -- not the output directory.
+//     It refuses `--resume`, which would be a run;
 //   - the adapter the run wrote is served by radiance itself: `r97train loss --lora <adapter>`,
 //     which preloads the directory through lora/preload.h, agrees with the held-out loss the
 //     trainer reported on the same file to 1e-4 relative. The adapter's adapter_config.json names
@@ -423,6 +426,35 @@ R97_TEST(train_host_cli_serves_the_int8_trunk) {
                                  int8_id + ", " + bf16_id + ")\n" + refused.error);
     if (fs::exists(root / "refused" / "run.json"))
         throw std::runtime_error("train: the refused resume wrote run.json");
+}
+
+// `train --dry-run`: the preflight docs/USAGE.md's flag table and docs/RUNBOOK.md section 4 promise.
+// The same arguments as a run, one flag more, and nothing written: the configuration resolved and
+// printed, and the output directory not made -- which is the difference the flag is for, since the
+// Trainer makes it as its first act.
+R97_TEST(train_cli_dry_run_resolves_and_writes_nothing) {
+    const r97::Fixture& fixture = r97::fixture();
+    const fs::path root = fs::path(radtest::tmpdir()) / "dry_run";
+    fs::create_directories(root);
+
+    const Outcome dry = run_train(fixture.container, root / "out",
+                                  "--steps 10 --lr 1e-2 --heldout " +
+                                      r97::detail::shell_quote(chat_small().string()) +
+                                      " --dry-run");
+    require_ok(dry, "train --dry-run");
+    R97_CHECK(dry.output.find("steps = 10") != std::string::npos);
+    R97_CHECK(dry.output.find("# dry run:") != std::string::npos);
+    R97_CHECK(!fs::exists(root / "out"));
+    R97_CHECK(!fs::exists(root / "out" / "train.jsonl"));
+
+    // A dry run is not a resume: the flag refuses the pair rather than silently ignoring one.
+    const Outcome refused =
+        run_train(fixture.container, root / "out2",
+                  "--steps 10 --lr 1e-2 --dry-run --resume " +
+                      r97::detail::shell_quote((root / "nothing").string()));
+    R97_CHECK(refused.status != 0);
+    R97_CHECK(refused.error.find("--dry-run does not start a resume") != std::string::npos);
+    R97_CHECK(!fs::exists(root / "out2"));
 }
 
 #endif  // R97_FIXTURE_PREFILL
