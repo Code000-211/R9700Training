@@ -121,6 +121,15 @@ struct OpTiming {
     std::string op;       // the op name the row was resolved under
     int64_t calls = 0;    // the row calls the walk made for the op
     double seconds = 0.0; // wall time around them
+    // Which side served them. Without it a slow op cannot be attributed: the host row is f64
+    // arithmetic that `parallel_for` spreads over the cores, the device row is a launch and a sync
+    // with the card mostly idle, and the two want opposite fixes.
+    bool host = false;
+    // The op's slots whose cotangent held a non-finite value (a NaN or an inf) when the walk was
+    // about to hand it on: one per slot, the scan stopping at the slot's first such value. A
+    // non-zero count names the op a NaN was born at instead of bisecting the step blind; the
+    // report's first_non_finite_* says which slot and whether the row produced it.
+    int64_t non_finite = 0;
 };
 
 // What the walk held at once, in bytes of tensor payload (values, not shapes or names): the
@@ -133,6 +142,31 @@ struct BackwardReport {
     int64_t peak_snapshot_bytes = 0;
     int64_t peak_cotangent_bytes = 0;
     std::vector<OpTiming> ops;
+
+    // The first non-finite cotangent the walk saw in a value it was about to hand on, named so a
+    // single run attributes a NaN instead of bisecting the step blind. Empty `first_non_finite_op`
+    // means the walk saw none. The op is the name its row was resolved under (the prepared
+    // record's, when the caller prepares one); the operand is the tape's buffer name and its index
+    // in the record's schema; `first_non_finite_position` is the record's position in the step and
+    // `first_non_finite_index` the value's offset in that operand's payload. `from_row` says the
+    // row produced it; false says the walk handed it in already non-finite -- a seed, the
+    // cotangent from above, or a record later in the forward that the walk has already walked.
+    std::string first_non_finite_op;
+    std::string first_non_finite_operand;
+    int64_t first_non_finite_operand_index = -1;
+    int64_t first_non_finite_position = -1;
+    int64_t first_non_finite_index = -1;
+    bool first_non_finite_from_row = false;
+
+    // The same question asked of the forward: whether every operand value the walk read was
+    // finite. A NaN born in the forward is a different bug from one born in the walk, and a
+    // gradient is only as good as the values it differentiates. `forward_first_*` name the first
+    // operand the walk met that was not, in the walk's order (the block's last record first).
+    bool forward_all_finite = true;
+    std::string forward_first_non_finite_operand;
+    int64_t forward_first_non_finite_operand_index = -1;
+    int64_t forward_first_non_finite_position = -1;
+    int64_t forward_first_non_finite_index = -1;
 };
 
 struct BackwardResult {

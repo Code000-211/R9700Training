@@ -29,6 +29,8 @@
 
 #include "r97/adjoint.h"
 
+#include "parallel.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -38,6 +40,15 @@
 
 namespace r97 {
 namespace {
+
+// The unit the parallel for cuts this row's row loops into (a one-row call stays on the calling
+// thread, and an odd M leaves one row to a worker), the unit a factor pass splits over (one
+// output column pair of the fold), and the unit a flat elementwise pass uses. Every unit writes
+// its own output and the inner sums stay that unit's serial order, so the partition moves nothing
+// a neighbour reads.
+constexpr int64_t kRowChunk = 2;
+constexpr int64_t kPairChunk = 2;
+constexpr int64_t kElemChunk = 1024;
 
 // The top of the int8 code grid, as quant.cpp's kTop.
 constexpr double kTop = 127.0;
@@ -183,7 +194,7 @@ void halves(const AdValue& a, const AdValue& b, const AdValue* as, const AdValue
             const GatedShape& sh, std::vector<double>* zg, std::vector<double>* zu) {
     zg->assign(static_cast<std::size_t>(sh.M * sh.n), 0.0);
     zu->assign(static_cast<std::size_t>(sh.M * sh.n), 0.0);
-    for (int64_t m = 0; m < sh.M; ++m) {
+    parallel_for(sh.M, kRowChunk, [&](int64_t m) {
         for (int64_t j = 0; j < sh.n; ++j) {
             double g_acc = 0.0, u_acc = 0.0;
             for (int64_t g = 0; g < sh.groups_k; ++g) {
@@ -202,7 +213,7 @@ void halves(const AdValue& a, const AdValue& b, const AdValue* as, const AdValue
             (*zg)[static_cast<std::size_t>(m * sh.n + j)] = g_acc;
             (*zu)[static_cast<std::size_t>(m * sh.n + j)] = u_acc;
         }
-    }
+    });
 }
 
 // The unrotated product and the quantiser's block over one `group` of it: the rotated value,
@@ -241,7 +252,10 @@ void gemm_nt_q_gated_twin(const OpRecord& rec, const std::vector<AdValue>& opera
     std::vector<double> zg, zu;
     halves(*a, *b, as, bs, sh, &zg, &zu);
     std::vector<double> p(static_cast<std::size_t>(sh.M * sh.n), 0.0);
-    for (std::size_t i = 0; i < p.size(); ++i) p[i] = act_of(zg[i], sigmoid) * zu[i];
+    parallel_for(static_cast<int64_t>(p.size()), kElemChunk, [&](int64_t i) {
+        p[static_cast<std::size_t>(i)] =
+            act_of(zg[static_cast<std::size_t>(i)], sigmoid) * zu[static_cast<std::size_t>(i)];
+    });
 
     // `out_bf16`, when bound, is the unrotated product the codes were taken over.
     const Operand* ob = operand_named(rec, "out_bf16");
@@ -249,8 +263,8 @@ void gemm_nt_q_gated_twin(const OpRecord& rec, const std::vector<AdValue>& opera
 
     std::vector<double> code(static_cast<std::size_t>(sh.M * sh.n), 0.0);
     std::vector<double> scale(static_cast<std::size_t>(sh.M * sh.groups_n), 0.0);
-    std::vector<double> v, c;
-    for (int64_t m = 0; m < sh.M; ++m) {
+    parallel_for(sh.M, kRowChunk, [&](int64_t m) {
+        std::vector<double> v, c;
         for (int64_t gi = 0; gi < sh.groups_n; ++gi) {
             const int64_t k0 = gi * sh.group;
             double s = 0.0;
@@ -259,7 +273,7 @@ void gemm_nt_q_gated_twin(const OpRecord& rec, const std::vector<AdValue>& opera
             std::copy(c.begin(), c.end(), code.begin() + base);
             scale[static_cast<std::size_t>(m * sh.groups_n + gi)] = s;
         }
-    }
+    });
     out->push_back(make_value(write_dtype(rec, "q", "i8"), {sh.M, sh.n}, std::move(code)));
     out->push_back(make_value(write_dtype(rec, "scale", "f32"), {sh.M, sh.groups_n},
                               std::move(scale)));
@@ -297,7 +311,10 @@ void gemm_nt_q_gated_adjoint(const AdjointCall& call) {
     std::vector<double> zg, zu;
     halves(a, b, as, bs, sh, &zg, &zu);
     std::vector<double> p(static_cast<std::size_t>(sh.M * sh.n), 0.0);
-    for (std::size_t i = 0; i < p.size(); ++i) p[i] = act_of(zg[i], sigmoid) * zu[i];
+    parallel_for(static_cast<int64_t>(p.size()), kElemChunk, [&](int64_t i) {
+        p[static_cast<std::size_t>(i)] =
+            act_of(zg[static_cast<std::size_t>(i)], sigmoid) * zu[static_cast<std::size_t>(i)];
+    });
 
     // The product's cotangent in the unrotated basis: the codes', masked at the forward's codes
     // and over the group's scale, rotated back, plus out_bf16's own when bound. The scale's
@@ -306,11 +323,15 @@ void gemm_nt_q_gated_adjoint(const AdjointCall& call) {
     std::vector<double> dy(total, 0.0);
     if (call.cot[0].value.size() == total) {
         std::vector<double> d = call.cot[0].value;  // the rotated basis, the codes' units
-        for (int64_t m = 0; m < sh.M; ++m) {
+        // A record whose scale is not positive is one this row refuses; the check runs before the
+        // partition, so a bad group leaves the activation's and the weight's cotangents untouched,
+        // as the serial loop's own early return did.
+        for (const double s : sc.value)
+            if (!(s > 0.0)) return;
+        parallel_for(sh.M, kRowChunk, [&](int64_t m) {
             for (int64_t gi = 0; gi < sh.groups_n; ++gi) {
                 const int64_t k0 = gi * sh.group;
                 const double s = sc.value[static_cast<std::size_t>(m * sh.groups_n + gi)];
-                if (!(s > 0.0)) return;
                 // The rotated value the quantiser quantised, the product's block through the
                 // same transform the forward used.
                 std::vector<double> v(p.begin() + static_cast<std::size_t>(m * sh.n + k0),
@@ -327,7 +348,7 @@ void gemm_nt_q_gated_adjoint(const AdjointCall& call) {
                 }
                 fwht(d.data() + static_cast<std::size_t>(m * sh.n + k0), sh.group);
             }
-        }
+        });
         dy = std::move(d);
     }
     const int iob = operand_at(call.rec, "out_bf16", 6);
@@ -336,10 +357,13 @@ void gemm_nt_q_gated_adjoint(const AdjointCall& call) {
 
     // The gate's halves, gated_quant_fp8's split: the gate's slope, the up's activation alone.
     std::vector<double> dzg(total, 0.0), dzu(total, 0.0);
-    for (std::size_t i = 0; i < total; ++i) {
-        dzg[i] = dy[i] * zu[i] * act_slope_of(zg[i], sigmoid);
-        dzu[i] = dy[i] * act_of(zg[i], sigmoid);
-    }
+    parallel_for(static_cast<int64_t>(total), kElemChunk, [&](int64_t i) {
+        dzg[static_cast<std::size_t>(i)] =
+            dy[static_cast<std::size_t>(i)] * zu[static_cast<std::size_t>(i)] *
+            act_slope_of(zg[static_cast<std::size_t>(i)], sigmoid);
+        dzu[static_cast<std::size_t>(i)] = dy[static_cast<std::size_t>(i)] *
+                                           act_of(zg[static_cast<std::size_t>(i)], sigmoid);
+    });
     AdValue& dx = (*call.dc)[static_cast<std::size_t>(ia)];
     AdValue& dw = (*call.dc)[static_cast<std::size_t>(ib)];
     if (dx.value.size() < static_cast<std::size_t>(sh.M * sh.K) ||
@@ -348,7 +372,7 @@ void gemm_nt_q_gated_adjoint(const AdjointCall& call) {
 
     // The activation's cotangent, gemm_nt_q's, on both halves: the dequantised weight, and the
     // dequantised activation's own basis, its scale not applied again.
-    for (int64_t m = 0; m < sh.M; ++m) {
+    parallel_for(sh.M, kRowChunk, [&](int64_t m) {
         for (int64_t k = 0; k < sh.K; ++k) {
             const int64_t g = k / sh.group;
             double acc = 0.0;
@@ -361,17 +385,20 @@ void gemm_nt_q_gated_adjoint(const AdjointCall& call) {
             }
             dx.value[static_cast<std::size_t>(m * sh.K + k)] += acc;
         }
-    }
+    });
 
     // The weight's, in its codes, and the scale's, which the forward dequantised over: dW takes
     // the dequantised activation, dS the codes alone.
     std::vector<double> ds(static_cast<std::size_t>(sh.N * sh.groups_k), 0.0);
-    for (int64_t m = 0; m < sh.M; ++m) {
-        for (int64_t g = 0; g < sh.groups_k; ++g) {
-            const int64_t k0 = g * sh.group;
-            const int64_t k1 = std::min(sh.K, k0 + sh.group);
-            const double sa = scale_at(as, m, g, sh.M, sh.groups_k);
-            for (int64_t j = 0; j < sh.n; ++j) {
+    // The weight's and the scale's accumulate over the activation's rows, so the pass splits over
+    // the fold's output columns: a column's weight row belongs to exactly one column pair, and the
+    // accumulation over the rows stays serial in the record's own order.
+    parallel_for(sh.n, kPairChunk, [&](int64_t j) {
+        for (int64_t m = 0; m < sh.M; ++m) {
+            for (int64_t g = 0; g < sh.groups_k; ++g) {
+                const int64_t k0 = g * sh.group;
+                const int64_t k1 = std::min(sh.K, k0 + sh.group);
+                const double sa = scale_at(as, m, g, sh.M, sh.groups_k);
                 const std::size_t i = static_cast<std::size_t>(m * sh.n + j);
                 for (int64_t k = k0; k < k1; ++k) {
                     const double av = a.value[static_cast<std::size_t>(m * sh.K + k)];
@@ -382,7 +409,7 @@ void gemm_nt_q_gated_adjoint(const AdjointCall& call) {
                 }
             }
         }
-    }
+    });
     // The scale's cotangent lands where the forward read the scale: the row-blocked plane the
     // kernel indexes by row block, or one of the whole planes scale_at accepts.
     if (ibs >= 0 && static_cast<std::size_t>(ibs) < call.dc->size()) {

@@ -9,6 +9,8 @@
 // input when the read goes back past the block).
 #include "r97/backward.h"
 
+#include "parallel.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -236,6 +238,40 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             std::max(result.report.peak_cotangent_bytes, live_bytes);
     };
 
+    // A non-finite value in a cotangent the walk is about to hand on: count it against the op, and
+    // keep the first one the walk met, with the operand it belongs to and where it came from. The
+    // counts and the naming are what turn a NaN gradient into one line a run can be read for; they
+    // change no value, no order and no row.
+    const auto note_non_finite = [&](const OpRecord& rec, const std::string& op, size_t j,
+                                     int64_t at, bool from_row) {
+        row_time[op].non_finite += 1;
+        if (!result.report.first_non_finite_op.empty()) return;
+        result.report.first_non_finite_op = op;
+        result.report.first_non_finite_operand = rec.operands[j].buffer;
+        result.report.first_non_finite_operand_index = static_cast<int64_t>(j);
+        result.report.first_non_finite_position = rec.position;
+        result.report.first_non_finite_index = at;
+        result.report.first_non_finite_from_row = from_row;
+    };
+
+    // The first value of a slot that is not finite, or -1. One pass, and it stops at the hit: the
+    // walk already touches every slot it hands on, so this is a scan of what it is holding, not a
+    // second pass over the store.
+    const auto first_non_finite = [](const std::vector<double>& v) -> int64_t {
+        for (size_t e = 0; e < v.size(); ++e)
+            if (!std::isfinite(v[e])) return static_cast<int64_t>(e);
+        return -1;
+    };
+
+    // One unit of work runs on the calling thread: handing a single chunk to a thread costs more
+    // than the chunk is worth.
+    const auto run_units = [](int64_t n, const auto& body) {
+        if (n > 1)
+            parallel_for(n, 1, body);
+        else if (n == 1)
+            body(0);
+    };
+
     // The cotangent of one version, created on first use.
     const auto version_cot = [&](Version& v) -> std::vector<double>& {
         if (!v.live) {
@@ -304,11 +340,13 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         }
     };
 
-    // A cotangent that leaves the block: dense over the buffer, created on first use.
-    const auto add_input_full = [&](const Buffer& b, int64_t lo, int64_t hi,
-                                    const std::vector<double>& full) {
-        if (lo >= hi || b.cols <= 0) return;
-        InputCotangent& in = inputs[b.name];
+    // The input slot of a buffer the block read but never wrote, created on first use. An existing
+    // slot is found, not touched: the distributing workers look a buffer up that they own alone,
+    // and only the serial creation ever inserts.
+    const auto input_slot = [&](const Buffer& b) -> InputCotangent& {
+        auto it = inputs.find(b.name);
+        if (it == inputs.end()) it = inputs.emplace(b.name, InputCotangent{}).first;
+        InputCotangent& in = it->second;
         if (in.value.empty() && b.rows * b.cols != 0) {
             in.buffer = b.name;
             in.row_lo = 0;
@@ -319,6 +357,14 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                 static_cast<int64_t>(in.value.size()) * static_cast<int64_t>(sizeof(double));
             touch();
         }
+        return in;
+    };
+
+    // A cotangent that leaves the block: dense over the buffer, created on first use.
+    const auto add_input_full = [&](const Buffer& b, int64_t lo, int64_t hi,
+                                    const std::vector<double>& full) {
+        if (lo >= hi || b.cols <= 0) return;
+        InputCotangent& in = input_slot(b);
         const int64_t cols = b.cols;
         for (int64_t r = lo; r < hi; ++r) {
             const double* src = &full[static_cast<size_t>(r * cols)];
@@ -397,40 +443,74 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             continue;
         }
 
-        // The forward values of every operand, as this op saw them.
+        // The forward values of every operand, as this op saw them. One worker per operand: each
+        // operand's slot is its own, so the copies -- at a real block's rows, the giga-byte frozen
+        // weights among them -- run side by side without a value moving. A refusal inside a unit
+        // comes back to the caller as itself, after the workers have run out their chunks.
         std::vector<AdValue> fwd(rec.operands.size());
-        int64_t snapshot_bytes = 0;
-        for (size_t j = 0; j < rec.operands.size(); ++j) {
-            const AdValue* v = snapshots.at(rec.position, j);
+        std::vector<int64_t> fwd_bytes(rec.operands.size(), 0);
+        // The forward's own values, per operand: where the first non-finite one sits. Each unit
+        // fills its own entry, and the serial read below names the first in operand order.
+        std::vector<int64_t> fwd_non_finite(rec.operands.size(), -1);
+        run_units(static_cast<int64_t>(rec.operands.size()), [&](int64_t j) {
+            const size_t k = static_cast<size_t>(j);
+            const AdValue* v = snapshots.at(rec.position, k);
             if (!v)
                 refuse("op '" + rec.op + "' at position " + std::to_string(rec.position) +
-                       " has no snapshot for operand '" + rec.operands[j].buffer + "'");
+                       " has no snapshot for operand '" + rec.operands[k].buffer + "'");
             // A view operand is snapped as the kernel saw it: its own shape, not the buffer's.
-            const std::vector<int64_t>& want = rec.operands[j].view_shape.empty()
-                                                   ? rec.operands[j].shape
-                                                   : rec.operands[j].view_shape;
+            const std::vector<int64_t>& want = rec.operands[k].view_shape.empty()
+                                                   ? rec.operands[k].shape
+                                                   : rec.operands[k].view_shape;
             if (v->shape != want)
                 refuse("op '" + rec.op + "' at position " + std::to_string(rec.position) +
-                       ": operand '" + rec.operands[j].buffer + "' is snapped with shape " +
+                       ": operand '" + rec.operands[k].buffer + "' is snapped with shape " +
                        shape_text(v->shape) + ", not " + shape_text(want));
             if (v->value.size() != static_cast<size_t>(numel(v->shape)))
                 refuse("op '" + rec.op + "' at position " + std::to_string(rec.position) +
-                       ": operand '" + rec.operands[j].buffer + "' is snapped with " +
+                       ": operand '" + rec.operands[k].buffer + "' is snapped with " +
                        std::to_string(v->value.size()) + " values for its shape");
-            fwd[j] = *v;
-            snapshot_bytes += payload_bytes(fwd[j]);
-        }
+            fwd[k] = *v;
+            fwd_bytes[k] = payload_bytes(fwd[k]);
+            fwd_non_finite[k] = first_non_finite(fwd[k].value);
+        });
+        // A sum of integers: the order the units finished in cannot move the figure.
+        int64_t snapshot_bytes = 0;
+        for (int64_t bytes : fwd_bytes) snapshot_bytes += bytes;
         result.report.peak_snapshot_bytes =
             std::max(result.report.peak_snapshot_bytes, snapshot_bytes);
+        // The forward's finiteness, kept once: the first operand the walk met that was not finite
+        // is enough to say a NaN was already in the values, and it is what a run needs to read.
+        if (result.report.forward_all_finite)
+            for (size_t j = 0; j < rec.operands.size(); ++j)
+                if (fwd_non_finite[j] >= 0) {
+                    result.report.forward_all_finite = false;
+                    result.report.forward_first_non_finite_operand = rec.operands[j].buffer;
+                    result.report.forward_first_non_finite_operand_index =
+                        static_cast<int64_t>(j);
+                    result.report.forward_first_non_finite_position = rec.position;
+                    result.report.forward_first_non_finite_index = fwd_non_finite[j];
+                    break;
+                }
 
-        // The cotangent of every operand the op wrote, writes' order.
+        // The cotangent of every operand the op wrote, writes' order: the copy out of the version
+        // store, one worker per written operand. The slots and the versions are each operand's own,
+        // so no unit reads what its neighbour writes.
         std::vector<AdValue> cot;
         std::vector<int> cot_index(rec.operands.size(), -1);
+        // Where the first non-finite value of each written operand's incoming cotangent sits: the
+        // values the walk is handed rather than the ones it produces.
+        std::vector<int64_t> cot_non_finite(rec.operands.size(), -1);
         for (size_t j = 0; j < rec.operands.size(); ++j) {
             if (!rec.operands[j].written) continue;
             cot_index[j] = static_cast<int>(cot.size());
-            Version& v = version_at(i, j);
-            AdValue c;
+            cot.emplace_back();
+        }
+        run_units(static_cast<int64_t>(rec.operands.size()), [&](int64_t j) {
+            const size_t k = static_cast<size_t>(j);
+            if (cot_index[k] < 0) return;
+            Version& v = version_at(i, k);
+            AdValue& c = cot[static_cast<size_t>(cot_index[k])];
             c.dtype = v.dtype;
             c.shape = v.shape;
             c.value.assign(static_cast<size_t>(numel(v.shape)), 0.0);
@@ -440,8 +520,8 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                     std::copy(src, src + v.cols,
                               c.value.begin() + static_cast<size_t>((v.row_lo + r) * v.cols));
                 }
-            cot.push_back(std::move(c));
-        }
+            cot_non_finite[k] = first_non_finite(c.value);
+        });
 
         // The adjoint sees the record the caller prepared when it wants one: the join may hand it
         // names and rows that differ from the tape's, while the walk keeps the tape's record for
@@ -473,6 +553,13 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             }
         }
         if (!fn) refuse(err);
+        // What the walk handed this op is already non-finite: a seed, the cotangent from above, or
+        // a record later in the forward that the walk has already walked. Recorded before the row
+        // runs, so the first non-finite the walk meets is attributed to where it came from and not
+        // to the row that merely passes it on.
+        for (size_t j = 0; j < rec.operands.size(); ++j)
+            if (cot_non_finite[j] >= 0)
+                note_non_finite(rec, adjoint_rec->op, j, cot_non_finite[j], false);
         // The frozen operands of the row that serves -- the fallback's, when the fallback took
         // the call -- resolved before the slots are sized: the walk does not ask a row for its
         // frozen operands, and a row that served must not write them anyway.
@@ -484,16 +571,20 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         // a plain write keep their dtype and shape but hold no payload: a record whose operands
         // are the model's big frozen weights therefore allocates no cotangent for them, and a
         // row that wrote such a slot would write into nothing.
+
+        // One worker per operand: each writes only its own slot, and the slots the row may add to
+        // -- the activation-sized ones -- are the ones that cost.
         std::vector<AdValue> dc(rec.operands.size());
         std::vector<char> sized(rec.operands.size(), 0);
-        for (size_t j = 0; j < rec.operands.size(); ++j) {
-            dc[j].dtype = fwd[j].dtype;
-            dc[j].shape = fwd[j].shape;
-            if (frozen_at.count(j)) continue;
-            if (rec.operands[j].written && !in_place_read(rec, j)) continue;
-            dc[j].value.assign(static_cast<size_t>(numel(dc[j].shape)), 0.0);
-            sized[j] = 1;
-        }
+        run_units(static_cast<int64_t>(rec.operands.size()), [&](int64_t j) {
+            const size_t k = static_cast<size_t>(j);
+            dc[k].dtype = fwd[k].dtype;
+            dc[k].shape = fwd[k].shape;
+            if (frozen_at.count(k)) return;
+            if (rec.operands[k].written && !in_place_read(rec, k)) return;
+            dc[k].value.assign(static_cast<size_t>(numel(dc[k].shape)), 0.0);
+            sized[k] = 1;
+        });
 
         {
             int64_t held = live_bytes;
@@ -520,6 +611,7 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         fn(with_slots);
         OpTiming& row_acc = row_time[adjoint_rec->op];
         row_acc.calls += 1;
+        row_acc.host = served == Side::host;
         row_acc.seconds += std::chrono::duration<double>(Clock::now() - row_begin).count();
 
         if (options.in_place_passthrough) {
@@ -539,6 +631,17 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             }
         }
 
+        // What the row produced, scanned where the walk is about to hand it on: the slots the row
+        // may add to -- a read, or an in-place write the record also reads. A slot the walk did
+        // not size is a frozen operand the row must not write, so there is nothing to scan; one
+        // hit per slot is enough to name it. The values the row was handed were scanned above, so
+        // a non-finite value recorded here is the row's own.
+        for (size_t j = 0; j < rec.operands.size(); ++j) {
+            if (!sized[j]) continue;
+            const int64_t at = first_non_finite(dc[j].value);
+            if (at >= 0) note_non_finite(rec, adjoint_rec->op, j, at, true);
+        }
+
         // The writers' adjoint has run: their cotangent storage is done. Nothing below reads a
         // written version's cotangent again.
         for (size_t j = 0; j < rec.operands.size(); ++j)
@@ -548,14 +651,17 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         // Hand what the adjoint produced to the versions each read saw, or out of the block. An
         // in-place write's cotangent is also what the value it replaced takes: its read segments
         // name that prior version, so it travels the same way a read's does.
-        for (size_t j = 0; j < rec.operands.size(); ++j) {
-            const bool in_place = in_place_read(rec, j);
-            if (rec.operands[j].written && !in_place) continue;
-            if (frozen_at.count(j)) continue;
+        //
+        // One worker per buffer: a version's storage belongs to one buffer, and an in-place op
+        // gives two operands the same buffer, so the buffer -- not the operand -- is the unit that
+        // owns every write to one store. The operands inside a unit keep the record's order, which
+        // is the serial loop's order, so every output element still sums its terms in the order it
+        // did and the bits do not move.
+        const auto distribute = [&](size_t j) {
             const int64_t bi = plan.by_name.at(rec.operands[j].buffer);
             Buffer& b = plan.buffers[static_cast<size_t>(bi)];
-            const std::vector<double> dense = dense_view(rec.operands[j], dc[j].value, b.rows,
-                                                         b.cols);
+            const std::vector<double> dense =
+                dense_view(rec.operands[j], dc[j].value, b.rows, b.cols);
             const std::vector<double>& values = dense.empty() ? dc[j].value : dense;
             if (values.size() != static_cast<size_t>(b.rows * b.cols))
                 refuse("op '" + rec.op + "': adjoint left operand '" + rec.operands[j].buffer +
@@ -565,11 +671,38 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                 if (seg.version >= 0) {
                     add_version_full(b.versions[static_cast<size_t>(seg.version)], seg.row_lo,
                                      seg.row_hi, values);
-                }
-                else
+                } else {
                     add_input_full(b, seg.row_lo, seg.row_hi, values);
+                }
             }
+        };
+        std::map<int64_t, std::vector<size_t>> by_buffer;
+        for (size_t j = 0; j < rec.operands.size(); ++j) {
+            const bool in_place = in_place_read(rec, j);
+            if (rec.operands[j].written && !in_place) continue;
+            if (frozen_at.count(j)) continue;
+            by_buffer[plan.by_name.at(rec.operands[j].buffer)].push_back(j);
         }
+        // Create the storage the units write before a worker runs: creation moves the live-byte
+        // count and, for a block input, inserts into the input map, and neither is a worker's to
+        // race on. The versions and slots are the ones the serial loop created, in the same record,
+        // so the report's peak stays the walk's figure.
+        for (const auto& unit : by_buffer) {
+            Buffer& b = plan.buffers[static_cast<size_t>(unit.first)];
+            if (b.cols <= 0) continue;
+            for (size_t j : unit.second)
+                for (const Segment& seg : plan.read_segments[i][j]) {
+                    if (seg.version >= 0)
+                        (void)version_cot(b.versions[static_cast<size_t>(seg.version)]);
+                    else
+                        (void)input_slot(b);
+                }
+        }
+        std::vector<std::pair<int64_t, std::vector<size_t>>> units(by_buffer.begin(),
+                                                                   by_buffer.end());
+        run_units(static_cast<int64_t>(units.size()), [&](int64_t u) {
+            for (size_t j : units[static_cast<size_t>(u)].second) distribute(j);
+        });
     }
 
     // The map iterates in op-name order, so the report's list comes out sorted.

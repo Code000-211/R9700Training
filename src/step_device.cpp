@@ -575,6 +575,29 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 OpTiming& acc = into[t.op];
                 acc.calls += t.calls;
                 acc.seconds += t.seconds;
+                acc.non_finite += t.non_finite;
+            }
+        };
+        // The first non-finite cotangent any of the step's walks handed on, and whether the
+        // forward's operands were finite. One walk's hit is the step's: the walks run from the
+        // head down through the layers, so this names the first the step met.
+        const auto merge_finiteness = [&measured](const BackwardReport& r) {
+            measured.forward_all_finite = measured.forward_all_finite && r.forward_all_finite;
+            if (measured.forward_first_non_finite_operand.empty() &&
+                !r.forward_first_non_finite_operand.empty()) {
+                measured.forward_first_non_finite_operand = r.forward_first_non_finite_operand;
+                measured.forward_first_non_finite_operand_index =
+                    r.forward_first_non_finite_operand_index;
+                measured.forward_first_non_finite_position = r.forward_first_non_finite_position;
+                measured.forward_first_non_finite_index = r.forward_first_non_finite_index;
+            }
+            if (measured.first_non_finite_op.empty() && !r.first_non_finite_op.empty()) {
+                measured.first_non_finite_op = r.first_non_finite_op;
+                measured.first_non_finite_operand = r.first_non_finite_operand;
+                measured.first_non_finite_operand_index = r.first_non_finite_operand_index;
+                measured.first_non_finite_position = r.first_non_finite_position;
+                measured.first_non_finite_index = r.first_non_finite_index;
+                measured.first_non_finite_from_row = r.first_non_finite_from_row;
             }
         };
 
@@ -593,11 +616,12 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         }
 
         BackwardOptions bo;
-        bo.side = Side::device;
+        bo.side = options.host_walk ? Side::host : Side::device;
         // A device row is an optimisation; where libr97 has none yet, the host row is the same
         // arithmetic in f64 and the walk has every operand pulled back already. The step's
-        // coverage names the ops that took the host path.
-        bo.allow_host_fallback = true;
+        // coverage names the ops that took the host path. The host A/B asks for the host rows
+        // themselves, so a missing one is an error that names it.
+        bo.allow_host_fallback = !options.host_walk;
         bo.grads = grads;
         const std::string grad_prefix = model.delta ? model.delta->grad_prefix() : "";
         bo.prefix = grad_prefix.c_str();
@@ -637,6 +661,7 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         const BackwardResult head =
             backward_block(head_walk, head_snaps, head_names, head_seeds, {}, bo);
         merge_ops(row_time, head.report.ops);
+        merge_finiteness(head.report);
         measured.peak_snapshot_store_bytes = head_snaps.bytes();
         measured.peak_snapshot_op_bytes = head.report.peak_snapshot_bytes;
         measured.peak_snapshot_bytes =
@@ -756,6 +781,7 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             const BackwardResult walked =
                 backward_block(records, snaps, block_names, {}, {incoming}, bo);
             merge_ops(row_time, walked.report.ops);
+            merge_finiteness(walked.report);
             // The join holds the whole block's snapshots while the walk copies one op out of
             // them, so what it holds at once is the store plus that one op. `before` holds the
             // last write of every buffer an op replaced in place, a second copy of what the store
@@ -789,8 +815,13 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         // container's weight ("@fused:..."), so filling the missing ones before splitting would
         // add a zero under every module name the split then adds the real gradient for.
         measured.grad_stage_bytes = device::grad_stage_bytes();
-        if (!device::grad_stage_flush(grads))
+        if (options.host_walk) {
+            // The host rows add to the ParamSet themselves: nothing was staged, and there is
+            // nothing to copy out.
+            device::grad_stage_discard();
+        } else if (!device::grad_stage_flush(grads)) {
             throw std::runtime_error("device step: the card's gradient staging did not copy out");
+        }
         stage.disarm();
         split_adapter_grads(grads, params, groups, grad_prefix);
         fill_missing_grads(grads, params);

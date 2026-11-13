@@ -75,6 +75,31 @@ Not in this step: the narrow-fold `gemm_nt_q_gated` (a 4096-token step takes the
 `gated_had_quant_i8g` pair, whose rows exist), the `rope_table` op (off the walk's path), and the
 logits op itself (the join handles it; no adjoint row exists for it, by design).
 
+## Where a non-finite gradient is attributed
+
+A step whose gradient holds a NaN or an inf reports where the walk first met one, instead of
+leaving it to a bisect. `BackwardReport` (and, summed over the step's walks, `DeviceStepReport`)
+carries `first_non_finite_op` / `first_non_finite_operand` / `first_non_finite_operand_index` /
+`first_non_finite_position` / `first_non_finite_index` and `first_non_finite_from_row`: the op whose
+row was being walked, the tape buffer of the operand whose cotangent held the value, its index in
+the record and the value's offset in that operand's payload, and whether the row produced it or the
+walk handed it in (a seed, the cotangent from above, or a record later in the forward). Each
+`OpTiming` in `row_seconds` counts the slots of its op that carried one (`non_finite`). The same
+question is asked of the forward's own operands (`forward_all_finite` and `forward_first_*`): a NaN
+born in the forward is a different bug from one born in the walk. The scan is one pass over each
+slot the walk already holds, stopping at the slot's first non-finite value, and changes no value,
+order or row.
+
+`device_step_tape` prints it as one line, after the walk's per-op split:
+
+```
+device_step_tape: non-finite: cotangent op gemm_nt_q, operand 'blk.3.ffn_gate_up.weight'[2] at position 812, value 4097, from the row | forward all finite | per op: gemm_nt_q 2/64
+```
+
+`cotangent none` and `per op: (none)` mean the walk handed on only finite values; `from the walk's
+input` instead of `from the row` means the op merely passed the value on. The results JSON carries
+the same numbers under `non_finite` and per op under `row_seconds[].non_finite`.
+
 ## How it is checked
 
 `tests/gpu/device_step.cpp`, model tier, a child process per case (ROCR is initialised once):

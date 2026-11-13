@@ -508,6 +508,70 @@ void card_case(const char* test, int64_t n, bool probe) {
         if (is_b && part == 0.0) b_all_nonzero = false;
     }
 
+    // ---- the A/B, only when the device walk's gradient was not finite: the same tape and the
+    // same params walked with the host rows (side = host, no fallback). A device row that is wrong
+    // shows as a finite host gradient beside the device one; both non-finite means the plumbing --
+    // the seeds, the head's cotangent, the staging -- rather than a row. The host walk costs the
+    // host's f64 arithmetic, hours on the real container, so a finite run never pays it.
+    nlohmann::json ab;
+    // The A/B costs the host's f64 walk -- hours on the real container -- so it runs only when
+    // asked for: R97_HOST_WALK_AB=1. The attribution line above is what a normal window reads.
+    const char* ab_env = std::getenv("R97_HOST_WALK_AB");
+    if (!all_finite && ab_env != nullptr && *ab_env == '1') {
+        r97::DeviceStepOptions host_options = options;
+        host_options.host_walk = true;
+        r97::DeviceStepReport host_report;
+        const r97::StepFn host_step = r97::device_step(*driver, model, host_options, &host_report);
+        r97::ParamSet host_grads;
+        const auto t_ab = std::chrono::steady_clock::now();
+        const r97::StepResult host_result = host_step(batch, params, &host_grads);
+        const double host_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t_ab).count();
+        bool host_all_finite = true;
+        int64_t host_non_finite_leaves = 0;
+        double host_norm_sq = 0.0;
+        for (const r97::Param& g : host_grads) {
+            bool leaf_finite = true;
+            for (float v : g.value) {
+                if (!std::isfinite(v)) leaf_finite = false;
+                host_norm_sq += double(v) * double(v);
+            }
+            if (!leaf_finite) {
+                host_all_finite = false;
+                ++host_non_finite_leaves;
+            }
+        }
+        ab = {{"loss", host_result.loss},
+              {"seconds", host_seconds},
+              {"n_grads", int64_t(host_grads.size())},
+              {"all_finite", host_all_finite},
+              {"non_finite_leaves", host_non_finite_leaves},
+              {"grad_norm", std::sqrt(host_norm_sq)},
+              {"first_non_finite_op", host_report.first_non_finite_op},
+              {"first_non_finite_operand", host_report.first_non_finite_operand},
+              {"first_non_finite_operand_index", host_report.first_non_finite_operand_index},
+              {"first_non_finite_position", host_report.first_non_finite_position},
+              {"first_non_finite_index", host_report.first_non_finite_index},
+              {"first_non_finite_from_row", host_report.first_non_finite_from_row},
+              {"forward_all_finite", host_report.forward_all_finite},
+              {"forward_operand", host_report.forward_first_non_finite_operand},
+              {"forward_position", host_report.forward_first_non_finite_position},
+              {"forward_value_index", host_report.forward_first_non_finite_index}};
+        std::printf("%s: host-walk A/B: %lld scored, loss %.6f, gradient %s (grad norm %.6g, %lld "
+                    "of %lld leaves non-finite), cotangent op '%s' operand '%s'[%lld] pos %lld "
+                    "value %lld from_row %d, forward_all_finite %d, %.1f s\n",
+                    test, (long long)host_result.scored, host_result.loss,
+                    host_all_finite ? "all finite" : "NOT finite", std::sqrt(host_norm_sq),
+                    (long long)host_non_finite_leaves, (long long)host_grads.size(),
+                    host_report.first_non_finite_op.c_str(),
+                    host_report.first_non_finite_operand.c_str(),
+                    (long long)host_report.first_non_finite_operand_index,
+                    (long long)host_report.first_non_finite_position,
+                    (long long)host_report.first_non_finite_index,
+                    host_report.first_non_finite_from_row ? 1 : 0,
+                    host_report.forward_all_finite ? 1 : 0, host_seconds);
+    }
+
     // One AdamW step off the gradient, at the config's default lr, weight decay 0: a zero
     // gradient leaves its parameter bit-identical, and a nonzero one moves it.
     const r97::ParamSet before = params;
@@ -580,6 +644,24 @@ void card_case(const char* test, int64_t n, bool probe) {
     j["names_match"]          = names_match;
     j["shapes_match"]         = shapes_match;
     j["all_finite"]           = all_finite;
+    // Where a non-finite cotangent was born: the op, the operand and the value, and whether the
+    // row produced it or the walk handed it in. `forward_all_finite` asks the same of the
+    // forward's own values, so a NaN that was already there is told apart from one the walk made.
+    j["non_finite"] = {{"op", rep.first_non_finite_op},
+                       {"operand", rep.first_non_finite_operand},
+                       {"operand_index", rep.first_non_finite_operand_index},
+                       {"position", rep.first_non_finite_position},
+                       {"value_index", rep.first_non_finite_index},
+                       {"from_row", rep.first_non_finite_from_row},
+                       {"forward_all_finite", rep.forward_all_finite},
+                       {"forward_operand", rep.forward_first_non_finite_operand},
+                       {"forward_operand_index", rep.forward_first_non_finite_operand_index},
+                       {"forward_position", rep.forward_first_non_finite_position},
+                       {"forward_value_index", rep.forward_first_non_finite_index}};
+    // The host-vs-device A/B of the same tape, run only when the device gradient was not finite
+    // (null otherwise): a finite host gradient beside the device one says a device row is wrong,
+    // both non-finite says the plumbing is.
+    j["ab_host_walk"] = ab;
     j["n_lora_a"]             = n_a;
     j["n_lora_b"]             = n_b;
     j["n_other"]              = n_other;
@@ -596,7 +678,8 @@ void card_case(const char* test, int64_t n, bool probe) {
     auto timing = [](const std::vector<r97::OpTiming>& v) {
         nlohmann::json a = nlohmann::json::array();
         for (const r97::OpTiming& t : v)
-            a.push_back({{"op", t.op}, {"calls", t.calls}, {"seconds", t.seconds}});
+            a.push_back({{"op", t.op}, {"calls", t.calls}, {"seconds", t.seconds},
+                         {"side", t.host ? "host" : "device"}, {"non_finite", t.non_finite}});
         return a;
     };
     j["row_seconds"]          = timing(rep.row_seconds);
@@ -627,14 +710,49 @@ void card_case(const char* test, int64_t n, bool probe) {
         std::string s;
         for (size_t i = 0; i < p.size() && i < 5; ++i) {
             char b[160];
-            std::snprintf(b, sizeof b, "%s%.1f s/%lld", i ? ", " : " ", p[i]->seconds,
-                          (long long)p[i]->calls);
+            std::snprintf(b, sizeof b, "%s%.1f s/%lld%s", i ? ", " : " ", p[i]->seconds,
+                          (long long)p[i]->calls, p[i]->host ? "h" : "d");
             s += p[i]->op + b;
         }
         return s.empty() ? std::string(" (none)") : s;
     };
     std::printf("%s: walk by op:%s | pull by op:%s\n", test, top(rep.row_seconds).c_str(),
                 top(rep.pull_seconds).c_str());
+    // Where the walk's first non-finite cotangent was born, and whether the forward's values were
+    // finite: the line a window is read for when `all_finite` is false. `from the row` means the
+    // op's adjoint produced it; `from the walk's input` means the walk handed it in -- a seed, the
+    // cotangent from above, or a record later in the forward. The per-op counts name every op that
+    // carried one (slots with a non-finite value, each counted once).
+    std::string cot_nf = "none";
+    if (!rep.first_non_finite_op.empty()) {
+        char b[256];
+        std::snprintf(b, sizeof b,
+                      "op %s, operand '%s'[%lld] at position %lld, value %lld, from the %s",
+                      rep.first_non_finite_op.c_str(), rep.first_non_finite_operand.c_str(),
+                      (long long)rep.first_non_finite_operand_index,
+                      (long long)rep.first_non_finite_position,
+                      (long long)rep.first_non_finite_index,
+                      rep.first_non_finite_from_row ? "row" : "walk's input");
+        cot_nf = b;
+    }
+    std::string fwd_nf = "all finite";
+    if (!rep.forward_all_finite) {
+        char b[256];
+        std::snprintf(b, sizeof b, "not finite: operand '%s'[%lld] at position %lld, value %lld",
+                      rep.forward_first_non_finite_operand.c_str(),
+                      (long long)rep.forward_first_non_finite_operand_index,
+                      (long long)rep.forward_first_non_finite_position,
+                      (long long)rep.forward_first_non_finite_index);
+        fwd_nf = b;
+    }
+    std::string nf_ops;
+    for (const r97::OpTiming& t : rep.row_seconds)
+        if (t.non_finite) {
+            nf_ops += (nf_ops.empty() ? " " : ", ") + t.op + " " + std::to_string(t.non_finite) +
+                      "/" + std::to_string(t.calls);
+        }
+    std::printf("%s: non-finite: cotangent %s | forward %s | per op:%s\n", test, cot_nf.c_str(),
+                fwd_nf.c_str(), nf_ops.empty() ? " (none)" : nf_ops.c_str());
 }
 
 }  // namespace

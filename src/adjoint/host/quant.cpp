@@ -17,6 +17,8 @@
 // possible; no walk appends a `<op>_ste` record.
 #include "r97/adjoint.h"
 
+#include "parallel.h"
+
 #include "rad_plugin.h"  // bf16 and fp8 e4m3, the fused quantiser's two grids
 
 #include <algorithm>
@@ -30,8 +32,11 @@
 namespace r97 {
 namespace {
 
+// The unit the parallel for cuts a quantiser pass into: one activation row, whose scale, codes and
+// rotation are its own. A call with fewer rows than this stays on the calling thread.
+constexpr int64_t kRowChunk = 2;
+
 // The top of the int8 code grid. The scale is the group's amax over it, so the largest value of
-// every group maps to this code.
 constexpr double kTop = 127.0;
 
 // The ops this file serves: the two of the family, and the linearised twin of each.
@@ -146,7 +151,7 @@ Point quantise(const std::vector<double>& x, int64_t rows, const Geometry& geo) 
     p.scale.assign(static_cast<size_t>(rows * geo.ngrp), 0.0);
     p.code.assign(static_cast<size_t>(rows * geo.n), 0.0);
     p.live.assign(static_cast<size_t>(rows * geo.n), 0);
-    for (int64_t r = 0; r < rows; ++r) {
+    parallel_for(rows, kRowChunk, [&](int64_t r) {
         for (int64_t g = 0; g < geo.ngrp; ++g) {
             const int64_t k0 = g * geo.group;
             const int64_t w = std::min(geo.group, geo.n - k0);  // a short last group
@@ -165,7 +170,7 @@ Point quantise(const std::vector<double>& x, int64_t rows, const Geometry& geo) 
                 p.live[j] = std::fabs(u) <= kTop ? 1 : 0;
             }
         }
-    }
+    });
     return p;
 }
 
@@ -278,16 +283,12 @@ void quant_adjoint(const AdjointCall& call) {
 
     // The values the quantiser saw, for the mask, from the activation the walk hands back.
     std::vector<double> v(x.value);
-    if (geo.rotated)
-        for (int64_t r = 0; r < rows; ++r)
-            for (int64_t gi = 0; gi < geo.ngrp; ++gi)
-                fwht(v.data() + r * geo.n + gi * geo.group, geo.group);
-
     std::vector<double> d(g.value);
-    for (int64_t r = 0; r < rows; ++r) {
+    parallel_for(rows, kRowChunk, [&](int64_t r) {
         for (int64_t gi = 0; gi < geo.ngrp; ++gi) {
             const int64_t k0 = gi * geo.group;
             const int64_t w = std::min(geo.group, geo.n - k0);
+            if (geo.rotated) fwht(v.data() + r * geo.n + k0, geo.group);
             const double s = scale.value[static_cast<size_t>(r * geo.ngrp + gi)];
             // The family's scale is amax/127, or 1 for the zero group: always positive.
             if (!(s > 0.0))
@@ -299,7 +300,7 @@ void quant_adjoint(const AdjointCall& call) {
             }
             if (geo.rotated) fwht(d.data() + r * geo.n + k0, geo.group);
         }
-    }
+    });
 
     AdValue& dx = call.dc->at(0);
     for (size_t i = 0; i < dx.value.size() && i < d.size(); ++i) dx.value[i] += d[i];

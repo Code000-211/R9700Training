@@ -42,6 +42,14 @@ struct DeviceStepOptions {
     // Mark a head-split adapter activation so the join reads it as [rows][K] with the reference
     // step's row, the host join's flag with the same meaning.
     bool reference_head_split = true;
+    // Walk the head and the blocks with the host rows instead of the device ones
+    // (`Side::host`, no fallback): the A/B of one tape. A device row that is wrong shows as a
+    // finite host gradient beside the device one; both non-finite means the plumbing -- the
+    // seeds, the head's cotangent, the staging -- rather than a row. The host rows add to the
+    // gradient ParamSet themselves, so nothing is staged on the card (grad_stage_bytes is 0), and
+    // the walk costs whatever the host's f64 arithmetic costs -- hours, not minutes, on the real
+    // container. A check runs it only when the device walk's gradient was not finite.
+    bool host_walk = false;
 };
 
 struct DeviceStepReport {
@@ -94,6 +102,24 @@ struct DeviceStepReport {
     std::vector<std::string> boundary_name;           // the tape buffer of each boundary
     std::vector<std::vector<double>> boundary_value;  // boundary forward values, bf16 widened
     std::vector<std::vector<double>> boundary_cotangent;
+
+    // The first non-finite cotangent the step's walks handed on, and whether the forward's operands
+    // were finite: a NaN born in the forward is a different bug from one born in the walk, and a
+    // gradient is only as good as the values it differentiates. Empty `first_non_finite_op` means
+    // the walks saw none; the walks run from the head down through the layers, so "first" is the
+    // first the step met, not the first in forward order. The per-op count is on row_seconds'
+    // OpTiming.
+    std::string first_non_finite_op;
+    std::string first_non_finite_operand;
+    int64_t first_non_finite_operand_index = -1;
+    int64_t first_non_finite_position = -1;
+    int64_t first_non_finite_index = -1;
+    bool first_non_finite_from_row = false;
+    bool forward_all_finite = true;
+    std::string forward_first_non_finite_operand;
+    int64_t forward_first_non_finite_operand_index = -1;
+    int64_t forward_first_non_finite_position = -1;
+    int64_t forward_first_non_finite_index = -1;
 };
 
 // The join. The driver must be configured for the device tier -- its ForwardConfig::kernels name

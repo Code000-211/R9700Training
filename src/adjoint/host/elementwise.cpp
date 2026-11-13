@@ -23,6 +23,8 @@
 // registered with the frozen operand, so the walk never asks them for a cotangent.
 #include "r97/adjoint.h"
 
+#include "parallel.h"
+
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -33,6 +35,10 @@
 
 namespace r97 {
 namespace {
+// The unit a flat elementwise pass splits into, and the unit a row-wise pass uses: one output
+// element, or one output row. A call below the row threshold runs on the calling thread.
+constexpr int64_t kElemChunk = 4096;
+constexpr int64_t kRowChunk = 2;
 
 /* ------------------------------------------------------------------ reading a record */
 
@@ -170,7 +176,9 @@ void mul_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector<A
     if (nb == 0) return;
 
     AdValue y = write_value(rec, 2, a.shape);
-    for (size_t i = 0; i < (size_t)na; ++i) y.value[i] = a.value[i] * b.value[row ? i % nb : i];
+    parallel_for(na, kElemChunk, [&](int64_t i) {
+        y.value[(size_t)i] = a.value[(size_t)i] * b.value[row ? (size_t)(i % nb) : (size_t)i];
+    });
     out->push_back(std::move(y));
 }
 
@@ -181,10 +189,21 @@ void mul_host_adjoint(const AdjointCall& call) {
     const size_t na = dy.value.size(), nb = b.value.size();
     if (nb == 0 || nb > na) return;
 
-    for (size_t i = 0; i < na; ++i) {
-        da.value[i] += dy.value[i] * b.value[nb == na ? i : i % nb];
-        db.value[nb == na ? i : i % nb] += dy.value[i] * a.value[i];
+    if (nb == na) {
+        parallel_for((int64_t)na, kElemChunk, [&](int64_t i) {
+            da.value[(size_t)i] += dy.value[(size_t)i] * b.value[(size_t)i];
+            db.value[(size_t)i] += dy.value[(size_t)i] * a.value[(size_t)i];
+        });
+        return;
     }
+    /* b is one row every row of a multiplies: db[j] sums the rows, so the pass splits over its
+     * columns, each keeping the rows serial -- the sum's order is the rows' own. */
+    parallel_for((int64_t)nb, kElemChunk, [&](int64_t j) {
+        for (size_t i = (size_t)j; i < na; i += nb) {
+            da.value[i] += dy.value[i] * b.value[(size_t)j];
+            db.value[(size_t)j] += dy.value[i] * a.value[i];
+        }
+    });
 }
 
 /* ------------------------------------------------------------------ scale: y = x * s[0] */
@@ -194,7 +213,9 @@ void scale_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector
     const AdValue& x = op[0];
     const double s = op[1].value[0];
     AdValue y = write_value(rec, 2, x.shape);
-    for (size_t i = 0; i < y.value.size(); ++i) y.value[i] = x.value[i] * s;
+    parallel_for((int64_t)y.value.size(), kElemChunk, [&](int64_t i) {
+        y.value[(size_t)i] = x.value[(size_t)i] * s;
+    });
     out->push_back(std::move(y));
 }
 
@@ -203,7 +224,9 @@ void scale_host_adjoint(const AdjointCall& call) {
         return;
     const double s = call.fwd[1].value[0];
     AdValue& dx = call.dc->at(0);
-    for (size_t i = 0; i < call.cot[0].value.size(); ++i) dx.value[i] += call.cot[0].value[i] * s;
+    parallel_for((int64_t)call.cot[0].value.size(), kElemChunk, [&](int64_t i) {
+        dx.value[(size_t)i] += call.cot[0].value[(size_t)i] * s;
+    });
 }
 
 /* ------------------------------------------------------------------ sigmoid: y = 1/(1+e^-x) */
@@ -212,7 +235,9 @@ void sigmoid_twin(const OpRecord&, const std::vector<AdValue>& op, std::vector<A
     if (op.size() < 1) return;
     const AdValue& x = op[0];
     AdValue y = x;
-    for (size_t i = 0; i < y.value.size(); ++i) y.value[i] = sigmoid(x.value[i]);
+    parallel_for((int64_t)y.value.size(), kElemChunk, [&](int64_t i) {
+        y.value[(size_t)i] = sigmoid(x.value[(size_t)i]);
+    });
     out->push_back(std::move(y));
 }
 
@@ -220,8 +245,9 @@ void sigmoid_host_adjoint(const AdjointCall& call) {
     if (call.cot.empty() || call.fwd.size() < 2 || call.dc->empty()) return;
     const AdValue &y = call.fwd[1], &dy = call.cot[0];  /* y, the op's own output */
     AdValue& dx = call.dc->at(0);
-    for (size_t i = 0; i < dy.value.size(); ++i)
-        dx.value[i] += dy.value[i] * y.value[i] * (1.0 - y.value[i]);
+    parallel_for((int64_t)dy.value.size(), kElemChunk, [&](int64_t i) {
+        dx.value[(size_t)i] += dy.value[(size_t)i] * y.value[(size_t)i] * (1.0 - y.value[(size_t)i]);
+    });
 }
 
 /* ------------------------------------------------------------------ silu: y = x * sigmoid(x) */
@@ -230,7 +256,9 @@ void silu_twin(const OpRecord&, const std::vector<AdValue>& op, std::vector<AdVa
     if (op.size() < 1) return;
     const AdValue& x = op[0];
     AdValue y = x;
-    for (size_t i = 0; i < y.value.size(); ++i) y.value[i] = act_value(kSilu, x.value[i]);
+    parallel_for((int64_t)y.value.size(), kElemChunk, [&](int64_t i) {
+        y.value[(size_t)i] = act_value(kSilu, x.value[(size_t)i]);
+    });
     out->push_back(std::move(y));
 }
 
@@ -238,8 +266,9 @@ void silu_host_adjoint(const AdjointCall& call) {
     if (call.cot.empty() || call.fwd.empty() || call.dc->empty()) return;
     const AdValue &x = call.fwd[0], &dy = call.cot[0];
     AdValue& dx = call.dc->at(0);
-    for (size_t i = 0; i < dy.value.size(); ++i)
-        dx.value[i] += dy.value[i] * act_slope(kSilu, x.value[i]);
+    parallel_for((int64_t)dy.value.size(), kElemChunk, [&](int64_t i) {
+        dx.value[(size_t)i] += dy.value[(size_t)i] * act_slope(kSilu, x.value[(size_t)i]);
+    });
 }
 
 /* ------------------------------------------------------------------ silu_mul: y = silu(g) * u */
@@ -254,12 +283,12 @@ void silu_mul_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vec
     if (n <= 0 || rows <= 0) return;
 
     AdValue y = write_value(rec, 1, {rows, n});
-    for (int64_t r = 0; r < rows; ++r) {
+    parallel_for(rows, kRowChunk, [&](int64_t r) {
         const int64_t xb = r * 2 * n, yb = r * n;
         for (int64_t i = 0; i < n; ++i)
             y.value[(size_t)(yb + i)] = act_value(kSilu, x.value[(size_t)(xb + i)]) *
                                         x.value[(size_t)(xb + n + i)];
-    }
+    });
     out->push_back(std::move(y));
 }
 
@@ -271,7 +300,7 @@ void silu_mul_host_adjoint(const AdjointCall& call) {
     if (n <= 0 || rows <= 0 || rows_of(dy, n) != rows) return;
 
     AdValue& dx = call.dc->at(0);
-    for (int64_t r = 0; r < rows; ++r) {
+    parallel_for(rows, kRowChunk, [&](int64_t r) {
         const int64_t xb = r * 2 * n, yb = r * n;
         for (int64_t i = 0; i < n; ++i) {
             const double g = x.value[(size_t)(xb + i)], u = x.value[(size_t)(xb + n + i)];
@@ -279,7 +308,7 @@ void silu_mul_host_adjoint(const AdjointCall& call) {
             dx.value[(size_t)(xb + i)] += d * u * act_slope(kSilu, g);
             dx.value[(size_t)(xb + n + i)] += d * act_value(kSilu, g);
         }
-    }
+    });
 }
 
 /* ------------------------------------------------------------------ act_mul: y = act(a) * b */
@@ -291,8 +320,9 @@ void act_mul_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
     if (!name || !act_of(*name, &act) || op[0].value.size() != op[1].value.size()) return;
 
     AdValue y = write_value(rec, 2, op[0].shape);
-    for (size_t i = 0; i < y.value.size(); ++i)
-        y.value[i] = act_value(act, op[0].value[i]) * op[1].value[i];
+    parallel_for((int64_t)y.value.size(), kElemChunk, [&](int64_t i) {
+        y.value[(size_t)i] = act_value(act, op[0].value[(size_t)i]) * op[1].value[(size_t)i];
+    });
     out->push_back(std::move(y));
 }
 
@@ -304,10 +334,13 @@ void act_mul_host_adjoint(const AdjointCall& call) {
 
     const AdValue &a = call.fwd[0], &b = call.fwd[1], &dy = call.cot[0];
     AdValue &da = call.dc->at(0), &db = call.dc->at(1);
-    for (size_t i = 0; i < dy.value.size() && i < a.value.size() && i < b.value.size(); ++i) {
-        da.value[i] += dy.value[i] * act_slope(act, a.value[i]) * b.value[i];
-        db.value[i] += dy.value[i] * act_value(act, a.value[i]);
-    }
+    size_t len = dy.value.size();
+    if (a.value.size() < len) len = a.value.size();
+    if (b.value.size() < len) len = b.value.size();
+    parallel_for((int64_t)len, kElemChunk, [&](int64_t i) {
+        da.value[(size_t)i] += dy.value[(size_t)i] * act_slope(act, a.value[(size_t)i]) * b.value[(size_t)i];
+        db.value[(size_t)i] += dy.value[(size_t)i] * act_value(act, a.value[(size_t)i]);
+    });
 }
 
 /* ------------------------------------------------------------------ cast: y = x in to */
@@ -324,7 +357,9 @@ void cast_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector<
 void cast_host_adjoint(const AdjointCall& call) {
     if (call.cot.empty() || call.dc->empty()) return;
     AdValue& dx = call.dc->at(0);
-    for (size_t i = 0; i < call.cot[0].value.size(); ++i) dx.value[i] += call.cot[0].value[i];
+    parallel_for((int64_t)call.cot[0].value.size(), kElemChunk, [&](int64_t i) {
+        dx.value[(size_t)i] += call.cot[0].value[(size_t)i];
+    });
 }
 
 /* ------------------------------------------------------------------ rmsnorm */
@@ -346,7 +381,7 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
     if (!w && wadd != 0.0) return;
 
     AdValue y = write_value(rec, 2, x.shape);
-    for (int64_t r = 0; r < rows; ++r) {
+    parallel_for(rows, kRowChunk, [&](int64_t r) {
         const int64_t b = r * n;
         double ss = 0.0;
         for (int64_t i = 0; i < n; ++i) ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
@@ -354,7 +389,7 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
         for (int64_t i = 0; i < n; ++i)
             y.value[(size_t)(b + i)] =
                 x.value[(size_t)(b + i)] * s * (w ? w->value[(size_t)i] + wadd : 1.0) * mult;
-    }
+    });
     out->push_back(std::move(y));
 }
 
@@ -377,7 +412,7 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
     if (!w && wadd != 0.0) return;
 
     AdValue& dx = call.dc->at(0);
-    for (int64_t r = 0; r < rows; ++r) {
+    parallel_for(rows, kRowChunk, [&](int64_t r) {
         const int64_t b = r * n;
         double ss = 0.0;
         for (int64_t i = 0; i < n; ++i) ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
@@ -392,7 +427,7 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
             const double shared = s * s * s * x.value[(size_t)(b + i)] * t / (double)n;
             dx.value[(size_t)(b + i)] += mult * (s * c * dy.value[(size_t)(b + i)] - shared);
         }
-    }
+    });
 }
 
 }  // namespace

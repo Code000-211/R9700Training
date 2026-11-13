@@ -26,6 +26,8 @@
 
 #include "r97/adjoint.h"
 
+#include "parallel.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -36,6 +38,11 @@
 
 namespace r97 {
 namespace {
+
+// The unit the parallel for cuts the query rows into: one row is one softmax per head, and the
+// row writes only its own output slice. Two rows can name the same key slot, which is why the
+// adjoint below stays on the calling thread.
+constexpr int64_t kRowChunk = 2;
 
 int64_t numel(const std::vector<int64_t>& shape) {
     int64_t n = 1;
@@ -261,9 +268,9 @@ void attention_twin(const OpRecord& rec, const std::vector<AdValue>& fwd,
     y.shape = c.q->shape;
     y.value.assign(c.q->value.size(), 0.0);
 
-    std::vector<int64_t> keys;
-    std::vector<double> score;
-    for (int64_t tok = 0; tok < c.rows; ++tok) {
+    parallel_for(c.rows, kRowChunk, [&](int64_t tok) {
+        std::vector<int64_t> keys;
+        std::vector<double> score;
         int64_t s = 0, qlen = 0, i = 0;
         c.row_of(tok, &s, &qlen, &i);
         const int64_t ctx = c.ctx[(size_t)s];
@@ -304,14 +311,20 @@ void attention_twin(const OpRecord& rec, const std::vector<AdValue>& fwd,
                     y.value[base + (size_t)d] += w * c.v_at(slot, d);
             }
         }
-    }
+    });
     out->push_back(std::move(y));
 }
 
 /* The adjoint. For one (query row, head), with p the softmax weights of its visible keys and
  * g_j = dL/ds_j the score's cotangent, g_j = p_j (G_j - sum_k p_k G_k) where
  * G_j = sum_d ycot[d] * V_j[d] * v_descale: the query's row, the score's cotangent and the pool row
- * of each key all follow from one pass over the keys. */
+ * of each key all follow from one pass over the keys.
+ *
+ * This row stays on the calling thread. Its pool cotangent is addressed by the key's slot, not by
+ * the query row: every query row that can see key j adds to the same pool element, so a partition
+ * over rows would need a cross-thread sum whose order is part of the contract. Splitting the other
+ * way (one unit per key) collides on the query's own cotangent instead, and a per-worker copy of
+ * the pool is the whole cache. The forward above is the half a partition can take. */
 void attention_host_adjoint(const AdjointCall& call) {
     if (call.cot.empty() || !call.dc || call.dc->size() < 2) return;
     Call c;

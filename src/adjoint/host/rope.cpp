@@ -37,6 +37,10 @@ double rope_double(const OpRecord& rec, const std::string& name, double dflt) {
 }
 
 adjoint::qk::RopeShape rope_shape(const OpRecord& rec, const AdValue& qkv) {
+    // `mode` is not refused here: this container's tape declares `mrope`, and for a text-only step
+    // the three position streams are equal, which is the NeoX rotation this row computes. A
+    // sectioned mode with differing streams would be a different rotation -- worth a row of its
+    // own, but not a refusal that stops every tape the container serves.
     adjoint::qk::RopeShape s;
     s.tokens = qkv.shape.empty() ? 0 : qkv.shape[0];
     s.head_dim = rope_param(rec, "head_dim", 0);
@@ -48,6 +52,13 @@ adjoint::qk::RopeShape rope_shape(const OpRecord& rec, const AdValue& qkv) {
             throw std::runtime_error("rope: cannot infer the head width");
         s.head_dim = qkv.shape[1] / (s.n_head + 2 * s.n_head_kv);
     }
+    // The operand's width has to be the one the parameters describe, or the row writes
+    // `tokens * width` doubles into a buffer sized from the operand.
+    if (qkv.shape.size() == 2 && s.n_head + 2 * s.n_head_kv > 0 &&
+        qkv.shape[1] != (s.n_head + 2 * s.n_head_kv) * s.head_dim)
+        throw std::runtime_error("rope: the operand is " + std::to_string(qkv.shape[1]) +
+                                 " wide, its parameters say " +
+                                 std::to_string((s.n_head + 2 * s.n_head_kv) * s.head_dim));
     return s;
 }
 
