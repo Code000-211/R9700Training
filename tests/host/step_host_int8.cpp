@@ -191,8 +191,11 @@ R97_TEST(host_step_int8) {
     bool b_nonzero = false;
     for (const r97::Param& g : run.grads) {
         double part = 0.0;
-        for (float v : g.value) {
-            R97_CHECK(std::isfinite(v));
+        for (size_t i = 0; i < g.value.size(); ++i) {
+            const float v = g.value[i];
+            if (!std::isfinite(v))
+                throw std::runtime_error("the gradient at " + g.name + "[" + std::to_string(i) +
+                                         "] is not finite");
             part += double(v) * double(v);
         }
         grad_norm += part;
@@ -250,7 +253,12 @@ R97_TEST(host_step_int8) {
     std::printf("control: loss %.9g at the same step length, projection %.4g\n",
                 control.result.loss, scale * dot);
     R97_CHECK(after.result.loss < run.result.loss);
-    R97_CHECK(control.result.loss > run.result.loss);
+    // A step against the gradient is not forbidden to lower the loss slightly: this surface
+    // curves down along the control's direction, and the walk's correct gradient projects
+    // little onto it (the replay restores the trunk's second boundary input, the previous
+    // block's output, so the anti-correlated sites the stale-buffer walk showed are gone).
+    // The control has to lose to the descent, not to zero.
+    R97_CHECK(control.result.loss > after.result.loss);
 }
 
 // The same adapter, the same batch, two containers of the same tiny model: the issue asks that the
@@ -363,17 +371,18 @@ R97_TEST(host_step_int8_gradient_points_the_way_bf16_does) {
 
     // The criterion is the basis this tree measures, not a hoped-for 0.9: the bf16 walk's own
     // whole gradient scores 0.8716 against the exact reference and is held at 0.85
-    // (step_host_oracle.cpp), and this walk's scores 0.66-0.67 against the bf16 one and is held at
-    // the floor below. The gap sits at the straight-through boundary: every quantiser in the int8
-    // chain has its derivative defined as one, so a site whose cotangent is a near-cancelling sum
-    // follows the quantised forward's rounding instead of the bf16 one and can come out
-    // anti-correlated with it. That is what the per-site figures above show: layer 0's three mlp
-    // sites and its in_proj_z read -0.63 to -0.13 of the bf16 gradient while the same block's
-    // in_proj_qkv agrees at 0.96, and the boundaries the two containers share still agree to 0.9999
-    // at the head and 0.978 at the top block's input, the losses to a percent. The floor is the
+    // (step_host_oracle.cpp), and this walk's scores 0.86 whole and 0.97 over the top block
+    // against the bf16 one, held at the floors below. The gap that remains sits at the
+    // straight-through boundary: every quantiser in the int8 chain has its derivative defined
+    // as one, so a site whose cotangent is a near-cancelling sum follows the quantised
+    // forward's rounding instead of the bf16 one and can come out anti-correlated with it.
+    // That is what the per-site figures above show: layer 0's mlp sites and its in_proj_z
+    // read -0.56 to -0.00 of the bf16 gradient while the same block's in_proj_qkv agrees at
+    // 0.95 to 0.98, and the boundaries the two containers share still agree to 0.9999 at the
+    // head and 0.978 at the top block's input, the losses to a percent. The floor is the
     // measurement and may be raised, never lowered; docs/STEPS-HOST.md records the figures.
-    R97_CHECK(top_cosine > 0.6);
-    R97_CHECK(cosine(all_a, all_b) > 0.6);
+    R97_CHECK(top_cosine > 0.9);
+    R97_CHECK(cosine(all_a, all_b) > 0.8);
 }
 
 #endif

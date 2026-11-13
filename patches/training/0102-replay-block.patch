@@ -1,4 +1,4 @@
-Concern: re-running one block of a step from a restored residual, after its ops have run
+Concern: re-running one block of a step from a restored residual, after its ops have run, in both trunk architectures
 Upstream: not-submitted
 
 The replay needs one thing from radiance that the issue observer (0101) does not give: a way to run
@@ -6,7 +6,9 @@ one block of the step alone, after its caller restored the residual at every bou
 block on the engine, the architecture reads rad_replay_block() at the top of step() and issues only
 that block between its brackets, and the observer, which runs after each op, hands the caller that
 op's bytes before the planner reuses the buffer. The patch adds no observer of its own: 0101 has the
-one call.
+one call. Both trunk architectures honour the block: the bf16 arch, and the int8 trunk behind
+qwen35_w8a8, whose replay takes the serial single-layer path with the serial brackets and never the
+pipelined one.
 diff --git a/abi/rad_runtime.h b/abi/rad_runtime.h
 index 3afcced..82191ef 100644
 --- a/abi/rad_runtime.h
@@ -113,11 +115,111 @@ index a7f9b9b..5564356 100644
      }
  
      RAD_ISSUE(c, m.op_final_norm,
+diff --git a/arch/qwen35_fp8/qwen35_fp8.cpp b/arch/qwen35_fp8/qwen35_fp8.cpp
+index 5c3d2a1..e4d8f0b 100644
+--- a/arch/qwen35_fp8/qwen35_fp8.cpp
++++ b/arch/qwen35_fp8/qwen35_fp8.cpp
+@@ -1645,6 +1645,33 @@
+     }
+ }
+ #endif
++/* One layer's ops: exactly what a block's brackets cover, so a replay re-issues the block and
++ * nothing else. The calibration taps stay inside, because they are part of the ops the tape
++ * sees. */
++static void run_layer(RadCtx* c, const RadBatch* batch, Model& m, const Layer& l, int64_t li,
++                      int64_t pf_h) {
++    if (l.full) l.attn.step(c, batch);
++    else        l.gdn.step(c, batch);
++    /* The calibration taps read the codes the block's GEMMs just read, before the next block's
++     * norm rewrites the shared input planes. */
++    if (l.cs_in >= 0) m.calib.tap(c, (size_t)l.cs_in, batch->n_tok);
++    if (l.cs_o >= 0) m.calib.tap(c, (size_t)l.cs_o, batch->n_tok);
++    prefetch_beside(c, l.op_pf_gu, l.pf_gu_w, pf_h);
++    dbg_resid(c, (int)li, "mix", m.g.n_embd, m.b_x, m.a_h.x);
++    l.mlp.step(c, batch);
++    if (l.cs_mlp >= 0) m.calib.tap(c, (size_t)l.cs_mlp, batch->n_tok);
++    if (l.cs_down >= 0) m.calib.tap(c, (size_t)l.cs_down, batch->n_tok);
++    prefetch_beside(c, l.op_pf_next, l.pf_next_w, pf_h);
++    dbg_resid(c, (int)li, "ffn", m.g.n_embd, m.b_x, m.a_h.x);
++
++    /* The tap, after the layer: the drafter conditions on this layer's output, which the next
++     * layer overwrites, so the rows are copied into this tap's column slice now. */
++    for (int t = 0; t < m.n_taps; ++t) {
++        if (m.tap_layer[t] != (int)li) continue;
++        RAD_ISSUE(c, m.op_tap, brows(m.b_x, batch->n_tok),
++                  bcol(m.b_dfsrc, (int64_t)t * m.g.n_embd, m.g.n_embd, batch->n_tok));
++    }
++}
+ 
+ static void step(RadCtx* c, const RadBatch* batch) {
+     Model& m = g_model[rad_rank(c)];
+@@ -1683,7 +1683,25 @@
+         m.mtp.step(c, batch);
+         return;
+     }
++
++    /* A layer replay (patches/training/0102): the caller put the block's input residual back and
++     * the engine cleared its recurrent state, so issue only that block, and none of the
++     * embeddings, other layers or the head. It runs the serial single-layer path with the same
++     * brackets the serial forward used: a replay must never enter the pipelined path. */
++    const int64_t replay = rad_replay_block(c);
++    if (replay >= 0) {
++        if (replay >= (int64_t)m.layers.size()) {
++            rad_step_fail(c, "replay block is past the trunk's layers");
++            return;
++        }
++        /* The recorded step is a prefill, so the decode-only expert prefetch ceiling does not
++         * apply to the replay. */
++        rad_block_begin(c, replay);
++        run_layer(c, batch, m, m.layers[(size_t)replay], replay, INT64_MAX);
++        rad_block_end(c, replay);
++        return;
++    }
+ 
+ #if !QWEN35_MOE
+     bool pipe_failed = false;
+     if (const int32_t* pcu = pipe_ready(c, batch, m, &pipe_failed)) {
+@@ -1717,30 +1762,9 @@
+     const int64_t pf_h =
+         batch->phase == RAD_PHASE_DECODE && batch->n_tok <= kPrefetchStepRows ? 1 : INT64_MAX;
+-    for (int64_t li = 0; li < (int64_t)m.layers.size(); ++li) {
+-        const Layer& l = m.layers[(size_t)li];
+-        rad_block_begin(c, li);
+-        if (l.full) l.attn.step(c, batch);
+-        else        l.gdn.step(c, batch);
+-        /* The calibration taps read the codes the block's GEMMs just read, before the next block's
+-         * norm rewrites the shared input planes. */
+-        if (l.cs_in >= 0) m.calib.tap(c, (size_t)l.cs_in, batch->n_tok);
+-        if (l.cs_o >= 0) m.calib.tap(c, (size_t)l.cs_o, batch->n_tok);
+-        prefetch_beside(c, l.op_pf_gu, l.pf_gu_w, pf_h);
+-        dbg_resid(c, (int)li, "mix", m.g.n_embd, m.b_x, m.a_h.x);
+-        l.mlp.step(c, batch);
+-        if (l.cs_mlp >= 0) m.calib.tap(c, (size_t)l.cs_mlp, batch->n_tok);
+-        if (l.cs_down >= 0) m.calib.tap(c, (size_t)l.cs_down, batch->n_tok);
+-        prefetch_beside(c, l.op_pf_next, l.pf_next_w, pf_h);
+-        dbg_resid(c, (int)li, "ffn", m.g.n_embd, m.b_x, m.a_h.x);
+-
+-        /* The tap, after the layer: the drafter conditions on this layer's output, which the next
+-         * layer overwrites, so the rows are copied into this tap's column slice now. */
+-        for (int t = 0; t < m.n_taps; ++t) {
+-            if (m.tap_layer[t] != (int)li) continue;
+-            RAD_ISSUE(c, m.op_tap, brows(m.b_x, batch->n_tok),
+-                      bcol(m.b_dfsrc, (int64_t)t * m.g.n_embd, m.g.n_embd, batch->n_tok));
+-        }
+-        rad_block_end(c, li);
+-    }
++    for (int64_t li = 0; li < (int64_t)m.layers.size(); ++li) {
++        rad_block_begin(c, li);
++        run_layer(c, batch, m, m.layers[(size_t)li], li, pf_h);
++        rad_block_end(c, li);
++    }
+ 
+     m.calib.after_step(c, batch->n_tok);
 diff --git a/core/engine.cpp b/core/engine.cpp
 index 3170856..41c03a2 100644
 --- a/core/engine.cpp
 +++ b/core/engine.cpp
-@@ -3674,4 +3674,47 @@ int Engine::run_server() {
+@@ -3674,4 +3674,56 @@ int Engine::run_server() {
      return rc;
  }
  
@@ -134,7 +236,16 @@ index 3170856..41c03a2 100644
 +        std::vector<int32_t> sidx;
 +        for (int32_t g = 0; g < b->n_kv_groups; ++g) {
 +            const KVGroupPlan* p = rk->kv.plan(g);
-+            if (!p || !p->stateful() || block < 0 || block >= (int64_t)p->n_layers) continue;
++            if (!p || !p->stateful() || block < 0) continue;
++            /* state_ptr takes the group's own layer index, and a group holds one cache per bound
++             * layer rather than per model layer: `block` is the absolute layer, so map it the way
++             * the issue path maps a KV operand. Without the map a group whose layers are not the
++             * model's first n hands back a null pointer and its state is never zeroed -- the
++             * layer's second replay then starts from the state its own first replay wrote. */
++            const KVPoolBinding* bind = rk->ctx.kv_binding((rad_kvgroup)g);
++            if (!bind || block >= (int64_t)bind->layer_slot.size()) continue;
++            const int32_t local = bind->layer_slot[(size_t)block];
++            if (local < 0) continue;
 +            const int64_t pitch = b->kv[g].state_index_pitch;
 +            if (pitch <= 0) continue;
 +            sidx.resize((size_t)(b->n_seq * pitch));
@@ -147,7 +258,7 @@ index 3170856..41c03a2 100644
 +                for (int64_t j = 0; j < pitch; ++j) {
 +                    const int32_t slot = sidx[(size_t)s * (size_t)pitch + (size_t)j];
 +                    if (slot < 0) continue;
-+                    void* q = rk->kv.state_ptr(g, (int32_t)block, slot);
++                    void* q = rk->kv.state_ptr(g, local, slot);
 +                    if (!q) continue;
 +                    if (rad_memset_async(q, 0, p->layer_bytes_per_state(), rk->ctx.stream()) < 0)
 +                        return RAD_E_DEVICE;
