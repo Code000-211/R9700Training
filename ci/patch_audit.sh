@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# ci/patch_audit.sh [root] -- audit the patch surface against docs/UPSTREAM.md.
+# ci/patch_audit.sh [root] -- audit the patch surface against its two documents.
 #
 # Every patch under patches/ is checked for
 #   * its two header lines, `Concern:` and `Upstream:`,
 #   * a row in docs/UPSTREAM.md that agrees with those lines and with the patch's size,
+#   * a row in patches/README.md that agrees with its set and upstream status,
 #   * a size no larger than the budget of that row (added + removed lines),
 # and every serving patch is checked not to touch a file a training patch introduced: the serving
 # set stands alone.
@@ -18,6 +19,7 @@ set -euo pipefail
 root=${1:-$(cd "$(dirname "$0")/.." && pwd)}
 root=$(cd "$root" && pwd)
 doc=$root/docs/UPSTREAM.md
+readme=$root/patches/README.md
 patches=$root/patches
 
 die() { printf 'patch_audit: %s\n' "$*" >&2; exit 2; }
@@ -25,6 +27,7 @@ fail() { printf 'patch_audit: %s\n' "$*" >&2; bad=1; }
 
 [[ -d $patches ]] || die "no patches/ under $root"
 [[ -f $doc ]] || die "missing $doc"
+[[ -f $readme ]] || die "missing $readme"
 command -v git >/dev/null || die "git is needed to count a patch's lines"
 
 bad=0
@@ -33,8 +36,8 @@ bad=0
 #   | `patches/<set>/<name>.patch` | <set> | <added> | <removed> | <budget> | <upstream> | <concern> |
 # The backticks around the path are how a row is found; the concern is the patch's Concern line
 # verbatim (no '|' in it).
-doc_field() { # doc_field <path> <field number>
-    awk -F'|' -v want="$1" -v field="$2" '
+doc_field() { # doc_field <file> <path> <field number>
+    awk -F'|' -v want="$2" -v field="$3" '
         !found && $0 ~ /^[ \t]*\|/ && index($0, "`" want "`") {
             v = $field
             gsub(/^[ \t]+|[ \t]+$/, "", v)
@@ -43,12 +46,17 @@ doc_field() { # doc_field <path> <field number>
             found = 1
         }
         END { if (!found) exit 1 }
-    ' "$doc"
+    ' "$1"
 }
 
-doc_paths=$(awk -F'|' '/^[ \t]*\|[ \t]*`patches\// {
-                            p = $2; gsub(/^[ \t]+|[ \t]+$/, "", p); gsub(/`/, "", p); print p
-                        }' "$doc")
+row_paths() { # row_paths <file> -- the backticked patch path of every table row
+    awk -F'|' '/^[ \t]*\|[ \t]*`patches\// {
+                   p = $2; gsub(/^[ \t]+|[ \t]+$/, "", p); gsub(/`/, "", p); print p
+               }' "$1"
+}
+
+doc_paths=$(row_paths "$doc")
+readme_paths=$(row_paths "$readme")
 
 all_patches=$(cd "$root" && find patches -name '*.patch' | LC_ALL=C sort)
 
@@ -99,12 +107,25 @@ while IFS= read -r rel; do
 
     set=${rel#patches/}
     set=${set%%/*}
-    d_set=$(doc_field "$rel" 3 || true)
-    d_added=$(doc_field "$rel" 4 || true)
-    d_removed=$(doc_field "$rel" 5 || true)
-    d_budget=$(doc_field "$rel" 6 || true)
-    d_upstream=$(doc_field "$rel" 7 || true)
-    d_concern=$(doc_field "$rel" 8 || true)
+    d_set=$(doc_field "$doc" "$rel" 3 || true)
+    d_added=$(doc_field "$doc" "$rel" 4 || true)
+    d_removed=$(doc_field "$doc" "$rel" 5 || true)
+    d_budget=$(doc_field "$doc" "$rel" 6 || true)
+    d_upstream=$(doc_field "$doc" "$rel" 7 || true)
+    d_concern=$(doc_field "$doc" "$rel" 8 || true)
+
+    # patches/README.md is the index: for each patch its set, what it is for, its upstream status.
+    r_set=$(doc_field "$readme" "$rel" 3 || true)
+    r_what=$(doc_field "$readme" "$rel" 4 || true)
+    r_upstream=$(doc_field "$readme" "$rel" 5 || true)
+    if [[ -z $r_what ]]; then
+        fail "$rel has no row in patches/README.md (its set, what it is for, its upstream status)"
+    else
+        [[ $r_set == "$set" ]] ||
+            fail "$name: patches/README.md says set '$r_set', the file is in '$set'"
+        [[ $r_upstream == "$upstream" ]] ||
+            fail "$name: patches/README.md says upstream '$r_upstream', the patch says '$upstream'"
+    fi
 
     for v in "$d_set" "$d_added" "$d_removed" "$d_budget" "$d_upstream" "$d_concern"; do
         [[ -n $v ]] || { fail "$rel: row in docs/UPSTREAM.md is missing a field"; break; }
@@ -150,10 +171,14 @@ while IFS= read -r rel; do
     [[ -n $rel ]] || continue
     grep -qxF "$rel" <<< "$all_patches" || fail "docs/UPSTREAM.md lists $rel, which is not a patch"
 done <<< "$doc_paths"
+while IFS= read -r rel; do
+    [[ -n $rel ]] || continue
+    grep -qxF "$rel" <<< "$all_patches" || fail "patches/README.md lists $rel, which is not a patch"
+done <<< "$readme_paths"
 
 if (( bad )); then
     printf 'patch_audit: FAILED\n' >&2
     exit 1
 fi
-printf 'patch_audit: %d patches, all within budget and in docs/UPSTREAM.md\n' \
+printf 'patch_audit: %d patches, all within budget and in docs/UPSTREAM.md and patches/README.md\n' \
     "$(wc -l <<< "$all_patches" | tr -d ' ')"
