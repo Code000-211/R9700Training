@@ -4,9 +4,12 @@
 // stock radiance carries. `--kld-record` is that path: it prefills every corpus document, takes the
 // next-token log-probability of each scored position and writes the NLL and the row's entropy to
 // DIR/rows.f32 -- the same two numbers `r97train loss` prints for the same tokens, from the model a
-// deployment actually runs. The adapter is named by `--kld-lora` (`cfg.kld_lora`), so the serve
-// goes through a slot radiance acquired itself: none of the trainer's prefill mode, its driver or
-// its adapter lookup is named here, and a build with only patches/serving/ has all of it.
+// deployment actually runs. `--kld-logits` (`patches/serving/0202-kld-record-logits.patch`) also
+// keeps each scored position's f32 logits in DIR/logits.f32, which is the row itself rather than
+// what it scores: two logit vectors that differ can share an NLL and an entropy, and a serve is
+// held to the row. The adapter is named by `--kld-lora` (`cfg.kld_lora`), so the serve goes through
+// a slot radiance acquired itself: none of the trainer's prefill mode, its driver or its adapter
+// lookup is named here, and a build with only patches/serving/ has all of it.
 //
 // Header-only, like the rest of tests/support/: one includer, no object file to collect.
 #pragma once
@@ -45,10 +48,12 @@ inline std::string radiance_home() {
 }
 
 // `hierarchy` is radiance's ordered kernel tier: {"libavx", "libref"} on the host, and the card's
-// test puts "libr4d" in front of it.
+// test puts "libr4d" in front of it. `logits` asks the record to keep each position's f32 logits
+// beside its row, which the host's exact check reads and the card's 27B serve does not: there a
+// full-vocabulary f32 row is 604 KiB a position, so only the rows are worth keeping.
 inline rad::Config config(const std::string& container, const std::string& corpus,
                           const std::string& record, const std::string& adapter, int64_t rank,
-                          const std::vector<std::string>& hierarchy) {
+                          const std::vector<std::string>& hierarchy, bool logits = false) {
     rad::Config cfg;
     cfg.model            = container;
     cfg.radiance_home    = radiance_home();
@@ -59,6 +64,7 @@ inline rad::Config config(const std::string& container, const std::string& corpu
     cfg.max_ctx          = 512;
     cfg.kld_corpus       = corpus;
     cfg.kld_record       = record;
+    cfg.kld_logits       = logits;
     if (!adapter.empty()) {
         cfg.kld_lora = kAdapterName;
         cfg.lora.adapters.push_back({ kAdapterName, adapter });
@@ -84,10 +90,13 @@ inline void write_corpus(const std::string& path, const std::vector<std::string>
     if (!out) throw std::runtime_error("served_prefill: short write to " + path);
 }
 
-// The rows of one record: NLL and entropy per scored position, row-major as rows.f32 holds them.
+// The rows of one record: NLL and entropy per scored position, row-major as rows.f32 holds them,
+// and (when the record kept them) the logits themselves, row-major as logits.f32 holds them.
 struct Served {
-    int64_t            n_rows = 0;
+    int64_t            n_rows  = 0;
+    int64_t            n_vocab = 0;
     std::vector<float> rows;
+    std::vector<float> logits;
 
     // The number `r97train loss` prints: the mean next-token NLL over the scored positions.
     double loss() const {
@@ -121,8 +130,30 @@ inline std::string json_str(const std::string& text, const std::string& key) {
     return close == std::string::npos ? std::string() : text.substr(open + 1, close - open - 1);
 }
 
+// Whether `"key": true` is in a kld.json, which is where the record says it kept the logits.
+inline bool json_true(const std::string& text, const std::string& key) {
+    const size_t k = text.find("\"" + key + "\"");
+    if (k == std::string::npos) return false;
+    const size_t colon = text.find(':', k + key.size() + 2);
+    if (colon == std::string::npos) return false;
+    size_t at = colon + 1;
+    while (at < text.size() && (text[at] == ' ' || text[at] == '\t')) ++at;
+    return text.compare(at, 4, "true") == 0;
+}
+
+// One file of a record, read whole, with the size kld.json claims for it.
+inline std::vector<char> read_whole(const std::string& path, int64_t bytes, const char* what) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("served_prefill: " + path + " has no " + what);
+    std::vector<char> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if ((int64_t)raw.size() != bytes)
+        throw std::runtime_error("served_prefill: " + path + " is not the size kld.json says");
+    return raw;
+}
+
 // The record `--kld-record` wrote: its manifest must name the whole-vocabulary form, and rows.f32
-// must be exactly the rows the manifest claims (two floats each).
+// must be exactly the rows the manifest claims (two floats each). A manifest that says it kept the
+// logits must have logits.f32 too, one full-vocabulary f32 row per position.
 inline Served read_record(const std::string& dir) {
     std::ifstream manifest(dir + "/kld.json");
     if (!manifest) throw std::runtime_error("served_prefill: " + dir + " has no kld.json");
@@ -143,8 +174,18 @@ inline Served read_record(const std::string& dir) {
     out.n_rows = (int64_t)(raw.size() / (2 * sizeof(float)));
     if (out.n_rows != json_int(text, "rows"))
         throw std::runtime_error("served_prefill: " + dir + "/rows.f32 and its kld.json disagree");
-    out.rows.resize(out.n_rows * 2);
+    out.rows.resize((size_t)out.n_rows * 2);
     std::memcpy(out.rows.data(), raw.data(), raw.size());
+
+    out.n_vocab = json_int(text, "n_vocab");
+    if (out.n_vocab <= 0)
+        throw std::runtime_error("served_prefill: " + dir + "/kld.json has no n_vocab");
+    if (json_true(text, "logits")) {
+        const int64_t     bytes = out.n_rows * out.n_vocab * 4;
+        std::vector<char> row   = read_whole(dir + "/logits.f32", bytes, "logits.f32");
+        out.logits.resize((size_t)out.n_rows * (size_t)out.n_vocab);
+        std::memcpy(out.logits.data(), row.data(), row.size());
+    }
     return out;
 }
 
@@ -153,9 +194,10 @@ inline Served read_record(const std::string& dir) {
 // adapter was accepted and the prefill ran.
 inline Served served(const std::string& container, const std::string& corpus,
                      const std::string& adapter, int64_t rank,
-                     const std::vector<std::string>& hierarchy, const std::string& record) {
+                     const std::vector<std::string>& hierarchy, const std::string& record,
+                     bool logits = false) {
     if (corpus.empty()) throw std::invalid_argument("served_prefill: an empty corpus");
-    rad::Engine engine(config(container, corpus, record, adapter, rank, hierarchy));
+    rad::Engine engine(config(container, corpus, record, adapter, rank, hierarchy, logits));
     const int   s = engine.start();
     if (s < 0)
         throw std::runtime_error(std::string("served_prefill: the engine could not start on ") +

@@ -22,6 +22,7 @@ and line budget. `ci/patch_audit.sh` holds the patches, that ledger and this tab
 | --- | --- | --- | --- |
 | `patches/serving/0201-lora-set-weights.patch` | serving | an adapter slot put in service from factors already in memory, not only from an adapter directory; the trainer's live slot and a serve's handover both use it | not-submitted |
 | `patches/serving/0201-narrow-head-gate.patch` | serving | the gated attention of a head narrower than the quantiser's group, which is the int8 fixture's 32-by-16 head, so that fixture's own attention runs | not-submitted |
+| `patches/serving/0202-kld-record-logits.patch` | serving | the KL record keeping each scored position's f32 logits beside its row (`--kld-logits`), so a serve is compared to the trainer's logits and not only to what they score | not-submitted |
 | `patches/serving/0210-lora-int8-trunk.patch` | serving | an adapter on the rotated int8 trunk through the host and card kernels, `libavx`, `libref` and `libr4d`: the adapter this deployment serves | not-submitted |
 | `patches/training/0101-issue-observer.patch` | training | one optional observer called per issue after its op has run, plus a pair of block brackets: the hook the tape, the boundary recorder and the replay all read | not-submitted |
 | `patches/training/0102-replay-block.patch` | training | running one recorded block alone from a restored residual, and each trunk architecture's agreement to honour it | not-submitted |

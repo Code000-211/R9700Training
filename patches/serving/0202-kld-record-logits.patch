@@ -1,0 +1,210 @@
+Concern: keep the scored positions' f32 logits in a KL reference, so a serve is compared bit for bit
+Upstream: not-submitted
+diff --git a/core/config.cpp b/core/config.cpp
+index 5276fad..333e43d 100644
+--- a/core/config.cpp
++++ b/core/config.cpp
+@@ -337,6 +337,9 @@ static const Flag g_flags[] = {
+     { "--kld-top",            "N",      "--kld-record keeps each position's N most likely tokens exactly and the\n"
+     "                                    mass of the rest, not the whole vocabulary (a corpus too large for\n"
+     "                                    full rows); 0 (default) keeps the whole vocabulary" },
++    { "--kld-logits",         nullptr,  "--kld-record keeps each scored position's f32 logits beside its row, so\n"
++    "                                    a serve of the same corpus compares bit for bit, not only by\n"
++    "                                    its scores" },
+     { "--kld-out",            "FILE",   "the --kld-ref report as JSON, and every position's numbers in FILE.rows" },
+     { "--kld-lora",           "NAME",   "run --kld-record / --kld-ref through the --lora adapter NAME" },
+     { "--kld-lora-sources",   "PREFIX", "--kld-lora only for documents whose source starts with PREFIX; the\n"
+@@ -1084,6 +1087,7 @@ int config_parse(int argc, char** argv, Config* c) {
+         else if (S("--kld-ref"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_ref = v; }
+         else if (S("--kld-corpus"))            { if (!(v = need(i))) return RAD_E_INVAL; c->kld_corpus = v; }
+         else if (S("--kld-top"))               { if (!num(0, kKldTopMax, &c->kld_top)) return RAD_E_INVAL; }
++        else if (S("--kld-logits"))            { c->kld_logits = true; }
+         else if (S("--calib-corpus"))          { if (!(v = need(i))) return RAD_E_INVAL; c->calib_corpus = v; }
+         else if (S("--calib-dir"))             { if (!(v = need(i))) return RAD_E_INVAL; c->calib_dir = v; }
+         else if (S("--calib-layers")) {
+@@ -1221,6 +1225,10 @@ int config_parse(int argc, char** argv, Config* c) {
+         RAD_ERR("--kld-top is how --kld-record stores a reference; --kld-ref reads the form from it");
+         return RAD_E_INVAL;
+     }
++    if (c->kld_logits && c->kld_record.empty()) {
++        RAD_ERR("--kld-logits is what --kld-record keeps; --kld-ref reads what the reference holds");
++        return RAD_E_INVAL;
++    }
+     if (!c->kld_out.empty() && c->kld_ref.empty()) {
+         RAD_ERR("--kld-out is the --kld-ref report");
+         return RAD_E_INVAL;
+@@ -1512,6 +1520,7 @@ const ShowRow kShow[] = {
+     { "--kld-ref",            [](const Config& c) { return or_none(c.kld_ref, "none"); } },
+     { "--kld-corpus",         [](const Config& c) { return or_none(c.kld_corpus, "none"); } },
+     { "--kld-top",            [](const Config& c) { return c.kld_top ? num(c.kld_top) : std::string("0 (the whole vocabulary)"); } },
++    { "--kld-logits",         [](const Config& c) { return onoff(c.kld_logits); } },
+     { "--calib-corpus",       [](const Config& c) { return or_none(c.calib_corpus, "none"); } },
+     { "--calib-dir",          [](const Config& c) { return or_none(c.calib_dir, "none"); } },
+     { "--calib-layers",       [](const Config& c) { return c.calib_layer_hi ? num(c.calib_layer_lo) + ":" + num(c.calib_layer_hi) : std::string("every layer"); } },
+diff --git a/core/kld.cpp b/core/kld.cpp
+index 64be394..9f20135 100644
+--- a/core/kld.cpp
++++ b/core/kld.cpp
+@@ -234,6 +234,7 @@ RowSums row_sums(const float* l, int64_t n, float m, float thr, const uint8_t* m
+ 
+ struct Kld::Scratch {
+     std::vector<uint16_t> f16;
++    std::vector<float>    raw;
+     std::vector<TopEntry> top;
+     std::vector<uint8_t>  mark;
+ };
+@@ -243,7 +244,7 @@ Kld::Kld() {
+ }
+ 
+ Kld::~Kld() {
+-    for (int fd : { fd_logp_, fd_top_, fd_rows_ }) if (fd >= 0) ::close(fd);
++    for (int fd : { fd_logp_, fd_top_, fd_rows_, fd_logits_ }) if (fd >= 0) ::close(fd);
+ }
+ 
+ std::vector<int32_t> Kld::tokens(size_t d) const {
+@@ -255,7 +256,7 @@ int Kld::open(const Config& cfg, std::shared_ptr<const Vocab> vocab, int64_t n_v
+               const std::string& model) {
+     if (cfg.kld_record.empty()) return score_against(cfg.kld_ref, cfg.kld_out, n_vocab, model);
+     RAD_TRY(load_corpus(cfg.kld_corpus, vocab));
+-    return record_into(cfg.kld_record, n_vocab, model, cfg.kld_top);
++    return record_into(cfg.kld_record, n_vocab, model, cfg.kld_top, cfg.kld_logits);
+ }
+ 
+ int Kld::score_against(const std::string& dir, const std::string& out, int64_t n_vocab,
+@@ -332,12 +333,14 @@ int Kld::load_corpus(const std::string& path, const std::shared_ptr<const Vocab>
+     return RAD_OK;
+ }
+ 
+-int Kld::record_into(const std::string& dir, int64_t n_vocab, const std::string& model, int top) {
++int Kld::record_into(const std::string& dir, int64_t n_vocab, const std::string& model, int top,
++                     bool logits) {
+     record_  = true;
+     dir_     = dir;
+     model_   = model;
+     n_vocab_ = n_vocab;
+     sparse_  = top > 0;
++    logits_  = logits;
+     top_     = sparse_ ? top : kKldTop;
+     rows_w_  = sparse_ ? 3 : 2;
+     if (docs_.empty() || top < 0 || top > kKldTopMax || top_ > n_vocab_) return RAD_E_INVAL;
+@@ -357,17 +360,20 @@ int Kld::record_into(const std::string& dir, int64_t n_vocab, const std::string&
+     if (!sparse_) fd_logp_ = create_sized(dir_ + "/logp.f16", n_rows_ * n_vocab_ * 2);
+     fd_top_  = create_sized(dir_ + "/top.bin", n_rows_ * top_ * (int64_t)sizeof(TopEntry));
+     fd_rows_ = create_sized(dir_ + "/rows.f32", n_rows_ * rows_w_ * 4);
+-    if ((!sparse_ && fd_logp_ < 0) || fd_top_ < 0 || fd_rows_ < 0) {
++    if (logits_) fd_logits_ = create_sized(dir_ + "/logits.f32", n_rows_ * n_vocab_ * 4);
++    if ((!sparse_ && fd_logp_ < 0) || fd_top_ < 0 || fd_rows_ < 0 || (logits_ && fd_logits_ < 0)) {
+         RAD_ERR("kld: cannot create the reference files in %s: %s", dir_.c_str(),
+                 std::strerror(errno));
+         return RAD_E_IO;
+     }
+     const int64_t bytes = (sparse_ ? 0 : n_rows_ * n_vocab_ * 2) +
+-                          n_rows_ * (top_ * (int64_t)sizeof(TopEntry) + rows_w_ * 4);
++                          n_rows_ * (top_ * (int64_t)sizeof(TopEntry) + rows_w_ * 4) +
++                          (logits_ ? n_rows_ * n_vocab_ * 4 : 0);
++    std::string form = sparse_ ? fmt("the %d most likely tokens and the tail's mass", top_)
++                              : std::string("the whole vocabulary");
++    if (logits_) form += " and every position's f32 logits";
+     RAD_INFO("kld: recording %lld positions over %zu documents (%zu tokens) into %s, %s, %.1f GiB",
+-             (long long)n_rows_, docs_.size(), tokens_.size(), dir_.c_str(),
+-             sparse_ ? fmt("the %d most likely tokens and the tail's mass", top_).c_str()
+-                     : "the whole vocabulary",
++             (long long)n_rows_, docs_.size(), tokens_.size(), dir_.c_str(), form.c_str(),
+              (double)bytes / (1024.0 * 1024.0 * 1024.0));
+     return RAD_OK;
+ }
+@@ -495,6 +501,16 @@ int Kld::score(const std::vector<KldSpan>& spans, const std::vector<KldShard>& s
+  * the tail's mass is summed over the tokens outside the head rather than taken as one minus the
+  * head, which would cancel to noise on a confident position. */
+ void Kld::record_row(const Job& j, const std::vector<KldShard>& sh, Scratch& w) {
++    /* --kld-logits keeps the row itself: the shards are the f32 logits the rest of this function
++     * reduces, so the file is what the model gave, not a function of it. */
++    if (fd_logits_ >= 0) {
++        if ((int64_t)w.raw.size() != n_vocab_) w.raw.assign((size_t)n_vocab_, 0.0f);
++        for (const KldShard& s : sh)
++            std::memcpy(w.raw.data() + s.vocab0, s.rows + j.at * s.width,
++                        (size_t)s.width * sizeof(float));
++        if (!pwrite_all(fd_logits_, w.raw.data(), (size_t)n_vocab_ * 4, j.row * n_vocab_ * 4))
++            io_err_.store(1);
++    }
+     TopEntry* top = w.top.data();
+     int n_top = 0;
+     double lse = 0, ent = 0, tail = 0;
+@@ -707,7 +723,7 @@ int Kld::finish() {
+     }
+     if (!record_) return report();
+ 
+-    for (int fd : { fd_logp_, fd_top_, fd_rows_ })
++    for (int fd : { fd_logp_, fd_top_, fd_rows_, fd_logits_ })
+         if (fd >= 0 && ::fsync(fd) != 0) { RAD_ERR("kld: fsync: %s", std::strerror(errno)); return RAD_E_IO; }
+     json m;
+     m["format"]         = sparse_ ? kFormatTop : kFormat;
+@@ -717,6 +733,7 @@ int Kld::finish() {
+     m["created"]        = now_iso();
+     m["n_vocab"]        = n_vocab_;
+     m["top"]            = top_;
++    m["logits"]         = logits_;
+     m["rows"]           = n_rows_;
+     json docs = json::array();
+     for (const Doc& d : docs_)
+diff --git a/core/kld.h b/core/kld.h
+index 3e93436..cc6bfd6 100644
+--- a/core/kld.h
++++ b/core/kld.h
+@@ -29,6 +29,9 @@
+  *   top.bin      [rows, kKldTop] {int32 id, f32 log p}: the most likely tokens exactly, where a
+  *                confident position's KL lives (f16 would cost ~1e-4 nats).
+  *   rows.f32     [rows, 2] the reference's own next-token NLL and entropy.
++ *   logits.f32   [rows, n_vocab] the reference's f32 logits at the scored positions, with
++ *                `--kld-logits`: what a serve of the same corpus is compared against bit for bit,
++ *                where rows.f32 would only compare what the logits score.
+  *
+  * The sparse form (`--kld-top N`, format radiance-kld-top-1) has no logp.f16; top.bin is
+  * [rows, N] {int32 id, f32 log p}, most likely first, and rows.f32 is [rows, 3], the third column
+@@ -84,7 +87,8 @@ public:
+     /* open() split for already-tokenised documents (tests): add_doc() each, then record_into()
+      * creates DIR; score_against() is the whole ref mode. */
+     int add_doc(const std::string& source, const std::vector<int32_t>& ids, int64_t score_from);
+-    int record_into(const std::string& dir, int64_t n_vocab, const std::string& model, int top = 0);
++    int record_into(const std::string& dir, int64_t n_vocab, const std::string& model, int top = 0,
++                    bool logits = false);
+     int score_against(const std::string& dir, const std::string& out, int64_t n_vocab,
+                       const std::string& model);
+ 
+@@ -126,8 +130,8 @@ private:
+     int  load_corpus(const std::string& path, const std::shared_ptr<const Vocab>& vocab);
+     int  load_ref(const std::string& dir);
+     void size_rows();
+-    /* A worker's row-sized scratch: the f16 row (full form), the head and the head's marks
+-     * (sparse form). */
++    /* A worker's row-sized scratch: the f16 row (full form), the logits row (--kld-logits), the
++     * head and the head's marks (sparse form). */
+     struct Scratch;
+     void record_row(const Job& j, const std::vector<KldShard>& sh, Scratch& w);
+     void score_row(const Job& j, const std::vector<KldShard>& sh, Scratch& w);
+@@ -140,11 +144,12 @@ private:
+     int64_t n_vocab_ = 0;
+     int     top_ = kKldTop;            /* entries a row of top.bin holds */
+     bool    sparse_ = false;           /* the --kld-top form: no logp.f16, tail mass in rows.f32 */
++    bool    logits_ = false;           /* --kld-logits: write each row's f32 logits to logits.f32 */
+     int64_t rows_w_ = 2;               /* rows.f32 columns */
+     std::vector<int32_t> tokens_;
+     std::vector<Doc> docs_;
+     int64_t n_rows_ = 0;
+-    int fd_logp_ = -1, fd_top_ = -1, fd_rows_ = -1;
++    int fd_logp_ = -1, fd_top_ = -1, fd_rows_ = -1, fd_logits_ = -1;
+ 
+     /* Per reference row. `seen_` marks a row written or scored; the rest is the ref mode's. */
+     std::vector<uint8_t> seen_;
+diff --git a/core/rad_core.h b/core/rad_core.h
+index dbdc8dc..b94b4df 100644
+--- a/core/rad_core.h
++++ b/core/rad_core.h
+@@ -1039,6 +1039,7 @@ struct Config {
+     std::string kld_lora_sources;       /* --kld-lora-sources PREFIX: only documents whose source starts so */
+     std::string kld_corpus;             /* --kld-corpus FILE, read by --kld-record only */
+     int         kld_top = 0;            /* --kld-top N: record the N most likely tokens and the tail; 0 the whole vocabulary */
++    bool        kld_logits = false;     /* --kld-logits: keep each scored position's f32 logits beside its row */
+ 
+     /* ---------------- CALIBRATION (GPTQ Hessians) ----------------
+      * `--calib-corpus FILE` replaces the server like the KL mode: every document of a JSONL corpus

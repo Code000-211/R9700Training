@@ -36,6 +36,7 @@ R97_TEST_ONLY=serving_prefill_with_the_fixture_adapter_matches_the_reference \
 ```
 
 They are the NLL and entropy radiance recorded for the test's two prompts (`rows.f32`), with the
-adapter named by `--kld-lora`. The serving build runs the same test and must reproduce the file
-byte for byte. `docs/TESTING.md` has the two-build check, and `docs/FIXTURES.md` the fixture the
-adapter was trained on.
+adapter named by `--kld-lora`, and the same run writes the f32 logits of every scored position to
+the `serving_logits.f32` beside the path it names (`logits.f32`, `--kld-logits`). The serving build
+runs the same test and must reproduce both files byte for byte. `docs/TESTING.md` has the two-build
+check, and `docs/FIXTURES.md` the fixture the adapter was trained on.
