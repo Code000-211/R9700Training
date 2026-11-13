@@ -254,6 +254,9 @@ static int ops_main(int argc, char** argv) {
     return inventory_main(container, home, kernels, record, batch_path);
 }
 
-R97_REGISTER_COMMAND("ops", "<file.rad>|--registered [--device N]", ops_main);
+R97_REGISTER_COMMAND("ops",
+                     "<file.rad> or --registered [--home <dir>] [--kernels <list>] "
+                     "[--record <file>] [--batch <file>] [--device N]",
+                     ops_main);
 
 }  // namespace r97tool

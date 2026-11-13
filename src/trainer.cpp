@@ -225,7 +225,7 @@ std::string join(const std::vector<std::string>& parts, const std::string& separ
     return text;
 }
 
-// The state file. The encoding is the one docs/TRAINING.md documents: a fixed magic, then
+// The state file. The encoding is the one docs/CHECKPOINT.md documents: a fixed magic, then
 // lengths and values in the machine's byte order. The bytes are only ever read by this file.
 constexpr char kStateMagic[8] = {'R', '9', '7', 'T', 'R', 'N', '0', '1'};
 constexpr uint32_t kStateVersion = 1;
