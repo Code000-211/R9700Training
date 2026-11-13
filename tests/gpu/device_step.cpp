@@ -483,9 +483,12 @@ void card_case(const char* test, int64_t n, bool probe) {
     // `b_all_nonzero` false names one leaf out of 400, and the next window should not have to
     // guess which. A leaf the walk never reached (an empty gradient) counts as zero too.
     std::string first_zero_a_leaf, first_zero_b_leaf;
-    // Which leaf does move, and whether it moves to a finite value or to NaN, is what tells the two
-    // candidate causes apart: a NaN leaf means the walk reached it and its cotangent was poisoned,
-    // a finite one means the walk differentiated a live cotangent all the way to that module.
+    // Which leaf does move, and whether it moves to a finite value or to NaN. Only one outcome is
+    // decisive: a *finite* non-zero leaf means the walk differentiated a live cotangent all the way
+    // to that module, which the cascade theory cannot produce (a zeroed dx never touches the last
+    // gemm's own lora rows). A NaN leaf is consistent with both candidates -- under a zero scale,
+    // dB = sum cy*sc*t is still NaN when cy is -- so it says only that the walk reached the leaf.
+    // The per-operand non-zero counts on the 288 lora rows are what settles the mechanism.
     std::string first_nonzero_a_leaf, first_nonzero_b_leaf;
     bool first_nonzero_a_finite = true, first_nonzero_b_finite = true;
     int64_t n_zero_a = 0, n_zero_b = 0;
