@@ -147,6 +147,17 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
     R97_CHECK(contains(script, "--kld-corpus"));
     R97_CHECK(contains(script, "--kld-lora trained"));
     R97_CHECK(contains(script, "tools/kld_loss.py"));
+    // The card half of the same measurement is a command of the script too: the trainer's own
+    // device-tier loss is the number the card's served loss is held to, the server is started
+    // with ROCR_VISIBLE_DEVICES naming the card (it has no --device of its own), and the run
+    // reads the backend line of the card's serve log, so a host-only serve cannot pass for it.
+    R97_CHECK(contains(script, "ROCR_VISIBLE_DEVICES=\"$R97_DEVICE\" \"$server\""));
+    R97_CHECK(contains(script, "--kld-record \"$kld/served-card\""));
+    R97_CHECK(contains(script, "AQL backend"));
+    // The card's serve names its kernel libraries: a HIP serving home also gets libr97, the
+    // trainer's own plugin, and the trainer's `loss --device` runs on libr4d, libavx and libref,
+    // so the served number has to come from the same three to be held to it.
+    R97_CHECK(contains(script, "--lora trained=\"$adapter\" --kernels libr4d,libavx,libref"));
     // The card's inventory is a command of the script, not prose beside it: the real `--device`
     // line sits next to the tested host one, and the no-card run says it took the skip branch.
     R97_CHECK(contains(script, "--device \"$R97_DEVICE\""));
@@ -205,6 +216,7 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
     R97_CHECK(contains(log, "the trainer's loss for the adapter"));
     R97_CHECK(contains(log, "section 0's serving-only build is a one-time input"));
     R97_CHECK(contains(log, "the serving build's loss is unchecked"));
+    R97_CHECK(contains(log, "the card's served loss is unchecked"));
     R97_CHECK(contains(log, "the card's inventory (ops --device) was not taken"));
     R97_CHECK(contains(log, "# dry run:"));
     R97_CHECK(fs::exists(run / "checkpoint-000000005" / "adapter"));

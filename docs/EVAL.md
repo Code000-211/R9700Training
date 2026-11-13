@@ -65,9 +65,10 @@ r97train data --model tiny_qwen35_bf16.rad --data tests/fixtures/chat_small.json
 Python), and checks the two losses agree to 1e-4 relative; `tests/host/data_cli.cpp` checks that
 what `--kld-corpus` writes has one row per scored token. `docs/RUNBOOK.md` §7 measures a trained
 adapter's loss twice: the trainer's `loss --lora`, held to the run's held-out loss, and the
-serving-only build's own `--lora` / `--kld-lora` record (issue #61's deployment path), held to the
-same number at the same 1e-4. The second is what radiance actually serves; the first is the check
-the host tier can run without a serving tree.
+serving-only build's own `--lora` / `--kld-lora` record (the deployment path, `docs/DEPLOYMENT.md`),
+held to the same number at the same 1e-4. On a card it measures the same pair again, with
+`loss --device` as the number the served one is held to. The served number is what radiance
+actually computes; the trainer's is the check the host tier can run without a serving tree.
 
 `tools/kld_loss.py` reads the NLL column of `rows.f32` and prints it in the same format as
 `r97train loss`; it accepts full and `--kld-top` records.

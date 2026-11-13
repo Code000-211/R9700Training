@@ -381,9 +381,71 @@ else
 fi
 ```
 
+The same adapter on a card is the second half of the same check, and it is a card's commands, not
+the host's. The serving build has to be a HIP build (section 0's default); the server has no
+`--device` of its own, so `ROCR_VISIBLE_DEVICES` names the card exactly as it does for the trainer;
+and the card's own `loss --device` is the number its served loss is held to, since the serve runs
+the same three libraries `--device` runs (`--kernels libr4d,libavx,libref`) and a HIP serving home
+also holds the trainer's `libr97`, which that list keeps out. `$R97_DEVICE` is the selector section
+2 already uses for the card, so the two sections cannot disagree about which one it is. The card's
+serve log must say `AQL backend`: a host-only serving build answers the block above, and a HIP
+build with no card visible answers these same commands on the host backend out of
+`serving_home`'s `libavx`, which is not what is being measured here.
+
+```sh
+if [ -x "$server" ] && [ -n "$R97_DEVICE" ]; then
+    trainer_card=$("$r97" loss --model "$R97_MODEL" --data "$R97_HELDOUT" \
+                          --lora "$adapter" --device "$R97_DEVICE" | sed -n 's/^loss: //p')
+    [ -n "$trainer_card" ] || {
+        echo "runbook: the trainer printed no loss for card $R97_DEVICE" >&2
+        exit 1
+    }
+    ROCR_VISIBLE_DEVICES="$R97_DEVICE" "$server" --model "$R97_MODEL" \
+              --radiance-home "$serving_home" \
+              --lora trained="$adapter" --kernels libr4d,libavx,libref --kld-lora trained \
+              --kld-corpus "$kld/heldout.jsonl" --kld-record "$kld/served-card" \
+              > "$R97_RUN-resumed/serve-card.log" 2>&1
+    grep -q 'AQL backend' "$R97_RUN-resumed/serve-card.log" || {
+        echo "runbook: the serving build did not run on card $R97_DEVICE; see" \
+             "$R97_RUN-resumed/serve-card.log" >&2
+        exit 1
+    }
+    served_card=$(python3 tools/kld_loss.py "$kld/served-card" | sed -n 's/^loss: //p')
+    [ -n "$served_card" ] || {
+        echo "runbook: tools/kld_loss.py printed no loss for $kld/served-card" >&2
+        exit 1
+    }
+    echo "the serving build's loss on card $R97_DEVICE $served_card, the trainer's card loss" \
+         "$trainer_card, the host's $resumed"
+
+    awk -v card="$trainer_card" -v host="$resumed" -v measured="$served_card" -v dev="$R97_DEVICE" '
+        function agree(a, b) {
+            d = a - b
+            if (d < 0) d = -d
+            t = b < 0 ? -b : b
+            if (t == 0) t = 1
+            return d <= 1e-4 * t
+        }
+        BEGIN {
+            if (!agree(measured, card) || !agree(measured, host)) {
+                printf "runbook: the serving build on card %s reports %s, " \
+                       "the trainer %s there, the host %s\n", dev, measured, card, host
+                exit 1
+            }
+        }'
+else
+    echo "runbook: no serving build or no R97_DEVICE; the card's served loss is unchecked"
+fi
+```
+
 1e-4 is the tolerance `tests/host/loss_cli.cpp` holds the trainer's loss and radiance's KL record
 to, and the same one `tests/host/train_host_cli.cpp` holds the loss across a resume to; the same
-one applies to both measurements here. `docs/EVAL.md` says how the two agree in the host tier.
+one applies to every measurement here, on the host and on the card. The card's serve names the
+three kernel libraries the trainer's `loss --device` runs on (`libr4d,libavx,libref`), so the
+served number and the number held to it come from the same kernels: a HIP serving home also holds
+`libr97`, the trainer's plugin, which radiance would otherwise load beside them. `docs/EVAL.md`
+says how the trainer's loss and radiance's record agree in the host tier, and `docs/DEPLOYMENT.md`
+says what the serving-only build carries and what the two measurements mean for a deployment.
 
 A checkpoint can be measured at any time without touching the run: `loss` on another `adapter/`
 answers whether it is worth keeping. Compare with the baseline of the same container and held-out
