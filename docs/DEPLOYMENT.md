@@ -29,6 +29,7 @@ half is:
 | --- | --- | --- |
 | `0201-lora-set-weights.patch` | put an adapter slot in service from factors already in memory, not only from a directory | an adapter handed over in memory, the trainer's live slot or a serve's |
 | `0201-narrow-head-gate.patch` | an int8 attention gate on a head narrower than the 128-column quantiser group | the `w8a8_fwht128` container's gated attention |
+| `0202-kld-record-logits.patch` | keep the scored positions' f32 logits in a KL reference, so a serve is compared bit for bit | the exact check of section 5: a serve held to the trainer's logits, not only to what they score |
 | `0210-lora-int8-trunk.patch` | a LoRA adapter on the rotated int8 trunk, through the host and card kernels | the adapter this deployment serves, on `libavx`/`libref` and on `libr4d` |
 
 `0201-lora-set-weights.patch` is in the serving set because radiance's own loader puts an adapter
@@ -144,13 +145,16 @@ claims the card has to show the first of them. What runs under it is libr4d's `l
 The first check is exact: the serving build's answer for a corpus with a trained adapter is the
 default build's, bit for bit. `tests/host/serving_prefill.cpp` serves the int8 fixture through
 `tests/fixtures/serving_adapter` — an adapter `r97train` wrote — with radiance's own KL-scored
-prefill (`--kld-record`, `--kld-lora trained`), and compares every recorded row (the next-token
-NLL and the row's entropy) to `tests/fixtures/serving_rows.f32`, which the same test wrote in the
-default build. Both trees run it: the prefill is the server's and the KL mode is in the pinned
-engine, so the test needs neither the observer nor the replay patch nor anything else in
-`patches/training/`. It also serves the same corpus with no adapter and requires the loss to
-differ, so an adapter a build silently dropped cannot pass on the bytes. That exact check is what
-holds the adapter path to the number a training run measured.
+prefill (`--kld-record`, `--kld-lora trained`, `--kld-logits`), and compares every scored
+position's f32 logits to `tests/fixtures/serving_logits.f32`, then the next-token NLL and entropy
+they score to `tests/fixtures/serving_rows.f32`; the same test wrote both in the default build.
+The logits are what the check is for: a permutation of two non-target logits, or a pair moved
+apart and together, leaves the NLL and the entropy where they were and the served distribution
+somewhere else. Both trees run it: the prefill is the server's, the KL mode is in the pinned
+engine and the logits file is `0202`, so the test needs neither the observer nor the replay patch
+nor anything else in `patches/training/`. It also serves the same corpus with no adapter and
+requires the loss to differ, so an adapter a build silently dropped cannot pass on the bytes. That
+exact check is what holds the adapter path to the number a training run measured.
 
 The second check is the trainer's own number, at `1e-4` relative (`docs/EVAL.md`). Radiance's KL
 mode scores the run's held-out corpus for the

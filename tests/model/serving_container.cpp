@@ -18,7 +18,7 @@
 // Label: model. Skipped (exit 77) when the container is absent; docs/DEPLOYMENT.md §4 says where
 // the container and the card sit.
 #include "../support/model_dir.h"
-#include "../support/self_check.h"
+#include "../support/test.h"
 
 #include <algorithm>
 
@@ -51,7 +51,9 @@ bool declares(const r97::ModelMeta& meta, const std::string& target) {
     return false;
 }
 
-void serving_container_can_take_the_trainers_adapter() {
+}  // namespace
+
+R97_TEST(serving_container_can_take_the_trainers_adapter) {
     const std::string container = r97test::container_or_skip(R97_MODEL_RAD);
     const r97::ModelMeta meta = r97::read_model_meta(container);
     R97_CHECK(meta.arch == "qwen35");
@@ -87,7 +89,3 @@ void serving_container_can_take_the_trainers_adapter() {
                 (long long)meta.layers, meta.targetable.size(), meta.input_basis.c_str(),
                 adapter.config.targets.size());
 }
-
-}  // namespace
-
-R97_SELF_CHECK(serving_container_can_take_the_trainers_adapter);

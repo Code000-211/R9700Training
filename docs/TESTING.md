@@ -40,7 +40,9 @@ A serving build (`cmake -B build-serving -G Ninja -DR97_PATCH_SET=serving`) appl
 are globbed in either build, so a check that compiles away in the serving build has to say so (with
 `R97_FIXTURE_PREFILL`, or the `R97_HAS_R97TRAIN` guard) rather than be named by a build rule.
 `tests/host/serving_prefill.cpp` serves an int8-fixture corpus through an adapter with radiance's
-own KL-scored prefill and holds the recorded rows to `tests/fixtures/serving_rows.f32` bit for bit;
+own KL-scored prefill and holds the scored positions' f32 logits to
+`tests/fixtures/serving_logits.f32` and the rows those logits score to
+`tests/fixtures/serving_rows.f32`, both bit for bit;
 `tests/gpu/serving_container.cpp` serves the real container on the card with an adapter written for
 its linears; `tests/host/serving_symbols.cpp` reads the built `rad_core` archive and fails when a
 serving build carries a trainer-only symbol -- the observer, the replay entry, the prefill driver
@@ -57,8 +59,8 @@ The adapter and served-rows fixtures were written in the default build: `r97trai
 int8 fixture wrote `tests/fixtures/serving_adapter` (the run is in that directory's `README.md`),
 and `R97_WRITE_SERVING_GOLDEN=<path>` with
 `R97_TEST_ONLY=serving_prefill_with_the_fixture_adapter_matches_the_reference ./build/r97_host_tests`
-wrote the rows from the same test. Regenerating them means running both again in the default build
-and copying the results under `tests/fixtures/`.
+wrote the rows to that path and the logits beside it, as `serving_logits.f32`. Regenerating them
+means running both again in the default build and copying the results under `tests/fixtures/`.
 
 ## The GPU test guard
 

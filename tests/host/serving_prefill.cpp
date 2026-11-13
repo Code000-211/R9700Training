@@ -5,14 +5,17 @@
 // default ("all") build carries the trainer's issue observer and replay hook, a serving-only build
 // carries neither. If the serving build computes anything other than what the default build's
 // radiance computes, the adapter a deployment loads does not answer what the trainer measured.
-// This test fixes the comparison to bytes: the NLL and entropy rows of one corpus with one
-// adapter, against tests/fixtures/.
+// This test fixes the comparison to bytes: the served logits of one corpus with one adapter, and
+// the NLL and entropy rows those logits score, against tests/fixtures/. The logits are the check --
+// a permutation of two non-target logits, or a pair moved together, leaves both rows where they
+// were -- and the rows are kept beside them because `r97train loss` prints those two numbers.
 //
 // The serve is radiance's own: `--kld-record` prefills the corpus and scores it through the adapter
-// slot (`--kld-lora`), which stock radiance has, so this test runs in a serving build without any
+// slot (`--kld-lora`), which stock radiance has, and `--kld-logits` keeps the f32 logits it scored
+// (patches/serving/0202-kld-record-logits.patch), so this test runs in a serving build without any
 // trainer-only patch (patches/serving/ has the LoRA on the int8 trunk, 0210, and nothing else it
-// needs). The reference rows were written by this test in the default build
-// (R97_WRITE_SERVING_GOLDEN=<path>); the same test runs in a serving build and must reproduce them
+// needs). The reference was written by this test in the default build
+// (R97_WRITE_SERVING_GOLDEN=<path>); the same test runs in a serving build and must reproduce it
 // exactly. The adapter in tests/fixtures/serving_adapter is one r97train wrote on the int8 fixture
 // (tests/fixtures/serving_adapter/README.md prints the run). docs/DEPLOYMENT.md §5 has the place of
 // this check in a deployment.
@@ -61,9 +64,11 @@ const std::vector<std::string>& prompts() {
     return text;
 }
 
-// On disk: "R97S" then n_rows as little-endian u32, then the rows (NLL, entropy) as f32. Written
-// and read only here, so the layout can be this small.
-constexpr char kMagic[4] = { 'R', '9', '7', 'S' };
+// On disk: "R97S" then n_rows as little-endian u32, then the rows (NLL, entropy) as f32; the logits
+// file is "R97L" then n_rows and n_vocab as u32, then the rows' logits as f32. Written and read only
+// here, so the layout can be this small.
+constexpr char kMagic[4]      = { 'R', '9', '7', 'S' };
+constexpr char kLogitMagic[4] = { 'R', '9', '7', 'L' };
 
 void put_u32(std::ofstream& out, uint32_t v) {
     unsigned char b[4] = { (unsigned char)(v), (unsigned char)(v >> 8), (unsigned char)(v >> 16),
@@ -101,6 +106,32 @@ void write_reference(const fs::path& path, const r97::served_prefill::Served& s)
     if (!out) throw std::runtime_error("serving_prefill: short write to " + path.string());
 }
 
+std::vector<float> read_logits(const fs::path& path, uint32_t* n_rows, uint32_t* n_vocab) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("serving_prefill: cannot read " + path.string());
+    char magic[4];
+    in.read(magic, 4);
+    if (std::memcmp(magic, kLogitMagic, 4) != 0)
+        throw std::runtime_error("serving_prefill: " + path.string() + " is not a served logits record");
+    *n_rows  = get_u32(in);
+    *n_vocab = get_u32(in);
+    std::vector<float> logits((size_t)*n_rows * (size_t)*n_vocab);
+    in.read(reinterpret_cast<char*>(logits.data()), (std::streamsize)(logits.size() * 4));
+    if (!in) throw std::runtime_error("serving_prefill: " + path.string() + " is short");
+    return logits;
+}
+
+void write_logits(const fs::path& path, const r97::served_prefill::Served& s) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) throw std::runtime_error("serving_prefill: cannot write " + path.string());
+    out.write(kLogitMagic, 4);
+    put_u32(out, (uint32_t)s.n_rows);
+    put_u32(out, (uint32_t)s.n_vocab);
+    out.write(reinterpret_cast<const char*>(s.logits.data()),
+              (std::streamsize)(s.logits.size() * 4));
+    if (!out) throw std::runtime_error("serving_prefill: short write to " + path.string());
+}
+
 }  // namespace
 
 R97_TEST(serving_prefill_with_the_fixture_adapter_matches_the_reference) {
@@ -114,10 +145,13 @@ R97_TEST(serving_prefill_with_the_fixture_adapter_matches_the_reference) {
 
     const r97::served_prefill::Served served =
         r97::served_prefill::served(f.container, corpus, adapter.string(), 16,
-                                    r97::served_prefill::host_hierarchy(), dir + "/served");
+                                    r97::served_prefill::host_hierarchy(), dir + "/served",
+                                    /*logits=*/true);
 
     R97_CHECK(served.n_rows > 0);
     R97_CHECK(served.finite());
+    R97_CHECK(served.n_vocab > 0);
+    R97_CHECK((int64_t)served.logits.size() == served.n_rows * served.n_vocab);
 
     // Prove the adapter was loaded and used: without it the same serve must score something else,
     // or the comparison below would pass on a build that ignored the adapter.
@@ -128,15 +162,31 @@ R97_TEST(serving_prefill_with_the_fixture_adapter_matches_the_reference) {
     R97_CHECK(plain.finite());
     R97_CHECK(plain.loss() != served.loss());
 
-    const fs::path reference_file = fixtures() / "serving_rows.f32";
+    const fs::path rows_file   = fixtures() / "serving_rows.f32";
+    const fs::path logits_file = fixtures() / "serving_logits.f32";
     if (const char* write = std::getenv("R97_WRITE_SERVING_GOLDEN")) {
         write_reference(write, served);
-        std::printf("serving_prefill: wrote the served rows to %s\n", write);
+        // The logits go beside the rows the run named: one reference, two files of it.
+        const fs::path logits = fs::path(write).parent_path() / "serving_logits.f32";
+        write_logits(logits, served);
+        std::printf("serving_prefill: wrote the served rows to %s and the logits to %s\n", write,
+                    logits.string().c_str());
         return;
     }
 
+    // The row itself first: every scored position's logits, byte for byte. These are the number a
+    // serve answers with, so a build whose logits differ anywhere fails here even where the NLL and
+    // the entropy of the scored token are the same.
+    uint32_t           logit_rows = 0, n_vocab = 0;
+    std::vector<float> logits = read_logits(logits_file, &logit_rows, &n_vocab);
+    R97_CHECK((int64_t)logit_rows == served.n_rows);
+    R97_CHECK((int64_t)n_vocab == served.n_vocab);
+    R97_CHECK(logits.size() == served.logits.size());
+    R97_CHECK(std::memcmp(logits.data(), served.logits.data(), logits.size() * 4) == 0);
+
+    // Then the two numbers the logits score, which are what `r97train loss` prints.
     uint32_t           n_rows = 0;
-    std::vector<float> reference = read_reference(reference_file, &n_rows);
+    std::vector<float> reference = read_reference(rows_file, &n_rows);
     R97_CHECK((int64_t)n_rows == served.n_rows);
     R97_CHECK(reference.size() == served.rows.size());
     R97_CHECK(std::memcmp(reference.data(), served.rows.data(), reference.size() * 4) == 0);

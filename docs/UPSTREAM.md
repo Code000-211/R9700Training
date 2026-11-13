@@ -39,6 +39,7 @@ calls the join. See
 | --- | --- | --- | --- | --- | --- | --- |
 | `patches/serving/0201-lora-set-weights.patch` | serving | 75 | 0 | 85 | not-submitted | put an adapter slot in service from factors already in memory, not only from a directory |
 | `patches/serving/0201-narrow-head-gate.patch` | serving | 6 | 3 | 15 | not-submitted | an int8 attention gate on a head narrower than the 128-column quantiser group |
+| `patches/serving/0202-kld-record-logits.patch` | serving | 45 | 13 | 64 | not-submitted | keep the scored positions' f32 logits in a KL reference, so a serve is compared bit for bit |
 | `patches/serving/0210-lora-int8-trunk.patch` | serving | 383 | 37 | 440 | not-submitted | a LoRA adapter on the rotated int8 trunk, through the host and card kernels |
 | `patches/training/0101-issue-observer.patch` | training | 152 | 0 | 170 | not-submitted | an optional issue observer and layer block brackets on the runtime context |
 | `patches/training/0102-replay-block.patch` | training | 173 | 45 | 230 | not-submitted | re-running one block of a step from a restored residual, after its ops have run, in both trunk architectures |
@@ -74,6 +75,11 @@ what it removed from each patch, is in `docs/reports/2026-11-11-patch-audit.md`.
 - `0201` is serving: radiance's service API loads an adapter from a directory, so a slot from
   factors already in memory needs an entry point. It reuses the slot and the swap the engine
   already has.
+- `0202` is serving: a deployment has to show that its serve is the trainer's, and the KL record
+  kept what the rows score (the next-token NLL and the entropy) but not the row it scored them
+  from. `--kld-logits` writes the f32 logits `Kld::record_row` already holds, so a reference can be
+  held to the model's own answer rather than to a function of it. It is off by default: a
+  full-vocabulary f32 row is 604 KiB a position on the 27B.
 - `0210` carries the int8 trunk end to end, and with it one step of the in-memory path: the
   factors `0201`'s `Engine::lora_set_weights` builds arrive in the basis the sites are fed, as a
   file adapter's do from their own header (`docs/ADAPTER.md` §4). `build_sites` records

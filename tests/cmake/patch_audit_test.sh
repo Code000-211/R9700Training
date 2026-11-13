@@ -3,8 +3,8 @@
 #
 # The audit runs against the tree (it must pass) and against copies that are made to break each of
 # its rules: a patch grown past its budget (whose diff stat must be printed), a patch with no
-# Concern line, a serving patch that touches a file a training patch introduces, and a stale row
-# in docs/UPSTREAM.md.
+# Concern line, a serving patch that touches a file a training patch introduces, a stale row in
+# docs/UPSTREAM.md, and a patch missing from or disagreeing with patches/README.md.
 set -euo pipefail
 
 src=${1:?usage: patch_audit_test.sh <source root>}
@@ -91,5 +91,26 @@ prepare
 grep -v '`patches/training/0102-replay-block.patch`' "$tree/docs/UPSTREAM.md" > "$tmp/doc"
 mv "$tmp/doc" "$tree/docs/UPSTREAM.md"
 check fail "0102-replay-block.patch has no row" "a patch missing from docs/UPSTREAM.md"
+
+# patches/README.md is the index too: a patch without a row fails, a row that disagrees with the
+# patch's upstream status fails, and a row without a patch is stale.
+prepare
+awk '!/`patches\/training\/0102-replay-block.patch`/' "$tree/patches/README.md" > "$tmp/readme"
+mv "$tmp/readme" "$tree/patches/README.md"
+check fail "0102-replay-block.patch has no row in patches/README.md" \
+    "a patch missing from patches/README.md"
+
+prepare
+sed '/`patches\/training\/0102-replay-block.patch`/ s/| not-submitted |/| merged |/' \
+    "$tree/patches/README.md" > "$tmp/readme"
+mv "$tmp/readme" "$tree/patches/README.md"
+check fail "0102-replay-block.patch: patches/README.md says upstream 'merged'" \
+    "a patches/README.md row whose upstream status differs from the patch's"
+
+prepare
+printf '| `patches/training/9999-gone.patch` | training | gone | not-submitted |\n' \
+    >> "$tree/patches/README.md"
+check fail "9999-gone.patch, which is not a patch" \
+    "a patches/README.md row with no patch"
 
 printf 'patch_audit_test: ok\n'

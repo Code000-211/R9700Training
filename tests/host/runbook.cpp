@@ -173,6 +173,16 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
     // trainer's own plugin, and the trainer's `loss --device` runs on libr4d, libavx and libref,
     // so the served number has to come from the same three to be held to it.
     R97_CHECK(contains(script, "--lora trained=\"$adapter\" --kernels libr4d,libavx,libref"));
+    // The card's serve names the limits the prose names, because the 27B's 256-sequence worst case
+    // does not fit the card's default and the engine stops at startup instead of serving; these are
+    // the three the report's card numbers were taken with.
+    R97_CHECK(contains(script, "--max-num-seqs 8"));
+    R97_CHECK(contains(script, "--max-num-batched-tokens 8192"));
+    R97_CHECK(contains(script, "--max-model-len 4096"));
+    // The card's served number is held to the host's only where the host tier has a number: a
+    // container the host tier cannot declare has none, and there the card's serve is held to
+    // `loss --device` alone.
+    R97_CHECK(contains(script, "host != \"\" && !agree(measured, host)"));
     // The card's inventory is a command of the script, not prose beside it: the real `--device`
     // line sits next to the tested host one, and the no-card run says it took the skip branch.
     R97_CHECK(contains(script, "--device \"$R97_DEVICE\""));
