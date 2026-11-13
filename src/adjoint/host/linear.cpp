@@ -8,6 +8,8 @@
 
 #include "host_step_record.h"
 
+#include "parallel.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -22,6 +24,11 @@ int64_t numel(const std::vector<int64_t>& shape) {
     for (int64_t d : shape) n *= d;
     return n;
 }
+// The pair of rows the parallel for cuts the M-row loops into: a one-row call (the fixture's
+// narrow cases) stays on the calling thread, and an odd M leaves one row to a worker rather
+// than a whole chunk. The row is the loops' output -- their inner sums stay the row's serial
+// order -- so the partition writes nothing a neighbour reads.
+constexpr int64_t kRowChunk = 2;
 
 const OpParam* find_param(const OpRecord& rec, const char* name) {
     for (const OpParam& p : rec.params) {
@@ -115,7 +122,7 @@ void gemm_nt_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     const Operand* w = first_write(rec);
     out->push_back(make_value(w != nullptr ? w->dtype : a->dtype, {M, N}));
     AdValue& y = out->back();
-    for (int64_t m = 0; m < M; ++m) {
+    parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t n = 0; n < N; ++n) {
             double acc = 0.0;
             for (int64_t k = 0; k < K; ++k) {
@@ -124,7 +131,7 @@ void gemm_nt_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
             }
             y.value[static_cast<std::size_t>(m * N + n)] = acc;
         }
-    }
+    });
 }
 
 void gemm_nt_adjoint(const AdjointCall& call) {
@@ -138,7 +145,7 @@ void gemm_nt_adjoint(const AdjointCall& call) {
     const int64_t N = param_int(call.rec, "N", b.shape.size() >= 2 ? b.shape[0] : 0);
     const int64_t M = param_int(call.rec, "M", a.shape.empty() ? 0 : a.shape[0]);
     AdValue& dx = (*call.dc)[static_cast<std::size_t>(ia)];
-    for (int64_t m = 0; m < M; ++m) {
+    parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t k = 0; k < K; ++k) {
             double acc = 0.0;
             for (int64_t n = 0; n < N; ++n) {
@@ -147,7 +154,7 @@ void gemm_nt_adjoint(const AdjointCall& call) {
             }
             dx.value[static_cast<std::size_t>(m * K + k)] += acc;
         }
-    }
+    });
 }
 
 // y[M,N] = (a codes * a_scale) * (b codes * b_scale)^T, grouped as the host kernel groups.
@@ -166,7 +173,7 @@ void gemm_nt_q_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     const Operand* w = first_write(rec);
     out->push_back(make_value(w != nullptr ? w->dtype : a->dtype, {M, N}));
     AdValue& y = out->back();
-    for (int64_t m = 0; m < M; ++m) {
+    parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t n = 0; n < N; ++n) {
             double acc = 0.0;
             for (int64_t g = 0; g < groups; ++g) {
@@ -181,7 +188,7 @@ void gemm_nt_q_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
             }
             y.value[static_cast<std::size_t>(m * N + n)] = acc;
         }
-    }
+    });
 }
 
 // dx in the dequantised activation basis: dy * W, where W dequantises the int8 weight codes.
@@ -200,7 +207,7 @@ void gemm_nt_q_adjoint(const AdjointCall& call) {
     const int64_t group = param_int(call.rec, "group", K > 0 ? K : 1);
     const int64_t groups = group > 0 ? (K + group - 1) / group : 1;
     AdValue& dx = (*call.dc)[static_cast<std::size_t>(ia)];
-    for (int64_t m = 0; m < M; ++m) {
+    parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t k = 0; k < K; ++k) {
             const int64_t g = group > 0 ? k / group : 0;
             double acc = 0.0;
@@ -211,7 +218,7 @@ void gemm_nt_q_adjoint(const AdjointCall& call) {
             }
             dx.value[static_cast<std::size_t>(m * K + k)] += acc;
         }
-    }
+    });
 }
 
 // logits_gemm: the same transposed product, with the head's own parameter names.
@@ -226,7 +233,7 @@ void logits_gemm_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     const Operand* y = first_write(rec);
     out->push_back(make_value(y != nullptr ? y->dtype : x->dtype, {M, N}));
     AdValue& logits = out->back();
-    for (int64_t m = 0; m < M; ++m) {
+    parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t n = 0; n < N; ++n) {
             double acc = 0.0;
             for (int64_t k = 0; k < K; ++k) {
@@ -235,7 +242,7 @@ void logits_gemm_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
             }
             logits.value[static_cast<std::size_t>(m * N + n)] = acc;
         }
-    }
+    });
 }
 
 void logits_gemm_adjoint(const AdjointCall& call) {
@@ -249,7 +256,7 @@ void logits_gemm_adjoint(const AdjointCall& call) {
     const int64_t N = param_int(call.rec, "n_vocab", w.shape.size() >= 2 ? w.shape[0] : 0);
     const int64_t M = x.shape.empty() ? 0 : x.shape[0];
     AdValue& dx = (*call.dc)[static_cast<std::size_t>(ix)];
-    for (int64_t m = 0; m < M; ++m) {
+    parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t k = 0; k < K; ++k) {
             double acc = 0.0;
             for (int64_t n = 0; n < N; ++n) {
@@ -258,7 +265,7 @@ void logits_gemm_adjoint(const AdjointCall& call) {
             }
             dx.value[static_cast<std::size_t>(m * K + k)] += acc;
         }
-    }
+    });
 }
 
 // gather_rows: y[i,:] = x[idx[i],:] and a negative index selects a zero row.
@@ -347,9 +354,10 @@ void gemm_nt_q_code_adjoint(const AdjointCall& call) {
     const int64_t group = param_int(call.rec, "group", K > 0 ? K : 1);
     const int64_t groups = group > 0 ? (K + group - 1) / group : 1;
     AdValue& dx = (*call.dc)[static_cast<std::size_t>(ia)];
-    for (int64_t m = 0; m < M; ++m)
+    parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t k = 0; k < K; ++k)
             dx.value[static_cast<std::size_t>(m * K + k)] *= scale_at(as, m, k / group, M, groups);
+    });
 }
 
 }  // namespace

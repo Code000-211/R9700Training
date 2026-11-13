@@ -22,6 +22,13 @@
 // basis apply the transform themselves.
 #pragma once
 
+// The host reference's parallel for. The header is shared with the plugin build, where the
+// device launch is the decode and the host loop below is never a card's work, so the include
+// and the partitioning are host builds' only; the plugin keeps the serial column loop.
+#if !defined(__HIPCC__) && !defined(__CUDACC__)
+#include "parallel.h"
+#endif
+
 #include <math.h>
 #include <stdint.h>
 
@@ -345,11 +352,26 @@ R97_IQR_HD int32_t r97_iqr_validate(const R97IqrDecodeDesc& d) {
 // tests check it against libquant's grid_tcq_decode, and the device kernel against it.
 inline int32_t r97_iqr_decode_host(const R97IqrDecodeDesc& d) {
     if (r97_iqr_validate(d)) return 1;
+#if defined(__HIPCC__) || defined(__CUDACC__)
     for (int64_t r0 = d.row0; r0 < d.row0 + d.rows; r0 += d.run_rows) {
         int64_t r1 = r0 + d.run_rows;
         if (r1 > d.rows_all) r1 = d.rows_all;
         for (int64_t j = 0; j < d.cols; ++j) r97_iqr_decode_column(d, r0, r1, j);
     }
+#else
+    // One unit per (run, column): a unit writes only its column of out_codes for its run's rows
+    // and, for the block's first column, the block's out_scale -- the units' outputs are
+    // disjoint, so the parallel for's chunking writes every value exactly once, as the serial
+    // loop did. The pair of runs the chunk cuts over is the no-threading threshold: a weight
+    // too small to hold one stays on the calling thread.
+    const int64_t nruns = (d.rows + d.run_rows - 1) / d.run_rows;
+    r97::parallel_for(nruns * d.cols, 16384, [&](int64_t u) {
+        const int64_t r0 = d.row0 + (u / d.cols) * d.run_rows;
+        int64_t r1 = r0 + d.run_rows;
+        if (r1 > d.rows_all) r1 = d.rows_all;
+        r97_iqr_decode_column(d, r0, r1, u % d.cols);
+    });
+#endif
     return 0;
 }
 

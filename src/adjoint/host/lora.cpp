@@ -34,6 +34,7 @@
 // derivative of its own, so its adjoint is this one's; its twin rounds, which is the only
 // difference between the two rows.
 #include "r97/adjoint.h"
+#include "parallel.h"
 
 #include <algorithm>
 #include <cmath>
@@ -52,6 +53,13 @@ int64_t numel(const std::vector<int64_t>& shape) {
     for (int64_t d : shape) n *= d;
     return n;
 }
+
+// The pair of rows the parallel for cuts the M-row loops into (a one-row call stays on the
+// calling thread), and the pair of (column, row) pairs a factor-gradient pass splits over.
+// The rows are the loops' outputs, and a factor's (column, row) is one of its: every unit's
+// sums stay that unit's own serial order, so the partition writes nothing a neighbour reads.
+constexpr int64_t kRowChunk = 2;
+constexpr int64_t kPairChunk = 2;
 
 /* The width of one scale group over K, read back from a stream of `groups` columns the way
  * radiance's make_scales does (grid_block in ref_gemm.h): the power of two whose ceiling division
@@ -223,15 +231,15 @@ void lora_shrink_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     t.dtype = write_dtype(rec, "f32");
     t.shape = {sh.M, sh.R};
     t.value.assign((size_t)(sh.M * sh.R), 0.0);
-    for (int64_t m = 0; m < sh.M; ++m) {
+    parallel_for(sh.M, kRowChunk, [&](int64_t m) {
         const int64_t s = row_slot(sh, m);
-        if (s < 0) continue;  // a base row: nothing written
+        if (s < 0) return;  // a base row: nothing written
         for (int64_t j = 0; j < sh.R; ++j) {
             double acc = 0.0;
             for (int64_t k = 0; k < sh.K; ++k) acc += x_at(sh, m, k) * a_at(sh, s, j, k);
             t.value[(size_t)(m * sh.R + j)] = acc;
         }
-    }
+    });
     out->push_back(std::move(t));
 }
 
@@ -264,20 +272,30 @@ void lora_shrink_host_adjoint(const AdjointCall& call) {
         if ((int64_t)s_cot->value.size() != sh.M * sh.groups) return;
     }
 
-    // `grad_entry` hands a reference into the ParamSet, which a later entry may move: ask again
-    // for each slot and use the reference before the next entry is made.
+    // `grad_entry` hands a reference into the ParamSet, which a later entry may move: the
+    // entries this call touches are made first, in the order the first rows find their slots,
+    // and the pointers are held until the gradient pass is done.
     const auto da_for = [&](int64_t s) -> Param* {
         const std::vector<int64_t> shape =
             call.fused_slots ? std::vector<int64_t>{sh.S * sh.R, sh.K}
                              : std::vector<int64_t>{sh.R, sh.K};
         return &grad_entry(call.grads, factor_grad_name(call, "lora_A", s), shape);
     };
+    std::vector<Param*> da(sh.S, nullptr);
+    if (call.grads)
+        for (int64_t m = 0; m < sh.M; ++m) {
+            const int64_t s = row_slot(sh, m);
+            if (s >= 0 && da[s] == nullptr) da[s] = da_for(s);
+        }
 
-    std::vector<double> g((size_t)sh.K, 0.0);
-    for (int64_t m = 0; m < sh.M; ++m) {
+    // The row's own outputs -- g, a_cot's row and s_cot's row -- are row-local, so the rows
+    // partition the work. dA sums over the rows, and the sum's order is the rows' per
+    // (slot, j, k): the pass over it splits over the (j, k) pairs, each keeping the rows
+    // serial.
+    parallel_for(sh.M, kRowChunk, [&](int64_t m) {
         const int64_t s = row_slot(sh, m);
-        if (s < 0) continue;  // a base row: no cotangent, no gradient
-        std::fill(g.begin(), g.end(), 0.0);
+        if (s < 0) return;  // a base row: no cotangent, no gradient
+        std::vector<double> g((size_t)sh.K, 0.0);
         for (int64_t j = 0; j < sh.R; ++j) {
             const double c = t_cot.value[(size_t)(m * sh.R + j)];
             if (c == 0.0) continue;
@@ -294,18 +312,19 @@ void lora_shrink_host_adjoint(const AdjointCall& call) {
             a_cot.value[e] += g[(size_t)k] * scale;
             s_cot->value[ge] += g[(size_t)k] * sh.a->value[e];
         }
-        if (call.grads) {
-            Param* da = da_for(s);
-            const int64_t row0 = call.fused_slots ? s * sh.R : 0;
-            for (int64_t j = 0; j < sh.R; ++j) {
+    });
+    if (call.grads)
+        parallel_for(sh.R * sh.K, kPairChunk, [&](int64_t u) {
+            const int64_t j = u / sh.K, k = u % sh.K;
+            for (int64_t m = 0; m < sh.M; ++m) {
+                const int64_t s = row_slot(sh, m);
+                if (s < 0) continue;
                 const double c = t_cot.value[(size_t)(m * sh.R + j)];
                 if (c == 0.0) continue;
-                for (int64_t k = 0; k < sh.K; ++k)
-                    da->value[(size_t)((row0 + j) * sh.K + k)] +=
-                        (float)(c * x_at(sh, m, k));
+                const int64_t row0 = call.fused_slots ? s * sh.R : 0;
+                da[s]->value[(size_t)((row0 + j) * sh.K + k)] += (float)(c * x_at(sh, m, k));
             }
-        }
-    }
+        });
 }
 
 // ------------------------------------------------------------------ lora_expand
@@ -379,9 +398,9 @@ void lora_expand_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     y.dtype = write_dtype(rec, "bf16");
     y.shape = {ex.M, ex.N};
     y.value.assign((size_t)(ex.M * ex.N), 0.0);
-    for (int64_t m = 0; m < ex.M; ++m) {
+    parallel_for(ex.M, kRowChunk, [&](int64_t m) {
         const int64_t s = row_slot(ex, m);
-        if (s < 0) continue;  // a base row: not read, not written
+        if (s < 0) return;  // a base row: not read, not written
         for (int64_t n = 0; n < ex.N; ++n) {
             double acc = 0.0;
             for (int64_t j = 0; j < ex.R; ++j) {
@@ -391,7 +410,7 @@ void lora_expand_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
             }
             y.value[(size_t)(m * ex.N + n)] = expand_scale(ex, s, n) * acc;
         }
-    }
+    });
     out->push_back(std::move(y));
 }
 
@@ -418,33 +437,50 @@ void lora_expand_host_adjoint(const AdjointCall& call) {
                              : std::vector<int64_t>{ex.N, ex.R};
         return &grad_entry(call.grads, factor_grad_name(call, "lora_B", s), shape);
     };
+    // The entries this call touches, made first in the order the first rows find their slots,
+    // the way the ParamSet's move rule wants; n_end is the slot's, read once from the entry.
+    std::vector<Param*> db(ex.S, nullptr);
+    if (call.grads)
+        for (int64_t m = 0; m < ex.M; ++m) {
+            const int64_t s = row_slot(ex, m);
+            if (s >= 0 && db[s] == nullptr) db[s] = db_for(s);
+        }
+    const int64_t cols = call.fused_slots ? ex.S * ex.R : ex.R;
+    std::vector<int64_t> n_end(ex.S, ex.N);
+    if (call.grads)
+        for (int64_t s = 0; s < ex.S; ++s)
+            if (db[s] && cols > 0 && db[s]->value.size() < (size_t)(ex.N * cols))
+                n_end[s] = (int64_t)db[s]->value.size() / cols;
 
-    for (int64_t m = 0; m < ex.M; ++m) {
+    // dt's row m is row-local, so the rows partition the work. dB sums over the rows, and the
+    // sum's order is the rows' per (slot, n, j): the pass over it splits over the (n, j)
+    // pairs, each keeping the rows serial.
+    parallel_for(ex.M, kRowChunk, [&](int64_t m) {
         const int64_t s = row_slot(ex, m);
-        if (s < 0) continue;
-        Param* const db = call.grads ? db_for(s) : nullptr;
-        /* The op's own N is the buffer's padded width; the parameter's shape, which the trainer
-         * allocated, is the module's true width. A record wider than its lora_B -- a padded row
-         * round -- has no columns past the parameter's, and reading them is past the end. */
-        const int64_t cols = call.fused_slots ? ex.S * ex.R : ex.R;
-        int64_t n_end = ex.N;
-        if (db && cols > 0 && db->value.size() < (size_t)(n_end * cols))
-            n_end = (int64_t)db->value.size() / cols;
-        for (int64_t n = 0; n < n_end; ++n) {
+        if (s < 0) return;
+        for (int64_t n = 0; n < n_end[s]; ++n) {
             const double c = y_cot.value[(size_t)(m * ex.N + n)];
             if (c == 0.0) continue;
             const double cs = c * expand_scale(ex, s, n);
             const size_t b0 = (size_t)((s * ex.N + n) * ex.R);
             for (int64_t j = 0; j < ex.R; ++j)
                 t_cot.value[(size_t)(m * ex.R + j)] += cs * ex.lb->value[b0 + (size_t)j];
-            if (db) {
-                const int64_t col0 = call.fused_slots ? s * ex.R : 0;
-                for (int64_t j = 0; j < ex.R; ++j)
-                    db->value[(size_t)(n * cols + col0 + j)] +=
-                        (float)(cs * ex.t->value[(size_t)(m * ex.R + j)]);
-            }
         }
-    }
+    });
+    if (call.grads)
+        parallel_for(ex.N * ex.R, kPairChunk, [&](int64_t u) {
+            const int64_t n = u / ex.R, j = u % ex.R;
+            for (int64_t m = 0; m < ex.M; ++m) {
+                const int64_t s = row_slot(ex, m);
+                if (s < 0 || n >= n_end[s]) continue;
+                const double c = y_cot.value[(size_t)(m * ex.N + n)];
+                if (c == 0.0) continue;
+                const double cs = c * expand_scale(ex, s, n);
+                const int64_t col0 = call.fused_slots ? s * ex.R : 0;
+                db[s]->value[(size_t)(n * cols + col0 + j)] +=
+                    (float)(cs * ex.t->value[(size_t)(m * ex.R + j)]);
+            }
+        });
 }
 
 }  // namespace
