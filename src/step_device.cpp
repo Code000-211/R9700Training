@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -620,6 +621,14 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         // The key of a frozen read, or empty when the operand is not one: a read of a buffer the
         // step writes is a value of that block, not a constant of the step.
         const auto frozen_key = [&step_writes](const OpRecord& rec, size_t j) -> std::string {
+            // R97_NO_SHARED_SNAPSHOTS=1 falls back to widening every operand per block. It exists
+            // because the sharing is the only change between the run that completed and the one
+            // whose child was killed, so a window can tell them apart in one run.
+            static const bool off = [] {
+                const char* e = std::getenv("R97_NO_SHARED_SNAPSHOTS");
+                return e != nullptr && *e == '1';
+            }();
+            if (off) return std::string();
             const Operand& o = rec.operands[j];
             if (o.written || step_writes.count(o.buffer)) return std::string();
             return snapshot_key(o);

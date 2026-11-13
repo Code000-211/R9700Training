@@ -22,25 +22,42 @@ ran with `R97_MODEL_DIR` naming the container: the build's `R97_MODEL_RAD` macro
 
 ## device_step_tape — the op coverage, and a full 512-token step
 
-**Pending.** The case is in the tree and its op-coverage probe runs; the 512-token walk has not
-completed a measured run yet, so this section carries no figures. The run that fills it is the
-one this report's window is for: the walk's per-op split (`row_seconds`, `pull_seconds`) is now
-printed and written to the case's JSON, so a single window yields both the total and the ops that
-hold it. What is already known, from the record and the refused runs:
+The case runs and descends; **it does not pass**, and the failure is the gradient's, not the loss's.
 
-- The 512-token tape declares 224 `gemm_nt_q` and 64 `gemm_nt_q_gated` calls; the fold's host
-  adjoint now exists (`src/adjoint/host/gemm_nt_q_gated.cpp`), so the walk no longer refuses there.
-- Before the walk's cotangent slots were sized only for the operands a row may write, every call
-  zero-filled a cotangent for the fold's `[34816, 5120]` weight (1.4 GB) and the head's four class
-  weights (~10 GB); `peak_cotangent_bytes` is what the walk actually held.
+| figure | value |
+| --- | --- |
+| scored | 511 of 512 |
+| loss → loss_after (one AdamW step) | 7371.591348 → 6347.883967 |
+| forward / head / backward / step | 46.9 s / 0.8 s / 1176.9 s / 1227.0 s |
+| residual boundaries / store | 65 / 640 MiB |
+| peak cotangent / VRAM peak | 490.9 MB / 20.28 GB |
+| `all_finite` | **false** — `grad norm nan` |
+| `a_all_zero`, `b_all_nonzero` | false, false |
+
+The walk's split (288 `gemm_nt_q` calls and 288 `lora_*`, 48 `gdn_chunk_scan`, 48
+`had_quant_act_i8g`): `gemm_nt_q` 76.3 s, `lora_expand` 5.5 s, `gdn_chunk_scan` 5.4 s,
+`lora_shrink` 5.4 s, `had_quant_act_i8g` 1.6 s — **~95 s of the 1177 s backward**. The rest is the
+walk's own per-op work (the f64 snapshot of every operand, the distribute, the store), which is why
+the parallelisation ticket exists and why the card sat at 3–5 % busy throughout.
+
+The NaN is born in the **forward**, not the walk: `forward_all_finite` is false, the first
+non-finite operand is `h` (position 1459, value index 62), and the walk's first bad cotangent is
+`rmsnorm`'s `x` at 1458 — the reader, not the producer. `b_all_nonzero` false is a second,
+independent gap: the check sums squares, so a NaN cannot make it read zero; one `lora_B` leaf
+really gets an exactly-zero gradient.
+
+The op coverage probe is separate and still runs: the tape declares 224 `gemm_nt_q` and 64
+`gemm_nt_q_gated` calls, and `probe_missing` lists the ops served by the host fallback rather than
+a device row.
 
 ## device_step_seq4096 — the ticket
 
-**Pending.** Not yet run: the 4096-token step needs a window sized by the 512 case's measured walk,
-and the case refuses before that measurement exists. The numbers this section will carry are the
-loss (to be cross-checked against `docs/reports/2026-11-12-device-forward.md`'s 34682.089228 /
-8.469375 for the same batch), `loss_after`, the gradient norm, the store and VRAM peaks, the
-forward/head/backward split, and tokens a second.
+**Not run.** At the 512 case's measured rate the backward is ~2.6 h at 4096 tokens (~2.8 h for the
+step), which is a window nobody wants to hold while the forward's NaN is still unexplained: a
+longer run of a step whose gradient is not finite proves nothing. It runs once the forward is
+finite, and its figures go here: loss (cross-checked against
+`docs/reports/2026-11-12-device-forward.md`'s 34682.089228 / 8.469375 for the same batch),
+`loss_after`, the gradient norm, the store and VRAM peaks, the phase split, and tokens a second.
 
 ## The device rows and the head's kernels
 
