@@ -172,9 +172,15 @@ measurement is `tests/host/runbook.cpp`'s when it is given the serving tree (`R9
 `docs/TESTING.md`): the test serves the adapter, answers one completion, and prints the two losses
 it compared, so both of the host's numbers are taken by `ctest` rather than by hand. The card's
 measurement is the same one in `docs/RUNBOOK.md` section 7's second block, held to the trainer's
-card number (`loss --device`) and to the host's, both at `1e-4`, with the serve log required to show
-the AQL backend; those numbers belong to the card, so the script is where they are, not this
-document, and no card has taken them yet.
+card number (`loss --device`) and, where a host run of the model exists, to the host's, both at
+`1e-4`, with the serve log required to show the AQL backend. Card 0 took those numbers on
+2026-11-13 for the 27B container: `loss --device 0` printed `1.37629250328` and the serving-only
+build's record `1.37629250298`, `2.2e-10` relative over the 1840 held-out positions, on `libr4d`.
+The record needs the card's limits named (`--max-num-seqs 8`,
+`--max-num-batched-tokens 8192`, `--max-model-len 4096`): the engine's 256-sequence default worst
+case asks for `36.70 GiB` of linear and conv state against the card's `16.17 GiB` of cache, and it
+stops at startup instead of serving. Both commands, and what the card did not take, are in
+`docs/reports/2026-11-13-serving-card.md`.
 
 A serve that was not measured is not a checked deployment: the host's exact served rows and its
 loss are measured here, and the card's adapter path is `tests/gpu/serving_container.cpp`'s under
@@ -182,10 +188,14 @@ the model label (the base container's prefill, then the same prefill through the
 two must differ). `tests/model/serving_container.cpp` checks the real container's serving
 handshake on the host: its arch, its basis, and that the adapter's targets are among its
 targetable linears. The card's *trained* number is the real run's (`docs/RUNBOOK.md` section 7's
-second block, `loss --device` against the served record), and no card has taken it yet: it needs
-the adapter a short real run writes, which is that run's, not a fixture's. Section 7's blocks say
-in their output which measurement they took and which they skipped, and a run without a serving
-build keeps the trainer's `loss --lora` number alone.
+second block, `loss --device` against the served record), and no card has taken it: it needs the
+adapter a short real run writes, and `r97train train` gives a run the host kernels (`opts.kernels`
+in `tools/train.cpp`) while the host tier cannot declare this container
+(`docs/reports/2026-11-12-device-forward.md`), so the card's serve above was held to the trainer's
+card number with the adapter the trainer's own writer made for the container it serves (section
+4), which is what a run writes. Section 7's blocks say in their output which measurement they
+took and which they skipped, and a run without a serving build keeps the trainer's `loss --lora`
+number alone.
 
 ## 6. Upstreaming
 
