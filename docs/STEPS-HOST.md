@@ -364,9 +364,11 @@ formed. The head cotangent that enters the trunk is therefore the dequantised on
 is comparable with the bf16 model's.
 
 `host_step_int8` checks the property a quantised trunk can give: the straight-through gradient is
-finite and nonzero, and a step along it lowers the driver's scored loss, while a step of the same
-length against it raises the loss -- so the check cannot be passed by a direction that merely has
-a negative projection.
+finite and nonzero, and a step along it lowers the driver's scored loss. A step of the same
+length against it -- a hash direction with a negative projection -- is held above the descent:
+it may lower the loss slightly (the surface curves down along that direction, and the walk's
+gradient projects little onto it), but it must not descend as well as the gradient's own step, so
+the check cannot be passed by a direction that merely has a negative projection.
 
 `host_step_int8_gradient_points_the_way_bf16_does` runs the same adapter on the same batch through
 both containers and compares the adapter's gradients, per site, per layer and whole. Both sides
@@ -381,16 +383,21 @@ has to pass: the wrong normalisation (`H/sqrt(128)`, or no mapping at all) moves
 five percent.
 
 What the walk measures on this tree, with that mapping and a nonzero `B`: the two losses agree to
-0.7 %; the gradients agree with a cosine of 0.67 whole and 0.66 over the top block; the top block's
-magnitude is 0.84 of the bf16 one. The per-site cosines run from -0.63 to 0.96 and the per-site
-magnitudes from 0.37 to 1.84.
+0.7 %; the gradients agree with a cosine of 0.86 whole and 0.97 over the top block; the top
+block's magnitude is 0.89 of the bf16 one. The per-site cosines run from -0.56 to 0.99 and the
+per-site magnitudes from 0.37 to 1.70. The replay gets those figures by restoring the trunk's
+second boundary input: in the int8 chain every block after the first reads the previous block's
+output beside the residual (the fused add of `rmsnorm_quant_fp8`), and a replay that handed those
+blocks the buffer's stale contents scored 0.67 whole instead, with the anti-correlated sites that
+the restored copy removes (the residual store's second copies, `docs/REPLAY.md`).
 
 ## The floors the int8 check holds
 
 - **The criterion is the measured basis, not a hoped-for 0.9.** `docs/PLAN.md` records it. The bf16
   walk's own whole gradient scores 0.8716 against the exact reference and is held at 0.85
-  (`tests/host/step_host_oracle.cpp`, `tests/host/step_host_grad.cpp`); the int8 walk's scores 0.67
-  against the bf16 one and is held at 0.6, with the per-site cosines running -0.63 to 0.96. The
+  (`tests/host/step_host_oracle.cpp`, `tests/host/step_host_grad.cpp`); the int8 walk's scores
+  0.86 whole and 0.97 over the top block against the bf16 one, held at 0.8 and 0.9, with the
+  per-site cosines running -0.56 to 0.99. The
   adapter gradients are comparable -- the two containers' fused and unfused layouts are layouts,
   and the walk and the split make the nine targets match element for element (see
   `docs/FIXTURES.md`) -- and the gap between the two containers is inside the blocks, not at their
@@ -402,10 +409,11 @@ magnitudes from 0.37 to 1.84.
   the code quantisers (`had_quant_act_i8g`, `rmsnorm_quant_fp8`, `gated_quant_fp8`, and
   `gemm_nt_q`'s code-basis wrapper, `docs/adjoints/quant.md`), so a site whose cotangent is a
   near-cancelling sum follows the quantised forward's rounding in place of the bf16 one and can
-  come out anti-correlated with it. That is exactly what the first block shows: its three `mlp`
-  sites and its `in_proj_z` read -0.63 to -0.13 of the bf16 gradient while the same block's
-  `in_proj_qkv` agrees at 0.96. It is the definition of the gradient the issue asks for, not a
-  defect of the walk, and it is why the fixture's floor is 0.6 and not 0.9.
+  come out anti-correlated with it. That is exactly what the first block shows: its `mlp` sites
+  and its `in_proj_z` read -0.56 to -0.00 of the bf16 gradient while the same block's
+  `in_proj_qkv` agrees at 0.95 to 0.98. It is the definition of the gradient the issue asks for,
+  not a defect of the walk, and it is why the fixture's floor is 0.8 whole and 0.9 over the top
+  block rather than a hoped-for 0.99.
 
 *The 10-12x magnitude the last round measured was the test's, not the walk's.* The committed test
 mapped `lora_A` through `H/sqrt(128)`, which is the normalisation the transform does not carry in

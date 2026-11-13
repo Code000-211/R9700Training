@@ -273,12 +273,13 @@ radtrain amendment, which named a milestone-2 base and gave no way to obtain it.
   Issue 29 adds a check that does not rest on our own derivation: autograd through transformers'
   implementation.
 - **The straight-through gradient is a definition.** It cannot be checked by finite differences.
-  Issue 36 checks that a descent step lowers the loss (a control step raises it) and that the int8
-  gradient agrees with the bf16 one where the quantisation allows. The plan set "cosine above 0.9"
-  before any gradient was measured; the measurements since do not reach it and set the acceptance
-  (`docs/STEPS-HOST.md`): the bf16 walk against the exact reference agrees to 0.8716 whole-gradient
-  cosine (floor 0.85), 0.76 to 0.99 per module; the int8 walk against the bf16 one to 0.67
-  whole-gradient (floor 0.6), per site from -0.63 to 0.96. The acceptance is the measured floors,
+  Issue 36 checks that a descent step lowers the loss (a control step of the same length against
+  the gradient stays above the descent) and that the int8 gradient agrees with the bf16 one where
+  the quantisation allows. The plan set "cosine above 0.9" before any gradient was measured; the
+  measurements since do not reach it and set the acceptance (`docs/STEPS-HOST.md`): the bf16 walk
+  against the exact reference agrees to 0.8716 whole-gradient cosine (floor 0.85), 0.76 to 0.99 per
+  module; the int8 walk against the bf16 one to 0.86 whole-gradient (floor 0.8) and 0.97 over the
+  top block (floor 0.9), per site from -0.56 to 0.99. The acceptance is the measured floors,
   and the quantiser's straight-through boundary is what moves the int8 figure off the bf16 one: a
   site whose cotangent is a near-cancelling sum follows the quantised forward's rounding. The
   floors are the measurement and may be raised, never lowered.

@@ -1,0 +1,45 @@
+Concern: the stream the step's ops issue on, so an observer can order a copy behind the op it sees
+Upstream: not-submitted
+
+The residual store (docs/REPLAY.md) keeps each boundary with a device copy enqueued on the step's
+lane, so the copy orders behind the op that wrote the boundary and ahead of the op that next
+reuses the buffer. The observer needs the lane's stream for that; this accessor exposes it, beside
+the replay mechanism the same consumers read. RAD_CTX_STREAM marks a build that carries the hook,
+so a consumer tests the macro rather than the radiance version.
+
+diff --git a/abi/rad_runtime.h b/abi/rad_runtime.h
+index 5c3d2a1..e4d8f0b 100644
+--- a/abi/rad_runtime.h
++++ b/abi/rad_runtime.h
+@@ -969,6 +969,16 @@
+ 
+ /* Install `observer` (copied) and clear it with null. Not thread safe; set it between steps. */
+ void rad_set_issue_observer(RadCtx* c, const RadIssueObserver* observer);
++
++/* The stream the current lane's ops issue on (lane 0's when no second lane is set): a copy the
++ * caller enqueues on it orders behind the ops already issued on the lane, so an observer can keep
++ * what an op wrote before the next op reuses its buffer. The training engine issues no second
++ * lane. Null for a null context. */
++RadStream rad_ctx_cur_stream(const RadCtx* c);
++
++/* Defined by a runtime that carries the context stream: a build tests this macro rather than
++ * the radiance version, because the hook may reach it as a downstream patch. */
++#define RAD_CTX_STREAM 1
+ 
+ /* Called by an architecture around one block of its forward. With no observer set both are one
+  * branch. */
+diff --git a/core/runtime/issue.cpp b/core/runtime/issue.cpp
+index 5c3d2a1..e4d8f0b 100644
+--- a/core/runtime/issue.cpp
++++ b/core/runtime/issue.cpp
+@@ -1420,6 +1420,10 @@
+ void rad_block_begin(RadCtx* c, int64_t block) {
+     if (c) static_cast<rad::Ctx*>(c)->block_event(block, 1);
+ }
++
++RadStream rad_ctx_cur_stream(const RadCtx* c) {
++    return c ? static_cast<const rad::Ctx*>(c)->cur_stream() : nullptr;
++}
+ 
+ void rad_block_end(RadCtx* c, int64_t block) {
+     if (c) static_cast<rad::Ctx*>(c)->block_event(block, 0);
