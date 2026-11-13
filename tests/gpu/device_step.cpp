@@ -479,6 +479,11 @@ void card_case(const char* test, int64_t n, bool probe) {
     bool a_all_nonzero    = true;   // the seeded start: every A leaf sees the cotangent
     bool b_all_nonzero    = true;   // both starts: the cotangent reaches B's factor
     int64_t n_a = 0, n_b = 0, n_other = 0;
+    // The first leaf of each factor whose gradient is exactly zero, and how many there are: a
+    // `b_all_nonzero` false names one leaf out of 400, and the next window should not have to
+    // guess which. A leaf the walk never reached (an empty gradient) counts as zero too.
+    std::string first_zero_a_leaf, first_zero_b_leaf;
+    int64_t n_zero_a = 0, n_zero_b = 0;
     double grad_norm_sq   = 0.0;
     for (const r97::Param& p : params) {
         const r97::Param* g = nullptr;
@@ -502,10 +507,18 @@ void card_case(const char* test, int64_t n, bool probe) {
         }
         grad_norm_sq += part;
         if (is_a) {
-            if (part == 0.0) a_all_nonzero = false;
+            if (part == 0.0) {
+                a_all_nonzero = false;
+                ++n_zero_a;
+                if (first_zero_a_leaf.empty()) first_zero_a_leaf = p.name;
+            }
             if (part != 0.0) a_all_zero = false;
         }
-        if (is_b && part == 0.0) b_all_nonzero = false;
+        if (is_b && part == 0.0) {
+            b_all_nonzero = false;
+            ++n_zero_b;
+            if (first_zero_b_leaf.empty()) first_zero_b_leaf = p.name;
+        }
     }
 
     // ---- the A/B, only when the device walk's gradient was not finite: the same tape and the
@@ -624,6 +637,10 @@ void card_case(const char* test, int64_t n, bool probe) {
     j["peak_snapshot_store_bytes"] = rep.peak_snapshot_store_bytes;
     j["peak_snapshot_op_bytes"] = rep.peak_snapshot_op_bytes;
     j["peak_cotangent_bytes"] = rep.peak_cotangent_bytes;
+    // The step's frozen operands -- weights and tables no op writes -- widened once and shared by
+    // every block: held beside the per-block store, so the step's total f64 snapshot payload at a
+    // block is peak_snapshot_bytes + shared_snapshot_bytes.
+    j["shared_snapshot_bytes"] = rep.shared_snapshot_bytes;
     j["grad_stage_bytes"]     = rep.grad_stage_bytes;
     j["d_hout_bytes"]         = rep.d_hout_bytes;
     j["head_rows"]            = rep.head_rows;
@@ -655,6 +672,7 @@ void card_case(const char* test, int64_t n, bool probe) {
                        {"from_row", rep.first_non_finite_from_row},
                        {"forward_all_finite", rep.forward_all_finite},
                        {"forward_operand", rep.forward_first_non_finite_operand},
+                       {"forward_op", rep.forward_first_non_finite_op},
                        {"forward_operand_index", rep.forward_first_non_finite_operand_index},
                        {"forward_position", rep.forward_first_non_finite_position},
                        {"forward_value_index", rep.forward_first_non_finite_index}};
@@ -668,6 +686,12 @@ void card_case(const char* test, int64_t n, bool probe) {
     j["a_all_zero"]           = a_all_zero;
     j["a_all_nonzero"]        = a_all_nonzero;
     j["b_all_nonzero"]        = b_all_nonzero;
+    // Which leaf of each factor lost its gradient, and how many: a `b_all_nonzero` false names a
+    // leaf out of 400, and the name is what the next window needs.
+    j["first_zero_a_leaf"]    = first_zero_a_leaf;
+    j["first_zero_b_leaf"]    = first_zero_b_leaf;
+    j["n_zero_a"]             = n_zero_a;
+    j["n_zero_b"]             = n_zero_b;
     j["grad_norm"]            = std::sqrt(grad_norm_sq);
     j["opt_applied"]          = applied;
     j["updates_done"]         = opt.updates_done();
@@ -693,10 +717,14 @@ void card_case(const char* test, int64_t n, bool probe) {
     // forward-only probe, the step's wall (and the join's own forward/head/backward split
     // inside it), and the descent call.
     std::printf("%s: %s: %lld scored, loss %.6f -> %.6f after one AdamW step, grad norm %.6g, "
-                "store %lld MiB, probe %.1f s, step %.1f s (forward %.1f, head %.1f, backward "
-                "%.1f), descent %.1f s\n",
+                "store %lld MiB, snapshots %lld MiB (store) + %lld MiB (op) + %lld MiB (shared), "
+                "probe %.1f s, step %.1f s (forward %.1f, head %.1f, backward %.1f), descent "
+                "%.1f s\n",
                 test, card.c_str(), (long long)result.scored, result.loss, after.loss,
                 std::sqrt(grad_norm_sq), (long long)(rep.residual_store_bytes / r97test::kMiB),
+                (long long)(rep.peak_snapshot_store_bytes / r97test::kMiB),
+                (long long)(rep.peak_snapshot_op_bytes / r97test::kMiB),
+                (long long)(rep.shared_snapshot_bytes / r97test::kMiB),
                 probe_seconds, step_seconds, rep.forward_seconds, rep.head_seconds,
                 rep.backward_seconds, after_seconds);
     // The same split, the few ops that hold the walk: the number that says whether a 4096-token
@@ -737,12 +765,26 @@ void card_case(const char* test, int64_t n, bool probe) {
     }
     std::string fwd_nf = "all finite";
     if (!rep.forward_all_finite) {
-        char b[256];
-        std::snprintf(b, sizeof b, "not finite: operand '%s'[%lld] at position %lld, value %lld",
-                      rep.forward_first_non_finite_operand.c_str(),
-                      (long long)rep.forward_first_non_finite_operand_index,
-                      (long long)rep.forward_first_non_finite_position,
-                      (long long)rep.forward_first_non_finite_index);
+        char b[288];
+        if (rep.forward_first_non_finite_op.empty()) {
+            // No walked op wrote it: the value entered from a boundary no walked op writes, so
+            // only the read the walk met can be named.
+            std::snprintf(b, sizeof b, "not finite: operand '%s'[%lld] at position %lld, value %lld",
+                          rep.forward_first_non_finite_operand.c_str(),
+                          (long long)rep.forward_first_non_finite_operand_index,
+                          (long long)rep.forward_first_non_finite_position,
+                          (long long)rep.forward_first_non_finite_index);
+        } else {
+            // The op that produced it, which the walk alone cannot name: it only meets the first
+            // reader downstream of the op that wrote the buffer.
+            std::snprintf(b, sizeof b,
+                          "not finite: %s wrote operand '%s'[%lld] at position %lld, value %lld",
+                          rep.forward_first_non_finite_op.c_str(),
+                          rep.forward_first_non_finite_operand.c_str(),
+                          (long long)rep.forward_first_non_finite_operand_index,
+                          (long long)rep.forward_first_non_finite_position,
+                          (long long)rep.forward_first_non_finite_index);
+        }
         fwd_nf = b;
     }
     std::string nf_ops;
@@ -753,6 +795,18 @@ void card_case(const char* test, int64_t n, bool probe) {
         }
     std::printf("%s: non-finite: cotangent %s | forward %s | per op:%s\n", test, cot_nf.c_str(),
                 fwd_nf.c_str(), nf_ops.empty() ? " (none)" : nf_ops.c_str());
+    // Which leaf of each factor lost its gradient: `b_all_nonzero` false names a leaf out of 400,
+    // and this line says which one and how many, so identifying it costs no second window.
+    std::string zero_a = "none";
+    std::string zero_b = "none";
+    if (!first_zero_a_leaf.empty())
+        zero_a = first_zero_a_leaf + " (" + std::to_string(n_zero_a) + " of " +
+                 std::to_string(n_a) + ")";
+    if (!first_zero_b_leaf.empty())
+        zero_b = first_zero_b_leaf + " (" + std::to_string(n_zero_b) + " of " +
+                 std::to_string(n_b) + ")";
+    std::printf("%s: zero-gradient leaves: lora_A %s, lora_B %s\n", test, zero_a.c_str(),
+                zero_b.c_str());
 }
 
 }  // namespace

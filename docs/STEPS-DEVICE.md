@@ -66,6 +66,20 @@ the evaluation pass of a training loop, and the pre-step reference of a check.
 | one block's f64 snapshots (host) | ~2.5 GB |
 | the card's gradient staging | one f32 buffer per leaf, 320 KiB + 768 KiB per `q_proj` at rank 16 |
 
+### The frozen operands, widened once
+
+An operand of a buffer the step never writes -- a block's weights, a table, a norm's scale -- is
+the same value in every block that reads it. `r97::SharedSnapshots`
+([`../include/r97/snapshot_share.h`](../include/r97/snapshot_share.h)) holds each one once for the
+step, keyed by `snapshot_key` (the buffer, dtype, shape, row window and view), and every block's
+walk binds that value instead of pulling the bytes back from the card and widening them again; a
+block's own store holds only what that block sees. The report says both: the
+`peak_snapshot_store_bytes` / `peak_snapshot_op_bytes` / `peak_snapshot_bytes` figures are one
+block's, and `shared_snapshot_bytes` is the single copy the step holds beside them -- at a block
+the join holds `peak_snapshot_bytes + shared_snapshot_bytes`. On the real container the frozen
+share is ~3.7 GiB of f64, which used to be pulled and widened again for each of the 64 blocks; that
+work sits outside the walk's timed rows and is a large part of the untimed backward.
+
 `DeviceStepOptions::keep_boundaries` is off by default. On, the report keeps every boundary's f64
 value **and** cotangent: 65 boundaries x 4096 x 5120 x 8 B is ~10 GiB each way, ~21 GiB for both.
 A check turns it on
@@ -100,6 +114,13 @@ device_step_tape: non-finite: cotangent op gemm_nt_q, operand 'blk.3.ffn_gate_up
 input` instead of `from the row` means the op merely passed the value on. The results JSON carries
 the same numbers under `non_finite` and per op under `row_seconds[].non_finite`.
 
+The device join also scans what each op *wrote*, so a forward NaN is named at its producer and not
+only at the first reader downstream of it: `forward_first_non_finite_op` is the op that wrote the
+first non-finite value the snapshot loop met (empty when no walked op wrote one -- a value that
+entered from a boundary no walked op writes). The line then reads `forward rmsnorm wrote operand
+'h'[0] at position 1458, value 62` rather than naming only the read of `h` at position 1459, and
+the JSON carries it as `non_finite.forward_op`.
+
 ## How it is checked
 
 `tests/gpu/device_step.cpp`, model tier, a child process per case (ROCR is initialised once):
@@ -112,6 +133,16 @@ the same numbers under `non_finite` and per op under `row_seconds[].non_finite`.
   init leaves B at zero) and every `lora_B` leaf's is not, one AdamW step moves only the `lora_B`
   leaves, and a second forward with the updated adapter is strictly lower — the gradient's
   direction, not just its shape.
+
+`device_step_tape` also prints which leaf of each factor has an exactly-zero gradient
+(`zero-gradient leaves: lora_A <name> (n of N), lora_B ...`), and the JSON carries
+`first_zero_a_leaf` / `first_zero_b_leaf` and the counts `n_zero_a` / `n_zero_b`: a
+`b_all_nonzero` false names one leaf out of 400, and the name is what a window needs to look at it.
+
+The sharing itself is pinned without a card: `tests/host/snapshot_share.cpp` walks a two-block
+tape whose blocks read one frozen weight, once with a per-block widen and once through
+`SharedSnapshots`. The walk's outputs are bit-identical, the weight's f64 values are the ones the
+per-block widen produced, and the per-block peak store falls by exactly the frozen share.
 
 The row-level checks are the kernel families' own: `tests/gpu/adjoint_{linear,lora,attention,...}.cpp`
 and `tests/gpu/vocab_head.cpp`.

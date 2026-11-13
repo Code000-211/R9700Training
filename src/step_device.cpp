@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -37,6 +38,7 @@
 #include "r97/backward.h"
 #include "r97/live_adapter.h"
 #include "r97/replay.h"
+#include "r97/snapshot_share.h"
 #include "r97/step_device.h"
 #include "r97/tape.h"
 
@@ -182,9 +184,10 @@ int64_t pulled_bytes(const Operand& op, const OperandContent& content) {
 
 // Every operand of `op` as the walk will ask for it, copied back on `stream` and waited for, so
 // the caller can snapshot them on the host. The copies are one queue's work: the ops that wrote
-// them were issued on the same lane.
+// them were issued on the same lane. `skip` (empty, or one entry per operand) marks an operand the
+// caller already holds -- a frozen one the step widened once -- and its bytes are not copied.
 void pull_operands(const OpRecord& op, const std::vector<OperandContent>& content, RadStream stream,
-                   std::vector<PulledContent>* held) {
+                   std::vector<PulledContent>* held, const std::vector<char>& skip = {}) {
     if (content.size() != op.operands.size())
         throw std::runtime_error("device step: op '" + op.op + "' recorded " +
                                  std::to_string(content.size()) + " operand contents for " +
@@ -195,6 +198,7 @@ void pull_operands(const OpRecord& op, const std::vector<OperandContent>& conten
         const Operand& operand = op.operands[j];
         const OperandContent& recorded = content[j];
         PulledContent& pull = (*held)[j];
+        if (!skip.empty() && skip[j]) continue;  // the caller's store answers this operand
         const int64_t bytes = pulled_bytes(operand, recorded);
         if (bytes > 0) {
             pull.bytes.resize(static_cast<size_t>(bytes));
@@ -324,6 +328,14 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             throw std::runtime_error("device step: the step has no block brackets to replay");
         if (store.boundaries() != static_cast<int64_t>(blocks.size()) + 1)
             throw std::runtime_error("device step: the boundary store does not match the blocks");
+
+        // The buffers the step writes: an operand of one of them is a value the step produced,
+        // which each block may see differently. Every other read is a constant of the step -- a
+        // weight, a table, a norm's scale -- and the same value in every block that reads it.
+        std::set<std::string> step_writes;
+        for (const OpRecord& rec : ops)
+            for (const Operand& o : rec.operands)
+                if (o.written) step_writes.insert(o.buffer);
 
         rad::Engine* engine = driver.engine();
         if (!engine) throw std::runtime_error("device step: the step left no engine");
@@ -600,19 +612,99 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 measured.first_non_finite_from_row = r.first_non_finite_from_row;
             }
         };
-
-        StoredSnapshots head_snaps;
-        for (const OpRecord& rec : head_walk) {
-            const std::vector<OperandContent>& content =
-                tape.contents(static_cast<size_t>(rec.position));
+        // The step's frozen operands, widened once and shared by every walk. A block's weights are
+        // the same f64 values in all 64 blocks; without this every block pulls them back from the
+        // card and widens them again -- ~3.7 GiB of f64 a block on the real container, rebuilt 64
+        // times. `shared` holds each once; a block's own store holds what only that block sees.
+        SharedSnapshots shared;
+        // The key of a frozen read, or empty when the operand is not one: a read of a buffer the
+        // step writes is a value of that block, not a constant of the step.
+        const auto frozen_key = [&step_writes](const OpRecord& rec, size_t j) -> std::string {
+            const Operand& o = rec.operands[j];
+            if (o.written || step_writes.count(o.buffer)) return std::string();
+            return snapshot_key(o);
+        };
+        // One record's operands as the walk will ask for them. A frozen read the shared store
+        // already holds is bound without a pull; the step's first read of one is pulled and
+        // widened here and held for every later block; everything else is pulled back and widened
+        // into the caller's per-block store.
+        struct SnappedRecord {
+            std::vector<AdValue> now;                            // frozen entries stay empty
+            std::vector<std::shared_ptr<const AdValue>> frozen;  // non-null: answered by `shared`
+        };
+        const auto snap_record = [&](const OpRecord& rec,
+                                     const std::vector<OperandContent>& content) {
+            SnappedRecord out;
+            out.now.resize(rec.operands.size());
+            out.frozen.assign(rec.operands.size(), nullptr);
+            std::vector<char> skip(rec.operands.size(), 0);
+            std::vector<std::string> key(rec.operands.size());
+            for (size_t j = 0; j < rec.operands.size(); ++j) {
+                key[j] = frozen_key(rec, j);
+                if (key[j].empty()) continue;
+                out.frozen[j] = shared.find(key[j]);
+                skip[j] = out.frozen[j] ? 1 : 0;
+            }
             std::vector<PulledContent> held;
             const Clock::time_point pull_begin = Clock::now();
-            pull_operands(rec, content, stream, &held);
+            pull_operands(rec, content, stream, &held, skip);
             OpTiming& pull_acc = pull_time[rec.op];
             pull_acc.calls += 1;
             pull_acc.seconds += seconds_since(pull_begin);
+            for (size_t j = 0; j < rec.operands.size(); ++j) {
+                if (out.frozen[j]) {
+                    shared.bind(rec.position, j, out.frozen[j]);
+                    continue;
+                }
+                out.now[j] = snapshot(rec.operands[j], held[j].content);
+                if (key[j].empty()) continue;
+                // The step's first read of a frozen operand: its one widen, which every later
+                // block binds instead of pulling and widening again.
+                out.frozen[j] = shared.insert(key[j], std::move(out.now[j]));
+                shared.bind(rec.position, j, out.frozen[j]);
+            }
+            return out;
+        };
+        // The op that produced the first non-finite forward value the snapshot loop met. The walk
+        // can only name the op that first read such a value, and the first reader of a bad buffer
+        // is downstream of the op that wrote it. Only written operands are scanned: a read's value
+        // belongs to the op that wrote it, and the frozen weights are reads.
+        struct ProducedValue {
+            bool found = false;
+            std::string op;
+            std::string buffer;
+            int64_t operand = -1;
+            int64_t position = -1;
+            int64_t value = -1;
+        };
+        ProducedValue produced;
+        const auto note_produced = [&produced](const OpRecord& rec,
+                                               const std::vector<AdValue>& now) {
+            if (produced.found) return;
+            for (size_t j = 0; j < rec.operands.size() && j < now.size(); ++j) {
+                if (!rec.operands[j].written) continue;
+                const std::vector<double>& v = now[j].value;
+                for (size_t e = 0; e < v.size(); ++e) {
+                    if (std::isfinite(v[e])) continue;
+                    produced.found = true;
+                    produced.op = rec.op;
+                    produced.buffer = rec.operands[j].buffer;
+                    produced.operand = static_cast<int64_t>(j);
+                    produced.position = rec.position;
+                    produced.value = static_cast<int64_t>(e);
+                    return;
+                }
+            }
+        };
+
+        StoredSnapshots head_snaps;
+        shared.set_base(&head_snaps);
+        for (const OpRecord& rec : head_walk) {
+            SnappedRecord snapped =
+                snap_record(rec, tape.contents(static_cast<size_t>(rec.position)));
+            note_produced(rec, snapped.now);
             for (size_t j = 0; j < rec.operands.size(); ++j)
-                head_snaps.set(rec.position, j, snapshot(rec.operands[j], held[j].content));
+                if (!snapped.frozen[j]) head_snaps.set(rec.position, j, std::move(snapped.now[j]));
         }
 
         BackwardOptions bo;
@@ -659,7 +751,7 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         head_seeds.back().row_hi = head_rows;
         head_seeds.back().cotangent = std::move(d_hout_host);
         const BackwardResult head =
-            backward_block(head_walk, head_snaps, head_names, head_seeds, {}, bo);
+            backward_block(head_walk, shared, head_names, head_seeds, {}, bo);
         merge_ops(row_time, head.report.ops);
         merge_finiteness(head.report);
         measured.peak_snapshot_store_bytes = head_snaps.bytes();
@@ -667,6 +759,7 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         measured.peak_snapshot_bytes =
             measured.peak_snapshot_store_bytes + measured.peak_snapshot_op_bytes;
         measured.peak_cotangent_bytes = head.report.peak_cotangent_bytes;
+        shared.set_base(nullptr);
         head_snaps = StoredSnapshots{};
 
         // The head's input cotangents stay alive with `head` for the whole layer loop, so they are
@@ -710,33 +803,29 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         LayerReplay replay(*engine, driver.tape(), store);
         for (int64_t layer = measured.layers - 1; layer >= 0; --layer) {
             StoredSnapshots snaps;
+            // This block's own values answer every key the step's frozen store does not hold.
+            shared.set_base(&snaps);
             // The post-issue observer runs after the op, so an operand an op replaces in place
             // holds the value the op wrote. A read of that same buffer is the value before the
             // op: the last write it saw, which is the previous op's post-issue content. Keep the
             // latter per buffer and give the in-place read that, or the adjoint differentiates
             // the op at its output instead of its input (the gated norm's gdn_o, above all).
             std::map<std::string, AdValue> before;
-            replay.replay(layer, [&snaps, &before, &options, &pull_time, stream](
+            replay.replay(layer, [&snaps, &snap_record, &note_produced, &before, &options](
                                      const OpRecord& op,
                                      const std::vector<OperandContent>& content) {
                 // The adjoint sees the step's rows and, for attention, the q view its family
                 // reads; the snapshots must have the same shapes the walk will ask for. The
-                // operands are the card's, so they are pulled back before they are read.
+                // operands are the card's, so they are pulled back before they are read; a frozen
+                // one the step already holds is bound from the shared store instead.
                 OpRecord shaped = op;
                 tighten_rows(shaped);
                 if (options.reference_head_split) mark_join_lora(shaped);
-                std::vector<PulledContent> held;
-                const Clock::time_point pull_begin = Clock::now();
-                pull_operands(shaped, content, stream, &held);
-                OpTiming& pull_acc = pull_time[op.op];
-                pull_acc.calls += 1;
-                pull_acc.seconds += seconds_since(pull_begin);
-                std::vector<AdValue> now(shaped.operands.size());
-                for (size_t j = 0; j < shaped.operands.size(); ++j)
-                    now[j] = snapshot(shaped.operands[j], held[j].content);
+                SnappedRecord snapped = snap_record(shaped, content);
+                note_produced(shaped, snapped.now);
                 for (size_t j = 0; j < shaped.operands.size(); ++j) {
                     const Operand& read = shaped.operands[j];
-                    if (read.written) continue;
+                    if (read.written || snapped.frozen[j]) continue;
                     bool in_place = false;
                     for (size_t k = 0; k < shaped.operands.size(); ++k) {
                         const Operand& write = shaped.operands[k];
@@ -744,26 +833,27 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                     }
                     if (!in_place) continue;
                     const auto prev = before.find(read.buffer);
-                    if (prev != before.end() && prev->second.shape == now[j].shape) {
-                        now[j] = prev->second;
+                    if (prev != before.end() && prev->second.shape == snapped.now[j].shape) {
+                        snapped.now[j] = prev->second;
                     } else if (read.buffer.rfind("kv:", 0) == 0) {
                         // The engine cleared the recurrent state before the replay, so a carried
                         // state read that no op in the block wrote yet enters zero.
-                        now[j].value.assign(now[j].value.size(), 0.0);
+                        snapped.now[j].value.assign(snapped.now[j].value.size(), 0.0);
                     }
                 }
                 for (size_t j = 0; j < shaped.operands.size(); ++j) {
                     const Operand& operand = shaped.operands[j];
+                    if (snapped.frozen[j]) continue;  // bound to the shared store by snap_record
                     if (operand.written && operand.buffer.rfind("kv:", 0) == 0 &&
                         before.find(operand.buffer) == before.end()) {
                         // A carried state this block has not written yet enters cold; the op's
                         // adjoint wants the state before the op, not the one it leaves.
-                        now[j].value.assign(now[j].value.size(), 0.0);
+                        snapped.now[j].value.assign(snapped.now[j].value.size(), 0.0);
                     }
-                    snaps.set(op.position, j, now[j]);
+                    snaps.set(op.position, j, snapped.now[j]);
                     if (operand.written && operand.view_shape.empty() && operand.rows > 0 &&
                         operand.rows == operand.shape[0]) {
-                        before[operand.buffer] = std::move(now[j]);
+                        before[operand.buffer] = std::move(snapped.now[j]);
                     }
                 }
             });
@@ -779,13 +869,14 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             BoundaryNames block_names;
             block_names.add(incoming.buffer, 0, tokens);
             const BackwardResult walked =
-                backward_block(records, snaps, block_names, {}, {incoming}, bo);
+                backward_block(records, shared, block_names, {}, {incoming}, bo);
             merge_ops(row_time, walked.report.ops);
             merge_finiteness(walked.report);
             // The join holds the whole block's snapshots while the walk copies one op out of
             // them, so what it holds at once is the store plus that one op. `before` holds the
             // last write of every buffer an op replaced in place, a second copy of what the store
-            // already keeps, and is part of what the replay holds.
+            // already keeps, and is part of what the replay holds. The step's frozen operands are
+            // not in this store: they are held once for the whole step (shared_snapshot_bytes).
             int64_t before_bytes = 0;
             for (const auto& entry : before) before_bytes += value_bytes(entry.second.value);
             const int64_t store_bytes = snaps.bytes() + before_bytes;
@@ -809,6 +900,19 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                                          first_rows(*below, tokens, meta.hidden)};
         }
         measured.backward_seconds = seconds_since(backward_begin);
+        // The op that produced the first non-finite forward value the step met, when a walked op
+        // wrote it: the walk's own naming names the first reader of the value, this its writer.
+        if (produced.found) {
+            measured.forward_all_finite = false;
+            measured.forward_first_non_finite_op = produced.op;
+            measured.forward_first_non_finite_operand = produced.buffer;
+            measured.forward_first_non_finite_operand_index = produced.operand;
+            measured.forward_first_non_finite_position = produced.position;
+            measured.forward_first_non_finite_index = produced.value;
+        }
+        // The frozen operands the step widened, each held once: the per-block figures above do
+        // not include them, and the join holds them beside a block's store for the whole walk.
+        measured.shared_snapshot_bytes = shared.bytes();
 
         // The card's staging is the step's total per leaf: one flush, then the delta's per-site
         // split. The split runs first: a fused weight's engine gradient is named after the

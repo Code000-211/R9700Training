@@ -73,6 +73,12 @@ struct DeviceStepReport {
     int64_t peak_snapshot_store_bytes = 0;
     int64_t peak_snapshot_op_bytes = 0;
     int64_t peak_cotangent_bytes = 0;
+    // The step's frozen operands -- the weights and tables no op of the step writes -- widened
+    // once for the whole step and shared by every block (r97/snapshot_share.h). They are held
+    // beside the per-block store, not in it, so the figures above describe what one block's walk
+    // holds and this one what the step holds once: at a block the join holds
+    // peak_snapshot_bytes + shared_snapshot_bytes.
+    int64_t shared_snapshot_bytes = 0;
 
     // The card's gradient staging when the step ended (0 when the step ran without grads).
     int64_t grad_stage_bytes = 0;
@@ -116,6 +122,13 @@ struct DeviceStepReport {
     int64_t first_non_finite_index = -1;
     bool first_non_finite_from_row = false;
     bool forward_all_finite = true;
+    // The op that wrote the first non-finite forward value the step's snapshot loop met. The walk
+    // can only name the op that first read such a value; the device join also scans what each op
+    // wrote, so a NaN born in the forward is named at its producer -- a layer's output, the
+    // embedding, or the head's norm -- and not only at the op downstream of it. Empty when the
+    // walk met no non-finite value, or when none of the walked ops wrote one (the value then
+    // entered from a boundary no walked op writes).
+    std::string forward_first_non_finite_op;
     std::string forward_first_non_finite_operand;
     int64_t forward_first_non_finite_operand_index = -1;
     int64_t forward_first_non_finite_position = -1;
