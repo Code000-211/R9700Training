@@ -49,6 +49,9 @@ the other's code. `ci/serving_build.sh` configures and builds both trees, runs e
 and then -- in the host-only run -- builds the serving tree's `radiance` server and runs the default
 tree's host tests with `R97_SERVING_BUILD` naming it, so `docs/RUNBOOK.md` section 7's serve takes
 its measured branch in CI rather than its skip branch. That script is what a CI with a card runs.
+When `ccache` is on `PATH`, both trees and radiance's own sub-build compile through it -- the cache
+under `$HOME/.cache/ccache` outlives the worktree, so a round rebuilds only what changed -- and
+`R97_NO_CCACHE=1` (or no `ccache` on `PATH`) turns it off.
 
 The adapter and served-rows fixtures were written in the default build: `r97train train` on the
 int8 fixture wrote `tests/fixtures/serving_adapter` (the run is in that directory's `README.md`),
