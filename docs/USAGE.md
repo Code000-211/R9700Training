@@ -228,8 +228,8 @@ usage: r97train train --model <file.rad> --out <dir> [--data <file.jsonl>] [--he
 | `--program <file>` | now | the op program a reference step replays |
 | `--config <file>` | now | read the configuration file first; a flag overrides it |
 | `--config-file <file>` | now | the same flag |
-| `--devices <N>` | planned: two cards, data-parallel (#57) | one sub-batch per card |
-| `--placement <spec>` | planned: layer split for containers that do not fit one card (#59) | which layers live on which card |
+| `--devices <N>` | planned: Two cards, data-parallel: the whole container on each card, adapter gradients summed every step (#57) | one sub-batch per card |
+| `--placement <spec>` | planned: Second placement: a layer split across the two cards, for containers that do not fit one card (#59) | which layers live on which card |
 
 ```sh
 build/r97train train --model <file.rad> --data <train.jsonl> --heldout <heldout.jsonl> \

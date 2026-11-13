@@ -364,6 +364,6 @@ drill "$tmp/no-info" "info: docs/USAGE.md has no" "a command missing from the do
 # A planned flag with no issue: the reader cannot tell which issue it waits on. A row carries the
 # issue's title and its tracker number; docs/PLAN.md cites its own positions as `R97 #<n>`, so the
 # two are not the same number and a row that drops them is what sends a reader to the wrong issue.
-sed 's/^| `--devices <N>` | planned: two cards, data-parallel (#57) /| `--devices <N>` | planned: two cards /' \
+sed 's/^| `--devices <N>` | planned: Two cards, data-parallel: the whole container on each card, adapter gradients summed every step (#57) /| `--devices <N>` | planned: Two cards, data-parallel /' \
     "$(usage_doc)" > "$tmp/planned-without-issue"
 drill "$tmp/planned-without-issue" "--devices" "a planned flag with no issue"

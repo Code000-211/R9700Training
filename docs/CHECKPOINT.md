@@ -26,6 +26,12 @@ The step in the name is the number of completed loop steps, and it is also the `
 state file. Checkpoints of one run sort by name in the order the loop wrote them, and a directory
 whose name has fewer than nine digits was not written by this loop.
 
+`trainer.state` names the container the run trained against in `base_id`: `r97train train` writes
+`sha256:` and the container file's SHA-256 there, over whatever the configuration names, and a
+resume compares it before restoring anything (`docs/TRAINING.md`). Beside it the state holds the
+optimiser's state, the batcher position and the loop's random-number state; the section below is
+the exact encoding.
+
 `run.json` sits beside the log rather than inside a checkpoint: the loop writes it once, before its
 first step, and a refused resume throws before that, so the directory keeps the configuration it
 already had. `docs/TRAINING.md` owns its fields.
@@ -47,7 +53,7 @@ writes it. Values are in the machine's byte order, with no padding and no checks
 | magic | 8 bytes, `R97TRN01` |
 | version | `u32`, currently `1` |
 | reserved | `u32`, `0` |
-| `base_id` | `u64` byte count, then that many bytes |
+| `base_id` | `u64` byte count, then that many bytes: the container's `sha256:<hex>` |
 | `step` | `i64`, completed loop steps |
 | `position.epoch` | `i64`, the batcher position of the next batch: epoch |
 | `position.step` | `i64`, the batcher position of the next batch: step |
@@ -82,7 +88,7 @@ Two rules follow for anyone touching the encoding:
 - `step`, so `steps` and `eval_every` are counted from where the run is;
 - the batcher position, so the next batch is the one the stopped run would have read;
 - `rng_state`, so shuffling and any sampled choice continue;
-- `base_id`.
+- `base_id`, the container's `sha256:<hex>` the run trained against, so a resume can compare it.
 
 The adapter directory is written by `TrainerOptions::write_adapter`, which the caller supplies;
 the loop creates the directory and knows nothing about the format.
@@ -101,9 +107,12 @@ The log is opened for append, so the resumed steps are added to the same `train.
 
 The rules a resume holds to:
 
-- **`base_id` must match.** `config.base_id` is the caller's opaque name for the base model a run
-  trains from, and `resume()` refuses with both ids in the message before it changes anything. It
-  is how a checkpoint of one container is kept from being resumed into another.
+- **`base_id` must match.** `r97train train` sets `config.base_id` to `sha256:` plus the SHA-256
+  of the container it trains against, so the id in a checkpoint names that container and nothing
+  else; `resume()` refuses with both ids in the message before it changes anything. It is how a
+  checkpoint of one container is kept from being resumed into another. A caller that drives
+  `Trainer` itself supplies its own string, which the trainer treats as opaque
+  (`docs/TRAINING.md`).
 - **The parameters must be the same adapter.** `resume()` restores the state's parameters into the
   `ParamSet` the run's `Delta` built, in order: a different count, or a parameter whose name, shape
   or size differs, is refused naming it. That comparison is all a resume learns about the delta.
