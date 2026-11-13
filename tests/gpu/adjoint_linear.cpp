@@ -26,13 +26,17 @@
 //   call; the adjoint is warmed up and averaged over three calls. docs/kernels/linear.md carries
 //   the numbers.
 //
-//   teeth: the wrong kernels below -- the scale grid dropped, and half the reduction dropped -- are
-//   run through the same comparison, which has to reject them.
+//   teeth: the wrong kernels below -- the scale grid dropped, half the reduction dropped, and the
+//   gather's accumulation dropped -- are run through the same comparison, which has to reject
+//   them.
 //
 // The values follow tests/host/adjoint_linear.cpp -- integer codes, bf16-exact bf16 operands,
 // power-of-two scales -- so that the two sides start from what the host test's kernel check starts
 // from. The cotangent is uniform random, which is the point of the model-shape cases: it exercises
 // the bf16 rounding of the gradient, not exactness.
+//
+// gather_rows, the head's gather, is the family's other device row: its cases are below with the
+// linears', compared whole, because its host row is one scatter pass.
 //
 // Label: gpu. The kernels launch on the card the guard reserved (R97_DEVICE selects it).
 #include "support/device_check.h"
@@ -104,6 +108,18 @@ OpRecord gemm_nt_rec(int64_t M, int64_t N, int64_t K) {
     return rec;
 }
 
+OpRecord gather_rows_rec(int64_t M, int64_t rows, int64_t n) {
+    OpRecord rec;
+    rec.op = "gather_rows";
+    rec.params = {{"M", M}, {"n", n}, {"dtype", "bf16"}};
+    rec.operands = {
+        {"x", "bf16", {rows, n}, 0, rows, false},
+        {"idx", "i32", {M}, 0, M, false},
+        {"y", "bf16", {M, n}, 0, M, true},
+    };
+    return rec;
+}
+
 // The same op over other rows: a host row reads its shape from the record, so the reference below
 // builds one of just the rows a case samples.
 OpRecord rec_rows(const OpRecord& rec, int64_t M) {
@@ -141,6 +157,50 @@ device_check::Case linear_case(const OpRecord& rec, uint64_t seed, std::string l
                 x = (static_cast<double>((r >> 16) % 16) + 1.0) / 256.0;  // power of two: exact
             } else {
                 x = 2.0 * unit(&seed) - 1.0;
+            }
+        }
+        c.in.push_back(std::move(v));
+    }
+    for (const Operand& o : rec.operands) {
+        if (!o.written) continue;
+        AdValue d = value_of(o);
+        for (double& x : d.value) x = 2.0 * unit(&seed) - 1.0;
+        c.cot.push_back(std::move(d));
+    }
+    return c;
+}
+
+// A gather case: x bf16-exact as a linear case's, the index integer rows of x with a negative one
+// in eleven -- the zero row a short prefill leaves -- and the cotangent uniform random, as the
+// linears'. A case that hands its own index pins the gather's edges instead of drawing them.
+device_check::Case gather_case(const OpRecord& rec, uint64_t seed, std::string label,
+                               const std::vector<int64_t>& idx = {}) {
+    device_check::Case c;
+    c.rec = rec;
+    c.label = std::move(label);
+    const int64_t src_rows = rec.operands[0].shape[0];
+    for (const Operand& o : rec.operands) {
+        if (o.written) continue;
+        AdValue v = value_of(o);
+        if (o.buffer == "idx" && !idx.empty()) {
+            if (idx.size() != v.value.size())
+                throw std::runtime_error("case for op '" + rec.op + "': the explicit index has " +
+                                         std::to_string(idx.size()) + " values, the record wants " +
+                                         std::to_string(v.value.size()));
+            for (std::size_t i = 0; i < idx.size(); ++i)
+                v.value[i] = static_cast<double>(idx[i]);
+        } else {
+            for (double& x : v.value) {
+                const uint64_t r = mix(&seed);
+                if (o.buffer == "idx") {
+                    x = (r >> 8) % 11 == 0 ? -1.0
+                                           : static_cast<double>(
+                                                 r % static_cast<uint64_t>(src_rows));
+                } else if (o.dtype == "bf16") {
+                    x = static_cast<double>(static_cast<int>(r % 257) - 128) / 128.0;  // exact in bf16
+                } else {
+                    x = 2.0 * unit(&seed) - 1.0;
+                }
             }
         }
         c.in.push_back(std::move(v));
@@ -301,6 +361,29 @@ void wrong_half_reduction(const AdjointCall& call) {
                                      : 1.0);
             dx.value[static_cast<std::size_t>(m * K + k)] += acc;
         }
+    }
+}
+
+// The accumulation dropped: the scatter overwrites each source row with the last row that
+// gathered it, instead of adding. The case it is run on gathers sixteen rows onto each source
+// row, so a kernel that writes returns the last gather's dy, not the sum.
+void wrong_gather_copy(const AdjointCall& call) {
+    const int ix = operand_pos(call.rec, "x");
+    const int ii = operand_pos(call.rec, "idx");
+    if (ix < 0 || ii < 0 || call.cot.empty()) wrong_case("x, idx and a cotangent");
+    const AdValue& x = call.fwd[static_cast<std::size_t>(ix)];
+    const AdValue& idx = call.fwd[static_cast<std::size_t>(ii)];
+    const AdValue& dy = call.cot.front();
+    const int64_t rows = x.shape[0];
+    const int64_t M = dy.shape[0];
+    const int64_t width = dy.shape.size() >= 2 ? dy.shape[1] : 1;
+    AdValue& dx = (*call.dc)[static_cast<std::size_t>(ix)];
+    for (int64_t i = 0; i < M; ++i) {
+        const int64_t r = static_cast<int64_t>(idx.value[static_cast<std::size_t>(i)]);
+        if (r < 0 || r >= rows) continue;
+        for (int64_t j = 0; j < width; ++j)
+            dx.value[static_cast<std::size_t>(r * width + j)] =
+                dy.value[static_cast<std::size_t>(i * width + j)];
     }
 }
 
@@ -577,8 +660,8 @@ r97test::GuardOptions guard_options() { return device_check::guard_options(int64
 }  // namespace
 
 R97_TEST(adjoint_linear_device_rows) {
-    // What the family registers: the two ops on Side::device, the same frozen positions as their
-    // host rows, and the int8 predicate that keeps the kernel to the 128-wide scale grid it serves.
+    // What the family registers: its ops on Side::device, the same frozen positions as their
+    // host rows, and the predicates that keep each kernel to the records it serves.
     // Loading the plugin registers the code objects it carries with HIP, which opens the card, so
     // this test takes the guard like every other gpu test: the lock and `R97_DEVICE` come first,
     // before anything touches a card. The rows it reads allocate nothing, so it declares no VRAM.
@@ -586,7 +669,8 @@ R97_TEST(adjoint_linear_device_rows) {
     const r97test::DeviceGuard guard(o);
     device_check::require_device(o.device);
     (void)device_check::load_plugin();
-    for (const OpRecord& rec : {gemm_nt_q_rec(4, 256, 128), gemm_nt_rec(4, 256, 128)}) {
+    for (const OpRecord& rec : {gemm_nt_q_rec(4, 256, 128), gemm_nt_rec(4, 256, 128),
+                                gather_rows_rec(4, 17, 128)}) {
         const std::vector<int> dev = adjoint_frozen(rec.op, Side::device, rec.params);
         const std::vector<int> host = adjoint_frozen(rec.op, Side::host, rec.params);
         R97_CHECK(!dev.empty());
@@ -599,6 +683,11 @@ R97_TEST(adjoint_linear_device_rows) {
     std::string why;
     R97_CHECK(adjoint_find(other.op, Side::device, other.params, &why) == nullptr);
     std::printf("gemm_nt_q group 64 is left to the host row: %s\n", why.c_str());
+    OpRecord gather = gather_rows_rec(4, 17, 128);  // the same gather on a dtype the kernel does
+    // not serve
+    gather.params[2].second = std::string("f32");
+    R97_CHECK(adjoint_find(gather.op, Side::device, gather.params, &why) == nullptr);
+    std::printf("gather_rows f32 is left to the host row: %s\n", why.c_str());
     std::fflush(stdout);
 }
 
@@ -657,11 +746,44 @@ R97_TEST(adjoint_linear_device_agrees) {
                                          std::to_string(inner_of(rec)));
         agrees_rows(c);
     }
+
+    // gather_rows, the head's gather, at the same shapes: its host row is one scatter pass, so
+    // every shape is compared whole -- the fixture's widths, one case that gathers sixteen rows
+    // onto each source row, and the model's hidden width at one and four thousand tokens, the
+    // single sequence and the packed batch, each with one row per sequence added before its own.
+    for (const OpRecord& rec : {gather_rows_rec(4, 17, 128),      // the tiny fixture's widths
+                                gather_rows_rec(17, 256, 37),
+                                gather_rows_rec(37, 320, 384),
+                                gather_rows_rec(512, 32, 128),    // sixteen gathers onto one row
+                                gather_rows_rec(4097, 4096, 5120),
+                                gather_rows_rec(4099, 4096, 5120)}) {
+        const int64_t M = *std::get_if<int64_t>(&rec.params[0].second);
+        const int64_t n = *std::get_if<int64_t>(&rec.params[1].second);
+        const int64_t rows = rec.operands[0].shape[0];
+        const device_check::Case c =
+            gather_case(rec, 0x4100 + static_cast<uint64_t>(n),
+                        "gather_rows " + std::to_string(M) + "x" + std::to_string(rows) + "x" +
+                            std::to_string(n));
+        agrees_whole(c);
+        if (r97test::bench()) print_bench(c, 20, 1);
+    }
+
+    // The gather's edges, pinned in one case so the drawing cannot miss them: a negative index,
+    // an index past the source rows, a duplicate index that must sum, a width that is not a
+    // multiple of sixteen, and more gather rows than source rows.
+    {
+        const OpRecord rec = gather_rows_rec(7, 4, 37);
+        const std::vector<int64_t> idx = {1, -1, 4, 1, 3, 0, 2};
+        const device_check::Case c = gather_case(rec, 0x4200, "gather_rows 7x4x37, the edges", idx);
+        agrees_whole(c);
+        if (r97test::bench()) print_bench(c, 20, 1);
+    }
 }
 
 R97_TEST(adjoint_linear_device_teeth) {
-    // The comparison has teeth: a kernel that drops the weight's scale grid, and one that drops
-    // half the reduction, are kernels this comparison has to reject.
+    // The comparison has teeth: a kernel that drops the weight's scale grid, one that drops half
+    // the reduction, and one that drops the gather's accumulation, are kernels this comparison
+    // has to reject.
     const r97test::GuardOptions o = guard_options();
     const r97test::DeviceGuard guard(o);
     device_check::require_device(o.device);
@@ -674,11 +796,14 @@ R97_TEST(adjoint_linear_device_teeth) {
          wrong_half_reduction},
         {linear_case(gemm_nt_q_rec(4, 256, 128), 0x5002, "int8, half the reduction"),
          wrong_half_reduction},
+        {gather_case(gather_rows_rec(512, 32, 128), 0x5003, "gather, the accumulation dropped"),
+         wrong_gather_copy},
     };
     for (const auto& [c, kernel] : wrong) {
         const Fit f = compare(c, kernel);
         R97_CHECK(!f.ok);
-        R97_CHECK(f.first_slot == operand_pos(c.rec, "a"));
+        const int want = operand_pos(c.rec, "a");
+        R97_CHECK(f.first_slot == (want < 0 ? operand_pos(c.rec, "x") : want));
         std::printf("%s: rejected, %lld mismatches, first at dc[%lld] index %lld\n",
                     c.label.c_str(), static_cast<long long>(f.mismatches),
                     static_cast<long long>(f.first_slot),

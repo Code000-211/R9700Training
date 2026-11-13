@@ -75,7 +75,7 @@ rank is `view_shape.size()`), after `written`/`in_place` so that a positional br
 reads.
 
 Three places use them. `Tape` copies a view's own values, packed in the view's order, because one
-span cannot follow a stride; `snapshot()` (`src/step_host.cpp`) reads a kept copy linearly when it
+span cannot follow a stride; `snapshot()` (`src/join_common.h`) reads a kept copy linearly when it
 holds exactly the view's values and walks the strides when it is looking at a live buffer; the
 block's snapshot is packed over the view's shape rather than the declared one, and `tighten_operand`
 narrows `view_shape[0]` the way it narrows `shape[0]`. `dense_view` (`src/backward.cpp`) scatters a

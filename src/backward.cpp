@@ -10,6 +10,7 @@
 #include "r97/backward.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <map>
@@ -21,6 +22,8 @@
 
 namespace r97 {
 namespace {
+
+using Clock = std::chrono::steady_clock;
 
 [[noreturn]] void refuse(const std::string& what) {
     throw std::runtime_error("r97: backward: " + what);
@@ -225,6 +228,7 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
 
     BackwardResult result;
     std::map<std::string, InputCotangent> inputs;  // the block's inputs, sorted by name
+    std::map<std::string, OpTiming> row_time;  // the row calls per op, for the report
     int64_t live_bytes = 0;                        // version storage plus input accumulators
 
     const auto touch = [&]() {
@@ -439,23 +443,6 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             cot.push_back(std::move(c));
         }
 
-        // dc: every operand, in schema order, all zeros for the adjoint to add to.
-        std::vector<AdValue> dc(rec.operands.size());
-        for (size_t j = 0; j < rec.operands.size(); ++j) {
-            dc[j].dtype = fwd[j].dtype;
-            dc[j].shape = fwd[j].shape;
-            dc[j].value.assign(static_cast<size_t>(numel(dc[j].shape)), 0.0);
-        }
-
-        {
-            int64_t held = live_bytes;
-            for (const AdValue& v : cot) held += payload_bytes(v);
-            for (const AdValue& v : dc) held += payload_bytes(v);
-            result.report.peak_cotangent_bytes =
-                std::max(result.report.peak_cotangent_bytes, held);
-        }
-
-
         // The adjoint sees the record the caller prepared when it wants one: the join may hand it
         // names and rows that differ from the tape's, while the walk keeps the tape's record for
         // its versions, boundaries and snapshots. The row is resolved from the prepared record's
@@ -470,8 +457,51 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         }
 
         std::string err;
-        const AdjointFn fn = adjoint_find(adjoint_rec->op, options.side, adjoint_rec->params, &err);
+        AdjointFn fn = adjoint_find(adjoint_rec->op, options.side, adjoint_rec->params, &err);
+        Side served = options.side;
+        if (!fn && options.allow_host_fallback && options.side != Side::host) {
+            // The requested side does not serve this op: the host row is the same arithmetic in
+            // f64, and the caller asked for the fallback. `err` keeps the requested side's
+            // message, so a missing row on both sides still refuses with the one that was asked
+            // for.
+            std::string host_err;
+            AdjointFn host_fn = adjoint_find(adjoint_rec->op, Side::host, adjoint_rec->params,
+                                             &host_err);
+            if (host_fn) {
+                fn = host_fn;
+                served = Side::host;
+            }
+        }
         if (!fn) refuse(err);
+        // The frozen operands of the row that serves -- the fallback's, when the fallback took
+        // the call -- resolved before the slots are sized: the walk does not ask a row for its
+        // frozen operands, and a row that served must not write them anyway.
+        const std::vector<int> frozen = adjoint_frozen(adjoint_rec->op, served, adjoint_rec->params);
+        const std::set<size_t> frozen_at(frozen.begin(), frozen.end());
+
+        // dc: one slot per operand, in schema order. A slot the row may add to -- a read, or an
+        // in-place write the record also reads -- is zeroed for it to add into. A frozen slot and
+        // a plain write keep their dtype and shape but hold no payload: a record whose operands
+        // are the model's big frozen weights therefore allocates no cotangent for them, and a
+        // row that wrote such a slot would write into nothing.
+        std::vector<AdValue> dc(rec.operands.size());
+        std::vector<char> sized(rec.operands.size(), 0);
+        for (size_t j = 0; j < rec.operands.size(); ++j) {
+            dc[j].dtype = fwd[j].dtype;
+            dc[j].shape = fwd[j].shape;
+            if (frozen_at.count(j)) continue;
+            if (rec.operands[j].written && !in_place_read(rec, j)) continue;
+            dc[j].value.assign(static_cast<size_t>(numel(dc[j].shape)), 0.0);
+            sized[j] = 1;
+        }
+
+        {
+            int64_t held = live_bytes;
+            for (const AdValue& v : cot) held += payload_bytes(v);
+            for (const AdValue& v : dc) held += payload_bytes(v);
+            result.report.peak_cotangent_bytes =
+                std::max(result.report.peak_cotangent_bytes, held);
+        }
 
         std::string record_prefix;
         const char* prefix = options.prefix;
@@ -486,7 +516,11 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             with_slots.slot_prefix = [&rec, &options](int64_t slot) {
                 return options.slot_prefix(rec, slot);
             };
+        const Clock::time_point row_begin = Clock::now();
         fn(with_slots);
+        OpTiming& row_acc = row_time[adjoint_rec->op];
+        row_acc.calls += 1;
+        row_acc.seconds += std::chrono::duration<double>(Clock::now() - row_begin).count();
 
         if (options.in_place_passthrough) {
             // An adjoint either describes what a read takes or leaves the slot it would write empty.
@@ -495,6 +529,9 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             // without touching the read's slot; a mul, a rope or a state update fill theirs).
             for (size_t j = 0; j < rec.operands.size(); ++j) {
                 if (!in_place_read(rec, j) || cot_index[j] < 0) continue;
+                // A slot the walk did not size is not the row's to fill: it is frozen, and the
+                // sum below would read it as "untouched" and copy the read's cotangent in.
+                if (!sized[j]) continue;
                 double written = 0.0;
                 for (double v : dc[j].value) written += std::fabs(v);
                 if (written == 0.0)
@@ -511,9 +548,6 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         // Hand what the adjoint produced to the versions each read saw, or out of the block. An
         // in-place write's cotangent is also what the value it replaced takes: its read segments
         // name that prior version, so it travels the same way a read's does.
-        const std::vector<int> frozen =
-            adjoint_frozen(adjoint_rec->op, options.side, adjoint_rec->params);
-        const std::set<size_t> frozen_at(frozen.begin(), frozen.end());
         for (size_t j = 0; j < rec.operands.size(); ++j) {
             const bool in_place = in_place_read(rec, j);
             if (rec.operands[j].written && !in_place) continue;
@@ -536,6 +570,12 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                     add_input_full(b, seg.row_lo, seg.row_hi, values);
             }
         }
+    }
+
+    // The map iterates in op-name order, so the report's list comes out sorted.
+    for (auto& [name, t] : row_time) {
+        t.op = name;
+        result.report.ops.push_back(std::move(t));
     }
 
     for (auto& [name, cot] : inputs) result.inputs.push_back(std::move(cot));

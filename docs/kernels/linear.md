@@ -1,7 +1,8 @@
 # Device adjoints: `linear`
 
-The frozen linears on the card. The rows are registered by `src/adjoint/device/linear.hip`, which
-is one of the kernels the device plugin builds into `libr97.so`
+The frozen linears on the card, and `gather_rows`, the head's gather, the family's other row.
+The rows are registered by `src/adjoint/device/linear.hip`, which is one of the kernels the
+device plugin builds into `libr97.so`
 (`src/adjoint/device/README.md`); the checks are `tests/gpu/adjoint_linear.cpp`, built on the
 harness every device adjoint uses (`tests/support/device_check.h`) for its case, card guard and
 lookup, with this family's own comparison in the test file beside them, and the arithmetic they
@@ -12,10 +13,12 @@ stand beside.
 | --- | --- | --- | --- | --- |
 | `gemm_nt_q` | `a`, `b`, `b_scale` | the cotangent of `a` | `a_scale`, `b`, `b_scale` | `dtype` `i8a8h` at `group` 128 |
 | `gemm_nt` | `a`, `b` | the cotangent of `a` | `b` | `dtype` `bf16` |
+| `gather_rows` | `x`, `idx` | the cotangent of `x` | `idx` | `dtype` `bf16` |
 
-Each row writes only the cotangent of the activation operand, and adds it into the slot the loader
-hands over (`call.dc[ia]`), so a tape walk sees the same `+=` the host row does. A record the
-predicate declines -- another `dtype`, another `group` -- gets no device row at all and keeps
+Each row writes only the cotangent of its input operand -- the activation of a linear, `x` of the
+gather -- and adds it into that operand's slot, so a tape walk sees the same `+=` the host row
+does. A record the predicate declines -- another `dtype`, another `group` -- gets no device row
+at all and keeps
 whatever row the host or another plugin provides; nothing falls back silently inside the kernel.
 
 `logits_gemm` is not covered here. Its arithmetic is `gemm_nt`'s, but the vocabulary edge is not one
@@ -39,6 +42,16 @@ lane holds the eight scales its own fragment columns need.
 
 `gemm_nt` is the same kernel with the weight already bf16 and no scale to apply.
 
+`gather_rows` is not a product: the forward picks rows of `x`, `y[i,:] = x[idx[i],:]` with a
+negative index a zero row, and the adjoint scatters the picked rows back,
+
+```text
+dx[idx[i],:] += dy[i,:]        dy: [M,n]   x, dx: [rows,n]
+```
+
+A source row that several gathers pick is the sum of their rows, and an index out of range
+contributes nothing, as in the host row.
+
 ## Precision
 
 Precision is the one this issue decides: int8 forward, bf16 backward. The codes are exact in bf16,
@@ -48,6 +61,10 @@ scale in f32, then rounded once to bf16 before the product -- the one rounding t
 the host adjoint's f64 sum, and the reason the two are compared by tolerance rather than for
 equality: each term carries a relative error up to 2^-9, so a heavily cancelling sum can show a
 larger relative error than any single term.
+
+The gather's is the same staging plus one rounding: `dy` is converted f64 -> bf16, the f32 atomics
+accumulate it, and the f32 result is rounded to bf16 once on the way out. The host row's f64 sum
+of the same bf16 values is the reference, held to the family's tolerance as the GEMM's rows are.
 
 The test holds the kernel to a tolerance with one term added to the harness's: every element it
 compares is within 2% of the host row's value plus `1e-3` plus a tenth of the RMS of the elements
@@ -103,6 +120,12 @@ The store goes out as scalars: lane `l` holds column `l & 15` of a tile and rows
 sixteen lanes write 32 contiguous bytes of one row of `dx` per step, and the rows and columns past
 `M` and `K` are dropped rather than written.
 
+The gather's kernel is one CTA per row of `dy`, 256 threads, each thread walking the width in
+stride and adding its row to the row of `x` the index names with an f32 atomic into a zeroed
+`dx`. The atomic is the only thing in the kernel that can run out of order -- a source row
+gathered by several rows is their sum in whatever order, the sum staying in f32 -- and the rest of
+the call is one read of `dy`, one write of `dx` and a zeroing of it.
+
 ## Shapes
 
 The fixture's shapes of both ops, and the model's hidden width with sixteen rows, are compared over
@@ -136,6 +159,24 @@ count looks like; the widths are the ones [`docs/ADAPTER.md`](../ADAPTER.md) wri
 `qwen3.8-27b-iqr-v4`. No `model`-labelled test is needed for them: a device row takes its shape from
 the record, not from the container, so the numbers below are the only thing a card run needs.
 
+The gather's cases are the fixture's three widths, one case that gathers sixteen rows onto each
+source row, one that pins the edges -- a negative index, an index past the source rows, a duplicate
+index that sums, a width that is not a multiple of sixteen and more gather rows than source rows --
+and the model's hidden width at one and four thousand tokens: the single 4096-token sequence and
+the packed batch of 317, 1009 and 2697, each carrying one row per sequence before its own, as the
+container's `out_ids` does. Every one is compared whole, not on sampled rows: the host row is one
+scatter pass, twenty-one million f64 additions at the model's shape.
+
+| shape | `M` | rows of `x` | width |
+| --- | --- | --- | --- |
+| fixture, 1 | 4 | 17 | 128 |
+| fixture, 2 | 17 | 256 | 37 |
+| fixture, 3 | 37 | 320 | 384 |
+| sixteen onto one | 512 | 32 | 128 |
+| one sequence | 4097 | 4096 | 5120 |
+| packed batch | 4099 | 4096 | 5120 |
+| the edges, pinned | 7 | 4 | 37 |
+
 Limits, each checked rather than assumed. A record outside them -- one the predicate above did not
 already decline -- is declined without writing to `dc`, the way a host row declines a shape it does
 not serve; an adjoint must not throw (`src/adjoint/device/README.md`).
@@ -149,6 +190,8 @@ not serve; an adjoint must not throw (`src/adjoint/device/README.md`).
 - `N` is padded up to a multiple of 16 with zero weight rows and zero `dy` columns, because the
   reduction tile is 16 channels wide. The fixture's eight-channel projections take that path,
   and the padded rows cannot add to the sum.
+- the gather serves the bf16 records only, takes an integer `idx`, and `M * n` and `rows * n`
+  must fit a 32-bit element offset;
 
 ## Scratch memory
 
@@ -161,6 +204,10 @@ MiB, so the formula is what the call asks for. The buffers come from the plugin'
 ledger (`src/adjoint/device/scratch.h`), so they are charged to radiance's VRAM pool, and the
 test resets the ledger around the call, measures the peak the call asked for, and fails a kernel
 that leaves any of it behind (`live_bytes` back to zero).
+
+The gather's call asks for `2*M*n` bytes of bf16 `dy`, `4*M` of i32 index and `4*rows*n` of f32
+`dx`, from the same ledger: 120.1 MiB at the model's hidden width (40.0 of `dy`, 80.0 of `dx`,
+16 KiB of index).
 
 ## Measurement
 
@@ -243,3 +290,6 @@ The card tier runs its tests from `main` (`tests/gpu/main.cpp`): the same launch
 faults inside `hipLaunchKernel` once radiance's device layer has initialised, so a device test
 cannot wait until the binary exits. (The host tier also runs from `tests/host/main.cpp`, for its own
 static-lifetime reason.) `--bench` is the gpu main's flag.
+
+The gather's cases print their lines in the same `--bench` run, one per shape; the card's numbers
+for them land with the card run this revision takes.

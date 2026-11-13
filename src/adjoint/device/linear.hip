@@ -31,6 +31,11 @@
 // columns -- so the staged tile is read with the eight scalar reads of a transposed fragment
 // instead of the two of a contiguous one. Staging it transposed in shared memory instead would cost
 // four times as many scattered LDS stores as those reads.
+//
+// gather_rows -- the head's gather of the block's last hidden row, this family's other row -- has
+// no product at all: its adjoint scatters dy's rows back to the rows of x they came from,
+// dx[idx[i],:] += dy[i,:], and nothing else. One CTA per row of dy, the accumulation an f32
+// atomic into a zeroed dx, which the row rounds to the op's dtype once on the way out.
 #include "r97/adjoint.h"
 
 #include "rad_device.h"
@@ -261,6 +266,38 @@ static int linear_dx_launch(bool quant, const void* dy, const void* w, const voi
     return static_cast<int>(hipGetLastError());
 }
 
+// ------------------------------------------------------------------ the gather's kernel
+
+// One CTA per row of dy: the thread walks the width in stride and adds the row to the row of x
+// the index names. The accumulation is the only arithmetic the backward asks of this op, and a
+// row gathered by several gathers must be their sum, so it is an f32 atomic into a zeroed dx --
+// there is no order to the sum to exploit, and the f32 of the atomic is the kernel's accumulation
+// type, as the row's f64 -> bf16 staging and one bf16 rounding on the way out make the rest of it
+// the same precision the host row's f64 sum is held to in the test. A negative index -- the zero
+// row a short prefill leaves -- and a row past the end of x contribute nothing.
+#define GR_THREADS 256
+
+__global__ __launch_bounds__(GR_THREADS) void gather_rows_dx_kernel(
+    const unsigned short* __restrict__ dy, const int* __restrict__ idx, float* __restrict__ dx,
+    int rows, int width) {
+    const int i = static_cast<int>(blockIdx.x);
+    const int r = idx[i];
+    if (r < 0 || r >= rows) return;
+    const unsigned short* const src = dy + static_cast<size_t>(i) * width;
+    float* const dst = dx + static_cast<size_t>(r) * width;
+    for (int c = threadIdx.x; c < width; c += blockDim.x) atomicAdd(&dst[c], bf2f(src[c]));
+}
+
+int gather_rows_dx_launch(const void* dy, const void* idx, void* dx, int M, int rows, int width,
+                          hipStream_t stream) {
+    const dim3 block(GR_THREADS);
+    const dim3 grid(M);
+    hipLaunchKernelGGL(gather_rows_dx_kernel, grid, block, 0, stream,
+                       static_cast<const unsigned short*>(dy), static_cast<const int*>(idx),
+                       static_cast<float*>(dx), rows, width);
+    return static_cast<int>(hipGetLastError());
+}
+
 // ------------------------------------------------------------------ the adjoint rows
 
 namespace r97 {
@@ -458,8 +495,86 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
     for (std::size_t i = 0; i < dx_n; ++i) dx.value[i] += of_bf16(host_dx[i]);
 }
 
+// The gather's row: dy staged bf16, the index staged i32, dx zeroed f32 and accumulated on the
+// card, rounded to the op's dtype once on the way out and added into the slot as f64. The row
+// serves the bf16 records only; another dtype keeps whatever the host row provides.
+void gather_rows_dx_adjoint(const AdjointCall& call) {
+    if (!call.dc) return;
+    const int ix = operand_pos(call.rec, "x");
+    const int ii = operand_pos(call.rec, "idx");
+    if (ix < 0 || ii < 0 || call.cot.empty()) return;
+    const AdValue& x = call.fwd[static_cast<std::size_t>(ix)];
+    const AdValue& idx = call.fwd[static_cast<std::size_t>(ii)];
+    if (static_cast<std::size_t>(ix) >= call.dc->size()) return;
+    AdValue& dx = (*call.dc)[static_cast<std::size_t>(ix)];
+    const AdValue& dy = call.cot[0];
+
+    const int64_t width = int_param(call.rec.params, "n", dy.shape.size() >= 2 ? dy.shape[1] : 1);
+    const int64_t M = dy.shape.empty() ? 0 : dy.shape[0];
+    const int64_t rows = x.shape.empty() ? 0 : x.shape[0];
+    if (M <= 0 || rows <= 0 || width <= 0) return;
+    /* The operand extents and the slot have to agree, and the index is discrete: a record that
+     * does not is one this row was not written for, and an adjoint must not throw. */
+    if (M * width != static_cast<int64_t>(dy.value.size()) ||
+        static_cast<int64_t>(idx.value.size()) < M ||
+        rows * width != static_cast<int64_t>(x.value.size()) ||
+        static_cast<int64_t>(dx.value.size()) != rows * width)
+        return;
+    /* The kernel's offsets are 32-bit, and an index that is not a whole row is a value this row
+     * was not handed. */
+    if (static_cast<double>(M) * static_cast<double>(width) >= 2147483648.0 ||
+        static_cast<double>(rows) * static_cast<double>(width) >= 2147483648.0)
+        return;
+    for (int64_t i = 0; i < M; ++i) {
+        const double v = idx.value[static_cast<std::size_t>(i)];
+        if (v != std::floor(v) || v < -2147483648.0 || v > 2147483647.0) return;
+    }
+
+    RadStream stream = adjoint_stream();
+    if (!stream) return;
+
+    const std::size_t dy_n = static_cast<std::size_t>(M * width);
+    const std::size_t idx_n = static_cast<std::size_t>(M);
+    const std::size_t dx_n = static_cast<std::size_t>(rows * width);
+
+    /* Staging: the tape's dy is f64 and the kernel's bf16, the index is f64 and the kernel's i32. */
+    std::vector<unsigned short> host_dy(dy_n);
+    for (std::size_t i = 0; i < dy_n; ++i) host_dy[i] = to_bf16(dy.value[i]);
+    std::vector<int> host_idx(idx_n);
+    for (std::size_t i = 0; i < idx_n; ++i) host_idx[i] = static_cast<int>(idx.value[i]);
+    std::vector<float> host_dx(dx_n);
+
+    device::ScratchBlock dev_dy(static_cast<int64_t>(dy_n * 2));
+    device::ScratchBlock dev_idx(static_cast<int64_t>(idx_n * 4));
+    device::ScratchBlock dev_dx(static_cast<int64_t>(dx_n * 4));
+    if (!dev_dy || !dev_idx || !dev_dx) return;
+
+    if (rad_memcpy_async(dev_dy.p, host_dy.data(), static_cast<int64_t>(dy_n * 2), stream) != 0)
+        return;
+    if (rad_memcpy_async(dev_idx.p, host_idx.data(), static_cast<int64_t>(idx_n * 4), stream) != 0)
+        return;
+    if (rad_memset_async(dev_dx.p, 0, static_cast<int64_t>(dx_n * 4), stream) != 0) return;
+
+    const int rc = gather_rows_dx_launch(dev_dy.p, dev_idx.p, dev_dx.p, static_cast<int>(M),
+                                         static_cast<int>(rows), static_cast<int>(width),
+                                         static_cast<hipStream_t>(stream));
+    if (rc != 0) return;  // a failed launch leaves dc as the host row's would if it declined
+
+    if (rad_stream_sync(stream) != 0) return;
+    if (rad_memcpy_async(host_dx.data(), dev_dx.p, static_cast<int64_t>(dx_n * 4), stream) != 0)
+        return;
+    if (rad_stream_sync(stream) != 0) return;
+
+    /* The f32 the card accumulated is rounded to the op's dtype -- bf16, which the predicate
+     * serves -- before it is added into the slot, the one rounding the host row's f64 sum is
+     * compared against in the test. */
+    for (std::size_t i = 0; i < dx_n; ++i)
+        dx.value[i] += of_bf16(to_bf16(static_cast<double>(host_dx[i])));
+}
+
 void gemm_nt_q_device(const AdjointCall& call) { linear_dx_adjoint(call, true); }
 void gemm_nt_device(const AdjointCall& call) { linear_dx_adjoint(call, false); }
+void gather_rows_device(const AdjointCall& call) { gather_rows_dx_adjoint(call); }
 
 bool serves_i8a8h(const std::vector<OpParam>& params) {
     int64_t group = 0;
@@ -472,6 +587,7 @@ bool serves_bf16(const std::vector<OpParam>& params) { return param_is(params, "
 }  // namespace r97
 
 // The frozen positions are the host rows' (docs/adjoints/linear.md): the activation scale, the codes
-// and their scale for the int8 linear, the weight alone for the bf16 one.
+// and their scale for the int8 linear, the weight alone for the bf16 one, the index for the gather.
 R97_REGISTER_ADJOINT_IF_F("gemm_nt_q", device, r97::gemm_nt_q_device, r97::serves_i8a8h, 1, 2, 3);
 R97_REGISTER_ADJOINT_IF_F("gemm_nt", device, r97::gemm_nt_device, r97::serves_bf16, 1);
+R97_REGISTER_ADJOINT_IF_F("gather_rows", device, r97::gather_rows_device, r97::serves_bf16, 1);

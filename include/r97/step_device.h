@@ -1,0 +1,112 @@
+// r97/step_device.h -- the device join: one model's adapter gradient on one card, as a StepFn.
+//
+// The forward driver runs the batch on the device kernel tier, the residual at every layer
+// boundary is kept in one VRAM allocation, and each block is replayed from it on the card and
+// walked in reverse with the device adjoints (Side::device). The forward values the walk reads
+// are the operands' bytes pulled back at the replay and widened to the walk's f64 contract; the
+// adapter's gradients are staged on the card by the device rows and flushed once, at the step's
+// end. The head is walked through the chunked CE loop and never holds a logit row's cotangent:
+// docs/STEPS-DEVICE.md owns the path and the memory it holds.
+//
+// The join names neither a loss nor an adapter kind, as the host join does: Model::objective
+// supplies the seeds, Model::delta the wire and the gradient names.
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "r97/backward.h"
+#include "r97/forward.h"
+#include "r97/head.h"
+#include "r97/step.h"
+
+#if defined(RAD_ISSUE_OBSERVER) && defined(RAD_REPLAY_BLOCK) && defined(RAD_CTX_STREAM)
+#define R97_DEVICE_STEP 1
+
+namespace r97 {
+
+struct DeviceStepOptions {
+    // Keep the boundary values and cotangents in the report, as the host join does. Off by
+    // default: at 4096 tokens one boundary's f64 copy is 4096 x 5120 x 8 B = 168 MB, and the
+    // report holds every boundary's value and cotangent -- 2 x 65 of them is ~21 GiB, past this
+    // host's headroom beside the walk's own store. A training loop never asks for them; a check
+    // does, on a batch that fits.
+    bool keep_boundaries = false;
+    // The VRAM the residual store may take. 0 means the card's free VRAM read when the engine is
+    // up -- after the model's load, before the step's serve -- and the store refuses with the
+    // plan's own numbers when the plan does not fit.
+    int64_t residual_budget_bytes = 0;
+    // The rows of one head chunk: the CE loop's chunk, and the transposed product's.
+    int64_t head_chunk_rows = kHeadChunkRows;
+    // Mark a head-split adapter activation so the join reads it as [rows][K] with the reference
+    // step's row, the host join's flag with the same meaning.
+    bool reference_head_split = true;
+};
+
+struct DeviceStepReport {
+    double loss = 0.0;
+    int64_t scored = 0;
+    int64_t tokens = 0;
+    int64_t hidden = 0;
+    int64_t layers = 0;
+
+    // The card's residual store: the plan's copies, its bytes, and the free VRAM it was checked
+    // against.
+    int64_t residual_boundaries = 0;
+    int64_t residual_extras = 0;
+    int64_t residual_store_bytes = 0;
+    int64_t residual_budget_bytes = 0;
+
+    // What the walk held on the host at once, in bytes of f64 payload: one block's snapshots
+    // (the store the join builds from the replay) plus the one op the walk copies out of it, and
+    // the cotangents. One chunk's worth, as the host join's figures are.
+    int64_t peak_snapshot_bytes = 0;
+    int64_t peak_snapshot_store_bytes = 0;
+    int64_t peak_snapshot_op_bytes = 0;
+    int64_t peak_cotangent_bytes = 0;
+
+    // The card's gradient staging when the step ended (0 when the step ran without grads).
+    int64_t grad_stage_bytes = 0;
+
+    // The head: the transposed product's accumulator, the rows the CE loop walked, and its
+    // chunks.
+    int64_t d_hout_bytes = 0;
+    int64_t head_rows = 0;
+    int64_t head_chunks = 0;
+
+    // The report's own f64 copies of the boundaries, when keep_boundaries is set.
+    int64_t kept_boundary_bytes = 0;
+
+    // Where the step's time went: the engine run (the model's load and the prefill), the head's
+    // loss and transposed product, and the replay-plus-walk of the blocks.
+    double forward_seconds = 0.0;
+    double head_seconds = 0.0;
+    double backward_seconds = 0.0;
+
+    // Where the backward's seconds went, per op name, summed over the head walk and every
+    // block: the adjoint row calls (each walk's own report), and the replay's pull-back of the
+    // op's operands -- one copy-and-sync per op, outside the walk. A long block can spend as
+    // much of the step here as in the rows.
+    std::vector<OpTiming> row_seconds;
+    std::vector<OpTiming> pull_seconds;
+
+    std::vector<std::string> boundary_name;           // the tape buffer of each boundary
+    std::vector<std::vector<double>> boundary_value;  // boundary forward values, bf16 widened
+    std::vector<std::vector<double>> boundary_cotangent;
+};
+
+// The join. The driver must be configured for the device tier -- its ForwardConfig::kernels name
+// the card's library and libr97, the plugin the device adjoints load from -- and must outlive the
+// returned StepFn. One call forwards the batch with the live adapter, walks it back on the card
+// and fills `grads` with the delta's gradients when it is non-null. `grads == nullptr` is a
+// forward-only call: the forward runs with the adapter fed from `params` and the report is filled,
+// but the head's gradient pass and the block walk are skipped -- the report's cotangent fields stay
+// empty and nothing is staged. A training loop's evaluation pass and a check's pre-step reference
+// are that call.
+StepFn device_step(ForwardDriver& driver, const Model& model,
+                   const DeviceStepOptions& options = {}, DeviceStepReport* report = nullptr);
+
+}  // namespace r97
+
+#endif  // RAD_ISSUE_OBSERVER && RAD_REPLAY_BLOCK && RAD_CTX_STREAM

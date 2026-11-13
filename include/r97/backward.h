@@ -97,6 +97,11 @@ struct BackwardOptions {
     // [S*R, K] (A) / [N, S*R] (B) gradient under the record's prefix, for a caller that splits it
     // afterwards. False keeps each slot under `prefix` or `slot_prefix`.
     bool fused_slots = false;
+    // When the requested side has no row for an op, take the host side's row for it instead of
+    // refusing. The device join sets this: a device row is an optimisation, the host row is the
+    // same arithmetic in f64, and the join already pulls every operand back for the walk. The
+    // step's coverage names the ops that took the host path.
+    bool allow_host_fallback = false;
 };
 
 // The cotangent of one of the block's inputs: a buffer the block read but never wrote. It is dense
@@ -109,13 +114,25 @@ struct InputCotangent {
     std::vector<double> value;       // row_hi * cols values, row-major
 };
 
+// One op's share of one block's walk: the adjoint row calls the walk made for it and the wall
+// time around them. A device row owns the bus inside the call -- its upload, launch and
+// download -- so the split across op names says where the block's backward seconds went.
+struct OpTiming {
+    std::string op;       // the op name the row was resolved under
+    int64_t calls = 0;    // the row calls the walk made for the op
+    double seconds = 0.0; // wall time around them
+};
+
 // What the walk held at once, in bytes of tensor payload (values, not shapes or names): the
 // forward values of one op (the only snapshots the core holds itself, beside the provider the
 // caller holds), and the cotangents -- the live version store, the block-input accumulators, and
-// the cot/dc vectors of the op being adjointed.
+// the cot/dc vectors of the op being adjointed. `ops` splits the walk's time across the rows it
+// called, sorted by op name; a row the walk never reached (off the path, behind a stop) names
+// nothing.
 struct BackwardReport {
     int64_t peak_snapshot_bytes = 0;
     int64_t peak_cotangent_bytes = 0;
+    std::vector<OpTiming> ops;
 };
 
 struct BackwardResult {

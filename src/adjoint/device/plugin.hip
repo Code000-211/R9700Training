@@ -60,6 +60,12 @@ void adjoint_register(const char*, Side, AdjointFn, const std::vector<int>&, Par
 // walk in src/head.cpp can run a chunk on the card.
 void head_ce_register(HeadCeKernel) {}
 
+// The vocabulary head's kernels are not an op's adjoint either: the device join runs them on the
+// card (src/adjoint/device/vocab_head.hip registers them into src/vocab_head.cpp). The struct is
+// forward-declared: the real one is src/vocab_head.h's, and this file need not drag the header in.
+struct VocabHeadKernels;
+void register_vocab_head_kernels(const VocabHeadKernels&) {}
+
 // The fused producers' adjoint (quant.hip) rebuilds the value the quantiser rotated through the
 // parts' twin. A process with no registry has no twin, and no device adjoint runs there either.
 TwinFn twin_find(const std::string&, const std::vector<OpParam>&, std::string*) { return nullptr; }
