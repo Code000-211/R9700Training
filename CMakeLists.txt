@@ -148,6 +148,14 @@ if(NOT R97_WITH_HIP STREQUAL "OFF")
   endif()
 endif()
 
+# radiance is configured and built in a tree of its own, so it does not inherit this project's
+# compiler launchers on its own: hand them on, or radiance's some 490 sources would bypass the
+# cache that ci/serving_build.sh fills. Empty when this project names no launcher.
+set(R97_RADIANCE_LAUNCHER_ARGS
+  -DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER}
+  -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}
+  -DCMAKE_HIP_COMPILER_LAUNCHER=${CMAKE_HIP_COMPILER_LAUNCHER})
+
 ExternalProject_Add(radiance_core
   PREFIX  ${CMAKE_BINARY_DIR}/radiance-ext
   SOURCE_DIR ${R97_RADIANCE_COPY}
@@ -157,6 +165,7 @@ ExternalProject_Add(radiance_core
     -DCMAKE_GENERATOR=${CMAKE_GENERATOR}
     -DCMAKE_C_COMPILER=${R97_RADIANCE_C_COMPILER}
     -DCMAKE_CXX_COMPILER=${R97_RADIANCE_CXX_COMPILER}
+    ${R97_RADIANCE_LAUNCHER_ARGS}
     -DRAD_BUILD_TESTS=OFF
     -DRAD_WITH_FFMPEG=OFF
     -DRAD_WITH_HIP=${RAD_WITH_HIP}
@@ -405,6 +414,14 @@ if(R97_BUILD_TESTS)
            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/patch_audit_test.sh
                    ${CMAKE_CURRENT_SOURCE_DIR})
   set_tests_properties(patch_audit PROPERTIES LABELS host)
+
+  # The build script's compiler launchers: with ccache on PATH both of its configure calls name it
+  # for C, C++ and HIP, and R97_NO_CCACHE=1 (or a machine without ccache) leaves it out. Stand-in
+  # cmake and ctest run it, so nothing is configured or built.
+  add_test(NAME serving_build_ccache
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/serving_build_ccache_test.sh
+                   ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(serving_build_ccache PROPERTIES LABELS host)
 
   # The configuration schema: the table the binary prints and the one docs/USAGE.md prints, cell
   # for cell, and the resolved configuration the `config` command prints. The test drives the
