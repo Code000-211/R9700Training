@@ -63,8 +63,8 @@ adapter are the files the run above left behind (under `/tmp` on this machine); 
 here to `heldout.jsonl`, `heldout.kld.jsonl` and `adapter`.
 
 ```sh
-M=/srv/models/qwen3.8-27b-iqr-v4/qwen3.8-27b-iq4r-s-v4.rad
-A=/tmp/run/r97-served-card-serving_container-HyEteV/adapter
+M=/srv/models/qwen3.8-27b-iqr-v4/qwen3.8-27b-iq4r-s-v4.rad        # the container
+A=<the adapter the serving case wrote>                            # rank 4, 64 down_proj modules
 ./build/r97train loss --device 0 --model "$M" --data heldout.jsonl --lora "$A"
 # loss: 1.37629250328      scored: 1840
 

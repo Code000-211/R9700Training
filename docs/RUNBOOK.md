@@ -400,6 +400,14 @@ serves out of `serving_home`'s `libavx`, which is not what is measured here. The
 `libr4d`, and a process that can see no card has no device code for it to declare, so it stops at
 startup with `invalid argument` rather than serving on the CPU and calling it the card's number.
 
+Two of the block's numbers need a run behind them. `$resumed` is the host's, and a model the host
+tier cannot declare -- the 27B container is one (`docs/reports/2026-11-12-device-forward.md`) -- has
+none, so there the served number is held to `loss --device` alone. And a model whose 256-sequence
+worst case does not fit the card needs its limits named on the serve (`--max-num-seqs 8`,
+`--max-num-batched-tokens 8192`, `--max-model-len 4096` for the corpus
+`docs/reports/2026-11-13-serving-card.md` measured) or the engine stops at startup instead of
+serving. Card 0 has taken that pair for the 27B container.
+
 ```sh
 if [ -x "$server" ] && [ -n "$R97_DEVICE" ]; then
     trainer_card=$("$r97" loss --model "$R97_MODEL" --data "$R97_HELDOUT" \
