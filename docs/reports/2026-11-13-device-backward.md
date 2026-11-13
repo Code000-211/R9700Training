@@ -43,8 +43,27 @@ the parallelisation ticket exists and why the card sat at 3–5 % busy throughou
 The NaN is born in the **forward**, not the walk: `forward_all_finite` is false, the first
 non-finite operand is `h` (position 1459, value index 62), and the walk's first bad cotangent is
 `rmsnorm`'s `x` at 1458 — the reader, not the producer. `b_all_nonzero` false is a second,
-independent gap: the check sums squares, so a NaN cannot make it read zero; one `lora_B` leaf
-really gets an exactly-zero gradient.
+independent and far larger gap: `a_changed = b_changed = 1` of 400 and `n_zero_a = n_zero_b = 399`
+(`/tmp/r97-dstep-device_step_tape-9Wn7iw/device_step_tape.json`), i.e. 399 of 400 `lora_A` **and**
+399 of 400 `lora_B` leaves come back exactly zero. The one leaf of each factor that does move holds
+the forward's NaN (`NaN != 0` counts as changed; `grad_norm` null, `all_finite` false). The split is
+not at fault — `n_grads = 800`, `names_match`/`shapes_match` true, and `Optimiser::step` validates
+every name and shape in order — and neither is coverage: 288 `lora_shrink` and 288 `lora_expand`
+device calls ran, one pair per declared weight.
+
+The mechanism is a silently-zero operand. `snapshot()` (`src/join_common.h`) returned zeros of an
+operand's declared shape whenever the tape could not describe its span (`OperandContent::bytes == 0`,
+set by the observer only for a contiguous tensor: `patches/training/0101-issue-observer.patch:203`),
+and `pull_operands` mirrored that fallback by handing the walk a null pointer. `lora_expand`'s
+`scale` (`RAD_B(pool.scale)`, operand 3) is exactly such a pool operand, and a zero scale zeroes
+**both** factors: `dB = sum cy*sc*t` is 0 and `dt = sum cy*sc*B` is 0, so `dA` (whose cotangent is
+`dt`) is 0 too. It now refuses by name, in both joins:
+
+    snapshot: op 'lora_expand': operand 'pool.scale' declares [N] but the tape carries no bytes for it
+
+An absent operand (no pointer) and an operand the tape does not name (the raw adapter-slot array,
+whose zero is a valid slot index) keep the zeros. `tests/host/lora_shrink_step_order.cpp`'s
+`snapshot_refuses_a_declared_operand_with_no_span` holds the three cases.
 
 The op coverage probe is separate and still runs: the tape declares 224 `gemm_nt_q` and 64
 `gemm_nt_q_gated` calls, and `probe_missing` lists the ops served by the host fallback rather than

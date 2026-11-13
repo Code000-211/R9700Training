@@ -211,9 +211,11 @@ void pull_operands(const OpRecord& op, const std::vector<OperandContent>& conten
                          what.c_str());
             pull.content.data = pull.bytes.data();
         } else {
-            // Nothing to copy: an absent operand, or one whose values the tape does not span. The
-            // snapshot reads such an operand as zeros, exactly as it does on the host.
-            pull.content.data = nullptr;
+            // Nothing to copy: an absent operand (the tape hands no pointer either, and the
+            // snapshot reads it as zeros), or one whose values the tape does not span -- which
+            // snapshot() refuses by name rather than reading as zeros. Keep the pointer the tape
+            // recorded, so that refusal sees the operand was there.
+            pull.content.data = recorded.data;
         }
         pull.content.bytes = recorded.bytes;
         pull.content.named = recorded.named;
@@ -665,7 +667,7 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                     shared.bind(rec.position, j, out.frozen[j]);
                     continue;
                 }
-                out.now[j] = snapshot(rec.operands[j], held[j].content);
+                out.now[j] = snapshot(rec.operands[j], held[j].content, rec.op.c_str());
                 if (key[j].empty()) continue;
                 // The step's first read of a frozen operand: its one widen, which every later
                 // block binds instead of pulling and widening again.

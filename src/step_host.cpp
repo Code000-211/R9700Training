@@ -248,7 +248,7 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
                 if (options.reference_head_split) mark_join_lora(shaped);
                 std::vector<AdValue> now(shaped.operands.size());
                 for (size_t j = 0; j < shaped.operands.size(); ++j)
-                    now[j] = snapshot(shaped.operands[j], content[j]);
+                    now[j] = snapshot(shaped.operands[j], content[j], shaped.op.c_str());
                 for (size_t j = 0; j < shaped.operands.size(); ++j) {
                     const Operand& read = shaped.operands[j];
                     if (read.written) continue;

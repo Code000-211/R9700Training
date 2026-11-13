@@ -151,7 +151,8 @@ inline bool joined_dense(const Operand& op, const OperandContent& content, std::
 // One operand as the op saw it, dense over the operand's full declared shape. The tape keeps the
 // slice the kernel saw, which for a ranged operand starts at row_lo; the walk's adjoints expect
 // the full buffer with the untouched rows zero.
-inline AdValue snapshot(const Operand& op, const OperandContent& content) {
+inline AdValue snapshot(const Operand& op, const OperandContent& content,
+                        const char* op_name = nullptr) {
     AdValue v;
     // The family adjoints read the record's dtype off the value too (an absent scale is spelled
     // "invalid"), so keep it with the numbers.
@@ -193,7 +194,22 @@ inline AdValue snapshot(const Operand& op, const OperandContent& content) {
     v.value.assign(static_cast<size_t>(std::max<int64_t>(total, 0)), 0.0);
     if (!content.data || total == 0) return v;
     if (joined_dense(op, content, &v.value)) return v;
-    if (content.bytes == 0) return v;
+    // A declared buffer or weight the tape handed a pointer for, but could not describe as one
+    // span (OperandContent::bytes is 0 for a slice that is not contiguous). Reading it as zeros is
+    // silent and wrong: the adjoint then differentiates a zero operand -- that is how every
+    // adapter module but one came back with an exactly-zero gradient. Refuse and name it.
+    // An operand the tape does not name (a raw batch field, a KV group, a table) keeps the zeros:
+    // its values are not a declared buffer's, and the raw slot's zero is a valid slot index.
+    if (content.bytes == 0) {
+        if (!content.named || op.shape.empty()) return v;
+        std::string shape = "[";
+        for (size_t d = 0; d < op.shape.size(); ++d)
+            shape += (d == 0 ? "" : ",") + std::to_string(op.shape[d]);
+        shape += "]";
+        throw std::runtime_error("snapshot: op '" + std::string(op_name ? op_name : "?") +
+                                 "': operand '" + op.buffer + "' declares " + shape +
+                                 " but the tape carries no bytes for it");
+    }
 
     const int64_t es = elem_size(op.dtype);
     if (es == 0)
