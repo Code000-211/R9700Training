@@ -483,6 +483,11 @@ void card_case(const char* test, int64_t n, bool probe) {
     // `b_all_nonzero` false names one leaf out of 400, and the next window should not have to
     // guess which. A leaf the walk never reached (an empty gradient) counts as zero too.
     std::string first_zero_a_leaf, first_zero_b_leaf;
+    // Which leaf does move, and whether it moves to a finite value or to NaN, is what tells the two
+    // candidate causes apart: a NaN leaf means the walk reached it and its cotangent was poisoned,
+    // a finite one means the walk differentiated a live cotangent all the way to that module.
+    std::string first_nonzero_a_leaf, first_nonzero_b_leaf;
+    bool first_nonzero_a_finite = true, first_nonzero_b_finite = true;
     int64_t n_zero_a = 0, n_zero_b = 0;
     double grad_norm_sq   = 0.0;
     for (const r97::Param& p : params) {
@@ -513,11 +518,21 @@ void card_case(const char* test, int64_t n, bool probe) {
                 if (first_zero_a_leaf.empty()) first_zero_a_leaf = p.name;
             }
             if (part != 0.0) a_all_zero = false;
+            if (part != 0.0 && first_nonzero_a_leaf.empty()) {
+                first_nonzero_a_leaf = p.name;
+                for (size_t i = 0; i < g->value.size(); ++i)
+                    if (!std::isfinite(g->value[i])) first_nonzero_a_finite = false;
+            }
         }
         if (is_b && part == 0.0) {
             b_all_nonzero = false;
             ++n_zero_b;
             if (first_zero_b_leaf.empty()) first_zero_b_leaf = p.name;
+        }
+        if (is_b && part != 0.0 && first_nonzero_b_leaf.empty()) {
+            first_nonzero_b_leaf = p.name;
+            for (size_t i = 0; i < g->value.size(); ++i)
+                if (!std::isfinite(g->value[i])) first_nonzero_b_finite = false;
         }
     }
 
@@ -689,6 +704,13 @@ void card_case(const char* test, int64_t n, bool probe) {
     // Which leaf of each factor lost its gradient, and how many: a `b_all_nonzero` false names a
     // leaf out of 400, and the name is what the next window needs.
     j["first_zero_a_leaf"]    = first_zero_a_leaf;
+    // The complement: the one leaf per factor that does move, and whether it moved to a finite
+    // value. A finite non-zero leaf means the walk differentiated a live cotangent all the way to
+    // that module; a NaN one means the walk reached it and the cotangent was already poisoned.
+    j["first_nonzero_a_leaf"] = first_nonzero_a_leaf;
+    j["first_nonzero_b_leaf"] = first_nonzero_b_leaf;
+    j["first_nonzero_a_finite"] = first_nonzero_a_finite;
+    j["first_nonzero_b_finite"] = first_nonzero_b_finite;
     j["first_zero_b_leaf"]    = first_zero_b_leaf;
     j["n_zero_a"]             = n_zero_a;
     j["n_zero_b"]             = n_zero_b;
