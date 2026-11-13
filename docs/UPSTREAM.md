@@ -45,10 +45,11 @@ calls the join. See
 | `patches/serving/0205-preload-adapter.patch` | serving | 72 | 0 | 80 | not-submitted | a run with no command line names the adapter its prefill steps load, before any engine exists |
 | `patches/serving/0210-lora-int8-trunk.patch` | serving | 383 | 37 | 440 | not-submitted | a LoRA adapter on the rotated int8 trunk, through the host and card kernels |
 | `patches/training/0101-issue-observer.patch` | training | 152 | 0 | 170 | not-submitted | an optional issue observer and layer block brackets on the runtime context |
-| `patches/training/0102-replay-block.patch` | training | 114 | 19 | 150 | not-submitted | re-running one block of a step from a restored residual, after its ops have run |
+| `patches/training/0102-replay-block.patch` | training | 173 | 45 | 230 | not-submitted | re-running one block of a step from a restored residual, after its ops have run, in both trunk architectures |
 | `patches/training/0119-issue-observer-hook.patch` | training | 12 | 0 | 20 | not-submitted | the training tape attaches to a RadCtx, and the Engine is the only owner of it |
 | `patches/training/0120-view-operands.patch` | training | 21 | 0 | 25 | not-submitted | the issue record names a narrowing view but not where its values are |
 | `patches/training/0121-issue-inout-mark.patch` | training | 2 | 0 | 8 | not-submitted | an operand whose kernel also reads the value it replaces is marked as such |
+| `patches/training/0122-issue-stream.patch` | training | 14 | 0 | 16 | not-submitted | the stream the step's ops issue on, so an observer can order a copy behind the op it sees |
 
 Every patch is `not-submitted` at this pin. None is `merged`: none is in radiance's `origin/main`.
 Moving one to `open` or `merged` changes only its own row and `Upstream:` line, in the pull request

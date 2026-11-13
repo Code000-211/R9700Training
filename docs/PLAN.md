@@ -45,7 +45,7 @@ No speed target is set; the issues ask for measurements next to the forward's ti
 | Base model | Containers of `StillDeadcode/qwen3.8-27b-iqr-v4`. First target `qwen3.8-27b-iq4r-s-v4.rad` (15.4 GiB, fits one card). |
 | Adapter | LoRA whose `A` reads the rotated int8 activation the base GEMM reads. PEFT file layout plus one key, `"radiance_input_basis": "fwht128"`. Default rank 16, alpha 32. |
 | Data | Chat JSONL, one `{"messages": [...]}` a line, rendered with the container's chat template. Loss on assistant turns only, up to 4096 tokens. Placeholder dataset: UltraChat 200k (MIT). |
-| Memory | The forward keeps only the residual at the 65 layer boundaries (about 2.5 GiB at 4096 tokens). The backward replays one layer at a time. |
+| Memory | The forward keeps the residual at the 65 layer boundaries, plus a second copy at each of the 63 boundaries whose int8 block fuses the residual add into its first norm and so reads two buffers: 128 copies, exactly 5 GiB at 4096 tokens. The backward replays one layer at a time. |
 | Two cards | Data-parallel first (whole container on each card), then a layer split for containers that do not fit one card, then a measurement against tensor-parallel. |
 | Verification | Finite differences on the host in f64; functional checks where rounding is involved; radiance itself as the final check. In addition, one independent reference for the bf16 trunk: transformers' own Qwen3.5 with PyTorch autograd on the tiny fixture. |
 | PyTorch | A reference, not a dependency. A script generates the reference files once; they are checked in under `tests/fixtures/oracle/`. The build and the tests never import Python. |
@@ -273,12 +273,13 @@ radtrain amendment, which named a milestone-2 base and gave no way to obtain it.
   Issue 29 adds a check that does not rest on our own derivation: autograd through transformers'
   implementation.
 - **The straight-through gradient is a definition.** It cannot be checked by finite differences.
-  Issue 36 checks that a descent step lowers the loss (a control step raises it) and that the int8
-  gradient agrees with the bf16 one where the quantisation allows. The plan set "cosine above 0.9"
-  before any gradient was measured; the measurements since do not reach it and set the acceptance
-  (`docs/STEPS-HOST.md`): the bf16 walk against the exact reference agrees to 0.8716 whole-gradient
-  cosine (floor 0.85), 0.76 to 0.99 per module; the int8 walk against the bf16 one to 0.67
-  whole-gradient (floor 0.6), per site from -0.63 to 0.96. The acceptance is the measured floors,
+  Issue 36 checks that a descent step lowers the loss (a control step of the same length against
+  the gradient stays above the descent) and that the int8 gradient agrees with the bf16 one where
+  the quantisation allows. The plan set "cosine above 0.9" before any gradient was measured; the
+  measurements since do not reach it and set the acceptance (`docs/STEPS-HOST.md`): the bf16 walk
+  against the exact reference agrees to 0.8716 whole-gradient cosine (floor 0.85), 0.76 to 0.99 per
+  module; the int8 walk against the bf16 one to 0.86 whole-gradient (floor 0.8) and 0.97 over the
+  top block (floor 0.9), per site from -0.56 to 0.99. The acceptance is the measured floors,
   and the quantiser's straight-through boundary is what moves the int8 figure off the bf16 one: a
   site whose cotangent is a near-cancelling sum follows the quantised forward's rounding. The
   floors are the measurement and may be raised, never lowered.

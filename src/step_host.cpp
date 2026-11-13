@@ -704,8 +704,20 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
                 if (adapter->update(wire, &err) != 0)
                     throw std::runtime_error("host step: cannot fill the live adapter: " + err);
             }
-            recorder = std::make_shared<BoundaryRecorder>(
-                driver.tape(), tokens, meta.hidden);
+            // The boundary store's plan. In the int8 trunk every block after the first reads the
+            // previous block's output beside the residual (its first norm is a fused add), so the
+            // plan holds a second copy at every boundary after the first -- without it the
+            // reverse replay below would feed those blocks a stale buffer. The natural trunk
+            // reads the residual alone. The recorder cross-checks the plan against the tape and
+            // throws when the two disagree.
+            ResidualPlan plan;
+            plan.boundaries = meta.layers + 1;
+            plan.tokens     = tokens;
+            plan.hidden     = meta.hidden;
+            if (meta.input_basis == "fwht128")
+                for (int64_t b = 0; b < plan.boundaries; ++b)
+                    plan.extra.push_back(b >= 1 && b < meta.layers ? 1 : 0);
+            recorder = std::make_shared<BoundaryRecorder>(driver.tape(), ResidualStore(plan));
         });
 
         const StepResult result = driver.step(model)(batch, params, nullptr);
