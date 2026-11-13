@@ -402,11 +402,14 @@ startup with `invalid argument` rather than serving on the CPU and calling it th
 
 Two of the block's numbers need a run behind them. `$resumed` is the host's, and a model the host
 tier cannot declare -- the 27B container is one (`docs/reports/2026-11-12-device-forward.md`) -- has
-none, so there the served number is held to `loss --device` alone. And a model whose 256-sequence
-worst case does not fit the card needs its limits named on the serve (`--max-num-seqs 8`,
-`--max-num-batched-tokens 8192`, `--max-model-len 4096` for the corpus
-`docs/reports/2026-11-13-serving-card.md` measured) or the engine stops at startup instead of
-serving. Card 0 has taken that pair for the 27B container.
+none, so there the served number is held to `loss --device` alone; the block below asks for the
+host's number only when there is one. And a model whose 256-sequence worst case does not fit the
+card needs its limits named on the serve (`--max-num-seqs 8`, `--max-num-batched-tokens 8192`,
+`--max-model-len 4096` for the corpus `docs/reports/2026-11-13-serving-card.md` measured) or the
+engine stops at startup instead of serving; the block below names those three. Card 0 has taken
+that pair for the 27B container. The tiny int8 fixture is not a card's container: its geometry has
+no `libr4d` kernel (`docs/DEPLOYMENT.md` section 4), so a card serves section 10's container, and
+the smoke run leaves `R97_DEVICE` empty and takes the else branch below.
 
 ```sh
 if [ -x "$server" ] && [ -n "$R97_DEVICE" ]; then
@@ -417,7 +420,8 @@ if [ -x "$server" ] && [ -n "$R97_DEVICE" ]; then
         exit 1
     }
     ROCR_VISIBLE_DEVICES="$R97_DEVICE" "$server" --model "$R97_MODEL" \
-              --radiance-home "$serving_home" \
+              --radiance-home "$serving_home" --max-num-seqs 8 \
+              --max-num-batched-tokens 8192 --max-model-len 4096 \
               --lora trained="$adapter" --kernels libr4d,libavx,libref --kld-lora trained \
               --kld-corpus "$kld/heldout.jsonl" --kld-record "$kld/served-card" \
               > "$R97_RUN-resumed/serve-card.log" 2>&1
@@ -432,9 +436,10 @@ if [ -x "$server" ] && [ -n "$R97_DEVICE" ]; then
         exit 1
     }
     echo "the serving build's loss on card $R97_DEVICE $served_card, the trainer's card loss" \
-         "$trainer_card, the host's $resumed"
+         "$trainer_card, the host's ${resumed:-none}"
 
-    awk -v card="$trainer_card" -v host="$resumed" -v measured="$served_card" -v dev="$R97_DEVICE" '
+    awk -v card="$trainer_card" -v host="${resumed:-}" -v measured="$served_card" \
+        -v dev="$R97_DEVICE" '
         function agree(a, b) {
             d = a - b
             if (d < 0) d = -d
@@ -443,9 +448,13 @@ if [ -x "$server" ] && [ -n "$R97_DEVICE" ]; then
             return d <= 1e-4 * t
         }
         BEGIN {
-            if (!agree(measured, card) || !agree(measured, host)) {
-                printf "runbook: the serving build on card %s reports %s, " \
-                       "the trainer %s there, the host %s\n", dev, measured, card, host
+            if (!agree(measured, card) || (host != "" && !agree(measured, host))) {
+                printf "runbook: the serving build on card %s reports %s, the trainer %s there", \
+                       dev, measured, card
+                if (host == "")
+                    printf "; the host tier has no number for this container\n"
+                else
+                    printf ", the host %s\n", host
                 exit 1
             }
         }'
