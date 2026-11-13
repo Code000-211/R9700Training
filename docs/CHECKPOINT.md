@@ -106,12 +106,22 @@ The rules a resume holds to:
   is how a checkpoint of one container is kept from being resumed into another.
 - **The parameters must be the same adapter.** `resume()` restores the state's parameters into the
   `ParamSet` the run's `Delta` built, in order: a different count, or a parameter whose name, shape
-  or size differs, is refused naming it. A different `delta.kind`, `delta.rank`, `delta.alpha`,
-  `delta.targets` or `delta.gate` builds a different set, so a checkpoint belongs to the delta
-  configuration that wrote it; keep that in the file the resume uses.
+  or size differs, is refused naming it. That comparison is all a resume learns about the delta.
+  `delta.rank` and `delta.targets` change the set the `lora` kind builds — `<module>.lora_A` and
+  `<module>.lora_B` for each targeted module, `rank` rows deep — so a checkpoint belongs to the
+  rank and the targets that wrote it: any other, or a `delta.kind` that builds a different set, is
+  refused on a count, a name or a shape. `delta.alpha` and `delta.gate` are not parameters, are not
+  in `trainer.state`, and are not compared. `alpha` enters the run as the sites' scale,
+  `alpha / rank` (`docs/ADAPTER.md`), so a resume with another one restores the same weights and
+  optimiser and then trains a different `StepFn`: accepted, and not bit-identical to the run it
+  continues. `delta.gate` asks for a non-LoRA slot that no delta builds yet, so it changes nothing;
+  the `lora` kind never reads it.
+  The delta configuration a run was trained under is `<out>/run.json`, written before the first
+  step; the file the resume uses should repeat it.
 - **The step function must be the same.** The bit-identical guarantee below is a guarantee about
-  one `StepFn`. Resuming a `--reference` run as an eventual device run continues the weights and
-  the schedule, but not bit for bit.
+  one `StepFn`, and `alpha` is part of it: the sites' scale is what the step applies. Resuming a
+  `--reference` run as an eventual device run continues the weights and the schedule, but not bit
+  for bit.
 - **The horizon is the run's, not the checkpoint's.** `steps` and `epochs` in the resuming
   configuration are the whole run's; a resumed run stops at that horizon, not `horizon + step`.
 

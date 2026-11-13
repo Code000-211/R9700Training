@@ -234,7 +234,11 @@ The check is the whole point of the section. The smoke run trains ten steps stra
 resumes from its half-way checkpoint into a second directory; the two runs' last held-out losses
 must be the same number digit for digit, because the step is deterministic and the checkpoint
 carries every input of it. A resumed run that drifts is a checkpoint that lost something —
-`docs/CHECKPOINT.md` lists what the resume refuses and what it holds to.
+`docs/CHECKPOINT.md` lists what the resume refuses and what it holds to. The resume reads the same
+`$R97_RUN.conf`, which is what keeps the delta configuration with the checkpoint: `delta.rank` and
+`delta.targets` change the parameter set, so a change to either is refused, as is a `delta.kind`
+that builds a different one; `delta.alpha` and `delta.gate` change nothing the resume compares, so
+a resume that changes either is accepted and continues a run the checkpoint does not describe.
 
 ```sh
 half=$((R97_STEPS / 2))

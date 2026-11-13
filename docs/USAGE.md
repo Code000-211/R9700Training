@@ -282,7 +282,7 @@ line's own flag, not a configuration key.
 | `delta.rank` | integer | 16 | **> 0**: the rank of the trainable factors |
 | `delta.alpha` | number | 32 | **finite, > 0**: the LoRA scale, applied as `alpha / rank` |
 | `delta.targets` | list | empty | comma-separated non-empty module names; empty means the delta's default |
-| `delta.gate` | boolean | false | `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`): train a gate beside the sites |
+| `delta.gate` | boolean | false | `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`): a gate beside the sites; no delta builds one yet |
 | `lr` | number | 0 | **finite, > 0**: the peak learning rate; must be set |
 | `weight_decay` | number | 0 | finite, >= 0: the optimiser's weight decay |
 | `warmup_steps` | integer | 0 | >= 0, counted in optimiser updates |

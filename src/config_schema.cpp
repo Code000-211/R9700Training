@@ -72,7 +72,7 @@ const std::vector<ConfigKey>& rows() {
          "comma-separated non-empty module names; empty means the delta's default"},
         {"delta.gate", ConfigType::Boolean,
          [](const Config& c) { return boolean_text(c.delta.gate); },
-         "true/false (also 1/0, yes/no, on/off): train a gate beside the sites"},
+         "true/false (also 1/0, yes/no, on/off): a gate beside the sites; no delta builds one yet"},
         {"lr", ConfigType::Real, [](const Config& c) { return number_text(c.lr); },
          "finite, > 0: the peak learning rate; must be set"},
         {"weight_decay", ConfigType::Real,
