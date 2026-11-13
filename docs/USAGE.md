@@ -206,7 +206,8 @@ usage: r97train ops <file.rad> or --registered [--home <dir>] [--kernels <list>]
 
 Answers "can this build run this container, on the host and on the card": the inventory the host
 tier prints is `docs/OPS-qwen35-host.md`, the card's is `docs/OPS-qwen35-device.md`, and
-`docs/RUNBOOK.md` section 10 says when to ask it.
+`docs/RUNBOOK.md` section 2 runs both forms (`R97_DEVICE` names the card) and section 10 says when
+to ask it.
 
 ### `train`
 

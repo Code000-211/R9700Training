@@ -64,7 +64,9 @@ Save the fenced blocks as one script under `runs/` and run it from the tree's to
 
 One block sets the four inputs, so the rest of the file is the same whether it runs on the fixture
 or on a real container. The default container is the newest `tiny_qwen35_w8a8.rad` under the test
-temporary directory — the one `ctest -L host` just converted.
+temporary directory — the one `ctest -L host` just converted. `R97_DEVICE` is the card selector
+the `gpu` tests read (`docs/TESTING.md`), and it is empty here because the smoke run has no card:
+section 2's block then says what it skipped.
 
 ```sh
 set -eu
@@ -76,6 +78,7 @@ set -o pipefail
 : "${R97_HELDOUT:=$R97_TRAIN}"                   # the held-out JSONL
 : "${R97_RUN:=runs/runbook}"                     # where the run writes; must not exist yet
 : "${R97_SERVING_BUILD:=$PWD/build-serving}"     # the serving-only build, section 7
+: "${R97_DEVICE:=}"                              # the card's ordinal; empty = no card
 : "${RADIANCE_HOME:=$R97_BUILD/radiance-build/radiance_home}" # the build's plugins
 r97="$R97_BUILD/r97train"
 
@@ -90,8 +93,9 @@ fi
          "run 'ctest --test-dir $R97_BUILD -L host' once, or set R97_MODEL" >&2
     exit 1
 }
-export R97_MODEL R97_STEPS R97_TRAIN R97_HELDOUT R97_RUN R97_SERVING_BUILD RADIANCE_HOME
-echo "runbook: $R97_MODEL, $R97_STEPS steps, $R97_TRAIN -> $R97_RUN (serving build $R97_SERVING_BUILD)"
+export R97_MODEL R97_STEPS R97_TRAIN R97_HELDOUT R97_RUN R97_SERVING_BUILD R97_DEVICE RADIANCE_HOME
+echo "runbook: $R97_MODEL, $R97_STEPS steps, $R97_TRAIN -> $R97_RUN" \
+     "(serving build $R97_SERVING_BUILD, card ${R97_DEVICE:-none})"
 ```
 
 ## 2. The container and the data, read before anything runs
@@ -115,11 +119,24 @@ skipped=$("$r97" data --model "$R97_MODEL" --data "$R97_TRAIN" | sed -n 's/^skip
 }
 ```
 
-The op inventory says whether this build can run the container at all. Its host kernels are the
-same check every run makes; on the card, `--device N` asks the device kernels the same question.
+The op inventory says whether this build can run the container at all. The host kernels are the
+same check every run makes, and the block below always runs that line; on the card, the same
+command with `--device N` asks the device kernels the same question, and the block runs that line
+too when `R97_DEVICE` names a card. `docs/OPS-qwen35-host.md` and `docs/OPS-qwen35-device.md` are
+the two inventories the output is read against.
 
 ```sh
 "$r97" ops "$R97_MODEL" --home "$RADIANCE_HOME" --kernels libavx,libref
+
+# The same inventory on the card: --device names the card, and libr4d is tried first. A host tier
+# (the smoke run) has no card, so R97_DEVICE stays empty and the block says what it skipped.
+if [ -n "$R97_DEVICE" ]; then
+    "$r97" ops "$R97_MODEL" --home "$RADIANCE_HOME" --kernels libr4d,libavx,libref \
+        --device "$R97_DEVICE"
+else
+    echo "runbook: R97_DEVICE is empty; the card's inventory (ops --device) was not taken," \
+         "docs/OPS-qwen35-device.md has it"
+fi
 ```
 
 ## 3. The configuration
@@ -403,7 +420,7 @@ The exit status is non-zero and the message on stderr names the thing at fault. 
 | a write error on `checkpoint-<step>` | the disk filled, or the directory is not writable | free space, then resume; the last complete checkpoint is intact |
 | the run stops before the step you meant | `steps` is the run's whole horizon, not the remainder's | set `steps` to where the run should end and resume |
 | `train: no radiance home: set RADIANCE_HOME to the directory holding architectures/, kernels/ and quantizers/` (`r97train loss: …` for `loss`; `--reference` fails with `reference step: live trace failed: …` instead) | the build's plugin directory was not found | `RADIANCE_HOME`, or build where the binary looks (`docs/FIXTURES.md`) |
-| a run fails at its first step with a device error while another job is on the card | one run per card | wait for the other job to end, or take another card with `--device N` on the read-only commands — never stop a process you did not start (section 0) |
+| a run fails at its first step with a device error while another job is on the card | one run per card | wait for the other job to end, or take another card (`R97_DEVICE=N`, which section 2's block passes as `--device`) — never stop a process you did not start (section 0) |
 
 The non-finite stop is the one failure that is not a mistake: the failing step changed no weight, no
 moment and no step count, no checkpoint was written for it, so the last good checkpoint is what the
@@ -412,7 +429,7 @@ the whole diagnosis.
 
 ## 10. The real run
 
-The same script with six variables set, and the fetched data in place:
+The same script with seven variables set, and the fetched data in place:
 
 | variable | value |
 | --- | --- |
@@ -422,6 +439,7 @@ The same script with six variables set, and the fetched data in place:
 | `R97_RUN` | `runs/lora-v1` |
 | `R97_STEPS` | `1000` |
 | `R97_SERVING_BUILD` | `build-serving` (section 0's serving-only build, for section 7) |
+| `R97_DEVICE` | `0`: the card section 2's inventory is taken on (`--device "$R97_DEVICE"`); empty keeps the host branch and the card stays unchecked |
 
 Then the blocks of sections 1 to 8 run as they stand — the dry run on the container and the two
 files, the run to its horizon, the resume from whatever checkpoint survived, the serve and the
@@ -433,13 +451,13 @@ card, and an `lr` for the run's length.
 
 For a card run, two things are added: the card is the run's alone (section 0's discipline — one
 run at a time, and never a process you did not start), and the pre-step inventory of section 2
-answers whether the run can start at all; on the card, `--device N` asks the device kernels the
-same question. An op listed as missing is a kernel this build does not have and the run will stop
-on it; `--registered` prints what the build has at all, and `docs/OPS-qwen35-host.md` and
-`docs/OPS-qwen35-device.md` are the reference inventories. Picking the cards a run uses
-(`--devices`, tracker #57) and splitting a container across them (`--placement`, tracker #59) are
-the two-card issues' flags, listed as planned in `docs/USAGE.md`; until they land, one card is one
-run on one device.
+answers whether the run can start at all; with `R97_DEVICE` naming a card, the block takes it a
+second time, `--device N`, and the device kernels answer the same question. An op listed as
+missing is a kernel this build does not have and the run will stop on it; `--registered` prints
+what the build has at all, and `docs/OPS-qwen35-host.md` and `docs/OPS-qwen35-device.md` are the
+reference inventories. Picking the cards a run uses (`--devices`, tracker #57) and splitting a
+container across them (`--placement`, tracker #59) are the two-card issues' flags, listed as
+planned in `docs/USAGE.md`; until they land, one card is one run on one device.
 
 ## 11. What checks this file
 
@@ -456,8 +474,11 @@ tree and the server still costs minutes, so the test does not do that. The same 
 hand with a serving tree built without HIP (`-DR97_PATCH_SET=serving -DR97_WITH_HIP=OFF`, section
 0's commands with the CPU backend): the server served the adapter and answered one completion, and
 the serving build's KL record gave `4.66220409289` against the trainer's `4.66220409013` —
-2.8e-9 apart, 6e-10 relative, well inside the 1e-4. The flag tables in `docs/USAGE.md` are held
-to `r97train <command> --help` by `tests/cmake/config_schema_test.sh`, and the configuration
-table there is held to that same document by the same test and to `include/r97/config.h` by
-`tests/host/config_schema.cpp`, which counts the header's members against the schema's rows: a key
-added on either side of that pair fails.
+2.8e-9 apart, 6e-10 relative, well inside the 1e-4. Section 2's card inventory is held to this file
+the same way: the script always carries the `--device` line, and a run with no card takes the
+branch that says it was skipped, so removing the line fails here even though that branch ran. The
+flag tables in `docs/USAGE.md` are held to `r97train <command> --help` by
+`tests/cmake/config_schema_test.sh`, and the configuration table there is held to that same
+document by the same test and to `include/r97/config.h` by `tests/host/config_schema.cpp`, which
+counts the header's members against the schema's rows: a key added on either side of that pair
+fails.

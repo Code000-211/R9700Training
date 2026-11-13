@@ -16,7 +16,10 @@
 //   - the one-time inputs the script deliberately does not run are still named by the document: the
 //     data fetch (`tools/fetch_ultrachat.py`, `docs/DATA.md`), the serving-only build
 //     (`-DR97_PATCH_SET=serving`) whose tree section 7 serves from, and the rule that one run has
-//     the card to itself.
+//     the card to itself;
+//   - the card's command is in the script beside the tested one: section 2's inventory carries the
+//     `--device` line next to the host line, and a run with no card takes the branch that says it
+//     was skipped, so deleting the line fails even though that branch is what executed.
 #include "../support/fixture.h"
 #include "../support/fixture_w8a8.h"
 #include "../support/test.h"
@@ -144,6 +147,9 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
     R97_CHECK(contains(script, "--kld-corpus"));
     R97_CHECK(contains(script, "--kld-lora trained"));
     R97_CHECK(contains(script, "tools/kld_loss.py"));
+    // The card's inventory is a command of the script, not prose beside it: the real `--device`
+    // line sits next to the tested host one, and the no-card run says it took the skip branch.
+    R97_CHECK(contains(script, "--device \"$R97_DEVICE\""));
 
     const fs::path dir = fs::path(radtest::tmpdir());
     const fs::path run = dir / "runbook";
@@ -172,10 +178,12 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
     // directory -- so the settings block is exercised rather than bypassed. The serving build is
     // pointed at a directory that does not exist: building it costs minutes, so the host tier runs
     // section 7's trainer measurement and the serve blocks' documented skip branch, not a serve.
+    // `R97_DEVICE` is cleared for the same reason: a card handed down from the environment would
+    // make section 2's card branch run on a host tier that is meant never to touch one.
     const fs::path no_serving = dir / "no-serving-build";
     const std::string command =
         "cd " + r97::detail::shell_quote(root.string()) + " && " +
-        "HIP_VISIBLE_DEVICES= ROCR_VISIBLE_DEVICES=99 " + "RAD_TEST_TMPDIR=" +
+        "HIP_VISIBLE_DEVICES= ROCR_VISIBLE_DEVICES=99 R97_DEVICE= " + "RAD_TEST_TMPDIR=" +
         r97::detail::shell_quote(dir.string()) + " " + "R97_BUILD=" +
         r97::detail::shell_quote(r97::detail::build_dir()) + " " + "R97_RUN=" +
         r97::detail::shell_quote(run.string()) + " " + "R97_SERVING_BUILD=" +
@@ -197,6 +205,7 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
     R97_CHECK(contains(log, "the trainer's loss for the adapter"));
     R97_CHECK(contains(log, "section 0's serving-only build is a one-time input"));
     R97_CHECK(contains(log, "the serving build's loss is unchecked"));
+    R97_CHECK(contains(log, "the card's inventory (ops --device) was not taken"));
     R97_CHECK(contains(log, "# dry run:"));
     R97_CHECK(fs::exists(run / "checkpoint-000000005" / "adapter"));
     R97_CHECK(fs::exists(run / "checkpoint-000000010" / "adapter"));
