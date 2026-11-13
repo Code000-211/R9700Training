@@ -388,9 +388,11 @@ and the card's own `loss --device` is the number its served loss is held to, sin
 the same three libraries `--device` runs (`--kernels libr4d,libavx,libref`) and a HIP serving home
 also holds the trainer's `libr97`, which that list keeps out. `$R97_DEVICE` is the selector section
 2 already uses for the card, so the two sections cannot disagree about which one it is. The card's
-serve log must say `AQL backend`: a host-only serving build answers the block above, and a HIP
-build with no card visible answers these same commands on the host backend out of
-`serving_home`'s `libavx`, which is not what is being measured here.
+serve log must say `AQL backend`. A host-only serving build answers the block above, and so does a
+HIP build whose command names no kernel library: it finds no card, takes the host backend, and
+serves out of `serving_home`'s `libavx`, which is not what is measured here. The line above names
+`libr4d`, and a process that can see no card has no device code for it to declare, so it stops at
+startup with `invalid argument` rather than serving on the CPU and calling it the card's number.
 
 ```sh
 if [ -x "$server" ] && [ -n "$R97_DEVICE" ]; then
@@ -533,14 +535,17 @@ own procedure, so a flag that changes without the runbook, a runbook command tha
 a non-`sh` block added to the file fails `ctest --test-dir build -L host`. The one-time inputs in
 section 0 are inline prose, not blocks, and are not run — the serving-only radiance build, the
 network fetch, and `ctest` itself. Section 7's serve and served-loss blocks are in the script and
-the test runs them; with no serving tree (`R97_SERVING_BUILD` is pointed at an absent directory)
-they take their `else` branch and say the serve was skipped, and the test holds the commands to the
-document so that removing them fails even though the branch did not execute. Building the serving
-tree and the server still costs minutes, so the test does not do that. The same script was run by
-hand with a serving tree built without HIP (`-DR97_PATCH_SET=serving -DR97_WITH_HIP=OFF`, section
-0's commands with the CPU backend): the server served the adapter and answered one completion, and
-the serving build's KL record gave `4.66220409289` against the trainer's `4.66220409013` —
-2.8e-9 apart, 6e-10 relative, well inside the 1e-4. Section 2's card inventory is held to this file
+the test runs them whenever the environment names a serving tree in `R97_SERVING_BUILD`: the server
+serves the adapter and answers one completion, and the test prints the pair of losses it took. With
+no tree they take their `else` branch and say the serve was skipped, and either way the test holds
+the commands to the document, so removing them fails even when the branch did not execute. Building
+the serving tree and the server still costs minutes, so the test does not do that; name a host-only
+one (section 0's commands with `-DR97_WITH_HIP=OFF`) and it serves the fixture. That run took
+`4.66220409289` from the serving build's KL record against the trainer's `4.6622040901259272` —
+`3e-9` apart, `6e-10` relative, well inside the `1e-4`. Section 7's card blocks are untouched by
+that run: with no `R97_DEVICE` they take their skip branch and say so, and the card's serve and its
+number are taken on the card, where the command names `libr4d` and the log has to show the AQL
+backend. Section 2's card inventory is held to this file
 the same way: the script always carries the `--device` line, and a run with no card takes the
 branch that says it was skipped, so removing the line fails here even though that branch ran. The
 flag tables in `docs/USAGE.md` are held to `r97train <command> --help` by

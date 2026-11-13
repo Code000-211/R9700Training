@@ -19,7 +19,12 @@
 //     the card to itself;
 //   - the card's command is in the script beside the tested one: section 2's inventory carries the
 //     `--device` line next to the host line, and a run with no card takes the branch that says it
-//     was skipped, so deleting the line fails even though that branch is what executed.
+//     was skipped, so deleting the line fails even though that branch is what executed;
+//   - a serve happens when the environment names a host-only serving tree (`R97_SERVING_BUILD`):
+//     the blocks above are then taken from the serving build rather than skipped, and the loss the
+//     serving build computes is held to the trainer's. A bare `ctest` has no tree -- building one
+//     costs minutes (`docs/RUNBOOK.md` section 0 calls it a one-time input) -- and takes the
+//     documented skip branch, which says so.
 #include "../support/fixture.h"
 #include "../support/fixture_w8a8.h"
 #include "../support/test.h"
@@ -117,6 +122,16 @@ std::string tail_of(const fs::path& path, std::size_t bytes) {
     return text.size() > bytes ? text.substr(text.size() - bytes) : text;
 }
 
+// The log's line that carries `needle`, so the run the test took can report what it measured.
+std::string line_with(const std::string& log, const std::string& needle) {
+    const std::size_t at = log.find(needle);
+    if (at == std::string::npos) return {};
+    const std::size_t begin = log.rfind('\n', at);
+    const std::size_t end = log.find('\n', at);
+    return log.substr(begin == std::string::npos ? 0 : begin + 1,
+                      end == std::string::npos ? std::string::npos : end - (begin + 1));
+}
+
 R97_TEST(runbook_script_runs_as_the_document_orders_it) {
     const fs::path root = source_root();
     const fs::path document_path = root / "docs" / "RUNBOOK.md";
@@ -186,19 +201,25 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
 
     // Run it the way the document says to: from the tree's top, with bash. The container is named
     // the way the document finds it -- the newest tiny_qwen35_w8a8.rad under the temporary
-    // directory -- so the settings block is exercised rather than bypassed. The serving build is
-    // pointed at a directory that does not exist: building it costs minutes, so the host tier runs
-    // section 7's trainer measurement and the serve blocks' documented skip branch, not a serve.
-    // `R97_DEVICE` is cleared for the same reason: a card handed down from the environment would
-    // make section 2's card branch run on a host tier that is meant never to touch one.
-    const fs::path no_serving = dir / "no-serving-build";
+    // directory -- so the settings block is exercised rather than bypassed. Section 7's serve runs
+    // from the serving-only build the environment names, and is skipped as the document says when
+    // it names none: building one costs minutes, so a bare `ctest -L host` runs the trainer's
+    // measurement and the blocks' documented skip branch, not a serve. The tree that suits this
+    // tier is a host-only one (`-DR97_WITH_HIP=OFF`): `R97_DEVICE` is cleared here, because a card
+    // handed down from the environment would make section 2's card branch run on a host tier that
+    // is meant never to touch one, and with no card visible a HIP tree's home offers `libr4d`, which
+    // declares no kernel and stops the server at startup.
+    std::string named_serving = r97::detail::env_or("R97_SERVING_BUILD");
+    const bool served = !named_serving.empty();
+    if (!served) named_serving = (dir / "no-serving-build").string();
+    const std::string& serving = named_serving;
     const std::string command =
         "cd " + r97::detail::shell_quote(root.string()) + " && " +
         "HIP_VISIBLE_DEVICES= ROCR_VISIBLE_DEVICES=99 R97_DEVICE= " + "RAD_TEST_TMPDIR=" +
         r97::detail::shell_quote(dir.string()) + " " + "R97_BUILD=" +
         r97::detail::shell_quote(r97::detail::build_dir()) + " " + "R97_RUN=" +
         r97::detail::shell_quote(run.string()) + " " + "R97_SERVING_BUILD=" +
-        r97::detail::shell_quote(no_serving.string()) + " bash " +
+        r97::detail::shell_quote(serving) + " bash " +
         r97::detail::shell_quote(script_path.string()) + " >" +
         r97::detail::shell_quote(log_path.string()) + " 2>&1";
     const int status = std::system(command.c_str());
@@ -211,11 +232,21 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
     }
 
     // And it ran the run: the two checkpoints, the resumed one, the trainer's measurement of the
-    // adapter, and the documented skip of the serve that needs the serving tree.
+    // adapter, and section 7's serve -- from the serving build when the environment named one, and
+    // the documented skip of both serves on the card when it has none.
     const std::string log = read_file(log_path);
     R97_CHECK(contains(log, "the trainer's loss for the adapter"));
-    R97_CHECK(contains(log, "section 0's serving-only build is a one-time input"));
-    R97_CHECK(contains(log, "the serving build's loss is unchecked"));
+    if (served) {
+        R97_CHECK(contains(log, "the serving build served"));
+        R97_CHECK(contains(log, "the serving build's loss for the adapter"));
+        // The number this run took is the run's own evidence (`docs/RUNBOOK.md` section 11 cites
+        // it), so the test that served prints it rather than keeping it to itself.
+        std::printf("runbook: %s\n",
+                    line_with(log, "the serving build's loss for the adapter").c_str());
+    } else {
+        R97_CHECK(contains(log, "section 0's serving-only build is a one-time input"));
+        R97_CHECK(contains(log, "the serving build's loss is unchecked"));
+    }
     R97_CHECK(contains(log, "the card's served loss is unchecked"));
     R97_CHECK(contains(log, "the card's inventory (ops --device) was not taken"));
     R97_CHECK(contains(log, "# dry run:"));

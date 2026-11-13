@@ -123,6 +123,7 @@ without the exit, for a caller that reports the absence itself.
 | `R97_TEST_ONLY` | a comma-separated list of registered test names; when set, the test runner runs only those. The reference check uses it to take its program-mode step in a child where no other test has run |
 | `R97_MODEL_DIR` | where the model tests find the container: a `.rad` file, or a directory that holds one (the first `*.rad` inside; the `qwen3.8-27b-iq4r-s-v4.rad` name wins if present) |
 | `R97_MODEL_RAD` | the same thing, resolved by the build at configure time; `R97_MODEL_DIR`, when set, wins over it |
+| `R97_SERVING_BUILD` | a host-only serving-only build tree (`-DR97_PATCH_SET=serving -DR97_WITH_HIP=OFF`) whose server `docs/RUNBOOK.md` section 7 serves from, for `tests/host/runbook.cpp`; when unset, the test takes section 7's documented skip branch instead of building one. A HIP tree is not this variable's: the host tier hides the card, and that tree's home offers `libr4d`, which declares nothing without a device |
 
 The default directory is `/srv/models/qwen3.8-27b-iqr-v4`. Fetch the container (15.4 GiB):
 

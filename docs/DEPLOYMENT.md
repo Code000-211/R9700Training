@@ -129,14 +129,18 @@ python3 tools/kld_loss.py /runs/runbook-resumed/kld/served
 
 On the fixture, with the runbook's ten-step run and a host-only serving build, the trainer's
 `loss --lora` is `4.66220409013` and the serving build's record is `4.66220409289`: `6e-10`
-relative, so what the deployment computes is the trainer's number to the digits it prints. The
-card's measurement is the same one in `docs/RUNBOOK.md` section 7's second block, held to the
-trainer's card number (`loss --device`) and to the host's, both at `1e-4`, with the serve log
-required to show the AQL backend; those numbers belong to the card, so the script is where they
-are, not this document.
+relative, so what the deployment computes is the trainer's number to the digits it prints. That
+measurement is `tests/host/runbook.cpp`'s when it is given the serving tree (`R97_SERVING_BUILD`,
+`docs/TESTING.md`): the test serves the adapter, answers one completion, and prints the two losses
+it compared, so both of the host's numbers are taken by `ctest` rather than by hand. The card's
+measurement is the same one in `docs/RUNBOOK.md` section 7's second block, held to the trainer's
+card number (`loss --device`) and to the host's, both at `1e-4`, with the serve log required to show
+the AQL backend; those numbers belong to the card, so the script is where they are, not this
+document, and no card has taken them yet.
 
-A serve that was not measured is not a checked deployment. Section 7's blocks say in their output
-which measurement they took and which they skipped, and a run without a serving build keeps the
+A serve that was not measured is not a checked deployment: the host's is measured, the card's is
+not, so the deployment is checked on the host alone. Section 7's blocks say in their output which
+measurement they took and which they skipped, and a run without a serving build keeps the
 trainer's `loss --lora` number alone.
 
 ## 6. Upstreaming
