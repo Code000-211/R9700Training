@@ -157,6 +157,16 @@ inline AdValue snapshot(const Operand& op, const OperandContent& content,
     // The family adjoints read the record's dtype off the value too (an absent scale is spelled
     // "invalid"), so keep it with the numbers.
     v.dtype = op.dtype;
+    // A dtype with no f64 form -- a plugin-private quantised tensor the kernel decodes in its own
+    // layout -- has no value a snapshot could hold, and the tape's byte count cannot name one: the
+    // refusal below is for a *readable* operand whose span was lost, not for this. Return the shape
+    // and no values: an adjoint row that needs the value guards on `value.empty()`, and one that
+    // needs the weight's planes reads them through joined_dense (whose bytes the tape carries for a
+    // host-side plane buffer).
+    if (content.bytes == 0 && content.named && elem_size(op.dtype) == 0) {
+        v.shape = op.view_shape.empty() ? op.shape : op.view_shape;
+        return v;
+    }
     // A strided or narrowed read -- the q norm and the gate read the two halves of the q|gate
     // projection, the gated-delta layer reads q|k|v out of one fused projection -- is packed over
     // its own shape: the adjoint that follows normalises the last dim the kernel normalised, and
@@ -195,9 +205,12 @@ inline AdValue snapshot(const Operand& op, const OperandContent& content,
     if (!content.data || total == 0) return v;
     if (joined_dense(op, content, &v.value)) return v;
     // A declared buffer or weight the tape handed a pointer for, but could not describe as one
-    // span (OperandContent::bytes is 0 for a slice that is not contiguous). Reading it as zeros is
-    // silent and wrong: the adjoint then differentiates a zero operand -- that is how every
-    // adapter module but one came back with an exactly-zero gradient. Refuse and name it.
+    // span: `OperandContent::bytes` is 0 for a slice that is not contiguous, and for any dtype with
+    // no element size (a plugin-private quantised weight reports bytes 0 while being contiguous).
+    // Reading it as zeros is silent and wrong: the adjoint then differentiates a zero operand, and
+    // that is one of the two ways the device step's adapter gradient came back zero for 399 of 400
+    // leaves. Refuse and name it; the tape's own description of such a tensor is what has to
+    // improve (patch 0123), not this fallback.
     // An operand the tape does not name (a raw batch field, a KV group, a table) keeps the zeros:
     // its values are not a declared buffer's, and the raw slot's zero is a valid slot index.
     if (content.bytes == 0) {

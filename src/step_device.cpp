@@ -165,8 +165,10 @@ int64_t pulled_bytes(const Operand& op, const OperandContent& content) {
     if (content.bytes > 0) return static_cast<int64_t>(content.bytes);
     if (op.view_shape.empty()) return 0;
     const int64_t es = elem_size(op.dtype);
-    if (es <= 0)
-        throw std::runtime_error("device step: cannot pull back operand dtype '" + op.dtype + "'");
+    // A dtype with no element size (a plugin-private quantised tensor) has no byte span to pull
+    // back, and no host-readable value either (snapshot returns the shape and no values for one).
+    // Nothing copies it, and no adjoint row reads its value.
+    if (es <= 0) return 0;
     if (op.view_off < 0)
         throw std::runtime_error("device step: operand '" + op.buffer +
                                  "' is a view with a negative offset, which has no span to pull "

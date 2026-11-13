@@ -173,9 +173,10 @@ R97_TEST(lora_shrink_reads_step_order_codes) {
 
 // join_common's snapshot(): a declared operand the tape handed a pointer for but could not
 // describe as one span is an error, not zeros of its declared shape. The silent zeros are what
-// zeroed both adapter factors of every module but one in the device step (n_zero_a = n_zero_b =
-// 399 of 400): lora_expand's `scale` is a pool operand, and a zero scale makes dB = 0 and dt = 0,
-// hence dA = 0 too. A pointer with no span is refused by name; an absent operand (no pointer) and
+// zeroed an operand in the device step (n_zero_a = n_zero_b = 399 of 400). Which operand is not
+// yet settled -- a plugin-private weight read as zeros cascades its zero dx up the walk, and a zero
+// scale on a lora row zeroes dB, dt and hence dA -- but a pointer with no span is refused by name
+// either way, so the next run says which. An absent operand (no pointer) and
 // an operand the tape does not name (a raw batch field -- the adapter slot array, whose zero is a
 // valid slot index) keep the zeros.
 R97_TEST(snapshot_refuses_a_declared_operand_with_no_span) {

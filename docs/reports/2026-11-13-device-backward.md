@@ -51,19 +51,35 @@ not at fault — `n_grads = 800`, `names_match`/`shapes_match` true, and `Optimi
 every name and shape in order — and neither is coverage: 288 `lora_shrink` and 288 `lora_expand`
 device calls ran, one pair per declared weight.
 
-The mechanism is a silently-zero operand. `snapshot()` (`src/join_common.h`) returned zeros of an
-operand's declared shape whenever the tape could not describe its span (`OperandContent::bytes == 0`,
-set by the observer only for a contiguous tensor: `patches/training/0101-issue-observer.patch:203`),
-and `pull_operands` mirrored that fallback by handing the walk a null pointer. `lora_expand`'s
-`scale` (`RAD_B(pool.scale)`, operand 3) is exactly such a pool operand, and a zero scale zeroes
-**both** factors: `dB = sum cy*sc*t` is 0 and `dt = sum cy*sc*B` is 0, so `dA` (whose cotangent is
-`dt`) is 0 too. It now refuses by name, in both joins:
+The mechanism was a silently-zero operand, and it is now a refusal instead of a silent zero.
+`snapshot()` (`src/join_common.h`) returned zeros of an operand's declared shape whenever the tape
+could not describe its span (`OperandContent::bytes == 0`), and `pull_operands` mirrored that
+fallback by handing the walk a null pointer. That is wrong for any operand whose value matters, so
+it refuses by name, in both joins:
 
-    snapshot: op 'lora_expand': operand 'pool.scale' declares [N] but the tape carries no bytes for it
+    snapshot: op 'gemm_nt_q': operand 'blk.63.attn_qg.weight' declares [12288,5120]
+              but the tape carries no bytes for it
+
+The operand named there is the one the real tape actually produces: a probe over
+`device_step_tape` (1620 zero-byte operands) found 1172 of dtype `plugin-private` — the quantised
+weight *and its scale*, both contiguous — and 448 `bf16` strided views already described by patch
+0120. `rad_dtype_bytes` is 0 for a plugin-private dtype (`build/radiance/abi/rad_types.h:213-217`),
+so a *contiguous* tensor of that dtype reports `bytes == 0`; `bytes == 0` therefore does not mean
+"not contiguous", it means "the tape cannot state a span". Patch `0123-view-unspannable.patch`
+describes such a tensor through `view_shape`/`view_stride` with `bytes` kept 0, and `snapshot()`
+returns its shape with no values; a readable dtype whose span is lost still refuses.
+
+**Which zero caused the 399/399 is not yet settled**, and this report should not claim it is. Two
+candidates remain, and both are consistent with every field measured: a plugin-private weight read
+as zeros in `gemm_nt_q`, whose zero `dx` cascades up the walk and zeroes every adapter it reaches;
+or a zero `scale`/`t`/`B` on one of the 288 `lora_shrink`/`lora_expand` rows, where `dB` and `dt`
+both vanish and take `dA` with them. Distinguishing them needs one run that prints, per lora record,
+the non-zero count of each operand's snapshot — after the plugin-private operands are described, so
+the run gets that far.
 
 An absent operand (no pointer) and an operand the tape does not name (the raw adapter-slot array,
-whose zero is a valid slot index) keep the zeros. `tests/host/lora_shrink_step_order.cpp`'s
-`snapshot_refuses_a_declared_operand_with_no_span` holds the three cases.
+whose zero is a valid slot index) keep the zeros. `tests/host/lora_shrink_step_order.cpp` and
+`tests/host/snapshot_view.cpp` hold the cases.
 
 The op coverage probe is separate and still runs: the tape declares 224 `gemm_nt_q` and 64
 `gemm_nt_q_gated` calls, and `probe_missing` lists the ops served by the host fallback rather than
