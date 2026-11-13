@@ -148,6 +148,14 @@ if(NOT R97_WITH_HIP STREQUAL "OFF")
   endif()
 endif()
 
+# radiance is configured and built in a tree of its own, so it does not inherit this project's
+# compiler launchers on its own: hand them on, or radiance's some 490 sources would bypass the
+# cache that ci/serving_build.sh fills. Empty when this project names no launcher.
+set(R97_RADIANCE_LAUNCHER_ARGS
+  -DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER}
+  -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}
+  -DCMAKE_HIP_COMPILER_LAUNCHER=${CMAKE_HIP_COMPILER_LAUNCHER})
+
 ExternalProject_Add(radiance_core
   PREFIX  ${CMAKE_BINARY_DIR}/radiance-ext
   SOURCE_DIR ${R97_RADIANCE_COPY}
@@ -157,6 +165,7 @@ ExternalProject_Add(radiance_core
     -DCMAKE_GENERATOR=${CMAKE_GENERATOR}
     -DCMAKE_C_COMPILER=${R97_RADIANCE_C_COMPILER}
     -DCMAKE_CXX_COMPILER=${R97_RADIANCE_CXX_COMPILER}
+    ${R97_RADIANCE_LAUNCHER_ARGS}
     -DRAD_BUILD_TESTS=OFF
     -DRAD_WITH_FFMPEG=OFF
     -DRAD_WITH_HIP=${RAD_WITH_HIP}
@@ -330,7 +339,13 @@ if(R97_BUILD_TESTS)
       ${R97_RADIANCE_COPY}/tests)   # radiance's write_qwen35, the fixture's checkpoint writer
     target_compile_definitions(r97_host_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}"
       # the int8 fixture's recipe, the one docs/FIXTURES.md prints
-      R97_FIXTURE_W8A8_RECIPE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/w8a8_fwht128.recipe")
+      R97_FIXTURE_W8A8_RECIPE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/w8a8_fwht128.recipe"
+      # what the serving-only checks read: the archive whose symbols they count, and which set
+      # built it (tests/host/serving_symbols.cpp)
+      R97_RAD_CORE_ARCHIVE="${R97_RADIANCE_LIB}")
+    if(R97_PATCH_SET STREQUAL "serving")
+      target_compile_definitions(r97_host_tests PRIVATE R97_PATCH_SET_SERVING=1)
+    endif()
     if(TARGET r97train)
       # The checks that run the binary in a child process have nothing to run in a serving build,
       # so those sources compile away rather than look for a binary that was never built.
@@ -399,6 +414,14 @@ if(R97_BUILD_TESTS)
            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/patch_audit_test.sh
                    ${CMAKE_CURRENT_SOURCE_DIR})
   set_tests_properties(patch_audit PROPERTIES LABELS host)
+
+  # The build script's compiler launchers: with ccache on PATH both of its configure calls name it
+  # for C, C++ and HIP, and R97_NO_CCACHE=1 (or a machine without ccache) leaves it out. Stand-in
+  # cmake and ctest run it, so nothing is configured or built.
+  add_test(NAME serving_build_ccache
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/serving_build_ccache_test.sh
+                   ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(serving_build_ccache PROPERTIES LABELS host)
 
   # The configuration schema: the table the binary prints and the one docs/USAGE.md prints, cell
   # for cell, and the resolved configuration the `config` command prints. The test drives the

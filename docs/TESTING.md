@@ -33,6 +33,33 @@ so nothing there reports a case it did not start. One consequence: on a machine 
 container and no card, `ctest -L model` fails in that entry, because a `model` run promises the
 container and not the card; exclude it there (`ctest -L model -E gpu_model_tests`).
 
+## The serving build
+
+A serving build (`cmake -B build-serving -G Ninja -DR97_PATCH_SET=serving`) applies none of
+`patches/training/`, and the tests that describe a deployment have to pass there: the same sources
+are globbed in either build, so a check that compiles away in the serving build has to say so (with
+`R97_FIXTURE_PREFILL`, or the `R97_HAS_R97TRAIN` guard) rather than be named by a build rule.
+`tests/host/serving_prefill.cpp` serves an int8-fixture corpus through an adapter with radiance's
+own KL-scored prefill and holds the recorded rows to `tests/fixtures/serving_rows.f32` bit for bit;
+`tests/gpu/serving_container.cpp` serves the real container on the card with an adapter written for
+its linears; `tests/host/serving_symbols.cpp` reads the built `rad_core` archive and fails when a
+serving build carries a trainer-only symbol -- the observer, the replay entry, the prefill driver
+or the adapter lookup -- and in the default build it requires them, so neither set can quietly grow
+the other's code. `ci/serving_build.sh` configures and builds both trees, runs each tree's labels,
+and then -- in the host-only run -- builds the serving tree's `radiance` server and runs the default
+tree's host tests with `R97_SERVING_BUILD` naming it, so `docs/RUNBOOK.md` section 7's serve takes
+its measured branch in CI rather than its skip branch. That script is what a CI with a card runs.
+When `ccache` is on `PATH`, both trees and radiance's own sub-build compile through it -- the cache
+under `$HOME/.cache/ccache` outlives the worktree, so a round rebuilds only what changed -- and
+`R97_NO_CCACHE=1` (or no `ccache` on `PATH`) turns it off.
+
+The adapter and served-rows fixtures were written in the default build: `r97train train` on the
+int8 fixture wrote `tests/fixtures/serving_adapter` (the run is in that directory's `README.md`),
+and `R97_WRITE_SERVING_GOLDEN=<path>` with
+`R97_TEST_ONLY=serving_prefill_with_the_fixture_adapter_matches_the_reference ./build/r97_host_tests`
+wrote the rows from the same test. Regenerating them means running both again in the default build
+and copying the results under `tests/fixtures/`.
+
 ## The GPU test guard
 
 Several people and several agents run GPU tests on one machine. Every `gpu` test takes the guard
@@ -123,6 +150,7 @@ without the exit, for a caller that reports the absence itself.
 | `R97_TEST_ONLY` | a comma-separated list of registered test names; when set, the test runner runs only those. The reference check uses it to take its program-mode step in a child where no other test has run |
 | `R97_MODEL_DIR` | where the model tests find the container: a `.rad` file, or a directory that holds one (the first `*.rad` inside; the `qwen3.8-27b-iq4r-s-v4.rad` name wins if present) |
 | `R97_MODEL_RAD` | the same thing, resolved by the build at configure time; `R97_MODEL_DIR`, when set, wins over it |
+| `R97_SERVING_BUILD` | a host-only serving-only build tree (`-DR97_PATCH_SET=serving -DR97_WITH_HIP=OFF`) whose server `docs/RUNBOOK.md` section 7 serves from, for `tests/host/runbook.cpp`; when unset, the test takes section 7's documented skip branch instead of building one. A HIP tree is not this variable's: the host tier hides the card, and that tree's home offers `libr4d`, which declares nothing without a device |
 
 The default directory is `/srv/models/qwen3.8-27b-iqr-v4`. Fetch the container (15.4 GiB):
 

@@ -1,0 +1,24 @@
+{
+  "peft_type": "LORA",
+  "task_type": "CAUSAL_LM",
+  "base_model_name_or_path": "tiny_qwen35_w8a8.rad",
+  "bias": "none",
+  "fan_in_fan_out": false,
+  "inference_mode": true,
+  "lora_alpha": 32,
+  "lora_dropout": 0.0,
+  "r": 16,
+  "target_modules": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "in_proj_qkv",
+    "in_proj_z",
+    "gate_proj",
+    "up_proj",
+    "down_proj"
+  ],
+  "use_rslora": false,
+  "radiance_input_basis": "fwht128"
+}

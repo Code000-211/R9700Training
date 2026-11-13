@@ -268,6 +268,12 @@ resumed=$(horizon_loss "$R97_RUN-resumed/train.jsonl")
 
 ## 7. The adapter, and the served loss against the trainer's
 
+`tests/gpu/serving_container.cpp` serves the container on the card's tier and
+`tests/model/serving_container.cpp` checks its serving handshake -- basis and targetable linears
+-- on the host tier; `ctest -L model` runs both when the container is present (the gpu case also
+takes the card). The blocks below are the hand-run form of the same serve, with the numbers
+printed.
+
 The checkpoint's `adapter/` is the directory radiance loads (`docs/ADAPTER.md` has what it holds
 and what radiance reads), and the run serves the checkpoint the resumed run wrote. The adapter's
 held-out loss is measured twice. First the trainer's, with `loss --lora`: it loads the adapter
@@ -381,9 +387,81 @@ else
 fi
 ```
 
+The same adapter on a card is the second half of the same check, and it is a card's commands, not
+the host's. The serving build has to be a HIP build (section 0's default); the server has no
+`--device` of its own, so `ROCR_VISIBLE_DEVICES` names the card exactly as it does for the trainer;
+and the card's own `loss --device` is the number its served loss is held to, since the serve runs
+the same three libraries `--device` runs (`--kernels libr4d,libavx,libref`) and a HIP serving home
+also holds the trainer's `libr97`, which that list keeps out. `$R97_DEVICE` is the selector section
+2 already uses for the card, so the two sections cannot disagree about which one it is. The card's
+serve log must say `AQL backend`. A host-only serving build answers the block above, and so does a
+HIP build whose command names no kernel library: it finds no card, takes the host backend, and
+serves out of `serving_home`'s `libavx`, which is not what is measured here. The line above names
+`libr4d`, and a process that can see no card has no device code for it to declare, so it stops at
+startup with `invalid argument` rather than serving on the CPU and calling it the card's number.
+
+Two of the block's numbers need a run behind them. `$resumed` is the host's, and a model the host
+tier cannot declare -- the 27B container is one (`docs/reports/2026-11-12-device-forward.md`) -- has
+none, so there the served number is held to `loss --device` alone. And a model whose 256-sequence
+worst case does not fit the card needs its limits named on the serve (`--max-num-seqs 8`,
+`--max-num-batched-tokens 8192`, `--max-model-len 4096` for the corpus
+`docs/reports/2026-11-13-serving-card.md` measured) or the engine stops at startup instead of
+serving. Card 0 has taken that pair for the 27B container.
+
+```sh
+if [ -x "$server" ] && [ -n "$R97_DEVICE" ]; then
+    trainer_card=$("$r97" loss --model "$R97_MODEL" --data "$R97_HELDOUT" \
+                          --lora "$adapter" --device "$R97_DEVICE" | sed -n 's/^loss: //p')
+    [ -n "$trainer_card" ] || {
+        echo "runbook: the trainer printed no loss for card $R97_DEVICE" >&2
+        exit 1
+    }
+    ROCR_VISIBLE_DEVICES="$R97_DEVICE" "$server" --model "$R97_MODEL" \
+              --radiance-home "$serving_home" \
+              --lora trained="$adapter" --kernels libr4d,libavx,libref --kld-lora trained \
+              --kld-corpus "$kld/heldout.jsonl" --kld-record "$kld/served-card" \
+              > "$R97_RUN-resumed/serve-card.log" 2>&1
+    grep -q 'AQL backend' "$R97_RUN-resumed/serve-card.log" || {
+        echo "runbook: the serving build did not run on card $R97_DEVICE; see" \
+             "$R97_RUN-resumed/serve-card.log" >&2
+        exit 1
+    }
+    served_card=$(python3 tools/kld_loss.py "$kld/served-card" | sed -n 's/^loss: //p')
+    [ -n "$served_card" ] || {
+        echo "runbook: tools/kld_loss.py printed no loss for $kld/served-card" >&2
+        exit 1
+    }
+    echo "the serving build's loss on card $R97_DEVICE $served_card, the trainer's card loss" \
+         "$trainer_card, the host's $resumed"
+
+    awk -v card="$trainer_card" -v host="$resumed" -v measured="$served_card" -v dev="$R97_DEVICE" '
+        function agree(a, b) {
+            d = a - b
+            if (d < 0) d = -d
+            t = b < 0 ? -b : b
+            if (t == 0) t = 1
+            return d <= 1e-4 * t
+        }
+        BEGIN {
+            if (!agree(measured, card) || !agree(measured, host)) {
+                printf "runbook: the serving build on card %s reports %s, " \
+                       "the trainer %s there, the host %s\n", dev, measured, card, host
+                exit 1
+            }
+        }'
+else
+    echo "runbook: no serving build or no R97_DEVICE; the card's served loss is unchecked"
+fi
+```
+
 1e-4 is the tolerance `tests/host/loss_cli.cpp` holds the trainer's loss and radiance's KL record
 to, and the same one `tests/host/train_host_cli.cpp` holds the loss across a resume to; the same
-one applies to both measurements here. `docs/EVAL.md` says how the two agree in the host tier.
+one applies to every measurement here, on the host and on the card. The card's serve names the
+three kernel libraries the trainer's `loss --device` runs on (`libr4d,libavx,libref`), so the
+served number and the number held to it come from the same kernels: a HIP serving home also holds
+`libr97`, the trainer's plugin, which radiance would otherwise load beside them. `docs/EVAL.md`
+says how the trainer's loss and radiance's record agree in the host tier, and `docs/DEPLOYMENT.md`
+says what the serving-only build carries and what the two measurements mean for a deployment.
 
 A checkpoint can be measured at any time without touching the run: `loss` on another `adapter/`
 answers whether it is worth keeping. Compare with the baseline of the same container and held-out
@@ -471,14 +549,17 @@ own procedure, so a flag that changes without the runbook, a runbook command tha
 a non-`sh` block added to the file fails `ctest --test-dir build -L host`. The one-time inputs in
 section 0 are inline prose, not blocks, and are not run — the serving-only radiance build, the
 network fetch, and `ctest` itself. Section 7's serve and served-loss blocks are in the script and
-the test runs them; with no serving tree (`R97_SERVING_BUILD` is pointed at an absent directory)
-they take their `else` branch and say the serve was skipped, and the test holds the commands to the
-document so that removing them fails even though the branch did not execute. Building the serving
-tree and the server still costs minutes, so the test does not do that. The same script was run by
-hand with a serving tree built without HIP (`-DR97_PATCH_SET=serving -DR97_WITH_HIP=OFF`, section
-0's commands with the CPU backend): the server served the adapter and answered one completion, and
-the serving build's KL record gave `4.66220409289` against the trainer's `4.66220409013` —
-2.8e-9 apart, 6e-10 relative, well inside the 1e-4. Section 2's card inventory is held to this file
+the test runs them whenever the environment names a serving tree in `R97_SERVING_BUILD`: the server
+serves the adapter and answers one completion, and the test prints the pair of losses it took. With
+no tree they take their `else` branch and say the serve was skipped, and either way the test holds
+the commands to the document, so removing them fails even when the branch did not execute. Building
+the serving tree and the server still costs minutes, so the test does not do that; name a host-only
+one (section 0's commands with `-DR97_WITH_HIP=OFF`) and it serves the fixture. That run took
+`4.26155194807` from the serving build's KL record against the trainer's `4.2615519630392633` —
+`1.5e-8` apart, `3.5e-9` relative, well inside the `1e-4`. Section 7's card blocks are untouched by
+that run: with no `R97_DEVICE` they take their skip branch and say so, and the card's serve and its
+number are taken on the card, where the command names `libr4d` and the log has to show the AQL
+backend. Section 2's card inventory is held to this file
 the same way: the script always carries the `--device` line, and a run with no card takes the
 branch that says it was skipped, so removing the line fails here even though that branch ran. The
 flag tables in `docs/USAGE.md` are held to `r97train <command> --help` by

@@ -1,0 +1,2 @@
+# The adapter is a committed fixture: its bytes are the trained weights the serving test loads.
+!*.safetensors
