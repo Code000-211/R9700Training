@@ -44,6 +44,21 @@ pattern, not the zero signature this work set out to remove. It is an **open def
 recorded here with its position so the next session starts from the tape rather than from
 the symptom.
 
+### Which run this is, and which one is still to come
+
+This JSON is the **zero-gradient acceptance**, and it was measured on a binary that
+predates the read-set fix (`e9eae50`, `src/step_device.cpp:737`: the buffer read outside
+the head walk is the logits, not the hidden state). On that binary the head norm's writer
+was unprovable, so `derive_read_sets` degraded to everything-readable and the `rmsnorm`
+row counters read `0/0/0` — which is why `all_finite false` here is the inf flowing into
+every gradient instead of being confined to the rows a consumer reads.
+
+**So the two 512 results are not the same result with different `all_finite`.** This run
+proves the ticket's core claim — the adapter gradient exists on all 800 leaves — and
+nothing about the read set. The read-set acceptance is the `accept3b` window on the binary
+built after `e9eae50`, which is the one that must show **511 zeroed / 1 readable** on the
+head's `rmsnorm` and is the run whose finiteness figures are the fixed path's.
+
 ### What the oracle does not say
 
 `docs/kernels/README.md`'s host reference asserts the boundary and adapter floors, which
