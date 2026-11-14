@@ -32,37 +32,55 @@ The case runs and descends; **it does not pass**, and the failure is the gradien
 | residual boundaries / store | 65 / 640 MiB |
 | peak snapshot store / op / cotangent | 1899 MiB / 204 MiB / 490.9 MB |
 | shared (frozen) snapshot bytes | 0 (the run holds `R97_NO_SHARED_SNAPSHOTS=1`) |
-| `all_finite` | **false** — `grad norm nan` |
-| `n_zero_a`, `n_zero_b` | **399 of 400, 399 of 400** |
-| `a_changed`, `b_changed` | 1, 1 — and `first_nonzero_a_leaf` is
-`model.layers.63.mlp.down_proj.lora_A` with `first_nonzero_a_finite` **false** |
+| `all_finite` | **false** — the forward's own inf, contained by nothing yet (below) |
+| `n_zero_a`, `n_zero_b` | **0 of 400, 0 of 400** — every leaf moves (`a_all_nonzero`/`b_all_nonzero` true) |
+| `n_lora_a`, `n_lora_b`, `n_params` | 400, 400, 800 — `names_match` true, 64 blocks probed |
+| `first_nonzero_a_finite` / `_b_finite` | **false** / **false** — `model.layers.0.linear_attn.in_proj_qkv.lora_A` / `…lora_B` |
+| row counters (`rmsnorm`, the whole walk) | **0 zeroed / 0 readable / 0 refused** over 1459 calls |
 
-Measured with the IQR decode live (the stored path is the default, `R97_STORED_WEIGHTS` retired) and
-the plugin-private planes read from the tape's own pointers: `/tmp/r97-512-window.log`, JSON
-`/tmp/r97-dstep-device_step_tape-WE1RtA/device_step_tape.json`. The backward is **581.7 s** against
-the 1176.9 s the same case took when every stored operand was refused and the walk fell back to the
-f64 rows, because the 288 `gemm_nt_q` records no longer pull 1.4 GB of weight each. The walk's split:
-`lora_expand` 6.2 s, `lora_shrink` 5.7 s, `gdn_chunk_scan` 5.5 s, `gemm_nt_q` 4.9 s,
-`had_quant_act_i8g` 1.8 s; the pull's: `gemm_nt_q` 1.9 s, `lora_expand` 1.4 s.
+Measured twice, and **the two runs differ in exactly one figure**: `/tmp/r97-dstep-device_step_tape-23nofj`
+(18:35, the device path marking the head walk's own input as external) and
+`…-PLpzBN` (18:54, marking the objective's logits, `e9eae50`). Same loss to the last digit
+(7371.591348378961 → 6347.883966664209), same `scored` 511, same 400/400 leaves, same
+`all_finite: false`. The counters are what separates them from a protected run: **`0/0/0` means the
+rule never fired** — this gradient was produced with no read set at all, not one that examined the
+rows and found nothing to zero. The 512-token expectation is `511 zeroed / 1 readable` on the head's
+norm (`gather_rows` selects one row of 512), and **that has not been observed yet**; the head walk
+now prints its decision (`r97: head read set: N of M records proven [...]`) so the next run names
+which condition fails instead of leaving it to be guessed.
 
-**The mechanism is now measured, and it is not the weight read.** With the decode proven against the
-engine's own `iqr_gemm_case` (`tests/gpu/adjoint_iqr_plane.cpp`, rel L2 0.00214 and 0.00231) and the
-tape's pointers reaching the row, **399 of 400 `lora_A` and 399 of 400 `lora_B` leaves are still
-exactly zero**, and the single leaf of each factor that moves holds the forward's NaN
-(`first_nonzero_a_finite` false). So reading the plugin-private weight was necessary — it is what
-makes `dx` exist at all — and it is not what zeroed 399 leaves. The candidates that remain are on the
-lora rows' own operands: a zero `scale`/`t`/`B` on one of the 288 `lora_shrink`/`lora_expand` records
-(`dB` and `dt` both vanish and take `dA` with them), or the `dc` sizing/in-place passthrough on those
-records. This report should not claim more than that.
+The phase split is the same in both: forward 46.8 s, head 0.82 s, backward 572.2 s, the optimizer
+step 46.5 s, and the step is **host-bound** — 388% CPU against 6% `GFX_ACTIVITY`, because every
+replayed operand is pulled to the host and joined in f64 with the pulls serialised against the
+arithmetic. That is a property of this harness, not of the model: it is a correctness harness, and
+its wall clock is not a throughput claim.
 
-The NaN is the forward's, and its **producer is now named**:
+The NaN's producer is the forward's, and it is named:
 
     device_step_tape: non-finite: cotangent op rmsnorm, operand 'x'[0] at position 1458, value 0,
       from the row | forward not finite: rmsnorm wrote operand 'h'[2] at position 1458, value 62
 
 i.e. the `rmsnorm` record at position 1458 wrote element 62 of its output `h` non-finite — row 0,
-column 62 of the final hidden — and the walk's first bad cotangent is that record's input. `1/33`
-`rmsnorm` ops are non-finite; the per-op counts are `add 3/1`, `gated_had_quant_i8g 2/64`,
+column 62 of the final hidden — and the walk's first bad cotangent is that record's input. **This is
+a known forward defect, not a cure**: the containment the read set provides only reaches a row no
+consumer reads, and only when the derivation proves the record. A non-finite value *inside* a row a
+consumer reads is refused by name, which is the correct outcome and the reason `all_finite` is
+false rather than silently zero.
+
+
+Measured with the IQR decode live (the stored path is the default, `R97_STORED_WEIGHTS` retired) and
+the plugin-private planes read from the tape's own pointers. The backward is **572.2 s**, against
+the 1176.9 s the same case took when every stored operand was refused and the walk fell back to the
+f64 rows, because the 288 `gemm_nt_q` records no longer pull 1.4 GB of weight each. The pull's own
+largest entries are `gemm_nt_q` 1.9 s and `lora_expand` 1.4 s.
+
+**Reading the plugin-private weight was necessary and is not the whole story**: it is what makes
+`dx` exist at all, and the 399-of-400 zero leaves it used to explain are gone — with the quant row
+reaching the tape's pointers and the read set threaded through, **all 400 `lora_A` and all 400
+`lora_B` leaves carry a gradient** (`n_zero_a`/`n_zero_b` 0, `names_match` true). What remains is
+finiteness, and that is the forward's.
+
+The per-op non-finite counts from the same run: `add 3/1`, `gated_had_quant_i8g 2/64`,
 `gdn_conv_prep 4/48`, `gemm_nt 8/48`, `gemm_nt_q 2/288`, `lora_expand 3/288`, `lora_shrink 3/288`,
 `rmsnorm 1/33`, `rmsnorm_had_quant_i8g 5/128`.
 
@@ -76,10 +94,11 @@ a device row.
 
 ## device_step_seq4096 — the ticket
 
-**Not run.** At the 512 case's measured rate the backward is ~2.6 h at 4096 tokens (~2.8 h for the
-step), which is a window nobody wants to hold while the forward's NaN is still unexplained: a
-longer run of a step whose gradient is not finite proves nothing. It runs once the forward is
-finite, and its figures go here: loss (cross-checked against
+**Running, and its figures are not in yet.** A 6000 s window (`/tmp/r97-inner-4096.sh`, opened
+18:54:23) holds the card for it. At the 512 case's measured rate the backward is ~2.6 h at 4096
+tokens, so a window that ends before the case does reports nothing rather than a partial figure;
+the section is filled from the case's JSON when it lands, and not before. Its figures go here: loss
+(cross-checked against
 `docs/reports/2026-11-12-device-forward.md`'s 34682.089228 / 8.469375 for the same batch),
 `loss_after`, the gradient norm, the store and VRAM peaks, the phase split, and tokens a second.
 
