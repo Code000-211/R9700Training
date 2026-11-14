@@ -44,6 +44,14 @@ pattern, not the zero signature this work set out to remove. It is an **open def
 recorded here with its position so the next session starts from the tape rather than from
 the symptom.
 
+**It is localized, not global.** The case's descent check passed on this run:
+`loss 7371.5913` before the step and `loss_after 6347.8839` after it, with
+`std::isfinite(after.loss)` holding. A NaN gradient would have taken the parameters to NaN
+and the loss with them. So the forward inf contaminates *some* leaves — `first_nonzero_a_finite`
+and `first_nonzero_b_finite` are false, i.e. the first non-zero leaf is one of them — while
+the step as a whole still descends. That bounds the defect: it is one column of one row
+reaching part of the adapter, not a broken walk.
+
 ### Which run this is, and which one is still to come
 
 This JSON is the **zero-gradient acceptance**, and it was measured on a binary that
@@ -55,9 +63,27 @@ every gradient instead of being confined to the rows a consumer reads.
 
 **So the two 512 results are not the same result with different `all_finite`.** This run
 proves the ticket's core claim — the adapter gradient exists on all 800 leaves — and
-nothing about the read set. The read-set acceptance is the `accept3b` window on the binary
-built after `e9eae50`, which is the one that must show **511 zeroed / 1 readable** on the
-head's `rmsnorm` and is the run whose finiteness figures are the fixed path's.
+nothing about the read set.
+
+**The read-set acceptance's expected numbers were wrong, and the diagnostic is what
+overturned them.** The device step prints the head walk's decision before walking it:
+
+```
+r97: head read set: 1 of 2 records proven [rmsnorm@1458 512 rows] [gather_rows@1459 unproven]
+r97: head read set: 1 of 2 records proven [rmsnorm@1458 4096 rows] [gather_rows@1459 unproven]
+```
+
+The derivation **does** prove the head norm, and the gather's index list covers **every
+row** — 512 of 512, 4096 of 4096. So no row of the final norm is unreadable, nothing may
+be zeroed, and the inf at `h` row 0 sits in a row the objective reads. `all_finite false`
+is then the honest outcome of the rule, not a failure of it: **the containment the read set
+offers is not available on this path.** The earlier expectation of `511 zeroed / 1 readable`
+came from assuming the gather selects only the last row; that premise is wrong, and the
+counters said so before the criteria could hide it.
+
+What the read set is worth here is therefore the *loud refusal* it produces for a
+non-finite row a consumer reads — which is the correct behaviour, and which is why the
+forward inf below is a defect to fix rather than one to contain.
 
 ### What the oracle does not say
 
