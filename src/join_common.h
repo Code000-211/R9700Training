@@ -200,15 +200,19 @@ inline AdValue snapshot(const Operand& op, const OperandContent& content,
     // A dtype with no f64 form -- a plugin-private quantised tensor the engine decodes in its own
     // stored layout -- has no value a snapshot could hold, and the tape's byte count cannot name
     // one: the refusal below is for a *readable* operand whose span was lost, not for this. Return
-    // the shape, no values, and (behind the gate) the pointer the tape recorded.
+    // the shape, no values, and the pointer and encoding the tape recorded.
     //
-    // The stored decode is opt-in while the trunk's weight encoding is still being identified: the
-    // container's plane is not the int8 pair's N*K bytes, so reading it with the int8 index faults
-    // rather than returning a wrong number. With R97_STORED_WEIGHTS unset the operand has neither
-    // values nor a pointer, and the walk refuses it by name exactly as it did before.
+    // The stored path is the default: the IQR decode it feeds is proven against the engine's own
+    // `iqr_gemm_case` on both of the container's forms (tests/gpu/adjoint_iqr_plane.cpp, whose
+    // hand-read plane is the one that test measures), so a shipped build decodes the trunk instead
+    // of refusing every weight of it. `R97_NO_STORED_WEIGHTS=1` is the kill switch: the operand
+    // then has neither values nor a pointer and the walk refuses it by name, exactly as before the
+    // pointer was threaded. The *form* gate lives in the row (src/adjoint/device/linear.hip): an
+    // encoding this build cannot decode throws with its name rather than reading the plane.
     if (content.bytes == 0 && content.named && elem_size(op.dtype) == 0) {
         v.shape = op.view_shape.empty() ? op.shape : op.view_shape;
-        if (const char* on = std::getenv("R97_STORED_WEIGHTS"); on != nullptr && on[0] == '1') {
+        const char* off = std::getenv("R97_NO_STORED_WEIGHTS");
+        if (off == nullptr || off[0] != '1') {
             v.raw = content.data;
             v.enc = op.enc;
         }

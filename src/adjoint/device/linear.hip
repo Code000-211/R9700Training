@@ -51,6 +51,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -427,16 +428,22 @@ RadStream adjoint_stream() {
     return s;
 }
 
-// A record the IQR path cannot serve names itself. Every return on that path leaves `dx` as it
-// was, which is the shape of the 399-of-400 zero-gradient bug with a new cause: a reader of a run's
-// JSON could not tell "the decode produced nothing" from "the row declined". The line carries the
-// form, so the next run's log says which guard fired rather than only that something did.
+// A record the IQR path cannot serve names itself, and throws. Every return on that path leaves
+// `dx` as it was, which is the shape of the 399-of-400 zero-gradient bug with a new cause: a reader
+// of a run's JSON could not tell "the decode produced nothing" from "the row declined". The message
+// carries the form, so the run's log says which guard fired rather than only that something did.
+// Nothing is in flight when this is called: each of the call sites below is a check that failed
+// before its launch, or a launch the driver refused.
 void iqr_decline(const char* why, const OpRecord& rec, const AdValue& b, int64_t N, int64_t K,
                  int64_t groups) {
-    std::fprintf(stderr, "r97: iqr dx declined: op %s: %s (N %lld K %lld G %lld form %s)\n",
-                 rec.op.c_str(), why, static_cast<long long>(N), static_cast<long long>(K),
-                 static_cast<long long>(groups), device::iqr_plane_form(b.enc));
+    char text[320];
+    std::snprintf(text, sizeof text,
+                  "r97: iqr dx declined: op %s: %s (N %lld K %lld G %lld form %s)",
+                  rec.op.c_str(), why, static_cast<long long>(N), static_cast<long long>(K),
+                  static_cast<long long>(groups), device::iqr_plane_form(b.enc));
+    std::fprintf(stderr, "%s\n", text);
     std::fflush(stderr);
+    throw std::runtime_error(text);
 }
 
 // dx[m,k] = sum_n dy[m,n] * W[n,k], with W the int8 codes and their per-block scale (`quant`) or
@@ -465,8 +472,12 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
      * pair above; the IQR trunk's (an IQR-V4 trellis at 4.81 bpw, so the codes plane is not N*K
      * bytes) is a trellis or a table whose form rides with the operand (AdValue::enc), and the row
      * decodes it with libr4d's own decoders into the two planes this kernel reads. Which one is the
-     * encoding's business, never the op's name. */
-    const bool iqr = stored && b.enc != nullptr && device::iqr_plane_supported(b.enc);
+     * encoding's business, never the op's name: `codes=i8` is the int8 pair, and every sub-byte
+     * codes plane is an IQR form. A narrow encoding this build cannot decode is refused here, by
+     * name -- falling through to the int8 reader would index N*K bytes into a 4.81-bpw plane and
+     * fault, which is the loudest wrong answer available. */
+    const bool narrow = stored && b.enc != nullptr && device::iqr_plane_narrow(b.enc);
+    const bool iqr = narrow && device::iqr_plane_supported(b.enc);
 
     const int64_t K = int_param(call.rec.params, "K", a.shape.size() >= 2 ? a.shape[1] : 0);
     const int64_t N = int_param(call.rec.params, "N", b.shape.size() >= 2 ? b.shape[0] : 0);
@@ -474,8 +485,13 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
     const int64_t group = int_param(call.rec.params, "group", K > 0 ? K : 1);
     const int64_t groups = group > 0 ? (K + group - 1) / group : 1;
     if (M <= 0 || N <= 0 || K <= 0) return;
+    if (narrow && !iqr)
+        iqr_decline("the weight's encoding is an IQR form this build cannot decode", call.rec, b, N,
+                    K, groups);
     /* The operand extents, the write's shape and the record's M, N, K have to agree; a record that
-     * does not is one this row was not written for, and an adjoint must not throw. */
+     * does not is one this row was not written for, and returns. A *stored plane* the row cannot
+     * decode is the other case: it throws, because a zero dx there is indistinguishable from a
+     * correct zero and that is exactly how #55 hid. */
     if (M * N != static_cast<int64_t>(dy.value.size()) ||
         M * K != static_cast<int64_t>(a.value.size()) ||
         static_cast<int64_t>(dx.value.size()) != M * K)

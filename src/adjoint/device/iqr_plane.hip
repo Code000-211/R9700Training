@@ -333,6 +333,17 @@ bool iqr_plane_supported(const void* enc) {
     return form_of(enc, &f);
 }
 
+// The int8 pair's encoding is `codes=i8`; every form in R4D_IQR_FORMS keeps its codes at fewer than
+// eight bits a value (r4d_iqr.h:5-19), and so does every form this file cannot decode. So the codes
+// plane's width is the whole discrimination, and it is the encoding's, not a name's.
+bool iqr_plane_narrow(const void* enc) {
+    if (enc == nullptr) return false;
+    const RadEncoding* e = static_cast<const RadEncoding*>(enc);
+    const RadEncPlane& cp = e->plane[0];
+    if (std::strncmp(cp.role, "codes", RAD_ENC_STR) != 0) return false;
+    return cp.dtype != RAD_I8;
+}
+
 bool iqr_plane_decode(const void* enc, uint32_t N, uint32_t K, const void* W, const void* S,
                       void* out, void* stream) {
     if (W == nullptr || S == nullptr || out == nullptr) return false;

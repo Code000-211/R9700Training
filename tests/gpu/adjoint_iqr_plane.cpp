@@ -123,9 +123,14 @@ uint64_t mix(uint64_t* s) {
 // One case's form: the code bits, the state bits, the rows a scale (0 = one a row; above 0, the
 // tcq_rb grid), whether the state's values are computed rather than read from a table, and whether
 // the scale is an e4m3 level under one f32 (else one f32 a row times one f32 a 128-K block).
+//
+// `enc_L` overrides the state bits the *encoding* declares (0: the planes' own), so a form that
+// classifies but has no kernel built is reachable; `refuse` expects the row to throw on it.
 struct Case {
     int B, L, lrb;
     bool mad, e4m3;
+    int enc_L = 0;
+    bool refuse = false;
 };
 
 // Builds the form's two planes, reads the weight they decode to out of them by hand, and holds the
@@ -201,7 +206,7 @@ void iqr_case(const Case& cs) {
     rad_enc_copy_str(enc.scheme, "trellis");  // the scheme libr4d's classify reads a trellis as
     rad_enc_copy_str(enc.transform, "fwht128");  // the hook's transform for an i8a8h operand
     rad_enc_add_plane(&enc, "codes", cs.B == 2 ? RAD_U2 : RAD_U5, 1, 1);
-    rad_enc_add_table(&enc, "trellis", RAD_I8, int64_t(1) << L, 1);
+    rad_enc_add_table(&enc, "trellis", RAD_I8, int64_t(1) << (cs.enc_L != 0 ? cs.enc_L : L), 1);
     if (cs.mad) rad_enc_add_table(&enc, "trellis.mad", RAD_U32, 2, 1);
     if (cs.e4m3) {
         rad_enc_add_plane(&enc, "scale", RAD_F8E4M3, 1, 128);
@@ -239,6 +244,12 @@ void iqr_case(const Case& cs) {
     // The codes: column e of a lane's segment is 16 B-bit codes (the tile's row 15 first) and then
     // the same column's first bits in the unit above -- the run's last tile at a run's first,
     // tail-biting. A row's state is the L bits from its own code.
+    //
+    // `bits_at` takes a *bit* offset (the codes plane is one bit stream, r4d_iqr.h:30-45), so a
+    // unit's byte offset is scaled to bits here: `seg`/`pseg` are bit offsets of the lane segment,
+    // and col/in_col below are bit offsets within it. Mixing the two reads the plane an eighth of
+    // the way in, which is a whole different unit's codes -- the first run of this case measured
+    // rel L2 1.46 that way.
     const uint32_t* ab = cs.mad
                              ? reinterpret_cast<const uint32_t*>(W.data() + aux_off + (int64_t(1) << L))
                              : nullptr;
@@ -248,8 +259,8 @@ void iqr_case(const Case& cs) {
             const int64_t rt = r / 16, within = r % 16, kb = k / 128;
             const int64_t lane = (k % 128) / 4, e = k % 4;
             const int64_t rp = (rt % run_tiles == 0) ? rt + run_tiles - 1 : rt - 1;
-            const int64_t seg = (rt * nkb + kb) * unit_bytes + lane * lane_bytes;
-            const int64_t pseg = (rp * nkb + kb) * unit_bytes + lane * lane_bytes;
+            const int64_t seg = ((rt * nkb + kb) * unit_bytes + lane * lane_bytes) * 8;
+            const int64_t pseg = ((rp * nkb + kb) * unit_bytes + lane * lane_bytes) * 8;
             const int64_t q = 15 - within;  // the stream position of this row's code (bottom-up)
             const int64_t col = e * 16 * B;  // where this column's stream starts in the segment
             const int64_t in_col = q * B;    // the row's own code within it
@@ -367,6 +378,28 @@ void iqr_case(const Case& cs) {
         return;
     }
     AdjointCall call{rec, fwd, cot, &dc, nullptr, ""};
+    if (cs.refuse) {
+        // A form the encoding classifies but this build has no kernel for must not come back as a
+        // zero dx: the row names it and throws. `iqr_plane_supported` is the classification, not a
+        // promise that a kernel exists, so the decode's own refusal is the one that has to be loud.
+        std::string what;
+        bool threw = false;
+        try {
+            device(call);
+        } catch (const std::exception& e) {
+            threw = true;
+            what = e.what();
+        }
+        std::printf("adjoint_iqr_plane: trellis b%d L%d lrb%d, encoding says L%d: %s\n", cs.B, L,
+                    cs.lrb, cs.enc_L, threw ? what.c_str() : "NOT REFUSED");
+        R97_CHECK(threw);
+        R97_CHECK(what.find("iqr dx declined") != std::string::npos);
+        R97_CHECK(what.find("did not decode") != std::string::npos);
+        R97_CHECK(what.find("L" + std::to_string(cs.enc_L)) != std::string::npos);
+        rad_dev_free(dev_w, RAD_MEM_DEVICE);
+        rad_dev_free(dev_s, RAD_MEM_DEVICE);
+        return;
+    }
     device(call);
 
     const std::vector<double>& dx = dc[0].value;
@@ -437,3 +470,8 @@ void iqr_case(const Case& cs) {
 
 R97_TEST(adjoint_iqr_plane_trellis_run_e4m3) { iqr_case(Case{5, 14, 5, false, true}); }
 R97_TEST(adjoint_iqr_plane_trellis_mad_row_f32) { iqr_case(Case{2, 16, 0, true, false}); }
+// L 13 classifies (r4d_iqr_layout.cpp:127 admits L <= 14) and no kernel in R4D_IQR_FORMS is built
+// at it, so the row must name the form and throw rather than leave dx at zero.
+R97_TEST(adjoint_iqr_plane_unbuilt_form_refuses) {
+    iqr_case(Case{5, 14, 0, false, true, 13, true});
+}

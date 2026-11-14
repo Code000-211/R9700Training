@@ -31,6 +31,11 @@ bool iqr_plane_scale(const void* enc, uint32_t N, uint32_t K, const void* S, voi
 // touching a device. A caller branches on it before it sizes anything.
 bool iqr_plane_supported(const void* enc);
 
+// Whether `enc`'s codes are narrower than a byte -- an IQR form rather than the int8 pair
+// (`codes=i8`, whose stored plane is N*K bytes). A narrow encoding the two calls above do not
+// decode must be refused: the int8 reader would index N*K bytes into a plane of B bits a value.
+bool iqr_plane_narrow(const void* enc);
+
 // The form's name, for the diagnostic that prints what a plane was classified as.
 const char* iqr_plane_form(const void* enc);
 
