@@ -28,54 +28,43 @@ The case runs and descends; **it does not pass**, and the failure is the gradien
 | --- | --- |
 | scored | 511 of 512 |
 | loss → loss_after (one AdamW step) | 7371.591348 → 6347.883967 |
-| forward / head / backward / step | 46.9 s / 0.8 s / 1176.9 s / 1227.0 s |
+| forward / head / backward | 46.72 s / 0.82 s / 581.66 s |
 | residual boundaries / store | 65 / 640 MiB |
-| peak cotangent / VRAM peak | 490.9 MB / 20.28 GB |
+| peak snapshot store / op / cotangent | 1899 MiB / 204 MiB / 490.9 MB |
+| shared (frozen) snapshot bytes | 0 (the run holds `R97_NO_SHARED_SNAPSHOTS=1`) |
 | `all_finite` | **false** — `grad norm nan` |
-| `a_all_zero`, `b_all_nonzero` | false, false |
+| `n_zero_a`, `n_zero_b` | **399 of 400, 399 of 400** |
+| `a_changed`, `b_changed` | 1, 1 — and `first_nonzero_a_leaf` is
+`model.layers.63.mlp.down_proj.lora_A` with `first_nonzero_a_finite` **false** |
 
-The walk's split (288 `gemm_nt_q` calls and 288 `lora_*`, 48 `gdn_chunk_scan`, 48
-`had_quant_act_i8g`): `gemm_nt_q` 76.3 s, `lora_expand` 5.5 s, `gdn_chunk_scan` 5.4 s,
-`lora_shrink` 5.4 s, `had_quant_act_i8g` 1.6 s — **~95 s of the 1177 s backward**. The rest is the
-walk's own per-op work (the f64 snapshot of every operand, the distribute, the store), which is why
-the parallelisation ticket exists and why the card sat at 3–5 % busy throughout.
+Measured with the IQR decode live (the stored path is the default, `R97_STORED_WEIGHTS` retired) and
+the plugin-private planes read from the tape's own pointers: `/tmp/r97-512-window.log`, JSON
+`/tmp/r97-dstep-device_step_tape-WE1RtA/device_step_tape.json`. The backward is **581.7 s** against
+the 1176.9 s the same case took when every stored operand was refused and the walk fell back to the
+f64 rows, because the 288 `gemm_nt_q` records no longer pull 1.4 GB of weight each. The walk's split:
+`lora_expand` 6.2 s, `lora_shrink` 5.7 s, `gdn_chunk_scan` 5.5 s, `gemm_nt_q` 4.9 s,
+`had_quant_act_i8g` 1.8 s; the pull's: `gemm_nt_q` 1.9 s, `lora_expand` 1.4 s.
 
-The NaN is born in the **forward**, not the walk: `forward_all_finite` is false, the first
-non-finite operand is `h` (position 1459, value index 62), and the walk's first bad cotangent is
-`rmsnorm`'s `x` at 1458 — the reader, not the producer. `b_all_nonzero` false is a second,
-independent and far larger gap: `a_changed = b_changed = 1` of 400 and `n_zero_a = n_zero_b = 399`
-(`/tmp/r97-dstep-device_step_tape-9Wn7iw/device_step_tape.json`), i.e. 399 of 400 `lora_A` **and**
-399 of 400 `lora_B` leaves come back exactly zero. The one leaf of each factor that does move holds
-the forward's NaN (`NaN != 0` counts as changed; `grad_norm` null, `all_finite` false). The split is
-not at fault — `n_grads = 800`, `names_match`/`shapes_match` true, and `Optimiser::step` validates
-every name and shape in order — and neither is coverage: 288 `lora_shrink` and 288 `lora_expand`
-device calls ran, one pair per declared weight.
+**The mechanism is now measured, and it is not the weight read.** With the decode proven against the
+engine's own `iqr_gemm_case` (`tests/gpu/adjoint_iqr_plane.cpp`, rel L2 0.00214 and 0.00231) and the
+tape's pointers reaching the row, **399 of 400 `lora_A` and 399 of 400 `lora_B` leaves are still
+exactly zero**, and the single leaf of each factor that moves holds the forward's NaN
+(`first_nonzero_a_finite` false). So reading the plugin-private weight was necessary — it is what
+makes `dx` exist at all — and it is not what zeroed 399 leaves. The candidates that remain are on the
+lora rows' own operands: a zero `scale`/`t`/`B` on one of the 288 `lora_shrink`/`lora_expand` records
+(`dB` and `dt` both vanish and take `dA` with them), or the `dc` sizing/in-place passthrough on those
+records. This report should not claim more than that.
 
-The mechanism was a silently-zero operand, and it is now a refusal instead of a silent zero.
-`snapshot()` (`src/join_common.h`) returned zeros of an operand's declared shape whenever the tape
-could not describe its span (`OperandContent::bytes == 0`), and `pull_operands` mirrored that
-fallback by handing the walk a null pointer. That is wrong for any operand whose value matters, so
-it refuses by name, in both joins:
+The NaN is the forward's, and its **producer is now named**:
 
-    snapshot: op 'gemm_nt_q': operand 'blk.63.attn_qg.weight' declares [12288,5120]
-              but the tape carries no bytes for it
+    device_step_tape: non-finite: cotangent op rmsnorm, operand 'x'[0] at position 1458, value 0,
+      from the row | forward not finite: rmsnorm wrote operand 'h'[2] at position 1458, value 62
 
-The operand named there is the one the real tape actually produces: a probe over
-`device_step_tape` (1620 zero-byte operands) found 1172 of dtype `plugin-private` — the quantised
-weight *and its scale*, both contiguous — and 448 `bf16` strided views already described by patch
-0120. `rad_dtype_bytes` is 0 for a plugin-private dtype (`build/radiance/abi/rad_types.h:213-217`),
-so a *contiguous* tensor of that dtype reports `bytes == 0`; `bytes == 0` therefore does not mean
-"not contiguous", it means "the tape cannot state a span". Patch `0123-view-unspannable.patch`
-describes such a tensor through `view_shape`/`view_stride` with `bytes` kept 0, and `snapshot()`
-returns its shape with no values; a readable dtype whose span is lost still refuses.
-
-**Which zero caused the 399/399 is not yet settled**, and this report should not claim it is. Two
-candidates remain, and both are consistent with every field measured: a plugin-private weight read
-as zeros in `gemm_nt_q`, whose zero `dx` cascades up the walk and zeroes every adapter it reaches;
-or a zero `scale`/`t`/`B` on one of the 288 `lora_shrink`/`lora_expand` rows, where `dB` and `dt`
-both vanish and take `dA` with them. Distinguishing them needs one run that prints, per lora record,
-the non-zero count of each operand's snapshot — after the plugin-private operands are described, so
-the run gets that far.
+i.e. the `rmsnorm` record at position 1458 wrote element 62 of its output `h` non-finite — row 0,
+column 62 of the final hidden — and the walk's first bad cotangent is that record's input. `1/33`
+`rmsnorm` ops are non-finite; the per-op counts are `add 3/1`, `gated_had_quant_i8g 2/64`,
+`gdn_conv_prep 4/48`, `gemm_nt 8/48`, `gemm_nt_q 2/288`, `lora_expand 3/288`, `lora_shrink 3/288`,
+`rmsnorm 1/33`, `rmsnorm_had_quant_i8g 5/128`.
 
 An absent operand (no pointer) and an operand the tape does not name (the raw adapter-slot array,
 whose zero is a valid slot index) keep the zeros. `tests/host/lora_shrink_step_order.cpp` and
