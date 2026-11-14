@@ -364,15 +364,21 @@ void cast_host_adjoint(const AdjointCall& call) {
 
 /* ------------------------------------------------------------------ rmsnorm */
 
-/* The rmsnorm family's gain: the first read after x. The plain record is x, w, y; the engine's
- * fused producer is x, residual?, w, q, scale, out?, whose residual is written -- so the first
- * read after x is the gain in both shapes. Reading operand 1 unconditionally made a fused record's
- * residual its gain (a silently wrong intermediate) and, where the tape records the residual as
- * absent, refused the record the adjoint needed served. */
-const AdValue* norm_gain(const OpRecord& rec, const std::vector<AdValue>& op) {
+/* The rmsnorm family's gain: the one non-written operand after x whose shape is a single row of
+ * `n` columns. The plain record is x, w{n}, y; the engine's fused producer is
+ * x, residual?:inout, w{n}, q{rows,n}, scale{rows,n/128}, out?. Picking by shape is what makes
+ * both work: operand 1 is the residual on the fused shape (written -- a silently wrong gain if
+ * used), and a merely positional rule falls through to q or scale whenever the gain's values are
+ * missing, which is a wrong gain (or a non-finite gradient) instead of a refusal. A gain the tape
+ * gave no values for is absent: the schema's `wadd` says whether the record needs one at all, so a
+ * plain norm still computes and a record that needs a gain refuses by name. */
+const AdValue* norm_gain(const OpRecord& rec, const std::vector<AdValue>& op, int64_t n) {
     const size_t count = std::min(op.size(), rec.operands.size());
     for (size_t j = 1; j < count; ++j) {
         if (rec.operands[j].written) continue;
+        const std::vector<int64_t>& shape = op[j].shape;
+        if (shape.size() != 1 || shape[0] != n) continue;
+        if (op[j].value.empty()) return nullptr;  // named, but the tape could not give it
         return &op[j];
     }
     return nullptr;
@@ -386,8 +392,8 @@ const AdValue* norm_gain(const OpRecord& rec, const std::vector<AdValue>& op) {
 void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector<AdValue>* out) {
     if (op.empty()) return;
     const AdValue& x = op[0];
-    const AdValue* w = norm_gain(rec, op);
     const int64_t n = width_of(rec, x.shape);
+    const AdValue* w = norm_gain(rec, op, n);
     const int64_t rows = rows_of(x, n);
     if (rows <= 0) return;
     if (w && (int64_t)w->value.size() < n) return;
@@ -423,16 +429,26 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
 void rmsnorm_host_adjoint(const AdjointCall& call) {
     if (call.cot.empty() || call.fwd.empty() || call.dc->empty()) return;
     const AdValue& x = call.fwd[0];
-    const AdValue* w = norm_gain(call.rec, call.fwd);
     const AdValue& dy = call.cot[0];
     const int64_t n = width_of(call.rec, x.shape);
+    const AdValue* w = norm_gain(call.rec, call.fwd, n);
     const int64_t rows = rows_of(x, n);
     if (rows <= 0) return;
-    if (w && (int64_t)w->value.size() < n) return;
+    // A gain the record names but the tape could not give values for cannot be served: the row
+    // would leave the input's cotangent untouched (a silent zero where the analytic answer is not
+    // zero). Refusing names it instead, as every other unservable operand on this path does.
+    if (w && (int64_t)w->value.size() < n)
+        throw std::runtime_error("r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +
+                                 std::to_string(call.rec.position) + ": the gain names " +
+                                 std::to_string(n) + " columns and the tape gave " +
+                                 std::to_string(w->value.size()));
     const double eps = param_num(call.rec, "eps", 1e-6);
     const double wadd = param_num(call.rec, "wadd", 0.0);
     const double mult = param_num(call.rec, "mult", 1.0);
-    if (!w && wadd != 0.0) return;
+    if (!w && wadd != 0.0)
+        throw std::runtime_error("r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +
+                                 std::to_string(call.rec.position) +
+                                 ": the record adds a gain offset and the tape names no gain");
 
     AdValue& dx = call.dc->at(0);
     std::vector<char> readable((size_t)rows, 0);
