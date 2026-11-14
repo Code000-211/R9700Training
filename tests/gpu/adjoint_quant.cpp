@@ -340,11 +340,17 @@ void fused_tape_shapes() {
                     rec.op.c_str(), (long long)rec.operands.size(), (int)sp.phantom, sum);
 
         // A count the row does not serve refuses by name instead of returning a zero gradient.
+        // Two extras, not one: one more write than the schema's shape is the fused producer's own
+        // layout (codes, scale, output), so only a count past every served layout is a wrong one.
         OpRecord wrong = rec;
         wrong.operands.push_back(Operand{"extra", "bf16", {rows, n}, 0, rows, true});
+        wrong.operands.push_back(Operand{"extra2", "bf16", {rows, n}, 0, rows, true});
         std::vector<AdValue> wfwd = fwd, wcot = cot, wdc = dc;
         wfwd.emplace_back();
+        wfwd.emplace_back();
         wcot.emplace_back();
+        wcot.emplace_back();
+        wdc.emplace_back();
         wdc.emplace_back();
         AdjointCall wcall{wrong, wfwd, wcot, &wdc, nullptr, ""};
         std::string what;

@@ -401,17 +401,13 @@ void quant_adjoint(const AdjointCall& call, Part part) {
     // shorter than that would be read out of bounds once the writes' roles are used.
     if (call.fwd.size() != (size_t)operands || (int64_t)call.dc->size() < operands) return;
 
-    const double n_d = param_num(call.rec, "n", 0.0);
-    const double group_d = param_num(call.rec, "group", 0.0);
-    if (n_d <= 0.0 || group_d <= 0.0 || group_d > 1024.0) return;
-    const int64_t n = (int64_t)n_d, group = (int64_t)group_d;
-    if ((group & (group - 1)) != 0 || n % group != 0) return;
-    const int64_t ngrp = n / group;
-
-    // The written operands' roles, by dtype and shape, never by position. `out` is the elementwise
-    // output the live tape's fused producers write beside the codes -- a real consumer of the same
-    // gradient -- and `phantom` is the write `rmsnorm_had_quant_i8g`'s record carries with neither a
-    // dtype nor a shape.
+    // The row width, the group count and the group size come from the operands, never from the
+    // record's `n`/`group` params: the live `gate_had_quant_i8g` record declares n=256 group=128
+    // while its codes are 6144 wide with a 48-group scale (group 128). The codes' own shape and the
+    // scale's own shape are the truth; the params are only a cross-check.
+    //
+    // The written operands' roles, by dtype and shape, never by position. `phantom` is the write a
+    // fused record carries with neither a dtype nor a shape.
     int64_t codes_at = -1, scale_at = -1, writes = 0, phantom = 0;
     for (int64_t j = 0; j < operands; ++j) {
         const Operand& o = call.rec.operands[(size_t)j];
@@ -422,24 +418,57 @@ void quant_adjoint(const AdjointCall& call, Part part) {
             continue;
         }
         if (o.dtype == "i8" || o.dtype == "fp8_e4m3" || o.dtype == "fp8_e5m2") {
-            if (codes_at < 0) codes_at = j;
-            continue;
-        }
-        if ((int64_t)o.shape.size() == 2 && o.shape[1] == ngrp) {
-            if (scale_at < 0) scale_at = j;
-            continue;
+            if (codes_at < 0 && (int64_t)o.shape.size() == 2) codes_at = j;
         }
     }
+    if (codes_at < 0)
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "': the " +
+                                 part_name(part) + " record's " + std::to_string(writes) +
+                                 " writes carry no codes (i8/fp8) operand");
+    const int64_t rows = call.rec.operands[(size_t)codes_at].shape[0];
+    const int64_t codes_n = call.rec.operands[(size_t)codes_at].shape[1];
+    // The elementwise output's width is the row width `n`. The gated producer's codes span gate_up,
+    // both halves, while its output is one half -- so the output's own shape decides, and the two
+    // shapes the tape really carries are both served: codes == n (schema's gated record) and
+    // codes == 2n (the live one).
+    int64_t n = codes_n;
+    for (int64_t j = 0; j < operands; ++j) {
+        const Operand& o = call.rec.operands[(size_t)j];
+        if (!o.written || j == codes_at) continue;
+        if ((int64_t)o.shape.size() != 2 || o.shape[0] != rows) continue;
+        if (o.shape[1] == codes_n || 2 * o.shape[1] == codes_n) {
+            n = o.shape[1];
+            break;
+        }
+    }
+    if (n <= 0 || codes_n % n != 0) return;
+    // The group scale is the one f32 write of `[rows, k]` whose k divides the codes' width.
+    for (int64_t j = 0; j < operands; ++j) {
+        const Operand& o = call.rec.operands[(size_t)j];
+        if (!o.written || j == codes_at) continue;
+        if (o.dtype != "f32" && o.dtype != "f16" && o.dtype != "bf16") continue;
+        if ((int64_t)o.shape.size() != 2 || o.shape[0] != rows || o.shape[1] <= 0) continue;
+        // A scale is narrower than the row: without this, the in-place elementwise output (the same
+        // width as the codes) matched first and the real `h.s8` was left looking like an output.
+        if (o.shape[1] >= codes_n || codes_n % o.shape[1] != 0) continue;
+        if (scale_at < 0) scale_at = j;
+    }
+    const int64_t ngrp = scale_at < 0 ? 0 : call.rec.operands[(size_t)scale_at].shape[1];
+    const int64_t group = ngrp > 0 ? codes_n / ngrp : 0;
+    if (group <= 0 || group > 1024 || (group & (group - 1)) != 0)
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "': the " +
+                                 part_name(part) + " record's codes are " +
+                                 std::to_string(codes_n) + " wide with a " +
+                                 std::to_string(ngrp) + "-group scale, which is not a group size");
     // The layouts this row serves, named per part and enumerated -- never a relaxed count, which
     // would let the row index operands on a layout it never verified. The schema's elementwise part
     // plus quantiser is two writes; the live tape's fused producers write the elementwise output
     // beside the codes as well (three), and `rmsnorm_had_quant_i8g` writes the normed value twice --
     // in place over its input and again as `h` (four). Anything else refuses by name, with the
     // writes listed, instead of returning a zero gradient.
-    const int64_t served = part == Part::quant ? 2 : 3;
-    const bool layout = writes == 2 || writes == served ||
-                        (part != Part::quant && writes == served + 1 && phantom <= 1);
-    if (reads != (int64_t)part_reads(part) || !layout) {
+    // Every write, as `[name dtype dims]`: both refusals below carry it, because a count that does
+    // not match and a role that is not found are the same question -- what did the tape write?
+    const auto writes_list = [&]() {
         std::string list;
         for (int64_t j = 0; j < operands; ++j) {
             const Operand& o = call.rec.operands[(size_t)j];
@@ -449,17 +478,29 @@ void quant_adjoint(const AdjointCall& call, Part part) {
             for (int64_t d : o.shape) list += " " + std::to_string(d);
             list += "]";
         }
+        return list;
+    };
+    const int64_t served = part == Part::quant ? 2 : 3;
+    const bool layout = writes == 2 || writes == served ||
+                        (part != Part::quant && writes == served + 1 && phantom <= 1);
+    if (reads != (int64_t)part_reads(part) || !layout)
         throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "': a " +
                                  part_name(part) + " record with " + std::to_string(operands) +
                                  " operands (" + std::to_string(reads) + " reads, " +
                                  std::to_string(writes) + " writes, " + std::to_string(phantom) +
-                                 " phantom) is not a layout this row serves; its writes:" + list);
-    }
+                                 " phantom) is not a layout this row serves; its writes:" +
+                                 writes_list());
     if (codes_at < 0 || scale_at < 0)
         throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "': the " +
                                  part_name(part) + " record's " + std::to_string(writes) +
                                  " writes carry no " +
-                                 (codes_at < 0 ? "codes (i8/fp8)" : "group scale") + " operand");
+                                 (codes_at < 0 ? "codes (i8/fp8)" : "group scale (n=" +
+                                                                        std::to_string(n) +
+                                                                        " group=" +
+                                                                        std::to_string(group) +
+                                                                        " ngrp=" +
+                                                                        std::to_string(ngrp) + ")") +
+                                 " operand; its writes:" + writes_list());
 
     const AdValue& codes = call.fwd[(size_t)codes_at];
     const AdValue& scale = call.fwd[(size_t)scale_at];
@@ -468,13 +509,11 @@ void quant_adjoint(const AdjointCall& call, Part part) {
         throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
                                  "': the codes' write has no cotangent slot");
     const AdValue& cot = call.cot[(size_t)cot_at];
-    if (codes.shape.size() != 2 || codes.shape[1] != n) return;
-    if (scale.shape.size() != 2 || scale.shape[1] != ngrp) return;
-    const int64_t rows = codes.shape[0];
     const int64_t total = rows * n;
-    if (rows <= 0 || (int64_t)codes.value.size() != total) return;
+    if (rows <= 0 || (int64_t)codes.value.size() != rows * codes_n) return;
     if ((int64_t)scale.value.size() != rows * ngrp) return;
-    if ((int64_t)cot.value.size() != total) return;
+    // The codes' cotangent is the codes' own width (2n for the gated producer's gate_up).
+    if ((int64_t)cot.value.size() != rows * codes_n) return;
 
     // What the backprop reads: the elementwise operands' widths, and the slots it answers for.
     const int64_t arg_count = part == Part::quant ? 0
@@ -483,12 +522,22 @@ void quant_adjoint(const AdjointCall& call, Part part) {
     // The gated producer answers for gate_up's two halves; the gate answers for two operands.
     const int64_t out_slot = part == Part::gated ? 2 * total : total;
     const int64_t out_count = part == Part::gated || part == Part::gate ? 2 * total : total;
+    // The elementwise op's second operand (`rmsnorm`'s weight, `gate`'s input) is the record's
+    // second READ -- never `fwd[1]`, which on the live tape's fused records is the phantom
+    // `none:1` write with no values. That mistake made this row return silently: the schema's
+    // two-write shape hid it and the fused record's guard failed on the phantom.
+    int64_t second_at = -1;
+    for (int64_t k = 1; k < operands && second_at < 0; ++k)
+        if (!call.rec.operands[(size_t)k].written) second_at = k;
+    if ((part == Part::rmsnorm || part == Part::gate) && second_at < 0)
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "': a " +
+                                 part_name(part) + " record with no second read");
     if (part == Part::rmsnorm && (int64_t)call.fwd[0].value.size() != total) return;
-    if (part == Part::rmsnorm && (int64_t)call.fwd[1].value.size() < n) return;
+    if (part == Part::rmsnorm && (int64_t)call.fwd[(size_t)second_at].value.size() < n) return;
     if (part != Part::rmsnorm && (int64_t)call.fwd[0].value.size() !=
                                      (part == Part::gated ? 2 * total : total))
         return;
-    if (part == Part::gate && (int64_t)call.fwd[1].value.size() != total) return;
+    if (part == Part::gate && (int64_t)call.fwd[(size_t)second_at].value.size() != total) return;
     if ((int64_t)call.dc->at(0).value.size() < out_slot) return;
     if (part == Part::gate && (int64_t)call.dc->at(1).value.size() < total) return;
 
@@ -510,10 +559,30 @@ void quant_adjoint(const AdjointCall& call, Part part) {
     RadStream s = adjoint_stream();
     if (!s) return;
 
-    device::ScratchBlock d_rotated(total * (int64_t)sizeof(float));
+    // The rotation covers the codes' whole width -- gate_up's both halves for the gated producer --
+    // so the buffer is sized by the codes, not by the elementwise output's `total`.
+    device::ScratchBlock d_rotated(rows * codes_n * (int64_t)sizeof(float));
     if (!d_rotated) return;
-    if (!mask_and_rotate(codes, scale, cot, rows, n, group, ngrp, y[0].value, s, d_rotated.p))
+    if (!mask_and_rotate(codes, scale, cot, rows, codes_n, group, ngrp, y[0].value, s,
+                         d_rotated.p))
         return;
+
+    // R97_DUMP_QUANT=1: what the row's stages produced, so a zero names its stage instead of the
+    // whole row. `cot` and `y` are the host inputs; `rotated` is read back off the card.
+    if (const char* dq = std::getenv("R97_DUMP_QUANT"); dq != nullptr && dq[0] == '1') {
+        double sc = 0.0, sy = 0.0;
+        for (double v : cot.value) sc += std::fabs(v);
+        for (double v : y[0].value) sy += std::fabs(v);
+        std::vector<float> h_rot((size_t)total);
+        if (rad_memcpy_async(h_rot.data(), d_rotated.p, total * 4, s) == 0 &&
+            rad_stream_sync(s) == 0) {
+            double sr = 0.0;
+            for (float v : h_rot) sr += std::fabs((double)v);
+            std::fprintf(stderr, "QUANT %s cot=%.6g y=%.6g rotated=%.6g\n", call.rec.op.c_str(),
+                         sc, sy, sr);
+            std::fflush(stderr);
+        }
+    }
 
     // The elementwise output's own cotangent, summed in before the back kernel. Every write that is
     // not the codes or the scale is the elementwise output: `total` values join the rotated
@@ -584,7 +653,7 @@ void quant_adjoint(const AdjointCall& call, Part part) {
         for (int64_t i = 0; i < first; ++i)
             h_arg[(size_t)i] = (float)call.fwd[0].value[(size_t)i];
         if (part == Part::rmsnorm || part == Part::gate) {
-            const AdValue& second = call.fwd[1];
+            const AdValue& second = call.fwd[(size_t)second_at];
             const int64_t count = part == Part::rmsnorm ? n : total;
             for (int64_t i = 0; i < count; ++i)
                 h_arg[(size_t)(total + i)] = (float)second.value[(size_t)i];
@@ -623,6 +692,12 @@ void quant_adjoint(const AdjointCall& call, Part part) {
 
     add_back((unsigned short*)d_out.p, out_slot, call.dc->at(0), s);
     if (part == Part::gate) add_back((unsigned short*)d_out.p + total, total, call.dc->at(1), s);
+    if (const char* dq = std::getenv("R97_DUMP_QUANT"); dq != nullptr && dq[0] == '1') {
+        double sd = 0.0;
+        for (double v : call.dc->at(0).value) sd += std::fabs(v);
+        std::fprintf(stderr, "QUANT %s dc0=%.6g\n", call.rec.op.c_str(), sd);
+        std::fflush(stderr);
+    }
 }
 
 void had_device_adjoint(const AdjointCall& call) { quant_adjoint(call, Part::quant); }
