@@ -89,13 +89,30 @@ inline std::map<int64_t, std::vector<int64_t>> derive_read_sets(
             if (writes) break;  // the value this record wrote is replaced here
             if (!reads) continue;
             saw_consumer = true;
-            // The one consumer this rule proves: gather_rows, whose second operand is its index
-            // list. Any other op could read any row, so the set is not proven.
-            if (c.op != "gather_rows" || c.operands.size() < 2 || c.operands[1].written) {
+            // The one consumer this rule proves: gather_rows. Its index list is found by ROLE --
+            // the one non-written operand that is not the value being gathered -- never by
+            // position: a record that orders its operands differently would have its output's
+            // slot read as an index list, and the record refused (or, worse, a written operand
+            // read as indices). Two candidates is not a shape this rule knows: unproven.
+            if (c.op != "gather_rows") {
                 proven = false;
                 break;
             }
-            const AdValue* idx = snaps.at(c.position, 1);
+            int64_t idx_at = -1;
+            for (size_t j = 0; j < c.operands.size(); ++j) {
+                const Operand& o = c.operands[j];
+                if (o.written || o.buffer == written->buffer) continue;
+                if (idx_at >= 0) {
+                    idx_at = -2;
+                    break;
+                }
+                idx_at = static_cast<int64_t>(j);
+            }
+            if (idx_at < 0) {
+                proven = false;
+                break;
+            }
+            const AdValue* idx = snaps.at(c.position, static_cast<size_t>(idx_at));
             if (idx == nullptr || idx->value.empty()) {
                 proven = false;
                 break;

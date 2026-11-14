@@ -162,6 +162,35 @@ R97_TEST(read_set_head_externals_are_the_logits_not_the_hidden_state) {
     R97_CHECK(r97::head_external_reads(head[0]).empty());
 }
 
+// The gather's index list is found by role, not by position: a record that orders its operands
+// differently must prove the same set, and a record with two candidate index operands is not a
+// shape this rule knows.
+R97_TEST(read_set_the_gather_index_is_found_by_role) {
+    const std::vector<OpRecord> index_third{
+        op("rmsnorm", {read("x", kRow), read("w", {2}), written("h", kRow)}, 0),
+        op("gather_rows", {read("h", kRow), written("h_out", kOut), read("raw:1", kIdx)}, 1),
+    };
+    r97::StoredSnapshots snaps;
+    snap(&snaps, 1, 2, kIdx, {1.0});  // the index list is the gather's third operand
+    const auto by_role = r97::derive_read_sets(index_third, index_third, snaps, {});
+    const auto norm = by_role.find(0);
+    R97_CHECK(norm != by_role.end());
+    R97_CHECK(norm->second == std::vector<int64_t>{1});
+    // Two non-written operands besides the value: which is the index list is not something the
+    // tape says, so the record is unproven rather than guessed.
+    const std::vector<OpRecord> ambiguous{
+        op("rmsnorm", {read("x", kRow), read("w", {2}), written("h", kRow)}, 0),
+        op("gather_rows", {read("h", kRow), read("raw:1", kIdx), read("raw:2", kIdx),
+                           written("h_out", kOut)},
+           1),
+    };
+    r97::StoredSnapshots both;
+    snap(&both, 1, 1, kIdx, {1.0});
+    snap(&both, 1, 2, kIdx, {0.0});
+    const auto ambiguous_reads = r97::derive_read_sets(ambiguous, ambiguous, both, {});
+    R97_CHECK(ambiguous_reads.find(0) == ambiguous_reads.end());
+}
+
 // The gather's index list is not in the walk's snapshots: unproven rather than guessed.
 R97_TEST(read_set_a_missing_index_list_is_unproven) {
     const std::vector<OpRecord> all{
