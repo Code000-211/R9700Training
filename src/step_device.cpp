@@ -726,10 +726,15 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         // The rows a consumer reads, from the whole tape (src/read_set.h's derive_read_sets):
         // a record whose every written output is read by a gather_rows and nothing else takes the
         // gather's index list as its read set, and every other record is left unproven and keeps
-        // the loud refusal. The head's seed buffer is read outside the tape, so the record that
-        // writes it is never proven.
+        // the loud refusal. The buffer read outside this walk is the LOGITS -- the objective's --
+        // and marking it is what leaves the head's own writer unproven, as the host path does with
+        // its seeds' buffers. The hidden state is not external: its value is read by the walk's own
+        // logits gemm, through the gather. Marking it external instead made the head's norm
+        // unprovable, so the 512 step zeroed and refused nothing and a forward inf in a row the
+        // gather never reads flowed into every gradient (all_finite false, layer 0's
+        // in_proj_qkv.lora_A/B non-finite).
         const std::map<int64_t, std::vector<int64_t>> head_reads =
-            derive_read_sets(head_walk, ops, shared, {hid_op.buffer});
+            derive_read_sets(head_walk, ops, shared, {logits_op.buffer});
 
         BackwardOptions bo;
         bo.side = options.host_walk ? Side::host : Side::device;
