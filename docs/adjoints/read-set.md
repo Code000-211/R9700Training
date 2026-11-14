@@ -22,13 +22,19 @@ consumer reads, or null. `row_readable(call, row)` is the only question a row as
 | `read_rows` | meaning | a non-finite row |
 |---|---|---|
 | `nullptr` | unknown | **refuses** |
-| empty vector | proven: no consumer reads any row | zeroed |
+| empty vector | **unknown**: an empty proof is vacuous, not death | **refuses** |
 | non-empty, row absent | proven: nothing reads this row | zeroed |
 | non-empty, row present | proven: a consumer reads this row | **refuses** |
 
 **Unknown is never unreadable.** A row set the caller cannot prove is null, and null keeps the
 refusal. That direction is the whole safety argument: a bug in the analysis costs a run that stops,
-never a gradient that is wrong.
+never a gradient that is wrong. The same holds at the consumer end, where an empty set is treated as
+unknown (`row_readable`): a derivation that finds no consumer may simply not have been handed the
+reader, so a proof of "nothing reads this value" is never acted on. The derivation therefore refuses
+to emit one (`saw_consumer`), and no row acts on one if it appears. A gather that legitimately
+selects **zero** rows consequently degrades to a loud refusal rather than a silent zero, which is
+the right trade: a zero-row index list is far more likely to be a broken operand than a real
+configuration.
 
 The row counts what it did (`AdjointCall::RowCount`, summed into `OpTiming` and out to the step's
 `row_seconds` JSON as `rows_zeroed_unreadable`, `rows_readable`, `rows_refused_non_finite`). The

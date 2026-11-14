@@ -635,6 +635,19 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             row_acc.rows_zeroed_unreadable += counted.zeroed_unreadable;
             row_acc.rows_readable += counted.readable;
             row_acc.rows_refused_non_finite += counted.refused_non_finite;
+            // A row the rule decided something about, named where it happened. A run that zeroes
+            // rows is a run whose read set proved something, and that must never be silent: the
+            // rule's failure mode is a live row zeroed, which is invisible in the gradient itself.
+            if (counted.zeroed_unreadable > 0 || counted.refused_non_finite > 0)
+                std::fprintf(stderr,
+                             "r97: read set: op '%s' at %lld: %lld of %lld proven rows zeroed, "
+                             "%lld readable, %lld refused (read set %s)\n",
+                             adjoint_rec->op.c_str(), (long long)rec.position,
+                             (long long)counted.zeroed_unreadable,
+                             (long long)(counted.zeroed_unreadable + counted.readable),
+                             (long long)counted.readable,
+                             (long long)counted.refused_non_finite,
+                             read_rows != nullptr ? "proven" : "unknown");
         };
         const Clock::time_point row_begin = Clock::now();
         try {

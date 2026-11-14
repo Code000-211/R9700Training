@@ -110,9 +110,14 @@ struct AdjointCall {
 };
 
 // Whether a row is read by a consumer, from a read set: a null set means the caller could not
-// prove the rows, and every row counts as read. `rows` is sorted (AdjointCall::read_rows).
+// prove the rows, and every row counts as read. So does an EMPTY set: a proof that nothing reads a
+// value is vacuous, not evidence of death -- a derivation that finds no consumer may simply not
+// have been handed the reader -- and acting on one zeroes a live value's whole gradient. The
+// invariant therefore holds at both ends: the derivation never produces an empty proof
+// (src/read_set.h's saw_consumer), and no row acts on one if it appears. `rows` is sorted
+// (AdjointCall::read_rows).
 inline bool row_readable(const std::vector<int64_t>* rows, int64_t row) {
-    if (rows == nullptr) return true;
+    if (rows == nullptr || rows->empty()) return true;  // unproven, not dead
     return std::binary_search(rows->begin(), rows->end(), row);
 }
 inline bool row_readable(const AdjointCall& call, int64_t row) {

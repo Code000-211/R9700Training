@@ -82,11 +82,31 @@ R97_TEST(read_set_from_a_lone_gather) {
     const auto it = reads.find(0);
     R97_CHECK(it != reads.end());
     R97_CHECK(it->second == std::vector<int64_t>{1});
-    // The gather's own output is not read by anything in the tape: with no consumer its rows are
-    // all provably unread, which is the correct empty set.
-    const auto g = reads.find(1);
-    R97_CHECK(g != reads.end());
-    R97_CHECK(g->second.empty());
+    // The gather's own output has no consumer in this tape. That is NOT proof that nothing reads
+    // it -- it is only proof that this tape does not show the reader -- so the record stays
+    // unproven and every row of it counts as readable. An empty set here would be a vacuous proof,
+    // and a vacuous proof zeroes a live value's whole gradient.
+    R97_CHECK(reads.find(1) == reads.end());
+}
+
+// The case the suite was missing: a record whose window contains no consumer at all is unproven,
+// whether the window ended at a rewrite or at the end of the tape. Proven-empty is only reachable
+// through a gather that reads nothing, which the index list is checked for separately.
+R97_TEST(read_set_with_no_consumer_at_all_is_unproven) {
+    const std::vector<OpRecord> ends_at_the_tape{
+        op("rmsnorm", {read("x", kRow), read("w", {2}), written("h", kRow)}, 0),
+    };
+    const std::vector<OpRecord> ends_at_a_rewrite{
+        op("rmsnorm", {read("x", kRow), read("w", {2}), written("h", kRow)}, 0),
+        op("add", {read("h", kRow), read("z", kRow), written("h", kRow)}, 1),
+        op("gather_rows", {read("h", kRow), read("raw:9", kIdx), written("h_out", kOut)}, 2),
+    };
+    r97::StoredSnapshots snaps;
+    snap(&snaps, 2, 1, kIdx, {1.0});
+    for (const auto& all : {ends_at_the_tape, ends_at_a_rewrite}) {
+        const auto reads = r97::derive_read_sets(all, all, snaps, {});
+        R97_CHECK(reads.find(0) == reads.end());
+    }
 }
 
 // A consumer that is not a gather leaves the record unproven: every row counts as readable.
@@ -195,6 +215,54 @@ R97_TEST(read_set_refuses_a_readable_non_finite_row) {
         threw = true;
     }
     R97_CHECK(threw);
+}
+
+// An EMPTY proof on the consumer side is unproven, not dead: every row counts as read, so a
+// non-finite row refuses rather than being silently zeroed. This is the invariant's second end --
+// the derivation must not produce an empty proof, and no row may act on one if it appears.
+R97_TEST(read_set_an_empty_proof_is_unproven) {
+    std::vector<OpRecord> records{
+        op("rmsnorm", {read("x", kRow), read("w", {2}), written("h", kRow)}, 0),
+    };
+    r97::StoredSnapshots snaps;
+    snap(&snaps, 0, 0, kRow, {kInf, 1.0, 3.0, 4.0});
+    snap(&snaps, 0, 1, {2}, {1.0, 1.0});
+    snap(&snaps, 0, 2, kRow, {1.0, 1.0, 1.0, 1.0});
+    r97::BoundaryNames names;
+    names.add("h", 0, 2);
+    const std::vector<Seed> seeds{[] {
+        Seed s;
+        s.buffer = "h";
+        s.row_lo = 0;
+        s.row_hi = 2;
+        s.cotangent = {1.0f, 1.0f, 1.0f, 1.0f};
+        return s;
+    }()};
+
+    std::map<int64_t, std::vector<int64_t>> reads{{0, {}}};  // an empty proof
+    r97::BackwardOptions bo;
+    bo.read_rows = &reads;
+    bool threw = false;
+    try {
+        (void)r97::backward_block(records, snaps, names, seeds, {}, bo);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    R97_CHECK(threw);  // row 0 counts as read, so it refuses rather than zeroing
+}
+
+// A gather that selects no rows is not a proof that nothing is read: a zero-row index list is far
+// more likely to be a broken index operand than a real configuration, so the record stays
+// unproven and a non-finite row refuses loudly.
+R97_TEST(read_set_a_zero_row_gather_is_unproven) {
+    const std::vector<OpRecord> all{
+        op("rmsnorm", {read("x", kRow), read("w", {2}), written("h", kRow)}, 0),
+        op("gather_rows", {read("h", kRow), read("raw:1", {0}), written("h_out", {0, 2})}, 1),
+    };
+    r97::StoredSnapshots snaps;
+    snap(&snaps, 1, 1, {0}, {});
+    const auto reads = r97::derive_read_sets(all, all, snaps, {});
+    R97_CHECK(reads.find(0) == reads.end());
 }
 
 }  // namespace

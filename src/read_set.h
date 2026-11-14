@@ -71,6 +71,11 @@ inline std::map<int64_t, std::vector<int64_t>> derive_read_sets(
         if (rows <= 0 || external_reads.count(written->buffer) != 0) continue;
         std::vector<int64_t> read;
         bool proven = true;
+        // A window with no consumer in it is not proof of anything: it means the tape handed to
+        // this analysis does not show the reader (a consumer outside it, a buffer renamed by a
+        // caller), and an empty set would zero every row of a live value. So a record is proven
+        // only when it has at least one consumer and every consumer is a gather.
+        bool saw_consumer = false;
         for (size_t i = where->second + 1; i < all_ops.size() && proven; ++i) {
             const OpRecord& c = all_ops[i];
             bool reads = false, writes = false;
@@ -83,6 +88,7 @@ inline std::map<int64_t, std::vector<int64_t>> derive_read_sets(
             }
             if (writes) break;  // the value this record wrote is replaced here
             if (!reads) continue;
+            saw_consumer = true;
             // The one consumer this rule proves: gather_rows, whose second operand is its index
             // list. Any other op could read any row, so the set is not proven.
             if (c.op != "gather_rows" || c.operands.size() < 2 || c.operands[1].written) {
@@ -103,7 +109,7 @@ inline std::map<int64_t, std::vector<int64_t>> derive_read_sets(
                 read.push_back(r);
             }
         }
-        if (!proven) continue;
+        if (!proven || !saw_consumer) continue;
         std::sort(read.begin(), read.end());
         read.erase(std::unique(read.begin(), read.end()), read.end());
         out.emplace(rec.position, std::move(read));
