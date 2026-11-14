@@ -911,6 +911,12 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             store_boundary(layer, below);
             incoming = IncomingCotangent{below->buffer, 0, tokens,
                                          first_rows(*below, tokens, meta.hidden)};
+            // `snaps` dies with this iteration, so the base must not outlive it: the share answers
+            // a miss from `base_`, and a stale pointer there is a use-after-free waiting for the
+            // first walk that asks for a key this block did not store. The head's walk clears its
+            // own base the same way.
+            shared.set_base(nullptr);
+            snaps = StoredSnapshots{};
         }
         measured.backward_seconds = seconds_since(backward_begin);
         // The op that produced the first non-finite forward value the step met, when a walked op

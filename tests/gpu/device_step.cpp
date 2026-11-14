@@ -206,9 +206,15 @@ void run_in_child(const std::string& dir, const char* test_name) {
     if (::waitpid(pid, &status, 0) != pid)
         throw std::runtime_error(std::string("device_step: ") + test_name + ": waitpid failed: " +
                                  std::strerror(errno));
-    if (!WIFEXITED(status))
-        throw std::runtime_error(std::string("device_step: ") + test_name +
-                                 "'s child was killed by a signal; the card may be held by another run");
+    if (!WIFEXITED(status)) {
+        // The signal, by name and number: "killed by a signal" alone cannot tell an OOM kill
+        // (SIGKILL) from a fault (SIGSEGV/SIGABRT) or a hang triaged by a supervisor (SIGTERM).
+        const int sig = WTERMSIG(status);
+        const char* name = ::strsignal(sig);
+        throw std::runtime_error(std::string("device_step: ") + test_name + "'s child was killed by "
+                                 "signal " + std::to_string(sig) + " (" +
+                                 (name ? name : "unknown") + "); the card may be held by another run");
+    }
     const int code = WEXITSTATUS(status);
     if (code != 0) {
         // 77 (the container absent) re-skips the way ctest records it; anything else is a failure.
