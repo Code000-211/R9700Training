@@ -734,7 +734,34 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         // gather never reads flowed into every gradient (all_finite false, layer 0's
         // in_proj_qkv.lora_A/B non-finite).
         const std::map<int64_t, std::vector<int64_t>> head_reads =
-            derive_read_sets(head_walk, ops, shared, {logits_op.buffer});
+            derive_read_sets(head_walk, ops, shared, head_external_reads(logits_rec));
+        // The head walk is where the read set has to earn its keep on the real container (a
+        // 512-token step reads one of the final norm's rows), so its decision is printed: which
+        // records were proven and how many rows each names. Without it a run that zeroes nothing
+        // looks the same whether the rule was never asked or never answered.
+        {
+            std::string line = "r97: head read set: " + std::to_string(head_reads.size()) + " of " +
+                               std::to_string(head_walk.size()) + " records proven";
+            for (const OpRecord& rec : head_walk) {
+                const auto it = head_reads.find(rec.position);
+                line += " [" + rec.op + "@" + std::to_string(rec.position) + " ";
+                if (it == head_reads.end()) {
+                    line += "unproven]";
+                    continue;
+                }
+                line += std::to_string(it->second.size()) + " rows";
+                if (it->second.size() <= 4) {
+                    line += " (";
+                    for (size_t k = 0; k < it->second.size(); ++k) {
+                        if (k != 0) line += ",";
+                        line += std::to_string(it->second[k]);
+                    }
+                    line += ")";
+                }
+                line += "]";
+            }
+            std::fprintf(stderr, "%s\n", line.c_str());
+        }
 
         BackwardOptions bo;
         bo.side = options.host_walk ? Side::host : Side::device;

@@ -132,6 +132,36 @@ R97_TEST(read_set_an_external_read_is_never_proven) {
     R97_CHECK(reads.find(1) == reads.end());
 }
 
+// A head walk's externals are the objective's buffer (the logits), never the walk's own input. This
+// is the bug the 512 step found: the device path marked the hidden state -- the final norm's
+// output -- so the record that writes it could never be proven and the read set never fired (0
+// zeroed, 0 readable, 0 refused over 1459 calls), while a forward inf in a row the gather never
+// reads reached every gradient. The two paths disagreeing is how it survived, so the marking is one
+// function and this pins it.
+R97_TEST(read_set_head_externals_are_the_logits_not_the_hidden_state) {
+    const std::vector<OpRecord> head{
+        op("rmsnorm", {read("x", kRow), read("w", {2}), written("h", kRow)}, 0),
+        op("gather_rows", {read("h", kRow), read("raw:1", kIdx), written("h_out", kOut)}, 1),
+        op("logits_gemm_vocab", {read("h_out", kOut), read("W", {3, 2}), written("logits", {1, 3})},
+           2),
+    };
+    r97::StoredSnapshots snaps;
+    snap(&snaps, 1, 1, kIdx, {1.0});  // the gather selects row 1 of 2
+    const std::set<std::string> external = r97::head_external_reads(head[2]);
+    R97_CHECK(external == std::set<std::string>{"logits"});
+    // With the objective's buffer marked, the norm's writer is proven and row 0 is dead.
+    const auto proven = r97::derive_read_sets(head, head, snaps, external);
+    const auto norm = proven.find(0);
+    R97_CHECK(norm != proven.end());
+    R97_CHECK(norm->second == std::vector<int64_t>{1});
+    // With the walk's input marked instead -- the bug -- nothing is proven and every row counts as
+    // readable, so a non-finite row 0 refuses instead of being zeroed.
+    const auto degraded = r97::derive_read_sets(head, head, snaps, {"h"});
+    R97_CHECK(degraded.find(0) == degraded.end());
+    // A walk that wrote no logits marks nothing: unproven, the fail-safe direction.
+    R97_CHECK(r97::head_external_reads(head[0]).empty());
+}
+
 // The gather's index list is not in the walk's snapshots: unproven rather than guessed.
 R97_TEST(read_set_a_missing_index_list_is_unproven) {
     const std::vector<OpRecord> all{

@@ -117,4 +117,21 @@ inline std::map<int64_t, std::vector<int64_t>> derive_read_sets(
     return out;
 }
 
+// The buffers a head walk is NOT allowed to prove: the logits, which the objective reads outside
+// the walk. Both step paths must mark the same semantic buffer, and they did not: the device path
+// marked the walk's *input* (the final norm's output) instead, so the record that writes the hidden
+// state could never be proven, the rule degraded to everything-readable, and on the 512 step it
+// zeroed and refused nothing over 1459 calls while a forward inf in a row no consumer reads
+// (gather_rows selects row 511 of 512) reached every gradient. A walk's input is read by the walk's
+// own records, so it is never external; the objective's buffer always is.
+//
+// Empty when the walk wrote no `logits`: nothing is marked, which leaves every record unproven and
+// keeps the loud refusal -- the fail-safe direction.
+inline std::set<std::string> head_external_reads(const OpRecord& logits_rec) {
+    std::set<std::string> out;
+    for (const Operand& o : logits_rec.operands)
+        if (o.written && o.buffer == "logits") out.insert(o.buffer);
+    return out;
+}
+
 }  // namespace r97

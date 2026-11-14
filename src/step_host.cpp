@@ -165,9 +165,13 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
 
         BoundaryNames names = BoundaryNames::from(driver.last());
         int64_t head_logits_rows = 0;
+        const OpRecord* head_logits_rec = nullptr;
         for (const OpRecord& rec : head_records)
             for (const Operand& o : rec.operands)
-                if (o.written && o.buffer == "logits") head_logits_rows = o.rows;
+                if (o.written && o.buffer == "logits") {
+                    head_logits_rows = o.rows;
+                    head_logits_rec = &rec;
+                }
         if (head_logits_rows <= 0)
             throw std::runtime_error("host step: the head wrote no logits rows");
         // The objective's window is L-1 rows a sequence; the head's buffer is all L after the
@@ -176,10 +180,12 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
         const std::vector<Seed> seeds = head_seeds(driver.last(), batch, head_records, tokens);
         // The rows a consumer reads (src/read_set.h's derive_read_sets): a record whose every
         // written output is read by a gather_rows and nothing else takes the gather's index list as
-        // its read set, and every other record is left unproven and keeps the loud refusal. A
-        // buffer a seed reads is read outside the tape, so the record that writes it is never
-        // proven.
-        std::set<std::string> head_external;
+        // its read set, and every other record is left unproven and keeps the loud refusal. The
+        // buffers read outside the walk are the objective's -- the logits -- and `head_external_reads`
+        // is the one place that says so, shared with the device step: the two paths marking
+        // different buffers is exactly how the device step came to mark its own input and never
+        // prove the head's norm.
+        std::set<std::string> head_external = head_external_reads(*head_logits_rec);
         for (const Seed& s : seeds) head_external.insert(s.buffer);
         const std::map<int64_t, std::vector<int64_t>> head_reads =
             derive_read_sets(head_records, ops, head_snaps, head_external);
