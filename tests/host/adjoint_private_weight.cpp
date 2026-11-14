@@ -18,6 +18,7 @@
 // integer codes and power-of-two scales, so only the summation order differs.
 // Label: host.
 #include "r97/adjoint.h"
+#include "r97/backward.h"
 #include "r97/op.h"
 #include "support/test.h"
 
@@ -225,4 +226,55 @@ R97_TEST(adjoint_private_weight_stored_layout_matches_the_f64_row) {
                 "%.3g\n",
                 rel, worst);
     R97_CHECK(rel < rel_tol);
+}
+
+// The gate: with R97_STORED_WEIGHTS unset the stored decode is off, so a plugin-private operand
+// carries neither values nor a pointer and the walk refuses it by name -- the behaviour before the
+// pointer was threaded, and what keeps a layout this row does not know from being read. One operand
+// is unspannable (`b`) and its scale is readable, so the refusal names `b` deterministically even
+// though the guard's units run in parallel.
+R97_TEST(adjoint_private_weight_refused_without_the_gate) {
+    const int64_t M = 2, N = 32, K = 256;
+    const int64_t group = 128, G = K / group;
+    OpRecord rec;
+    rec.op = "gemm_nt_q";
+    rec.params = {{"M", M}, {"N", N}, {"K", K}, {"group", group}, {"dtype", "i8a8h"}};
+    rec.operands = {
+        {"a", "i8", {M, K}, 0, M, false},
+        {"a_scale", "f32", {M, G}, 0, M, false},
+        {"b", "i8", {N, K}, 0, N, false},
+        {"b_scale", "bf16", {N, G}, 0, N, false},
+        {"y", "f32", {M, N}, 0, M, true},
+    };
+    StoredSnapshots snaps;
+    for (std::size_t i = 0; i < rec.operands.size(); ++i) {
+        AdValue v;
+        v.dtype = rec.operands[i].dtype;
+        v.shape = rec.operands[i].shape;
+        v.value.assign(static_cast<std::size_t>(numel(v.shape)), 0.0);
+        // What snapshot() returns with the gate unset: the shape, no values, no pointer.
+        if (rec.operands[i].buffer == "b") v.value.clear();
+        snaps.set(rec.position, i, std::move(v));
+    }
+    BoundaryNames names;
+    names.add("y", 0, M);
+    std::vector<Seed> seeds;
+    seeds.emplace_back();
+    seeds.back().buffer = "y";
+    seeds.back().row_lo = 0;
+    seeds.back().row_hi = M;
+    seeds.back().cotangent.assign(static_cast<std::size_t>(M * N), 0.5f);
+    BackwardOptions bo;
+    bo.side = Side::host;
+
+    std::string what;
+    try {
+        backward_block({rec}, snaps, names, seeds, {}, bo);
+    } catch (const std::exception& e) {
+        what = e.what();
+    }
+    std::printf("adjoint_private_weight: gate off refuses: %s\n", what.c_str());
+    R97_CHECK(!what.empty());
+    R97_CHECK(what.find("operand 'b'") != std::string::npos);
+    R97_CHECK(what.find("0 values") != std::string::npos);
 }

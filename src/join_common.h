@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <stdexcept>
@@ -157,15 +159,39 @@ inline AdValue snapshot(const Operand& op, const OperandContent& content,
     // The family adjoints read the record's dtype off the value too (an absent scale is spelled
     // "invalid"), so keep it with the numbers.
     v.dtype = op.dtype;
+    // R97_DUMP_SNAP=1 prints a plugin-private operand's whole description -- the dtype string, the
+    // tape's byte count and pointer, and the view -- for the first few gemm_nt_q records. It is how
+    // the trunk weight's stored layout is identified; see docs/adjoints/linear.md.
+    if (const char* d = std::getenv("R97_DUMP_SNAP"); d != nullptr && d[0] == '1') {
+        static long n = 0;
+        if (op_name != nullptr && std::string(op_name) == "gemm_nt_q" && n < 4) {
+            ++n;
+            std::string sh, vs, vst;
+            for (int64_t x : op.shape) sh += std::to_string(x) + " ";
+            for (int64_t x : op.view_shape) vs += std::to_string(x) + " ";
+            for (int64_t x : op.view_stride) vst += std::to_string(x) + " ";
+            std::fprintf(stderr,
+                         "DUMPSNAP op=%s buffer=%s dtype=%s shape=[%s] bytes=%zu named=%d data=%p "
+                         "view_shape=[%s] view_stride=[%s] view_off=%lld\n",
+                         op_name, op.buffer.c_str(), op.dtype.c_str(), sh.c_str(), content.bytes,
+                         static_cast<int>(content.named), content.data, vs.c_str(), vst.c_str(),
+                         static_cast<long long>(op.view_off));
+            std::fflush(stderr);
+        }
+    }
     // A dtype with no f64 form -- a plugin-private quantised tensor the engine decodes in its own
-    // stored layout (the w8a8_fwht128 trunk hands the tape its weight and scale as "w8a8...") --
-    // has no value a snapshot could hold, and the tape's byte count cannot name one: the refusal
-    // below is for a *readable* operand whose span was lost, not for this. Return the shape, no
-    // values, and the pointer the tape recorded, so a device row that knows the plugin's layout
-    // reads the bytes where they live. The tape gave no span, so the row owns the decode.
+    // stored layout -- has no value a snapshot could hold, and the tape's byte count cannot name
+    // one: the refusal below is for a *readable* operand whose span was lost, not for this. Return
+    // the shape, no values, and (behind the gate) the pointer the tape recorded.
+    //
+    // The stored decode is opt-in while the trunk's weight encoding is still being identified: the
+    // container's plane is not the int8 pair's N*K bytes, so reading it with the int8 index faults
+    // rather than returning a wrong number. With R97_STORED_WEIGHTS unset the operand has neither
+    // values nor a pointer, and the walk refuses it by name exactly as it did before.
     if (content.bytes == 0 && content.named && elem_size(op.dtype) == 0) {
         v.shape = op.view_shape.empty() ? op.shape : op.view_shape;
-        v.raw = content.data;
+        if (const char* on = std::getenv("R97_STORED_WEIGHTS"); on != nullptr && on[0] == '1')
+            v.raw = content.data;
         return v;
     }
     // A strided or narrowed read -- the q norm and the gate read the two halves of the q|gate
