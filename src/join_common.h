@@ -161,22 +161,40 @@ inline AdValue snapshot(const Operand& op, const OperandContent& content,
     // "invalid"), so keep it with the numbers.
     v.dtype = op.dtype;
     // R97_DUMP_SNAP=1 prints a plugin-private operand's whole description -- the dtype string, the
-    // tape's byte count and pointer, and the view -- for the first few gemm_nt_q records. It is how
-    // the trunk weight's stored layout is identified; see docs/adjoints/linear.md.
+    // tape's byte count and pointer, and the view -- for the first few records of the ops whose
+    // stored operands decide a gradient: gemm_nt_q's weight and scale, and every lora row's
+    // (a lora operand the tape does not name keeps zeros, and that is a silent zero). It is how the
+    // trunk weight's stored layout was identified and how a zero operand is told from a wrong span;
+    // see docs/adjoints/linear.md. The non-zero count is over the span the tape gave, so a named
+    // operand that is all zeros shows as nz=0 of n rather than as an absent line.
     if (const char* d = std::getenv("R97_DUMP_SNAP"); d != nullptr && d[0] == '1') {
-        static long n = 0;
-        if (op_name != nullptr && std::string(op_name) == "gemm_nt_q" && n < 4) {
+        static long n_gemm = 0, n_lora = 0;
+        const std::string name = op_name != nullptr ? op_name : "";
+        const bool lora = name == "lora_expand" || name == "lora_shrink";
+        long& n = lora ? n_lora : n_gemm;
+        if ((name == "gemm_nt_q" || lora) && n < (lora ? 40 : 4)) {
             ++n;
             std::string sh, vs, vst;
             for (int64_t x : op.shape) sh += std::to_string(x) + " ";
             for (int64_t x : op.view_shape) vs += std::to_string(x) + " ";
             for (int64_t x : op.view_stride) vst += std::to_string(x) + " ";
+            long nz = -1;
+            long long span = 0;
+            const int64_t es = elem_size(op.dtype);
+            if (content.data != nullptr && es > 0 && content.bytes > 0) {
+                nz = 0;
+                span = static_cast<long long>(content.bytes) / es;
+                for (long long i = 0; i < span; ++i)
+                    if (read_elem(op.dtype,
+                                  static_cast<const uint8_t*>(content.data) + i * es, 0) != 0.0)
+                        ++nz;
+            }
             std::fprintf(stderr,
                          "DUMPSNAP op=%s buffer=%s dtype=%s shape=[%s] bytes=%zu named=%d data=%p "
-                         "view_shape=[%s] view_stride=[%s] view_off=%lld\n",
+                         "view_shape=[%s] view_stride=[%s] view_off=%lld nonzero=%ld of %lld\n",
                          op_name, op.buffer.c_str(), op.dtype.c_str(), sh.c_str(), content.bytes,
                          static_cast<int>(content.named), content.data, vs.c_str(), vst.c_str(),
-                         static_cast<long long>(op.view_off));
+                         static_cast<long long>(op.view_off), nz, span);
             // The stored form's inputs (patch 0124): the engine's own planes, so a form the row
             // derives is checkable against what the layout hook saw.
             if (op.enc != nullptr) {
