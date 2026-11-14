@@ -593,6 +593,9 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 acc.calls += t.calls;
                 acc.seconds += t.seconds;
                 acc.non_finite += t.non_finite;
+                acc.rows_zeroed_unreadable += t.rows_zeroed_unreadable;
+                acc.rows_readable += t.rows_readable;
+                acc.rows_refused_non_finite += t.rows_refused_non_finite;
             }
         };
         // The first non-finite cotangent any of the step's walks handed on, and whether the
@@ -720,6 +723,14 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 if (!snapped.frozen[j]) head_snaps.set(rec.position, j, std::move(snapped.now[j]));
         }
 
+        // The rows a consumer reads, from the whole tape (src/read_set.h's derive_read_sets):
+        // a record whose every written output is read by a gather_rows and nothing else takes the
+        // gather's index list as its read set, and every other record is left unproven and keeps
+        // the loud refusal. The head's seed buffer is read outside the tape, so the record that
+        // writes it is never proven.
+        const std::map<int64_t, std::vector<int64_t>> head_reads =
+            derive_read_sets(head_walk, ops, shared, {hid_op.buffer});
+
         BackwardOptions bo;
         bo.side = options.host_walk ? Side::host : Side::device;
         // A device row is an optimisation; where libr97 has none yet, the host row is the same
@@ -763,6 +774,7 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         head_seeds.back().row_lo = 0;
         head_seeds.back().row_hi = head_rows;
         head_seeds.back().cotangent = std::move(d_hout_host);
+        bo.read_rows = &head_reads;
         const BackwardResult head =
             backward_block(head_walk, shared, head_names, head_seeds, {}, bo);
         merge_ops(row_time, head.report.ops);
@@ -881,6 +893,13 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             }
             BoundaryNames block_names;
             block_names.add(incoming.buffer, 0, tokens);
+            // This block's own read sets, from the whole tape: a consumer in a later block is
+            // found in `ops`, and the block's input boundary is read outside the tape. Every block
+            // record's consumer is a GEMM or a norm, so none is proven and every one keeps the
+            // loud refusal -- the map is built anyway so the rule lives in one place.
+            const std::map<int64_t, std::vector<int64_t>> block_reads =
+                derive_read_sets(records, ops, shared, {incoming.buffer});
+            bo.read_rows = &block_reads;
             const BackwardResult walked =
                 backward_block(records, shared, block_names, {}, {incoming}, bo);
             merge_ops(row_time, walked.report.ops);

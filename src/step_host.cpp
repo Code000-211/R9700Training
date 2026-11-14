@@ -174,6 +174,16 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
         // sampler's rows, and the moved seeds live in that space.
         names.add("logits", 0, head_logits_rows);
         const std::vector<Seed> seeds = head_seeds(driver.last(), batch, head_records, tokens);
+        // The rows a consumer reads (src/read_set.h's derive_read_sets): a record whose every
+        // written output is read by a gather_rows and nothing else takes the gather's index list as
+        // its read set, and every other record is left unproven and keeps the loud refusal. A
+        // buffer a seed reads is read outside the tape, so the record that writes it is never
+        // proven.
+        std::set<std::string> head_external;
+        for (const Seed& s : seeds) head_external.insert(s.buffer);
+        const std::map<int64_t, std::vector<int64_t>> head_reads =
+            derive_read_sets(head_records, ops, head_snaps, head_external);
+        bo.read_rows = &head_reads;
         const BackwardResult head = backward_block(head_records, head_snaps, names, seeds, {}, bo);
         // What the join held while the head walked: its whole store, which is held up front, plus
         // the copies of the one op being adjointed. The walk's own figure counts the latter only.
@@ -293,6 +303,12 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
             }
             BoundaryNames block_names;
             block_names.add(incoming.buffer, 0, tokens);
+            // This block's own read sets, from the whole tape (src/join_common.h). Every block
+            // record's consumer is a GEMM or a norm, so none is proven and every one keeps the
+            // loud refusal; the map is built anyway so the rule lives in one place.
+            const std::map<int64_t, std::vector<int64_t>> block_reads =
+                derive_read_sets(records, ops, snaps, {incoming.buffer});
+            bo.read_rows = &block_reads;
             const BackwardResult walked = backward_block(records, snaps, block_names, {},
                                                          {incoming}, bo);
             // The join holds the whole block's snapshots while the walk copies one op out of them,

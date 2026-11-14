@@ -354,11 +354,19 @@ bool mask_and_rotate(const AdValue& codes, const AdValue& scale, const AdValue& 
 }
 
 // The tape's cotangents are f64 and are added to, never overwritten: other ops share them.
-void add_back(unsigned short* d_out, int64_t count, AdValue& into, RadStream s) {
+// `rows_per` and `read_rows`, when given, are the two-way rule (r97/adjoint.h's
+// AdjointCall::read_rows): a row no consumer reads is provably dead, so its values are skipped
+// rather than summed -- a non-finite value there is an artefact of the formula over a row nothing
+// reads, not a gradient.
+void add_back(unsigned short* d_out, int64_t count, AdValue& into, RadStream s, int64_t rows_per = 0,
+              const std::vector<int64_t>* read_rows = nullptr) {
     std::vector<unsigned short> h((size_t)count);
     if (rad_memcpy_async(h.data(), d_out, count * 2, s) != 0) return;
     if (rad_stream_sync(s) != 0) return;
-    for (int64_t i = 0; i < count; ++i) into.value[(size_t)i] += bf16_to_f32(h[(size_t)i]);
+    for (int64_t i = 0; i < count; ++i) {
+        if (rows_per > 0 && !row_readable(read_rows, i / rows_per)) continue;
+        into.value[(size_t)i] += bf16_to_f32(h[(size_t)i]);
+    }
 }
 
 // The elementwise output's own cotangent, summed into the one the codes' path produced: the fused
@@ -556,6 +564,42 @@ void quant_adjoint(const AdjointCall& call, Part part) {
                                  std::to_string(y[0].value.size()) + " values, not " +
                                  std::to_string(total));
 
+    // The two-way rule (r97/adjoint.h's AdjointCall::read_rows): a row a consumer reads is
+    // differentiated, and a non-finite activation in it refuses -- the analytic `0 * inf` over a
+    // live row is a bug, not a gradient. A row no consumer reads is provably dead, so it is left
+    // zero and counted: the zero is the correct cotangent for a value nothing reads. When the
+    // caller could not prove the read set every row is readable, and the refusal is what it was
+    // before the read set existed. The codes' path above is untouched: a record whose codes are
+    // read by a weight has every code read, so this rule only ever fires for a record whose every
+    // write is gathered.
+    int64_t zeroed = 0, admitted = 0, refused = 0;
+    if (part == Part::rmsnorm) {
+        for (int64_t r = 0; r < rows; ++r) {
+            if (!row_readable(call, r)) {
+                ++zeroed;
+                continue;
+            }
+            ++admitted;
+            const int64_t b = r * n;
+            double ss = 0.0;
+            for (int64_t i = 0; i < n && std::isfinite(ss); ++i)
+                ss += call.fwd[0].value[(size_t)(b + i)] * call.fwd[0].value[(size_t)(b + i)];
+            if (!std::isfinite(ss)) ++refused;
+        }
+        if (call.row_count) {
+            call.row_count->zeroed_unreadable += zeroed;
+            call.row_count->readable += admitted;
+            call.row_count->refused_non_finite += refused;
+        }
+        if (refused > 0)
+            throw std::runtime_error(
+                "r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +
+                std::to_string(call.rec.position) + ": " + std::to_string(refused) + " of " +
+                std::to_string(admitted) +
+                " rows a consumer reads have a non-finite activation; refusing rather than zeroing "
+                "a live row's gradient");
+    }
+
     RadStream s = adjoint_stream();
     if (!s) return;
 
@@ -690,7 +734,8 @@ void quant_adjoint(const AdjointCall& call, Part part) {
             break;
     }
 
-    add_back((unsigned short*)d_out.p, out_slot, call.dc->at(0), s);
+    add_back((unsigned short*)d_out.p, out_slot, call.dc->at(0), s,
+             part == Part::rmsnorm ? n : 0, part == Part::rmsnorm ? call.read_rows : nullptr);
     if (part == Part::gate) add_back((unsigned short*)d_out.p + total, total, call.dc->at(1), s);
     if (const char* dq = std::getenv("R97_DUMP_QUANT"); dq != nullptr && dq[0] == '1') {
         double sd = 0.0;

@@ -364,13 +364,29 @@ void cast_host_adjoint(const AdjointCall& call) {
 
 /* ------------------------------------------------------------------ rmsnorm */
 
+/* The rmsnorm family's gain: the first read after x. The plain record is x, w, y; the engine's
+ * fused producer is x, residual?, w, q, scale, out?, whose residual is written -- so the first
+ * read after x is the gain in both shapes. Reading operand 1 unconditionally made a fused record's
+ * residual its gain (a silently wrong intermediate) and, where the tape records the residual as
+ * absent, refused the record the adjoint needed served. */
+const AdValue* norm_gain(const OpRecord& rec, const std::vector<AdValue>& op) {
+    const size_t count = std::min(op.size(), rec.operands.size());
+    for (size_t j = 1; j < count; ++j) {
+        if (rec.operands[j].written) continue;
+        return &op[j];
+    }
+    return nullptr;
+}
+
 /* y[r, i] = x[r, i] * rsqrt(mean(x[r]^2) + eps) * (w[i] + wadd) * mult, the gain formed in f64
  * (the kernel forms it in f32, before the store's rounding). `wadd` without a gain is refused by
- * the kernel and left to nothing here. */
+ * the kernel and left to nothing here. A gain the record names but the tape could not give values
+ * for cannot be served: the twin would compute a different norm, and a wrong intermediate is worse
+ * than a refusal. */
 void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector<AdValue>* out) {
     if (op.empty()) return;
     const AdValue& x = op[0];
-    const AdValue* w = op.size() > 1 && !op[1].value.empty() ? &op[1] : nullptr;
+    const AdValue* w = norm_gain(rec, op);
     const int64_t n = width_of(rec, x.shape);
     const int64_t rows = rows_of(x, n);
     if (rows <= 0) return;
@@ -396,11 +412,18 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
 /* dx_j = mult * (s * c_j * dy_j - (s^3 x_j / n) * sum_i dy_i x_i c_i), c = (w + wadd).
  *
  * The second term is the row's shared rms: every element of the row moves it, so every dy_i
- * weights x_j. */
+ * weights x_j.
+ *
+ * The two-way rule (r97/adjoint.h's AdjointCall::read_rows): a row a consumer reads is
+ * differentiated, and a non-finite value in it refuses -- the analytic `0 * inf` over a live row
+ * is a bug, not a gradient. A row no consumer reads is provably dead, so it is left zero and
+ * counted: the zero is the correct cotangent for a value nothing reads. When the caller could not
+ * prove the read set every row is readable, and the refusal is what it was before the read set
+ * existed. */
 void rmsnorm_host_adjoint(const AdjointCall& call) {
     if (call.cot.empty() || call.fwd.empty() || call.dc->empty()) return;
     const AdValue& x = call.fwd[0];
-    const AdValue* w = call.fwd.size() > 1 && !call.fwd[1].value.empty() ? &call.fwd[1] : nullptr;
+    const AdValue* w = norm_gain(call.rec, call.fwd);
     const AdValue& dy = call.cot[0];
     const int64_t n = width_of(call.rec, x.shape);
     const int64_t rows = rows_of(x, n);
@@ -412,7 +435,35 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
     if (!w && wadd != 0.0) return;
 
     AdValue& dx = call.dc->at(0);
+    std::vector<char> readable((size_t)rows, 0);
+    int64_t zeroed = 0, admitted = 0, refused = 0;
+    for (int64_t r = 0; r < rows; ++r) {
+        if (!row_readable(call, r)) {
+            ++zeroed;
+            continue;
+        }
+        readable[(size_t)r] = 1;
+        ++admitted;
+        const int64_t b = r * n;
+        double ss = 0.0;
+        for (int64_t i = 0; i < n && std::isfinite(ss); ++i)
+            ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
+        if (!std::isfinite(ss)) ++refused;
+    }
+    if (call.row_count) {
+        call.row_count->zeroed_unreadable += zeroed;
+        call.row_count->readable += admitted;
+        call.row_count->refused_non_finite += refused;
+    }
+    if (refused > 0)
+        throw std::runtime_error(
+            "r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +
+            std::to_string(call.rec.position) + ": " + std::to_string(refused) + " of " +
+            std::to_string(admitted) +
+            " rows a consumer reads have a non-finite activation; refusing rather than zeroing a "
+            "live row's gradient");
     parallel_for(rows, kRowChunk, [&](int64_t r) {
+        if (!readable[(size_t)r]) return;
         const int64_t b = r * n;
         double ss = 0.0;
         for (int64_t i = 0; i < n; ++i) ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];

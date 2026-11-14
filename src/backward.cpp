@@ -607,19 +607,43 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             record_prefix = options.record_prefix(rec);
             prefix = record_prefix.c_str();
         }
+        // The rows a consumer of the whole tape reads, when the caller proved them. A record the
+        // caller left out is unproven: the row sees null and treats every row as readable.
+        const std::vector<int64_t>* read_rows = nullptr;
+        if (options.read_rows) {
+            const auto it = options.read_rows->find(rec.position);
+            if (it != options.read_rows->end()) read_rows = &it->second;
+        }
+        AdjointCall::RowCount counted;
         AdjointCall call{*adjoint_rec, fwd, cot, &dc, options.grads, prefix};
         call.fused_slots = options.fused_slots;
+        call.read_rows = read_rows;
+        call.row_count = &counted;
         AdjointCall with_slots = call;
         if (options.slot_prefix)
             with_slots.slot_prefix = [&rec, &options](int64_t slot) {
                 return options.slot_prefix(rec, slot);
             };
+        // The row's share of the report: the call, its wall time and the two-way rule's counts.
+        // A row that refuses accounts what it did before it threw -- a refusal is one of the two
+        // outcomes the report counts, and the throw must not lose it.
+        const auto account = [&](double seconds) {
+            OpTiming& row_acc = row_time[adjoint_rec->op];
+            row_acc.calls += 1;
+            row_acc.host = served == Side::host;
+            row_acc.seconds += seconds;
+            row_acc.rows_zeroed_unreadable += counted.zeroed_unreadable;
+            row_acc.rows_readable += counted.readable;
+            row_acc.rows_refused_non_finite += counted.refused_non_finite;
+        };
         const Clock::time_point row_begin = Clock::now();
-        fn(with_slots);
-        OpTiming& row_acc = row_time[adjoint_rec->op];
-        row_acc.calls += 1;
-        row_acc.host = served == Side::host;
-        row_acc.seconds += std::chrono::duration<double>(Clock::now() - row_begin).count();
+        try {
+            fn(with_slots);
+        } catch (...) {
+            account(std::chrono::duration<double>(Clock::now() - row_begin).count());
+            throw;
+        }
+        account(std::chrono::duration<double>(Clock::now() - row_begin).count());
 
         if (options.in_place_passthrough) {
             // An adjoint either describes what a read takes or leaves the slot it would write empty.
@@ -659,7 +683,10 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         if (const char* d = std::getenv("R97_DUMP_DC");
             d != nullptr && d[0] == '1' &&
             (rec.op == "rope" || rec.op == "lora_expand" || rec.op == "lora_shrink" ||
-             rec.op == "rmsnorm")) {
+             rec.op == "rmsnorm" ||
+             // The inf hunt: every record of the last block, so the earliest forward value that is
+             // not finite is named by its op and position rather than guessed.
+             (rec.position >= 1390 && rec.position <= 1458))) {
             for (size_t j = 0; j < rec.operands.size(); ++j) {
                 int64_t nonzero = 0, nonfinite = 0;
                 double maxabs = 0.0;

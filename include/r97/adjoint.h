@@ -30,6 +30,7 @@
 // Neither is registered here: the op registry is keyed by op and does not know them.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -85,7 +86,38 @@ struct AdjointCall {
     // `[S*R, K]` (A) / `[N, S*R]` (B) gradient under `prefix`, for a caller that splits the fused
     // factor afterwards. False keeps each slot's factor under its own name.
     bool fused_slots = false;
+    // The rows of the op's output that a consumer of the whole tape reads, sorted and unique, when
+    // the caller can prove them; null when it cannot, which is the default and means every row is
+    // readable. A row outside a proven set is provably unread, so a non-finite forward value there
+    // is zeroed rather than refused: the zero is the correct cotangent for a value nothing reads.
+    // A row inside it that is not finite refuses, as every row did before this field existed.
+    //
+    // Proven means derived from the tape, not inferred: today only a record whose every written
+    // output is read by gather_rows and nothing else takes the gather's index operand as its read
+    // set (docs/adjoints/read-set.md). Any other consumer -- an op, a boundary the next block
+    // reads, a seed, a buffer rewritten before it is read -- leaves the set null, because unknown
+    // is never unreadable.
+    const std::vector<int64_t>* read_rows = nullptr;
+    // Where the row reports the two-way rule's outcome, or null when the caller keeps no count.
+    // A row that zeroes a readable row, or refuses a dead one, is wrong, and these three numbers
+    // are what a step's report says happened instead.
+    struct RowCount {
+        int64_t zeroed_unreadable = 0;  // rows left zero because the read set excludes them
+        int64_t readable = 0;           // rows the read set admits (every row when it is null)
+        int64_t refused_non_finite = 0; // readable rows refused because their value was not finite
+    };
+    RowCount* row_count = nullptr;
 };
+
+// Whether a row is read by a consumer, from a read set: a null set means the caller could not
+// prove the rows, and every row counts as read. `rows` is sorted (AdjointCall::read_rows).
+inline bool row_readable(const std::vector<int64_t>* rows, int64_t row) {
+    if (rows == nullptr) return true;
+    return std::binary_search(rows->begin(), rows->end(), row);
+}
+inline bool row_readable(const AdjointCall& call, int64_t row) {
+    return row_readable(call.read_rows, row);
+}
 
 // A twin: the forward in f64. `operands` are the op's read operands in schema order; `out` receives
 // one AdValue per written operand, in the writes' schema order.

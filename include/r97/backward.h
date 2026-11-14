@@ -102,6 +102,12 @@ struct BackwardOptions {
     // same arithmetic in f64, and the join already pulls every operand back for the walk. The
     // step's coverage names the ops that took the host path.
     bool allow_host_fallback = false;
+    // The rows of a record's output that any consumer reads, when the caller proved them
+    // (r97/adjoint.h's AdjointCall::read_rows): record position -> sorted row indices. A position
+    // absent from the map is unproven, and the walk hands that record null -- unknown is never
+    // unreadable. The map outlives the walk; the join derives it from the whole tape
+    // (src/read_set.h's derive_read_sets) and points this at the walk's own list.
+    const std::map<int64_t, std::vector<int64_t>>* read_rows = nullptr;
 };
 
 // The cotangent of one of the block's inputs: a buffer the block read but never wrote. It is dense
@@ -130,6 +136,14 @@ struct OpTiming {
     // non-zero count names the op a NaN was born at instead of bisecting the step blind; the
     // report's first_non_finite_* says which slot and whether the row produced it.
     int64_t non_finite = 0;
+    // The two-way rule's outcome, summed over the calls (r97/adjoint.h's AdjointCall::RowCount): the
+    // rows the row left zero because the read set proves nothing reads them, the rows it
+    // differentiated, and the rows it refused because they are read and their value was not finite.
+    // A step that zeroes a live row or serves a dead one is wrong, and these are the numbers that
+    // say which happened -- 511 zeroed and 1 readable for the head's norm at 512 tokens.
+    int64_t rows_zeroed_unreadable = 0;
+    int64_t rows_readable = 0;
+    int64_t rows_refused_non_finite = 0;
 };
 
 // What the walk held at once, in bytes of tensor payload (values, not shapes or names): the

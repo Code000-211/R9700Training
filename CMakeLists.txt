@@ -331,6 +331,7 @@ if(R97_BUILD_TESTS)
     target_link_libraries(r97_host_tests PRIVATE ${R97_LINK_WHOLE})
     target_include_directories(r97_host_tests PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/tests
+      ${CMAKE_CURRENT_SOURCE_DIR}/src   # read_set.h: the read-set derivation is host-testable
       ${R97_RADIANCE_COPY}/tests)   # radiance's write_qwen35, the fixture's checkpoint writer
     target_compile_definitions(r97_host_tests PRIVATE R97_MODEL_RAD="${R97_MODEL_RAD}"
       # the int8 fixture's recipe, the one docs/FIXTURES.md prints

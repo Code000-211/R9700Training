@@ -734,7 +734,10 @@ void card_case(const char* test, int64_t n, bool probe) {
         nlohmann::json a = nlohmann::json::array();
         for (const r97::OpTiming& t : v)
             a.push_back({{"op", t.op}, {"calls", t.calls}, {"seconds", t.seconds},
-                         {"side", t.host ? "host" : "device"}, {"non_finite", t.non_finite}});
+                         {"side", t.host ? "host" : "device"}, {"non_finite", t.non_finite},
+                         {"rows_zeroed_unreadable", t.rows_zeroed_unreadable},
+                         {"rows_readable", t.rows_readable},
+                         {"rows_refused_non_finite", t.rows_refused_non_finite}});
         return a;
     };
     j["row_seconds"]          = timing(rep.row_seconds);

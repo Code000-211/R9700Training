@@ -11,11 +11,13 @@
 #if defined(RAD_ISSUE_OBSERVER) && defined(RAD_REPLAY_BLOCK)
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -24,6 +26,7 @@
 
 #include "rad_encoding.h"  // the stored form a plugin-private weight's decode derives (0124)
 #include "rad_planes.h"  // the joined form a quantised lm_head reaches the tape in
+#include "read_set.h"  // the read-set derivation (r97 headers only, so the host tier tests it)
 #include "r97/adjoint.h"
 #include "r97/backward.h"
 #include "r97/batch.h"
