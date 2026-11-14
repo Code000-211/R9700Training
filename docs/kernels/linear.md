@@ -54,6 +54,13 @@ values; only where `b` and `b_scale` are read changes. That path requires `N % 1
 `K % 128 == 0`, which every weight the `i8a8h` GEMM runs already satisfies, and it needs no staged
 copy of either plane, so its scratch is `dy` and `dx` alone.
 
+An IQR trunk weight (the IQ5R container's, `docs/adjoints/linear.md`) reaches the same kernel
+through the same `STORED` path, after two scratch planes are built for the call: `iqr_plane_decode`
+writes the codes in frag64 order and `iqr_plane_scale` writes the form's scale in the tile-major
+bf16 plane, both with libr4d's own decoders and offsets. So the kernel is handed one plane pair
+either way -- an IQR form is a different plane, not a different product -- and its scratch for such
+a call is `dy`, `dx`, and the two decoded planes (`N*K` bytes and `N*K/128*2` bytes).
+
 `gather_rows` is not a product: the forward picks rows of `x`, `y[i,:] = x[idx[i],:]` with a
 negative index a zero row, and the adjoint scatters the picked rows back,
 

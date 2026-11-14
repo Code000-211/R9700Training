@@ -41,7 +41,9 @@
 #include "rad_device.h"
 
 #include "scratch.h"
+// plane_index.h -- the stored planes' addressing, shared with the IQR decode.
 #include "plane_index.h"
+#include "iqr_plane.h"
 
 #include <hip/hip_runtime.h>
 
@@ -425,6 +427,18 @@ RadStream adjoint_stream() {
     return s;
 }
 
+// A record the IQR path cannot serve names itself. Every return on that path leaves `dx` as it
+// was, which is the shape of the 399-of-400 zero-gradient bug with a new cause: a reader of a run's
+// JSON could not tell "the decode produced nothing" from "the row declined". The line carries the
+// form, so the next run's log says which guard fired rather than only that something did.
+void iqr_decline(const char* why, const OpRecord& rec, const AdValue& b, int64_t N, int64_t K,
+                 int64_t groups) {
+    std::fprintf(stderr, "r97: iqr dx declined: op %s: %s (N %lld K %lld G %lld form %s)\n",
+                 rec.op.c_str(), why, static_cast<long long>(N), static_cast<long long>(K),
+                 static_cast<long long>(groups), device::iqr_plane_form(b.enc));
+    std::fflush(stderr);
+}
+
 // dx[m,k] = sum_n dy[m,n] * W[n,k], with W the int8 codes and their per-block scale (`quant`) or
 // the bf16 weight as it stands. `stored` is the plugin-private pair the w8a8_fwht128 trunk hands
 // the tape: the weight and its scale have no f64 form, so the card's own frag64/t16 planes are
@@ -444,10 +458,15 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
     const AdValue* bs = ibs >= 0 ? &call.fwd[static_cast<std::size_t>(ibs)] : nullptr;
     const AdValue& dy = call.cot[0];
 
-    /* The plugin-private pair: no f64 values, one pointer each into the engine's stored planes.
-     * Only the int8 grid has such a form; a bf16 weight with no values is a record this row does
-     * not serve. */
+    /* The plugin-private pair: no f64 values, one pointer each into the engine's stored planes. A
+     * bf16 weight with no values is a record this row does not serve. */
     const bool stored = quant && b.value.empty() && b.raw != nullptr;
+    /* The plugin-private pair is one of two stored forms. The w8a8_fwht128 container's is the int8
+     * pair above; the IQR trunk's (an IQR-V4 trellis at 4.81 bpw, so the codes plane is not N*K
+     * bytes) is a trellis or a table whose form rides with the operand (AdValue::enc), and the row
+     * decodes it with libr4d's own decoders into the two planes this kernel reads. Which one is the
+     * encoding's business, never the op's name. */
+    const bool iqr = stored && b.enc != nullptr && device::iqr_plane_supported(b.enc);
 
     const int64_t K = int_param(call.rec.params, "K", a.shape.size() >= 2 ? a.shape[1] : 0);
     const int64_t N = int_param(call.rec.params, "N", b.shape.size() >= 2 ? b.shape[0] : 0);
@@ -462,13 +481,23 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
         static_cast<int64_t>(dx.value.size()) != M * K)
         return;
     if (stored) {
-        /* The stored planes are the i8a8h pair, so the geometry is the record's: the scale grid is
-         * 128 wide, the code fragment is 16 rows by 64 k, and both planes are whole. A record that
-         * does not fit is one this row was not written for. */
-        if (group != LD_BK) return;
-        if (bs == nullptr || bs->raw == nullptr || !bs->value.empty()) return;
-        if (b.shape.size() != 2 || b.shape[0] != N || b.shape[1] != K) return;
-        if (N % LD_BN != 0 || K % LD_BK != 0) return;
+        /* Both stored forms keep the same geometry: a scale grid 128 wide, whole planes, and the
+         * weight's own shape. Only the plane's layout differs -- the int8 pair's, or the IQR form
+         * the encoding names -- so what a record has to satisfy is the same either way, and one
+         * that does not fit is one this row was not written for. The IQR path names itself: a
+         * silent return here is the 399-of-400 zero-gradient signature with a new cause. */
+        const char* why = nullptr;
+        if (group != LD_BK) why = "the scale grid is not 128 wide";
+        else if (bs == nullptr || bs->raw == nullptr || !bs->value.empty())
+            why = "the scale operand carries no stored plane";
+        else if (b.shape.size() != 2 || b.shape[0] != N || b.shape[1] != K)
+            why = "the weight's shape is not the record's [N, K]";
+        else if (N % LD_BN != 0 || K % LD_BK != 0)
+            why = "N or K is not a whole number of fragments";
+        if (why != nullptr) {
+            if (iqr) iqr_decline(why, call.rec, b, N, K, groups);
+            return;
+        }
     } else if (N * K != static_cast<int64_t>(b.value.size())) {
         return;
     }
@@ -535,6 +564,29 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
     device::ScratchBlock dev_dx(static_cast<int64_t>(dx_n * 2));
     if (!dev_dy || (!stored && !dev_w) || (!stored && quant && !dev_sc) || !dev_dx) return;
 
+    /* An IQR form's two planes, decoded on the card for this call: the codes into the int8
+     * fragment order this kernel reads, and the form's scale into its tile-major bf16 plane. Both
+     * are derived from the encoding, which is why a record whose weight is not this form never
+     * reaches here. */
+    device::ScratchBlock dev_iqr_w(iqr ? Np * K : 0);
+    device::ScratchBlock dev_iqr_s(iqr ? Np * groups * 2 : 0);
+    if (iqr) {
+        if (!dev_iqr_w || !dev_iqr_s) {
+            iqr_decline("the decode's scratch could not be allocated", call.rec, b, N, K, groups);
+            return;
+        }
+        if (!device::iqr_plane_decode(b.enc, static_cast<uint32_t>(N), static_cast<uint32_t>(K),
+                                      b.raw, bs->raw, dev_iqr_w.p, stream)) {
+            iqr_decline("the codes plane did not decode", call.rec, b, N, K, groups);
+            return;
+        }
+        if (!device::iqr_plane_scale(b.enc, static_cast<uint32_t>(N), static_cast<uint32_t>(K),
+                                     bs->raw, dev_iqr_s.p, stream)) {
+            iqr_decline("the scale plane did not decode", call.rec, b, N, K, groups);
+            return;
+        }
+    }
+
     if (rad_memcpy_async(dev_dy.p, host_dy.data(), static_cast<int64_t>(dy_n * 2), stream) != 0)
         return;
     if (!stored) {
@@ -547,13 +599,18 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
             return;
     }
 
-    /* The card's own planes for the stored pair; the staged copies otherwise. */
-    const void* const w_ptr = stored ? b.raw : dev_w.p;
-    const void* const sc_ptr = stored ? bs->raw : (quant ? dev_sc.p : nullptr);
+    /* The card's own planes for the stored pair -- the operand's for the int8 layout, the decode's
+     * for an IQR form -- and the staged copies otherwise. */
+    const void* const w_ptr = iqr ? dev_iqr_w.p : (stored ? b.raw : dev_w.p);
+    const void* const sc_ptr =
+        iqr ? dev_iqr_s.p : (stored ? bs->raw : (quant ? dev_sc.p : nullptr));
     const int rc = linear_dx_launch(quant, stored, dev_dy.p, w_ptr, sc_ptr, dev_dx.p,
                                     static_cast<int>(M), static_cast<int>(Np), static_cast<int>(K),
                                     static_cast<int>(groups), static_cast<hipStream_t>(stream));
-    if (rc != 0) return;  // a failed launch leaves dc as the host row's would if it declined
+    if (rc != 0) {
+        if (iqr) iqr_decline("the dx kernel did not launch", call.rec, b, N, K, groups);
+        return;  // a failed launch leaves dc as the host row's would if it declined
+    }
 
     if (rad_stream_sync(stream) != 0) return;
     if (rad_memcpy_async(host_dx.data(), dev_dx.p, static_cast<int64_t>(dx_n * 2), stream) != 0)

@@ -11,11 +11,18 @@
 // What this file states itself is only the classification -- which form an encoding's planes are --
 // because libr4d's classify is file-static (libr4d/r4d_iqr_layout.cpp:83-158). It is ported rule for
 // rule and cites the lines; a wrong classification makes the decode read the wrong width, which
-// tests/host/adjoint_iqr_plane.cpp pins by requiring a wrong form to change dx.
+// tests/gpu/adjoint_iqr_plane.cpp pins against a hand-read plane: a wrong form changes dx.
 //
 // The decoded values are written in the int8 frag64 order the i8a8h row already reads
 // (plane_index.h), so the linear row's dx runs unchanged over a decoded plane. One wave decodes one
 // unit -- 16 rows by 128 columns -- through libr4d's own LDS transpose.
+//
+// The scale needs the same treatment: the dx kernel reads one bf16 per (row, 128-K block) in the
+// tile-major plane, and a form's scale is that bf16, an E4M3 level under its f32 second level, or
+// one f32 a row times one f32 a block -- or, on the tcq_rb grid, the block's own bf16, the row's
+// factor already in the codes. iqr_plane_scale writes the row's plane from the same offsets libr4d
+// reads the form's at (r4d_iqr.h's own_scale/fold_scale/cf_off/blk_off), so the row reads one plane
+// whatever the form was.
 #include "iqr_plane.h"
 
 #include "plane_index.h"
@@ -193,10 +200,13 @@ __global__ __launch_bounds__(32) void iqr_decode_kernel(Ctx c0, uint8_t* __restr
     const uint32_t units = (c.N / 16u) * nkb;
     for (uint32_t u = blockIdx.x; u < units; u += gridDim.x) {
         const uint32_t rt = u / nkb, kb = u % nkb;
-        constexpr bool UNS = D::MAD && F::LRB == 0;
         typename D::Raw cur = D::fetch(c, rt, kb, lane, true);
         uint32_t w[16];
-        D::template rows<UNS>(cur, c, rb_ratio<F>(c, rt * 16u + (lane & 15u), kb), w);
+        // `rows<false>`: the values as the signed int8 codes the i8a8h row reads. The forward's
+        // computed-trellis GEMM takes them unsigned (`rows<true>`, each byte the value plus 126)
+        // because its dot subtracts the bias in the accumulator; a plane written for a *second*
+        // consumer has no such bias, so the plain signed form is the one that travels.
+        D::template rows<false>(cur, c, rb_ratio<F>(c, rt * 16u + (lane & 15u), kb), w);
         D::unzero(c, rt, kb, w);  // the zero form's bias; a no-op for every other form
         r4d_fp8::Stage8 s[2];
         frag(w, tr, lane, s);
@@ -236,6 +246,64 @@ bool launch(const IqrForm& f, uint32_t N, uint32_t K, const void* W, const void*
     return hipGetLastError() == hipSuccess;
 }
 
+template <class F>
+__device__ __forceinline__ uint16_t eff_scale(const Ctx& c, uint32_t r, uint32_t kb) {
+    constexpr Form f{F::KIND, F::B, F::LV, F::L, F::LRB, F::SC, 0};
+    if constexpr (F::LRB != 0) {
+        // A trellis on the tcq_rb grid: `rows` already put the row's own factor over the block's
+        // into the codes (rb_ratio), so what the value is multiplied by is the block's scale B.
+        const uint16_t* bp = (const uint16_t*)(c.S + blk_off(f, c.N, (int64_t)c.nkb * 128));
+        return bp[(size_t)(r >> F::LRB) * c.nkb + kb];
+    } else if constexpr (F::SC == kRowF32) {
+        // One f32 a row over the whole K and one f32 a 128-K block shared by every row: the fold
+        // the forward's epilogue applies, rounded to the bf16 the row's plane holds.
+        const float row = ((const float*)c.S)[r];
+        const float cf = ((const float*)(c.S + cf_off(f, c.N, (int64_t)c.nkb * 128)))[kb];
+        return static_cast<uint16_t>(bf16_bits(row * cf));
+    } else {
+        // bf16 as stored, or E4M3 under its second level: the row's own scale, which is what
+        // libr4d's decoder reads back for it (own_scale).
+        return static_cast<uint16_t>(own_scale<F>(c, r, kb));
+    }
+}
+
+// One thread an entry of the plane the i8a8h row reads: N rows by K/128 blocks of bf16 in the
+// tile-major order plane_index.h's t16_go addresses (r4d_iqr.h's scale buffer is that same order,
+// so the bf16 form is a copy and the other forms are the product its form stands for).
+template <class F>
+__global__ void iqr_scale_kernel(Ctx c, uint16_t* __restrict__ out) {
+    const uint32_t n = c.N * c.nkb;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const uint32_t r = i / c.nkb, kb = i - r * c.nkb;
+        out[t16_go(static_cast<int>(c.nkb), static_cast<int>(r), static_cast<int>(kb))] =
+            eff_scale<F>(c, r, kb);
+    }
+}
+
+template <class F>
+bool launch_scale(uint32_t N, uint32_t K, const void* S, void* out, void* stream) {
+    Ctx c{};
+    c.S = static_cast<const uint8_t*>(S);
+    c.N = N;
+    c.nkb = K / 128u;
+    if (c.nkb == 0 || N % 16u != 0) return false;
+    const uint32_t n = N * c.nkb, threads = 256;
+    hipLaunchKernelGGL((iqr_scale_kernel<F>), dim3((n + threads - 1) / threads), dim3(threads), 0,
+                       static_cast<hipStream_t>(stream), c, static_cast<uint16_t*>(out));
+    return hipGetLastError() == hipSuccess;
+}
+
+bool dispatch_scale(const IqrForm& f, uint32_t N, uint32_t K, const void* S, void* out,
+                    void* stream) {
+#define R97_IQR_TRY_SCALE(K_, B_, LV_, L_, LRB_, SC_)                                             \
+    if (f.kind == (K_) && f.bits == (B_) && f.lv == (LV_) && f.L == (L_) && f.lrb == (LRB_) &&    \
+        f.scale == (SC_))                                                                         \
+        return launch_scale<FormT<K_, B_, LV_, L_, LRB_, SC_>>(N, K, S, out, stream);
+    R4D_IQR_FORMS(R97_IQR_TRY_SCALE)
+#undef R97_IQR_TRY_SCALE
+    return false;
+}
+
 bool dispatch(const IqrForm& f, uint32_t N, uint32_t K, const void* W, const void* S, void* out,
               void* stream) {
 // The parameters carry a trailing underscore because the preprocessor substitutes inside `f.lv`
@@ -249,17 +317,36 @@ bool dispatch(const IqrForm& f, uint32_t N, uint32_t K, const void* W, const voi
     return false;
 }
 
+// The form `enc` names, derived exactly as the engine's layout hook derived the planes: the
+// transform the hook passes for an i8a8h op is the encoding's own (r4d_iqr_layout.cpp:212).
+bool form_of(const void* enc, IqrForm* f) {
+    if (enc == nullptr) return false;
+    const RadEncoding* e = static_cast<const RadEncoding*>(enc);
+    const bool rot = std::strcmp(e->transform, "fwht128") == 0;
+    return classify(e, rot ? "fwht128" : "", f);
+}
+
 }  // namespace
+
+bool iqr_plane_supported(const void* enc) {
+    IqrForm f;
+    return form_of(enc, &f);
+}
 
 bool iqr_plane_decode(const void* enc, uint32_t N, uint32_t K, const void* W, const void* S,
                       void* out, void* stream) {
-    if (enc == nullptr || W == nullptr || S == nullptr || out == nullptr) return false;
-    const RadEncoding* e = static_cast<const RadEncoding*>(enc);
-    // The transform the engine's own layout hook passes for an i8a8h op (r4d_iqr_layout.cpp:212).
-    const bool rot = std::strcmp(e->transform, "fwht128") == 0;
+    if (W == nullptr || S == nullptr || out == nullptr) return false;
     IqrForm f;
-    if (!classify(e, rot ? "fwht128" : "", &f)) return false;
+    if (!form_of(enc, &f)) return false;
     return dispatch(f, N, K, W, S, out, stream);
+}
+
+bool iqr_plane_scale(const void* enc, uint32_t N, uint32_t K, const void* S, void* out,
+                     void* stream) {
+    if (S == nullptr || out == nullptr) return false;
+    IqrForm f;
+    if (!form_of(enc, &f)) return false;
+    return dispatch_scale(f, N, K, S, out, stream);
 }
 
 const char* iqr_plane_form(const void* enc) {
@@ -267,10 +354,8 @@ const char* iqr_plane_form(const void* enc) {
     static const char* kScale[] = {"bf16", "e4m3-tensor", "e4m3-row", "row-f32"};
     static thread_local char text[96];
     if (enc == nullptr) return "none";
-    const RadEncoding* e = static_cast<const RadEncoding*>(enc);
-    const bool rot = std::strcmp(e->transform, "fwht128") == 0;
     IqrForm f;
-    if (!classify(e, rot ? "fwht128" : "", &f)) return "unclassified";
+    if (!form_of(enc, &f)) return "unclassified";
     std::snprintf(text, sizeof text, "%s b%u L%u lrb%u lrun%u scale=%s",
                   f.kind < 7 ? kKind[f.kind] : "?", f.bits, f.L, f.lrb, f.lrun,
                   f.scale < 4 ? kScale[f.scale] : "?");

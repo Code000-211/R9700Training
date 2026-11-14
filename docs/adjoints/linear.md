@@ -126,10 +126,21 @@ does state is the *classification* (which form an encoding is), ported rule for 
 the int8 fragment order `frag_go` already reads (`plane_index.h`), so the linear row's `dx` runs
 unchanged over a decoded plane.
 
-The piece still to land is the **scale plane**: the `dx` kernel reads a bf16 per (row, 128 K) in
-tile-major order (`t16_go`), and an IQR form's scale is `kRowF32`, E4M3 with a second level, or that
-bf16 -- each with its own stored order, taken from the layout hook. Until that is written and held
-to the f64 row, the row declines an IQR encoding and the gate stays closed on the container.
+The scale plane is emitted per form. The `dx` kernel reads one bf16 per (row, 128-K block) in
+tile-major order (`t16_go`), and `iqr_plane_scale` writes exactly that from the form's own planes in
+the layout hook's order (`r4d_iqr.h`'s `own_scale`, `fold_scale`, `cf_off`, `blk_off`): the bf16
+level as stored, an E4M3 level times its f32 second level rounded to bf16, one f32 a row times its
+block's f32 factor, and on the `tcq_rb` grid the block's own bf16 -- the row's factor is already in
+the codes, which `Dec::rows` puts there with the same ratio. The record declares the scale operand
+with the *weight's* shape, so its geometry comes from the form, never from `bs->shape`. The decoded
+codes and the emitted scale are scratch for the call, and the row then runs the same
+`linear_dx_kernel<Q, STORED>` the int8 pair does: an IQR form is a different *plane*, not a
+different product.
+
+`tests/gpu/adjoint_iqr_plane.cpp` holds that path to the f64 product on two forms -- a table trellis
+on the `tcq_rb` grid under an e4m3 level, and a computed trellis (`kTrellisMad`) under one f32 a row
+times its blocks -- reading the weight out of the planes' own bit streams by hand.
+
 
 ## `logits_gemm`
 

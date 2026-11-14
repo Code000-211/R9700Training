@@ -20,6 +20,17 @@ namespace device {
 bool iqr_plane_decode(const void* enc, uint32_t N, uint32_t K, const void* W, const void* S,
                       void* out, void* stream);
 
+// Writes the form's scale in the plane the i8a8h row reads: N rows by K/128 blocks of bf16 in the
+// tile-major order plane_index.h's t16_go addresses -- the row's own scale for a bf16 form, the
+// product an E4M3 level or a per-row f32 with its block factors stands for otherwise. The record
+// declares the scale with the weight's shape, so its geometry is the form's, never the record's.
+bool iqr_plane_scale(const void* enc, uint32_t N, uint32_t K, const void* S, void* out,
+                     void* stream);
+
+// Whether `enc` is a form this file decodes: the classification the two calls above apply, without
+// touching a device. A caller branches on it before it sizes anything.
+bool iqr_plane_supported(const void* enc);
+
 // The form's name, for the diagnostic that prints what a plane was classified as.
 const char* iqr_plane_form(const void* enc);
 
