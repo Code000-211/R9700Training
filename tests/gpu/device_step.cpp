@@ -891,6 +891,15 @@ static void device_step_case(const char* test, int64_t n, bool probe) {
     const int64_t layers = j.at("layers").get<int64_t>();
     const double after   = j.at("loss_after").get<double>();
 
+    // The headline numbers, before any check below can throw, so a failing case says what it
+    // measured and not only which assertion failed.
+    std::printf("%s: results: loss %.9g -> %.9g (%+.6g) | scored %lld | all_finite %d | "
+                "step %.1f s (fwd %.1f bwd %.1f head %.1f)\n",
+                test, loss, after, after - loss, (long long)scored,
+                j.value("all_finite", false) ? 1 : 0, j.value("step_seconds", 0.0),
+                j.value("forward_seconds", 0.0), j.value("backward_seconds", 0.0),
+                j.value("head_seconds", 0.0));
+
     const r97::ModelMeta meta = r97::read_model_meta(container);
 
     // The step's loss over every scored token: the sum the join's forward and the objective

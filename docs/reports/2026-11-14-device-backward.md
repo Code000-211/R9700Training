@@ -104,9 +104,31 @@ and a prediction of OOM that the card never sees.
 
 ### The run
 
-*(filled from `/tmp/r97-dstep-device_step_seq4096-*/device_step_seq4096.json` when the
-6000 s window lands: its own contract — `a_all_zero`, `b_all_nonzero`, `a_changed == 0`,
-`b_changed == n_b` — with the wall clock, and the named refusal if it trips one.)*
+**First attempt (2026-11-14 20:24, 6000 s window): the case failed its descent check and
+left no results file.** The window ran to completion — prefill of 4096 positions in 3 s, the
+step itself, then `device_step_seq4096: threw: check failed: after.loss < result.loss` — and
+the JSON was never written, because `card_case` threw at the descent checks
+(`tests/gpu/device_step.cpp:640-642`) *before* it wrote the results file (`:746`) and before
+the `non-finite:` / `walk by op:` attribution prints (`:781-846`). The one line that says
+where a non-finite value was born was therefore unreachable exactly when it was needed, and
+the run's 90 minutes produced a single line.
+
+**That is fixed, not worked around** (`27fdcc2`): the three descent checks now run at the end
+of the function, after the file is on disk and the attribution has printed, and a
+`descent: loss A -> B (+delta)` line joins them; the parent prints a one-line summary of the
+JSON's headline numbers before its own checks. The checks still fail the case — they no longer
+take the evidence with them.
+
+**What the failure does and does not say.** `after.loss` was *finite* and merely not lower
+(`std::isfinite(after.loss)` passed, `after.loss < result.loss` did not), so the 4096
+gradient was not NaN and the step did not ascend into a non-finite parameter. It is
+consistent with three things that are not yet distinguished: a wrong-but-finite gradient, lr
+overshoot on 400 rank-16 leaves at 1e-3, and the case's own zero-`A` contract at this start.
+Attributing it needs the numbers, which the fix above now guarantees.
+
+**The next run** is the 512 confirmation first (the forward inf below is the live defect),
+then this case again against its own contract — `a_all_zero`, `b_all_nonzero`,
+`a_changed == 0`, `b_changed == n_b` — with the wall clock.
 
 ## The rows this run depended on
 
