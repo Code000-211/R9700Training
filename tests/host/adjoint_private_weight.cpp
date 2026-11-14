@@ -289,3 +289,105 @@ R97_TEST(adjoint_private_weight_kill_switch_refuses_by_name) {
     R97_CHECK(what.find("operand 'b'") != std::string::npos);
     R97_CHECK(what.find("0 values") != std::string::npos);
 }
+
+// The stored path is the default: a plugin-private operand reaches a row with the tape's pointer
+// (`raw`) and no f64 values, and the walk admits it so a device row can decode the engine's
+// layout. A host row that indexed the empty value would read out of bounds; one whose size check
+// met it first (the fold's) would return silently and leave the activation's cotangent zero.
+// Each host linear row the device step's host fallback can serve on a stored trunk therefore
+// refuses a stored operand by name. The pointer's byte is a canary: the refusal happens before
+// any read, so a regression to indexing it still throws out of range rather than reading it.
+R97_TEST(host_linear_rows_refuse_a_stored_weight_by_name) {
+    const int64_t M = 2, N = 32, K = 256;
+    const int64_t group = 128, G = K / group;
+    const int canary = 0;
+
+    auto stored_case = [&](OpRecord rec, const std::string& weight, const std::string& seed) {
+        StoredSnapshots snaps;
+        for (std::size_t i = 0; i < rec.operands.size(); ++i) {
+            AdValue v;
+            v.dtype = rec.operands[i].dtype;
+            v.shape = rec.operands[i].shape;
+            v.value.assign(static_cast<std::size_t>(numel(v.shape)), 0.0);
+            if (rec.operands[i].buffer == weight) {
+                // What the default path of snapshot() hands over: the shape, the tape's pointer,
+                // no values (src/join_common.h; tests/host/snapshot_view.cpp pins it).
+                v.value.clear();
+                v.raw = &canary;
+            }
+            snaps.set(rec.position, i, std::move(v));
+        }
+        BoundaryNames names;
+        for (const Operand& o : rec.operands)
+            if (o.written) names.add(o.buffer, 0, o.rows);
+        std::vector<Seed> seeds;
+        seeds.emplace_back();
+        seeds.back().buffer = seed;
+        seeds.back().row_lo = 0;
+        seeds.back().row_hi = M;
+        std::size_t n = 0;
+        for (const Operand& o : rec.operands)
+            if (o.buffer == seed) n = static_cast<std::size_t>(numel(o.shape));
+        R97_CHECK(n != 0);
+        seeds.back().cotangent.assign(n, 0.5f);
+        BackwardOptions bo;
+        bo.side = Side::host;
+
+        std::string what;
+        try {
+            backward_block({rec}, snaps, names, seeds, {}, bo);
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        std::printf("host_linear_rows: %s stored %s refuses: %s\n", rec.op.c_str(),
+                    weight.c_str(), what.c_str());
+        R97_CHECK(what.find("op '" + rec.op + "'") != std::string::npos);
+        R97_CHECK(what.find("operand '" + weight + "'") != std::string::npos);
+        R97_CHECK(what.find("plugin-private") != std::string::npos);
+    };
+
+    {
+        OpRecord rec;
+        rec.op = "gemm_nt";
+        rec.params = {{"M", M}, {"N", N}, {"K", K}, {"dtype", "bf16"}};
+        rec.operands = {{"a", "bf16", {M, K}, 0, M, false},
+                        {"b", "bf16", {N, K}, 0, N, false},
+                        {"y", "bf16", {M, N}, 0, M, true}};
+        stored_case(rec, "b", "y");
+    }
+    {
+        OpRecord rec;
+        rec.op = "gemm_nt_q";
+        rec.params = {{"M", M}, {"N", N}, {"K", K}, {"group", group}, {"dtype", "i8a8h"}};
+        rec.operands = {{"a", "i8", {M, K}, 0, M, false},
+                        {"a_scale", "f32", {M, G}, 0, M, false},
+                        {"b", "i8", {N, K}, 0, N, false},
+                        {"b_scale", "bf16", {N, G}, 0, N, false},
+                        {"y", "f32", {M, N}, 0, M, true}};
+        stored_case(rec, "b", "y");
+    }
+    {
+        // The fold's shape check runs before its stored check, so this record has to pass it:
+        // N/2 = 16 over group 16.
+        OpRecord rec;
+        rec.op = "gemm_nt_q_gated";
+        rec.params = {{"M", M}, {"N", N}, {"K", K}, {"group", 16}, {"act", "silu"},
+                      {"dtype", "i8a8h"}};
+        rec.operands = {{"a", "i8", {M, K}, 0, M, false},
+                        {"a_scale", "f32", {M, K / 16}, 0, M, false},
+                        {"b", "i8", {N, K}, 0, N, false},
+                        {"b_scale", "bf16", {N, K / 16}, 0, N, false},
+                        {"q", "i8", {M, N / 2}, 0, M, true},
+                        {"scale", "f32", {M, 1}, 0, M, true}};
+        stored_case(rec, "b", "q");
+    }
+    {
+        OpRecord rec;
+        rec.op = "logits_gemm";
+        rec.params = {{"n_embd", K}, {"n_vocab", N}};
+        rec.operands = {{"x", "bf16", {M, K}, 0, M, false},
+                        {"lm_head", "bf16", {N, K}, 0, N, false},
+                        {"y", "bf16", {M, N}, 0, M, true}};
+        stored_case(rec, "lm_head", "y");
+    }
+}

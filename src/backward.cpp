@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <map>
 #include <set>
@@ -645,6 +647,57 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             if (!sized[j]) continue;
             const int64_t at = first_non_finite(dc[j].value);
             if (at >= 0) note_non_finite(rec, adjoint_rec->op, j, at, true);
+        }
+
+        // R97_DUMP_DC=1: what a row was handed and what it left, per operand, for the ops an
+        // adapter's gradient flows through and the one the forward's NaN was born in. `fwd_at`
+        // is the first non-finite of the forward value (-1: finite); a sized slot's non-zero
+        // count, non-finite count and largest magnitude say whether a cotangent died upstream of
+        // the row (all zero) or in the row's own arithmetic (non-zero here, zero in the
+        // gradient). Unsized slots (frozen, plain writes) print their forward values only. Read
+        // it the way R97_DUMP_SNAP's operand dump is.
+        if (const char* d = std::getenv("R97_DUMP_DC");
+            d != nullptr && d[0] == '1' &&
+            (rec.op == "rope" || rec.op == "lora_expand" || rec.op == "lora_shrink" ||
+             rec.op == "rmsnorm")) {
+            for (size_t j = 0; j < rec.operands.size(); ++j) {
+                int64_t nonzero = 0, nonfinite = 0;
+                double maxabs = 0.0;
+                if (sized[j])
+                    for (double v : dc[j].value) {
+                        if (!std::isfinite(v)) {
+                            ++nonfinite;
+                            continue;
+                        }
+                        if (v != 0.0) ++nonzero;
+                        maxabs = std::max(maxabs, std::fabs(v));
+                    }
+                std::fprintf(stderr,
+                             "DUMPDC op=%s pos=%s buffer=%s shape=%s sized=%d nonzero=%lld "
+                             "nonfinite=%lld maxabs=%.6g fwd_at=%lld\n",
+                             rec.op.c_str(), std::to_string(rec.position).c_str(),
+                             rec.operands[j].buffer.c_str(), shape_text(dc[j].shape).c_str(),
+                             static_cast<int>(sized[j]), static_cast<long long>(nonzero),
+                             static_cast<long long>(nonfinite), maxabs,
+                             fwd_non_finite[j]);
+            }
+            std::fflush(stderr);
+        }
+        // R97_DUMP_DC=1, second list: every forward value the walk met that was not finite, in
+        // walk (reverse) order. The last line of it is the earliest record in forward order that
+        // carried a NaN -- the producer's neighbourhood, not the first reader the report names.
+        if (const char* d = std::getenv("R97_DUMP_DC"); d != nullptr && d[0] == '1') {
+            static long n_nf = 0;
+            for (size_t j = 0; j < rec.operands.size(); ++j) {
+                if (fwd_non_finite[j] < 0) continue;
+                if (n_nf < 200) {
+                    ++n_nf;
+                    std::fprintf(stderr, "DUMPNF op=%s pos=%s buffer=%s at=%lld\n",
+                                 rec.op.c_str(), std::to_string(rec.position).c_str(),
+                                 rec.operands[j].buffer.c_str(), fwd_non_finite[j]);
+                }
+            }
+            std::fflush(stderr);
         }
 
         // The writers' adjoint has run: their cotangent storage is done. Nothing below reads a

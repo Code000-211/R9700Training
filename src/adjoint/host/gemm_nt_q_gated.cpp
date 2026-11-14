@@ -35,6 +35,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -138,6 +139,17 @@ double scale_at(const AdValue* scale, int64_t row, int64_t group, int64_t rows, 
     if (n == rows) return scale->value[static_cast<std::size_t>(row)];
     const int64_t at = std::min<int64_t>(row * groups + group, n - 1);
     return scale->value[static_cast<std::size_t>(at)];
+}
+
+// A stored operand: the tape gives its bytes behind `raw` in the engine's private layout and
+// nothing in `value`. A host row that indexed its empty value would read out of bounds, and the
+// size check in the adjoint would return silently, leaving the activation's cotangent zero --
+// the zero-adapter-gradient signature with a new cause. The row refuses it by name instead, as
+// the device row declines a stored plane it cannot decode.
+[[noreturn]] void refuse_stored(const OpRecord& rec, int pos) {
+    throw std::runtime_error("r97: host adjoint: op '" + rec.op + "': operand '" +
+                             rec.operands[static_cast<std::size_t>(pos)].buffer +
+                             "' is stored in a plugin-private encoding the host row cannot read");
 }
 
 // silu and its slope, gated_quant_fp8's pair; the sigmoid form is the record's other `act`.
@@ -245,6 +257,10 @@ void gemm_nt_q_gated_twin(const OpRecord& rec, const std::vector<AdValue>& opera
     const AdValue* as = read_at(rec, operands, operand_at(rec, "a_scale", 1));
     const AdValue* bs = read_at(rec, operands, operand_at(rec, "b_scale", 3));
     if (a == nullptr || b == nullptr) return;
+    if (a->raw != nullptr) refuse_stored(rec, ia);
+    if (b->raw != nullptr) refuse_stored(rec, ib);
+    if (as != nullptr && as->raw != nullptr) refuse_stored(rec, operand_at(rec, "a_scale", 1));
+    if (bs != nullptr && bs->raw != nullptr) refuse_stored(rec, operand_at(rec, "b_scale", 3));
     GatedShape sh;
     if (!shape_of(rec, *a, *b, &sh)) return;
     const bool sigmoid = param_string(rec, "act", "silu") == "sigmoid";
@@ -299,6 +315,10 @@ void gemm_nt_q_gated_adjoint(const AdjointCall& call) {
     const AdValue& sc = call.fwd[static_cast<std::size_t>(operand_at(call.rec, "scale", 5))];
     GatedShape sh;
     if (!shape_of(call.rec, a, b, &sh)) return;
+    // A stored operand has no host arithmetic; the size check below must not get the chance to
+    // return silently for it, so this is checked before it.
+    if (a.raw != nullptr) refuse_stored(call.rec, ia);
+    if (b.raw != nullptr) refuse_stored(call.rec, ib);
     // The operand extents and the record's M, N, K have to agree; a record that does not is one
     // this row was not written for, and an adjoint must not throw.
     if (a.value.size() != static_cast<std::size_t>(sh.M * sh.K) ||

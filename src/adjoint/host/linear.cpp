@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -108,12 +109,27 @@ double scale_at(const AdValue* scale, int64_t row, int64_t group, int64_t rows, 
     return scale->value[static_cast<std::size_t>(at)];
 }
 
+// A stored operand: the tape gives its bytes behind `raw` in the engine's private layout and
+// nothing in `value`. A device row decodes that layout from the pointer; a host row that indexed
+// its empty value would read out of bounds, and a scale that answered 1.0 for it would be a
+// silent wrong number. The row refuses it by name, as the device row declines a stored plane it
+// cannot decode, so a stored weight never reaches this file's loops.
+[[noreturn]] void refuse_stored(const OpRecord& rec, int pos) {
+    throw std::runtime_error("r97: host adjoint: op '" + rec.op + "': operand '" +
+                             rec.operands[static_cast<std::size_t>(pos)].buffer +
+                             "' is stored in a plugin-private encoding the host row cannot read");
+}
+
 // y[M,N] = a[M,K] * b[N,K]^T, with the f32 accumulation of the host kernel done in f64.
 void gemm_nt_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
                   std::vector<AdValue>* out) {
     const AdValue* a = read_at(rec, operands, operand_pos(rec, "a"));
     const AdValue* b = read_at(rec, operands, operand_pos(rec, "b"));
     if (a == nullptr || b == nullptr) return;
+    const int ia = operand_pos(rec, "a");
+    const int ib = operand_pos(rec, "b");
+    if (a->raw != nullptr) refuse_stored(rec, ia);
+    if (b->raw != nullptr) refuse_stored(rec, ib);
     const int64_t K = param_int(rec, "K", a->shape.size() >= 2 ? a->shape[1] : 0);
     const int64_t N = param_int(rec, "N", b->shape.size() >= 2 ? b->shape[0] : 0);
     // `M` is the weight's capacity; the operand's own first dimension is how many rows this call
@@ -141,6 +157,7 @@ void gemm_nt_adjoint(const AdjointCall& call) {
     const AdValue& a = call.fwd[static_cast<std::size_t>(ia)];
     const AdValue& b = call.fwd[static_cast<std::size_t>(ib)];
     const AdValue& dy = call.cot[0];
+    if (b.raw != nullptr) refuse_stored(call.rec, ib);
     const int64_t K = param_int(call.rec, "K", a.shape.size() >= 2 ? a.shape[1] : 0);
     const int64_t N = param_int(call.rec, "N", b.shape.size() >= 2 ? b.shape[0] : 0);
     const int64_t M = param_int(call.rec, "M", a.shape.empty() ? 0 : a.shape[0]);
@@ -165,6 +182,10 @@ void gemm_nt_q_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     const AdValue* as = read_at(rec, operands, operand_pos(rec, "a_scale"));
     const AdValue* bs = read_at(rec, operands, operand_pos(rec, "b_scale"));
     if (a == nullptr || b == nullptr) return;
+    if (a->raw != nullptr) refuse_stored(rec, operand_pos(rec, "a"));
+    if (b->raw != nullptr) refuse_stored(rec, operand_pos(rec, "b"));
+    if (as != nullptr && as->raw != nullptr) refuse_stored(rec, operand_pos(rec, "a_scale"));
+    if (bs != nullptr && bs->raw != nullptr) refuse_stored(rec, operand_pos(rec, "b_scale"));
     const int64_t K = param_int(rec, "K", a->shape.size() >= 2 ? a->shape[1] : 0);
     const int64_t N = param_int(rec, "N", b->shape.size() >= 2 ? b->shape[0] : 0);
     const int64_t M = a->shape.empty() ? param_int(rec, "M", 0) : a->shape[0];
@@ -200,6 +221,8 @@ void gemm_nt_q_adjoint(const AdjointCall& call) {
     const AdValue& a = call.fwd[static_cast<std::size_t>(ia)];
     const AdValue& b = call.fwd[static_cast<std::size_t>(ib)];
     const AdValue* bs = ibs >= 0 ? &call.fwd[static_cast<std::size_t>(ibs)] : nullptr;
+    if (b.raw != nullptr) refuse_stored(call.rec, ib);
+    if (bs != nullptr && bs->raw != nullptr) refuse_stored(call.rec, ibs);
     const AdValue& dy = call.cot[0];
     const int64_t K = param_int(call.rec, "K", a.shape.size() >= 2 ? a.shape[1] : 0);
     const int64_t N = param_int(call.rec, "N", b.shape.size() >= 2 ? b.shape[0] : 0);
@@ -227,6 +250,8 @@ void logits_gemm_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     const AdValue* x = read_at(rec, operands, operand_pos(rec, "x"));
     const AdValue* w = read_at(rec, operands, operand_pos(rec, "lm_head"));
     if (x == nullptr || w == nullptr) return;
+    if (x->raw != nullptr) refuse_stored(rec, operand_pos(rec, "x"));
+    if (w->raw != nullptr) refuse_stored(rec, operand_pos(rec, "lm_head"));
     const int64_t K = param_int(rec, "n_embd", x->shape.size() >= 2 ? x->shape[1] : 0);
     const int64_t N = param_int(rec, "n_vocab", w->shape.size() >= 2 ? w->shape[0] : 0);
     const int64_t M = x->shape.empty() ? 0 : x->shape[0];
@@ -251,6 +276,7 @@ void logits_gemm_adjoint(const AdjointCall& call) {
     if (ix < 0 || iw < 0 || call.cot.empty()) return;
     const AdValue& x = call.fwd[static_cast<std::size_t>(ix)];
     const AdValue& w = call.fwd[static_cast<std::size_t>(iw)];
+    if (w.raw != nullptr) refuse_stored(call.rec, iw);
     const AdValue& dy = call.cot[0];
     const int64_t K = param_int(call.rec, "n_embd", x.shape.size() >= 2 ? x.shape[1] : 0);
     const int64_t N = param_int(call.rec, "n_vocab", w.shape.size() >= 2 ? w.shape[0] : 0);
@@ -274,6 +300,7 @@ void gather_rows_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     const AdValue* x = read_at(rec, operands, operand_pos(rec, "x"));
     const AdValue* idx = read_at(rec, operands, operand_pos(rec, "idx"));
     if (x == nullptr || idx == nullptr) return;
+    if (x->raw != nullptr) refuse_stored(rec, operand_pos(rec, "x"));
     const int64_t width = param_int(rec, "n", x->shape.size() >= 2 ? x->shape[1] : 1);
     const Operand* y = first_write(rec);
     const int64_t rows = y != nullptr && !y->shape.empty() ? y->shape[0] : static_cast<int64_t>(idx->value.size());
@@ -318,6 +345,7 @@ void embed_lookup_twin(const OpRecord& rec, const std::vector<AdValue>& operands
     const AdValue* tokens = read_at(rec, operands, operand_pos(rec, "tokens"));
     const AdValue* table = read_at(rec, operands, operand_pos(rec, "wte"));
     if (tokens == nullptr || table == nullptr) return;
+    if (table->raw != nullptr) refuse_stored(rec, operand_pos(rec, "wte"));
     const int64_t width = param_int(rec, "n_embd", table->shape.size() >= 2 ? table->shape[1] : 1);
     const int64_t vocab = param_int(rec, "n_vocab", table->shape.size() >= 2 ? table->shape[0] : 0);
     const int64_t offset = param_int(rec, "vocab_offset", 0);
