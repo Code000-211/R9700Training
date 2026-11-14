@@ -651,11 +651,7 @@ void quant_adjoint(const AdjointCall& call, Part part) {
                 ss += call.fwd[0].value[(size_t)(b + i)] * call.fwd[0].value[(size_t)(b + i)];
             if (!std::isfinite(ss)) ++refused;
         }
-        if (call.row_count) {
-            call.row_count->zeroed_unreadable += zeroed;
-            call.row_count->readable += admitted;
-            call.row_count->refused_non_finite += refused;
-        }
+        count_read_rows(call.row_count, call.read_rows, zeroed, admitted, refused);
         if (refused > 0)
             throw std::runtime_error(
                 "r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +

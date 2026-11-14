@@ -29,6 +29,12 @@
 // The contract gives a device adjoint f64 operands, not device buffers, so this call owns every
 // device buffer it touches. They are scratch, freed before it returns; the harness reports the
 // high-water mark.
+//
+// The rmsnorm row applies the two-way rule (r97/adjoint.h's AdjointCall::read_rows): a row no
+// consumer reads is left zero and counted, a row a consumer reads is differentiated and refuses if
+// its activation is not finite, and a row handed no set counts nothing. The rule lives here as
+// well as on the host and in quant.hip's Part::rmsnorm because the head's final norm is this op:
+// the plain `rmsnorm`, not the fused producer.
 #include "r97/adjoint.h"
 
 #include "scratch.h"
@@ -380,6 +386,37 @@ bool download_add(AdValue& slot, const void* d, int64_t n, RadStream s) {
     return true;
 }
 
+/* Adds a kernel's result back into the tape, row by row: a row the read set does not admit is
+ * skipped, so the value the kernel left there -- an artefact of the formula over a row nothing
+ * reads -- never reaches the cotangent. A null or empty set admits every row, exactly as
+ * row_readable says, so the unfiltered path is the same loop. */
+bool download_add_rows(AdValue& slot, const void* d, int64_t rows, int64_t n, RadStream s,
+                       const std::vector<int64_t>* read_rows) {
+    if (rows <= 0 || n <= 0) return true;
+    const int64_t count = rows * n;
+    if (slot.dtype == "f32") {
+        std::vector<float> h((size_t)count);
+        if (rad_memcpy_async(h.data(), d, f32_bytes(count), s) != 0) return false;
+        if (rad_stream_sync(s) != 0) return false;
+        for (int64_t r = 0; r < rows; ++r) {
+            if (!row_readable(read_rows, r)) continue;
+            for (int64_t i = 0; i < n; ++i)
+                slot.value[(size_t)(r * n + i)] += (double)h[(size_t)(r * n + i)];
+        }
+        return true;
+    }
+    std::vector<unsigned short> h((size_t)count);
+    const int64_t bytes = count * (int64_t)sizeof(unsigned short);
+    if (rad_memcpy_async(h.data(), d, bytes, s) != 0) return false;
+    if (rad_stream_sync(s) != 0) return false;
+    for (int64_t r = 0; r < rows; ++r) {
+        if (!row_readable(read_rows, r)) continue;
+        for (int64_t i = 0; i < n; ++i)
+            slot.value[(size_t)(r * n + i)] += (double)bf16_to_f32(h[(size_t)(r * n + i)]);
+    }
+    return true;
+}
+
 /* ------------------------------------------------------------------ mul: y = a * b */
 
 void mul_device_adjoint(const AdjointCall& call) {
@@ -617,6 +654,37 @@ void rmsnorm_device_adjoint(const AdjointCall& call) {
     AdValue& x_dc = call.dc->at(0);
     if ((int64_t)x_dc.value.size() < rows * n) return;
 
+    // The two-way rule (r97/adjoint.h's AdjointCall::read_rows): a row a consumer reads is
+    // differentiated, and a non-finite activation in it refuses -- the analytic `0 * inf` over a
+    // live row is a bug, not a gradient. A row no consumer reads is provably dead, so it is left
+    // zero and counted: the zero is the correct cotangent for a value nothing reads. When the
+    // caller could not prove the read set every row is readable, and the refusal is what it was
+    // before the read set existed. This row is the plain `rmsnorm` the head's final norm is (the
+    // fused `rmsnorm_had_quant_i8g` producer is quant.hip's Part::rmsnorm): without it the head's
+    // norm never consulted the set, so the 512 step's counters read 0/0/0 whether the rule fired
+    // or not and a forward inf in a row no consumer reads reached every gradient.
+    int64_t zeroed = 0, admitted = 0, refused = 0;
+    for (int64_t r = 0; r < rows; ++r) {
+        if (!row_readable(call, r)) {
+            ++zeroed;
+            continue;
+        }
+        ++admitted;
+        const int64_t b = r * n;
+        double ss = 0.0;
+        for (int64_t i = 0; i < n && std::isfinite(ss); ++i)
+            ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
+        if (!std::isfinite(ss)) ++refused;
+    }
+    count_read_rows(call.row_count, call.read_rows, zeroed, admitted, refused);
+    if (refused > 0)
+        throw std::runtime_error(
+            "r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +
+            std::to_string(call.rec.position) + ": " + std::to_string(refused) + " of " +
+            std::to_string(admitted) +
+            " rows a consumer reads have a non-finite activation; refusing rather than zeroing a "
+            "live row's gradient");
+
     RadStream stream = adjoint_stream();
     if (!stream) return;
 
@@ -632,7 +700,7 @@ void rmsnorm_device_adjoint(const AdjointCall& call) {
                        (hipStream_t)stream, (const float*)d_x.p,
                        w ? (const float*)d_w.p : nullptr, (const float*)d_y_cot.p,
                        store_in(x_dc, d_x_dc.p), n, eps, wadd, mult);
-    download_add(x_dc, d_x_dc.p, rows * n, stream);
+    download_add_rows(x_dc, d_x_dc.p, rows, n, stream, call.read_rows);
 }
 
 }  // namespace

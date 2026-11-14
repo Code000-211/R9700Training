@@ -41,6 +41,11 @@ The row counts what it did (`AdjointCall::RowCount`, summed into `OpTiming` and 
 counts are the check on the analysis: for a 512-token step the head's norm must report **511
 zeroed and 1 readable** -- the head's `gather_rows` selects one row of the 512 -- and a run that
 reports 512 or 0 has a wrong read set, not a different forward.
+A row counts only when the caller proved a set for it (`count_read_rows`, `include/r97/adjoint.h`):
+a row handed no set reports nothing, so `0/0/0` means the rule was never asked, while a set covering
+every row reports `N/0/0`. A row that consults the set must therefore report even when it zeroes
+nothing -- otherwise a proven-and-nothing-to-zero run is indistinguishable from one whose rule never
+fired, which is the tell this whole section exists to read.
 
 ## Deriving it: `derive_read_sets` (`src/read_set.h`)
 
@@ -94,8 +99,10 @@ the rule, the analysis widens with a second case to design and test against, not
   `read_set_head_externals_are_the_logits_not_the_hidden_state` pins it.
 - `src/backward.cpp` looks the record's position up in the map and sets `call.read_rows` -- the
   record's list, or null when the map does not name it -- plus `call.row_count`.
-- The rmsnorm rows apply the rule: `rmsnorm_host_adjoint` (`src/adjoint/host/elementwise.cpp`) and
-  the `rmsnorm` part of `quant_adjoint` (`src/adjoint/device/quant.hip`, through `add_back`'s
+- The rmsnorm rows apply the rule: `rmsnorm_host_adjoint` (`src/adjoint/host/elementwise.cpp`),
+  `rmsnorm_device_adjoint` (`src/adjoint/device/elementwise.hip`, the plain `rmsnorm` the head's
+  final norm is -- it left the rule out, so the head's norm never consulted the set), and the
+  `rmsnorm` part of `quant_adjoint` (`src/adjoint/device/quant.hip`, through `add_back`'s
   `rows_per`/`read_rows`). The twin path -- `rmsnorm_twin`, which serves the fused
   `rmsnorm_had_quant_i8g` record -- honours it too: a record whose non-finite rows are all
   unreadable is servable, and the twin no longer refuses it.
@@ -120,7 +127,10 @@ fewer than a row refuses by name too.
   the counts at 1/1/0; a non-finite row inside the read set refuses; an empty proof is unproven
   (window ending at a rewrite and at the tape's end alike); a zero-row gather is unproven; and the
   head's externals are the logits, not the walk's input -- marked `{"h"}` proves nothing, marked
-  `{"logits"}` proves the norm and names the gather's single row.
+  `{"logits"}` proves the norm and names the gather's single row; a set covering every row reports
+  `2/0/0` (the rule fired and zeroed nothing), a row handed no set reports `0/0/0`, and a row that
+  ignores the set reports `0/0/0` too (`read_set_a_full_set_reports_every_row_readable`,
+  `read_set_an_unproven_row_reports_nothing`, `read_set_a_row_that_ignores_the_set_reports_nothing`).
 - `tests/gpu/device_step.cpp`'s `device_step_tape` (512 tokens, the real container) is the
   acceptance: the step's `row_seconds` must carry `rmsnorm` with `rows_zeroed_unreadable == 511`
   and `rows_readable == 1`. **The counters are the tell**: `0/0/0` is a gradient produced with no

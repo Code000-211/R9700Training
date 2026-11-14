@@ -101,9 +101,15 @@ struct AdjointCall {
     // Where the row reports the two-way rule's outcome, or null when the caller keeps no count.
     // A row that zeroes a readable row, or refuses a dead one, is wrong, and these three numbers
     // are what a step's report says happened instead.
+    //
+    // The counts answer "which rows did the proved set admit", so a row fills them only when the
+    // caller proved a set for it (read_rows != null). A row handed no set reports nothing: a run
+    // that proved no set at all reads 0/0/0, and a run whose rule fired reports the rows it
+    // admitted even when it zeroed none -- a set covering every row reads N/0/0. Without that, a
+    // proven-and-nothing-to-zero run is indistinguishable from a rule that never fired.
     struct RowCount {
-        int64_t zeroed_unreadable = 0;  // rows left zero because the read set excludes them
-        int64_t readable = 0;           // rows the read set admits (every row when it is null)
+        int64_t zeroed_unreadable = 0;  // rows left zero because the proved set excludes them
+        int64_t readable = 0;           // rows the proved set admits
         int64_t refused_non_finite = 0; // readable rows refused because their value was not finite
     };
     RowCount* row_count = nullptr;
@@ -122,6 +128,19 @@ inline bool row_readable(const std::vector<int64_t>* rows, int64_t row) {
 }
 inline bool row_readable(const AdjointCall& call, int64_t row) {
     return row_readable(call.read_rows, row);
+}
+
+// Count what one row did with the two-way rule, when the caller keeps a count AND proved a set. A
+// row handed no set reports nothing (AdjointCall::RowCount): 0/0/0 then says the rule was never
+// asked, while a set covering every row still reports N/0/0, so a fired rule is never mistaken for
+// one that never ran. A row that does not consult the set at all leaves row_count untouched, which
+// is the same outcome by a different road.
+inline void count_read_rows(AdjointCall::RowCount* c, const std::vector<int64_t>* rows,
+                            int64_t zeroed, int64_t admitted, int64_t refused) {
+    if (c == nullptr || rows == nullptr) return;
+    c->zeroed_unreadable += zeroed;
+    c->readable += admitted;
+    c->refused_non_finite += refused;
 }
 
 // A twin: the forward in f64. `operands` are the op's read operands in schema order; `out` receives

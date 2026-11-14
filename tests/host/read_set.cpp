@@ -324,4 +324,125 @@ R97_TEST(read_set_a_zero_row_gather_is_unproven) {
     R97_CHECK(reads.find(0) == reads.end());
 }
 
+// A row that consults a proved set reports what the set admitted even when it zeroed nothing: a set
+// covering every row reads N/0/0, so a run whose rule fired is never mistaken for one that never
+// ran. The counter is the only trace -- both rows are differentiated, so the gradient cannot tell.
+R97_TEST(read_set_a_full_set_reports_every_row_readable) {
+    std::vector<OpRecord> records{
+        op("rmsnorm", {read("x", kRow), read("w", {2}), written("h", kRow)}, 0),
+    };
+    r97::StoredSnapshots snaps;
+    snap(&snaps, 0, 0, kRow, {1.0, 2.0, 3.0, 4.0});
+    snap(&snaps, 0, 1, {2}, {1.0, 1.0});
+    snap(&snaps, 0, 2, kRow, {1.0, 1.0, 1.0, 1.0});
+    r97::BoundaryNames names;
+    names.add("h", 0, 2);
+    const std::vector<Seed> seeds{[] {
+        Seed s;
+        s.buffer = "h";
+        s.row_lo = 0;
+        s.row_hi = 2;
+        s.cotangent = {1.0f, 1.0f, 1.0f, 1.0f};
+        return s;
+    }()};
+
+    std::map<int64_t, std::vector<int64_t>> reads{{0, {0, 1}}};  // every row: nothing to zero
+    r97::BackwardOptions bo;
+    bo.read_rows = &reads;
+    const r97::BackwardResult got = r97::backward_block(records, snaps, names, seeds, {}, bo);
+
+    const r97::OpTiming* t = nullptr;
+    for (const r97::OpTiming& x : got.report.ops)
+        if (x.op == "rmsnorm") t = &x;
+    R97_CHECK(t != nullptr);
+    R97_CHECK(t->rows_readable == 2);
+    R97_CHECK(t->rows_zeroed_unreadable == 0);
+    R97_CHECK(t->rows_refused_non_finite == 0);
+
+    const r97::InputCotangent* x = nullptr;
+    for (const auto& in : got.inputs)
+        if (in.buffer == "x") x = &in;
+    R97_CHECK(x != nullptr);
+    R97_CHECK(x->value[0] != 0.0 || x->value[1] != 0.0);
+    R97_CHECK(x->value[2] != 0.0 || x->value[3] != 0.0);
+}
+
+// A row the caller proved no set for reports neither counter: 0/0/0 then says the rule was never
+// asked, which is what makes the counts a tell. The row still differentiates every row -- unknown
+// is never unreadable -- it just does not claim to have consulted a set.
+R97_TEST(read_set_an_unproven_row_reports_nothing) {
+    std::vector<OpRecord> records{
+        op("rmsnorm", {read("x", kRow), read("w", {2}), written("h", kRow)}, 0),
+    };
+    r97::StoredSnapshots snaps;
+    snap(&snaps, 0, 0, kRow, {1.0, 2.0, 3.0, 4.0});
+    snap(&snaps, 0, 1, {2}, {1.0, 1.0});
+    snap(&snaps, 0, 2, kRow, {1.0, 1.0, 1.0, 1.0});
+    r97::BoundaryNames names;
+    names.add("h", 0, 2);
+    const std::vector<Seed> seeds{[] {
+        Seed s;
+        s.buffer = "h";
+        s.row_lo = 0;
+        s.row_hi = 2;
+        s.cotangent = {1.0f, 1.0f, 1.0f, 1.0f};
+        return s;
+    }()};
+
+    r97::BackwardOptions bo;  // read_rows stays null: the caller proved nothing
+    const r97::BackwardResult got = r97::backward_block(records, snaps, names, seeds, {}, bo);
+
+    const r97::OpTiming* t = nullptr;
+    for (const r97::OpTiming& x : got.report.ops)
+        if (x.op == "rmsnorm") t = &x;
+    R97_CHECK(t != nullptr);
+    R97_CHECK(t->rows_readable == 0);
+    R97_CHECK(t->rows_zeroed_unreadable == 0);
+    R97_CHECK(t->rows_refused_non_finite == 0);
+
+    // Unproven, so every row counts as read and both are differentiated all the same.
+    const r97::InputCotangent* x = nullptr;
+    for (const auto& in : got.inputs)
+        if (in.buffer == "x") x = &in;
+    R97_CHECK(x != nullptr);
+    R97_CHECK(x->value[0] != 0.0 || x->value[1] != 0.0);
+    R97_CHECK(x->value[2] != 0.0 || x->value[3] != 0.0);
+}
+
+// A row that does not consult the set at all reports nothing either: handing it a proven set is
+// invisible, because it never touches row_count. `cast` is such a row -- the read set is the
+// rmsnorm family's, and a row that ignores it is the ambiguous 0/0/0 the tell has to keep apart
+// from a fired rule.
+R97_TEST(read_set_a_row_that_ignores_the_set_reports_nothing) {
+    std::vector<OpRecord> records{
+        op("cast", {read("x", kRow), written("y", kRow)}, 0),
+    };
+    r97::StoredSnapshots snaps;
+    snap(&snaps, 0, 0, kRow, {1.0, 2.0, 3.0, 4.0});
+    snap(&snaps, 0, 1, kRow, {1.0, 2.0, 3.0, 4.0});  // the walk reads the written operand too
+    r97::BoundaryNames names;
+    names.add("y", 0, 2);
+    const std::vector<Seed> seeds{[] {
+        Seed s;
+        s.buffer = "y";
+        s.row_lo = 0;
+        s.row_hi = 2;
+        s.cotangent = {1.0f, 1.0f, 1.0f, 1.0f};
+        return s;
+    }()};
+
+    std::map<int64_t, std::vector<int64_t>> reads{{0, {0, 1}}};
+    r97::BackwardOptions bo;
+    bo.read_rows = &reads;
+    const r97::BackwardResult got = r97::backward_block(records, snaps, names, seeds, {}, bo);
+
+    const r97::OpTiming* t = nullptr;
+    for (const r97::OpTiming& x : got.report.ops)
+        if (x.op == "cast") t = &x;
+    R97_CHECK(t != nullptr);
+    R97_CHECK(t->rows_readable == 0);
+    R97_CHECK(t->rows_zeroed_unreadable == 0);
+    R97_CHECK(t->rows_refused_non_finite == 0);
+}
+
 }  // namespace
