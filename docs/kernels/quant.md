@@ -11,17 +11,27 @@ issues: `had_quant_act_i8g`, `rmsnorm_had_quant_i8g`, `gated_had_quant_i8g`, `ga
 
 ## What the rows serve
 
-Every record writes the quantiser's two outputs and nothing else: the int8 codes and one f32 scale
-per group. The reads are the fused producer's own operands, and the row pins their order, because a
-device adjoint has no schema beyond the record it is handed: the codes and the scale are the last
-two operands, the reads are everything before them.
+Every record writes the quantiser's outputs: the int8 codes, one f32 scale per group, and -- on the
+fused producers the card issues -- the elementwise output beside them, `rmsnorm_had_quant_i8g`
+writing the normed value twice (in place over its input and again as `h`). A device adjoint has no
+schema beyond the record it is handed, so the row takes every role from the record and never from a
+position: the codes are the one `i8`/`fp8` write of two dimensions, the scale the one
+`f32`/`f16`/`bf16` write of `[rows, k]` narrower than the codes' row whose `k` divides it, and every
+other write is the elementwise output, whose own cotangent is summed in beside the codes' path. The
+params are not the truth either: the live `gate_had_quant_i8g` declares `n = 256` while its codes
+are 6144 wide with a 48-group scale (`group = 128`), so the widths come from the codes' and the
+scale's own shapes and the params are only a cross-check.
 
 | op | reads | writes |
 |---|---|---|
 | `had_quant_act_i8g` | `x` `[M, n]` | `q` `i8` `[M, n]`, `scale` `f32` `[M, n/group]` |
-| `rmsnorm_had_quant_i8g` | `x` `[M, n]`, `w` `[n]` | as above |
-| `gated_had_quant_i8g` | `gate_up` `[M, 2n]` | as above |
-| `gate_had_quant_i8g` | `gate` `[M, n]`, `x` `[M, n]` | as above |
+| `rmsnorm_had_quant_i8g` | `x` `[M, n]`, `w` `[n]` | as above, and the fused output(s) |
+| `gated_had_quant_i8g` | `gate_up` `[M, 2n]` | as above, and the fused output |
+| `gate_had_quant_i8g` | `gate` `[M, n]`, `x` `[M, n]` | as above, and the fused output |
+
+The live `gate_had_quant_i8g` record, for instance, is `gate` and `x` read, then
+`[attn_out.q8 i8 512 6144]`, `[attn_out.s8 f32 512 48]` and `[attn_out bf16 512 6144]` written: the
+codes are 6144 wide, the scale 48, the group 128.
 
 Parameters, read the way the host adjoint reads them (`n` and `group` as an int or a decimal
 string, the rest as strings):
@@ -80,9 +90,13 @@ shares a stage across its threads without changing a digit.
 - **The gain is frozen.** `rmsnorm_had_quant_i8g` registers as `R97_REGISTER_ADJOINT_IF_F(..., 1)`,
   matching `R97_REGISTER_ADJOINT_F("rmsnorm", host, ..., 1)`: `w`'s slot stays zero, and the test
   checks the row's frozen list is `{1}`.
-- **No throw.** A record whose operands, widths or parameters do not fit the row returns without
-  touching `dc`; so does a part whose twin refuses the record (the parts' twins throw on a record
-  they cannot serve, and the call catches that).
+- **A short operand refuses; it does not return a zero.** A record whose layout, widths or
+  parameters do not fit refuses by name, listing every write the record carried; a slot the walk
+  hands back short refuses naming the operand and both counts (`operand 'dc[1]' has 3145727
+  values, the row needs 3145728`), and a part whose twin refuses the record is a refusal too. Only a
+  record the row cannot index at all -- `fwd`/`dc` shorter than the schema, a width that does not
+  divide -- still returns untouched: a zero there is indistinguishable from a gradient, which is
+  the failure this row exists to remove.
 
 `plugin.hip` gains a `twin_find` fallback beside its `adjoint_register` and scratch ones: the plugin
 references a registry function for the first time, and without the fallback it would fail to load
@@ -92,8 +106,9 @@ tests the executable's definition wins, as `ENABLE_EXPORTS` intends.
 
 ## What is not served
 
-- `quant_act_i8g` without the rotation, the fp8 quantisers, and the `out_bf16`/`residual` forms of
-  these records: no row, so a lookup finds nothing rather than a wrong kernel.
+- `quant_act_i8g` without the rotation and the fp8 quantisers: no row, so a lookup finds nothing
+  rather than a wrong kernel. The int8 fused records' own `out_bf16` and `residual` writes are
+  served -- they are the elementwise outputs the roles above find.
 - `group` above 1024, a group that is not a power of two, and a group that does not divide `n`: the
   predicates refuse the record at the lookup.
 - `gated_had_quant_i8g` with `act = "sigmoid"` (a second, different half) and
@@ -110,6 +125,8 @@ tests the executable's definition wins, as `ENABLE_EXPORTS` intends.
 | `1024 x 5120` | the real hidden size, one sequence |
 | `2024 x 5120` | a batch of unequal lengths (300 + 700 + 1024) |
 | `4096 x 5120` | the real hidden size, the longest sequence |
+| the live tape's shapes | `fused_tape_shapes`: the fused producers' three- and four-write records, the phantom `none:1` write ahead of the codes, and a write count past every served layout refusing by name |
+| the live gate record | `live_gate_shape`: `gate_had_quant_i8g` as the tape carries it -- params `n = 256 group = 128`, codes `[4, 6144]`, scale `[4, 48]`, output `[4, 6144]` -- so the roles are found from the shapes and the params are not believed; and a `dc[1]` or `fwd[0]` one value short refusing by name instead of returning a zero |
 
 The reference is `docs/kernels/README.md`'s `HostRef`: the quantiser's host adjoint on the
 intermediate, then the elementwise part's host adjoint, in the order the kernel undoes them, and the
@@ -119,6 +136,9 @@ family has no fused row of its own yet. It also checks that the four device rows
 that the RMS norm's row freezes the gain, that `gated_had_quant_i8g` with `act = "gelu"` finds no
 row, and that the harness rejects a wrong kernel -- one that hands the cotangent back without the
 mask and the inverse rotation.
+
+Two of those cases are the ones a silent return used to hide behind: the fused record's write count,
+and a slot the walk hands back short.
 
 ## Timing and scratch
 

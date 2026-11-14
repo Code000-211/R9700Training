@@ -540,14 +540,30 @@ void quant_adjoint(const AdjointCall& call, Part part) {
     if ((part == Part::rmsnorm || part == Part::gate) && second_at < 0)
         throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "': a " +
                                  part_name(part) + " record with no second read");
-    if (part == Part::rmsnorm && (int64_t)call.fwd[0].value.size() != total) return;
-    if (part == Part::rmsnorm && (int64_t)call.fwd[(size_t)second_at].value.size() < n) return;
+    // A short operand is a refusal by name, never a return: a silent return here is a zero
+    // gradient that agrees with nothing, which is the signature this row exists to remove. Each
+    // check says which operand came up short and by how much, so a real record names its hole
+    // instead of showing a leaf of zeros.
+    const auto short_operand = [&](const char* what, size_t have, int64_t need) {
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "' at " +
+                                 std::to_string(call.rec.position) + ": operand '" + what +
+                                 "' has " + std::to_string(have) + " values, the row needs " +
+                                 std::to_string(need));
+    };
+    if (part == Part::rmsnorm && (int64_t)call.fwd[0].value.size() != total)
+        short_operand("fwd[0]", call.fwd[0].value.size(), total);
+    if (part == Part::rmsnorm && (int64_t)call.fwd[(size_t)second_at].value.size() < n)
+        short_operand("fwd[1]", call.fwd[(size_t)second_at].value.size(), n);
     if (part != Part::rmsnorm && (int64_t)call.fwd[0].value.size() !=
                                      (part == Part::gated ? 2 * total : total))
-        return;
-    if (part == Part::gate && (int64_t)call.fwd[(size_t)second_at].value.size() != total) return;
-    if ((int64_t)call.dc->at(0).value.size() < out_slot) return;
-    if (part == Part::gate && (int64_t)call.dc->at(1).value.size() < total) return;
+        short_operand("fwd[0]", call.fwd[0].value.size(),
+                      part == Part::gated ? 2 * total : total);
+    if (part == Part::gate && (int64_t)call.fwd[(size_t)second_at].value.size() != total)
+        short_operand("fwd[1]", call.fwd[(size_t)second_at].value.size(), total);
+    if ((int64_t)call.dc->at(0).value.size() < out_slot)
+        short_operand("dc[0]", call.dc->at(0).value.size(), out_slot);
+    if (part == Part::gate && (int64_t)call.dc->at(1).value.size() < total)
+        short_operand("dc[1]", call.dc->at(1).value.size(), total);
 
     std::vector<AdValue> y;
     // The elementwise part's twin is what makes this row's rotation the same numbers as the host

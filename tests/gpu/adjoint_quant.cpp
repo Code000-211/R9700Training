@@ -365,6 +365,104 @@ void fused_tape_shapes() {
     }
 }
 
+
+// The live `gate_had_quant_i8g` record, as the tape carries it: the params declare n=256
+// group=128 while the codes are 6144 wide with a 48-group scale (group 128), and the elementwise
+// output is a third write beside them. Every role is the shapes', not the params' -- pinning this
+// is what the schema's four-operand shape could not do, and the short-operand refusals below are
+// the ones that used to be silent zeros.
+void live_gate_shape() {
+    const int64_t rows = 4, codes_n = 6144, ngrp = 48;  // group 128, the live record's
+    const int64_t total = rows * codes_n;
+    uint64_t seed = 0x9a7f0badull;
+
+    OpRecord rec;
+    rec.position = 1453;
+    rec.op = "gate_had_quant_i8g";
+    // `n` names something else entirely (256): the row must read the widths off the operands, and
+    // only the activation and the group's power-of-two come from the params.
+    rec.params = {{"M", rows},
+                  {"n", int64_t(256)},
+                  {"group", int64_t(128)},
+                  {"dtype", std::string("bf16")},
+                  {"act", std::string("sigmoid")}};
+    rec.operands = {read_operand("gate", rows, codes_n), read_operand("x", rows, codes_n),
+                    Operand{"q8", "i8", {rows, codes_n}, 0, rows, true},
+                    Operand{"s8", "f32", {rows, ngrp}, 0, rows, true},
+                    Operand{"out", "bf16", {rows, codes_n}, 0, rows, true}};
+    std::vector<AdValue> fwd;
+    fwd.push_back(device_check::random_value("bf16", {rows, codes_n}, &seed));
+    fwd.push_back(device_check::random_value("bf16", {rows, codes_n}, &seed));
+    AdValue codes;
+    codes.dtype = "i8";
+    codes.shape = {rows, codes_n};
+    codes.value.resize((size_t)total);
+    for (int64_t i = 0; i < total; ++i) codes.value[(size_t)i] = double((i * 37) % 255) - 127.0;
+    fwd.push_back(std::move(codes));
+    AdValue scale;
+    scale.dtype = "f32";
+    scale.shape = {rows, ngrp};
+    scale.value.resize((size_t)(rows * ngrp));
+    for (int64_t i = 0; i < rows * ngrp; ++i) scale.value[(size_t)i] = 1.0 + 0.01 * (i % 7);
+    fwd.push_back(std::move(scale));
+    fwd.push_back(device_check::random_value("bf16", {rows, codes_n}, &seed));
+
+    // One cotangent per write, in the record's write order: the codes' is cot[0] here.
+    const std::vector<AdValue> cot = {device_check::random_value("f32", {rows, codes_n}, &seed),
+                                      device_check::random_value("f32", {rows, ngrp}, &seed),
+                                      device_check::random_value("f32", {rows, codes_n}, &seed)};
+    std::vector<AdValue> dc;
+    for (const Operand& o : rec.operands) {
+        AdValue v;
+        v.dtype = o.dtype;
+        v.shape = o.shape;
+        v.value.assign((size_t)numel(o.shape), 0.0);
+        dc.push_back(std::move(v));
+    }
+    AdjointCall call{rec, fwd, cot, &dc, nullptr, ""};
+    AdjointFn fn = adjoint_find(rec.op, Side::device, rec.params, nullptr);
+    R97_CHECK(fn != nullptr);
+    fn(call);
+    double sg = 0.0, sx = 0.0;
+    for (double v : dc.at(0).value) sg += std::fabs(v);
+    for (double v : dc.at(1).value) sx += std::fabs(v);
+    R97_CHECK(sg > 0.0);
+    R97_CHECK(sx > 0.0);
+    std::printf("gate_had_quant_i8g live shape (codes %lld wide, %lld-group scale): roles found, "
+                "|dc| %.6g + %.6g\n",
+                (long long)codes_n, (long long)ngrp, sg, sx);
+
+    // A slot the walk hands back short refuses by name: `dc[1]` is x's cotangent, `fwd[0]` the
+    // gate's activation. A return here would be the zero this row was fixed never to produce.
+    {
+        std::vector<AdValue> short_dc = dc;
+        short_dc.at(1).value.resize((size_t)(total - 1));
+        AdjointCall sc{rec, fwd, cot, &short_dc, nullptr, ""};
+        std::string what;
+        try {
+            fn(sc);
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        R97_CHECK(what.find("dc[1]") != std::string::npos);
+        R97_CHECK(what.find(rec.op) != std::string::npos);
+        std::printf("gate_had_quant_i8g short dc[1]: %s\n", what.c_str());
+    }
+    {
+        std::vector<AdValue> short_fwd = fwd;
+        short_fwd.at(0).value.resize((size_t)(total - 1));
+        AdjointCall sf{rec, short_fwd, cot, &dc, nullptr, ""};
+        std::string what;
+        try {
+            fn(sf);
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        R97_CHECK(what.find("fwd[0]") != std::string::npos);
+        std::printf("gate_had_quant_i8g short fwd[0]: %s\n", what.c_str());
+    }
+}
+
 void run() {
     const auto options = device_check::guard_options(int64_t(1) << 30);
     const r97test::DeviceGuard guard(options);
@@ -423,8 +521,10 @@ void run() {
         std::printf("rejected the wrong kernel: %s\n", wrong.note.c_str());
     }
 
-    // The live tape's shapes, which the schema's count check used to refuse in silence.
+    // The live tape's shapes, which the schema's count check used to refuse in silence, and the
+    // gate record's own widths, which its params do not name.
     fused_tape_shapes();
+    live_gate_shape();
 }
 
 }  // namespace
