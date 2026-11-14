@@ -466,7 +466,12 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                 refuse("op '" + rec.op + "' at position " + std::to_string(rec.position) +
                        ": operand '" + rec.operands[k].buffer + "' is snapped with shape " +
                        shape_text(v->shape) + ", not " + shape_text(want));
-            if (v->value.size() != static_cast<size_t>(numel(v->shape)))
+            // A plugin-private operand (the w8a8_fwht128 trunk's weight and its scale) has no
+            // f64 form: the snapshot carries its shape and the tape's pointer but no values, and
+            // a device row decodes the engine's stored layout from that pointer. An operand with
+            // neither values nor a pointer is still refused: it is the case the walk cannot
+            // differentiate at all.
+            if (v->value.size() != static_cast<size_t>(numel(v->shape)) && v->raw == nullptr)
                 refuse("op '" + rec.op + "' at position " + std::to_string(rec.position) +
                        ": operand '" + rec.operands[k].buffer + "' is snapped with " +
                        std::to_string(v->value.size()) + " values for its shape");

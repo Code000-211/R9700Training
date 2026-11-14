@@ -157,14 +157,15 @@ inline AdValue snapshot(const Operand& op, const OperandContent& content,
     // The family adjoints read the record's dtype off the value too (an absent scale is spelled
     // "invalid"), so keep it with the numbers.
     v.dtype = op.dtype;
-    // A dtype with no f64 form -- a plugin-private quantised tensor the kernel decodes in its own
-    // layout -- has no value a snapshot could hold, and the tape's byte count cannot name one: the
-    // refusal below is for a *readable* operand whose span was lost, not for this. Return the shape
-    // and no values: an adjoint row that needs the value guards on `value.empty()`, and one that
-    // needs the weight's planes reads them through joined_dense (whose bytes the tape carries for a
-    // host-side plane buffer).
+    // A dtype with no f64 form -- a plugin-private quantised tensor the engine decodes in its own
+    // stored layout (the w8a8_fwht128 trunk hands the tape its weight and scale as "w8a8...") --
+    // has no value a snapshot could hold, and the tape's byte count cannot name one: the refusal
+    // below is for a *readable* operand whose span was lost, not for this. Return the shape, no
+    // values, and the pointer the tape recorded, so a device row that knows the plugin's layout
+    // reads the bytes where they live. The tape gave no span, so the row owns the decode.
     if (content.bytes == 0 && content.named && elem_size(op.dtype) == 0) {
         v.shape = op.view_shape.empty() ? op.shape : op.view_shape;
+        v.raw = content.data;
         return v;
     }
     // A strided or narrowed read -- the q norm and the gate read the two halves of the q|gate

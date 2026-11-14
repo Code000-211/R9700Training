@@ -54,6 +54,13 @@ struct AdValue {
     std::string dtype;          // the forward dtype, as the record carries it
     std::vector<int64_t> shape; // full logical shape, row-major
     std::vector<double> value;  // numel(shape) values, row-major
+    // The operand's bytes where the tape recorded them -- a device pointer under the device join,
+    // the caller's pointer under the host join. Set only for an operand whose dtype has no f64
+    // form (a plugin-private quantised tensor the engine decodes in its own stored layout); null
+    // for every operand the tape gave values for. `value` is empty for such an operand, and the
+    // shape is still the op's, so a row that decodes the bytes owns the layout and one that needs
+    // f64 must decline. A row never adds to a gradient through this pointer.
+    const void* raw = nullptr;
 };
 
 // One call of an adjoint.

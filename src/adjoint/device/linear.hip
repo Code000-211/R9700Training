@@ -126,6 +126,40 @@ __device__ __forceinline__ v8bf scale8(v8bf x, const float* s) {
     return out.b;
 }
 
+// ------------------------------------------------------------------ the engine's stored layout
+//
+// A `w8a8_fwht128` container hands the tape its weight and its scale as plugin-private operands:
+// no f64 form, no byte span, one pointer each. The pin stores them in two planes, and the forward
+// GEMM reads exactly these (third_party/radiance/libr4d/r4d_fp8_layout.cpp):
+//
+//   codes  int8 [N][K], tag "r4d.i8h.w.frag64": a (16 row, 64 k) tile of 1024 bytes laid out as
+//          32 lanes x 32 bytes. Lane l's 32 bytes are its four 8-byte fragments, bytes 8t of them
+//          covering k = t*16 + (l>>4)*8 .. +7 of row l&15 (libr4d/r4d_fp8_frag.h, frag_src; the
+//          host relayout walks the same permutation, r4d_rad_relayout_i8_block's frag_walk).
+//   scale  bf16, tag "r4d.i8.s.t16": tile-major [N/16][K/128][16], the sixteen rows of a fragment
+//          tile side by side for one 128-K block -- d[((r/16)*G + g)*16 + r%16] = s[r*G + g], the
+//          loop in r4d_rad_relayout_i8_block.
+//
+// The kernel reads eight consecutive k of one weight row, which frag64 keeps contiguous inside one
+// fragment, so one 8-byte group is one address; and the scale a fragment column carries is that
+// row's, in the tile's row slot. K is a multiple of 128 (the scale grid's block) and N of 16 (the
+// fragment's rows) for any weight the i8a8h GEMM runs, so neither index leaves its plane.
+
+// The byte offset of the 8-byte fragment that starts at column `k` (k % 8 == 0) of `row`.
+__device__ __forceinline__ size_t frag_go(int K, int row, int k) {
+    const int kk = k & 63;
+    const int lane = (row & 15) + 16 * ((kk & 15) >> 3);
+    return ((static_cast<size_t>(row >> 4) * static_cast<size_t>(K >> 6) +
+             static_cast<size_t>(k >> 6)) * 32u + static_cast<size_t>(lane)) * 32u +
+           static_cast<size_t>((kk >> 4) * 8);
+}
+
+// The element index of (row, block `g` of K) in the tile-major bf16 scale plane.
+__device__ __forceinline__ size_t t16_go(int G, int row, int g) {
+    return (static_cast<size_t>(row >> 4) * static_cast<size_t>(G) + static_cast<size_t>(g)) * 16u +
+           static_cast<size_t>(row & 15);
+}
+
 // ------------------------------------------------------------------ the kernel
 
 #define LD_WAVES 8              // waves per CTA, 256 threads
@@ -138,7 +172,10 @@ __device__ __forceinline__ v8bf scale8(v8bf x, const float* s) {
 #define LD_TILE (LD_BN * LD_PITCH)  // staged weight tile, one reduction step
 
 // `Q`: int8 codes with a bf16 scale per block, or a bf16 weight already dequantised.
-template <bool Q>
+// `STORED`: the weight and its scale are the engine's plugin-private planes -- frag64 codes and a
+// t16 scale, the helpers above -- so `w` and `wscale` are the card's pointers into them, not
+// row-major copies. Only `Q` has a stored form.
+template <bool Q, bool STORED = false>
 __global__ __launch_bounds__(LD_WAVES * 32) void linear_dx_kernel(
     const unsigned short* __restrict__ dy, const void* __restrict__ w,
     const unsigned short* __restrict__ wscale, unsigned short* __restrict__ dx, int M, int N, int K,
@@ -160,8 +197,10 @@ __global__ __launch_bounds__(LD_WAVES * 32) void linear_dx_kernel(
         int ke = k0 + e;
         if (ke + 8 > K) ke = K - 8;
         if (Q) {
-            const unsigned* p = reinterpret_cast<const unsigned*>(
-                static_cast<const char*>(w) + static_cast<size_t>(nr) * K + ke);
+            const size_t off =
+                STORED ? frag_go(K, nr, ke) : static_cast<size_t>(nr) * K + ke;
+            const unsigned* p =
+                reinterpret_cast<const unsigned*>(static_cast<const char*>(w) + off);
             raw[0] = p[0];
             raw[1] = p[1];
         } else {
@@ -213,9 +252,11 @@ __global__ __launch_bounds__(LD_WAVES * 32) void linear_dx_kernel(
 
         float scl[8];
 #pragma unroll
-        for (int c = 0; c < 8; ++c)
-            scl[c] = have_scale ? bf2f(wscale[static_cast<size_t>(n0 + 8 * (c >> 2) + kc + (c & 3)) * G + g])
-                                : 1.0f;
+        for (int c = 0; c < 8; ++c) {
+            const int row_c = n0 + 8 * (c >> 2) + kc + (c & 3);
+            const size_t at = STORED ? t16_go(G, row_c, g) : static_cast<size_t>(row_c) * G + g;
+            scl[c] = have_scale ? bf2f(wscale[at]) : 1.0f;
+        }
 
 #pragma unroll
         for (int mt = 0; mt < LD_TM; ++mt) {
@@ -249,17 +290,23 @@ __global__ __launch_bounds__(LD_WAVES * 32) void linear_dx_kernel(
         }
 }
 
-static int linear_dx_launch(bool quant, const void* dy, const void* w, const void* wscale, void* dx,
-                            int M, int N, int K, int G, hipStream_t stream) {
+static int linear_dx_launch(bool quant, bool stored, const void* dy, const void* w,
+                            const void* wscale, void* dx, int M, int N, int K, int G,
+                            hipStream_t stream) {
     const dim3 block(LD_WAVES * 32);
     const dim3 grid((M + LD_BM - 1) / LD_BM, (K + LD_BK - 1) / LD_BK);
-    if (quant)
-        hipLaunchKernelGGL((linear_dx_kernel<true>), grid, block, 0, stream,
+    if (stored)
+        hipLaunchKernelGGL((linear_dx_kernel<true, true>), grid, block, 0, stream,
                            static_cast<const unsigned short*>(dy), w,
-                           static_cast<const unsigned short*>(wscale), static_cast<unsigned short*>(dx),
-                           M, N, K, G);
+                           static_cast<const unsigned short*>(wscale),
+                           static_cast<unsigned short*>(dx), M, N, K, G);
+    else if (quant)
+        hipLaunchKernelGGL((linear_dx_kernel<true, false>), grid, block, 0, stream,
+                           static_cast<const unsigned short*>(dy), w,
+                           static_cast<const unsigned short*>(wscale),
+                           static_cast<unsigned short*>(dx), M, N, K, G);
     else
-        hipLaunchKernelGGL((linear_dx_kernel<false>), grid, block, 0, stream,
+        hipLaunchKernelGGL((linear_dx_kernel<false, false>), grid, block, 0, stream,
                            static_cast<const unsigned short*>(dy), w,
                            static_cast<const unsigned short*>(nullptr),
                            static_cast<unsigned short*>(dx), M, N, K, G);
@@ -389,7 +436,10 @@ RadStream adjoint_stream() {
 }
 
 // dx[m,k] = sum_n dy[m,n] * W[n,k], with W the int8 codes and their per-block scale (`quant`) or
-// the bf16 weight as it stands.
+// the bf16 weight as it stands. `stored` is the plugin-private pair the w8a8_fwht128 trunk hands
+// the tape: the weight and its scale have no f64 form, so the card's own frag64/t16 planes are
+// read in place and frag_go/t16_go is the decode. The f64 path is untouched for a record whose
+// operands do have values.
 void linear_dx_adjoint(const AdjointCall& call, bool quant) {
     if (!call.dc) return;
     const int ia = operand_pos(call.rec, "a");
@@ -404,6 +454,11 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
     const AdValue* bs = ibs >= 0 ? &call.fwd[static_cast<std::size_t>(ibs)] : nullptr;
     const AdValue& dy = call.cot[0];
 
+    /* The plugin-private pair: no f64 values, one pointer each into the engine's stored planes.
+     * Only the int8 grid has such a form; a bf16 weight with no values is a record this row does
+     * not serve. */
+    const bool stored = quant && b.value.empty() && b.raw != nullptr;
+
     const int64_t K = int_param(call.rec.params, "K", a.shape.size() >= 2 ? a.shape[1] : 0);
     const int64_t N = int_param(call.rec.params, "N", b.shape.size() >= 2 ? b.shape[0] : 0);
     const int64_t M = int_param(call.rec.params, "M", a.shape.empty() ? 0 : a.shape[0]);
@@ -414,17 +469,28 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
      * does not is one this row was not written for, and an adjoint must not throw. */
     if (M * N != static_cast<int64_t>(dy.value.size()) ||
         M * K != static_cast<int64_t>(a.value.size()) ||
-        N * K != static_cast<int64_t>(b.value.size()) ||
         static_cast<int64_t>(dx.value.size()) != M * K)
         return;
+    if (stored) {
+        /* The stored planes are the i8a8h pair, so the geometry is the record's: the scale grid is
+         * 128 wide, the code fragment is 16 rows by 64 k, and both planes are whole. A record that
+         * does not fit is one this row was not written for. */
+        if (group != LD_BK) return;
+        if (bs == nullptr || bs->raw == nullptr || !bs->value.empty()) return;
+        if (b.shape.size() != 2 || b.shape[0] != N || b.shape[1] != K) return;
+        if (N % LD_BN != 0 || K % LD_BK != 0) return;
+    } else if (N * K != static_cast<int64_t>(b.value.size())) {
+        return;
+    }
     /* Only the int8 grid has a scale grid, and the kernel's block of K is one of its 128-wide
      * blocks; a bf16 weight carries none, and `group` falls back to K there. */
     if (quant && group != LD_BK) return;
     if (K < 8 || K % 8 != 0) return;
     /* The reduction tile is 16 output channels wide, so a narrow projection -- the fixture's eight-
      * and twelve-channel ones -- gets zero rows of weight and zero dy columns out to 16. They add
-     * nothing to the sum and every fragment read stays inside its buffer. */
-    const int64_t Np = (N + LD_BN - 1) / LD_BN * LD_BN;
+     * nothing to the sum and every fragment read stays inside its buffer. The stored planes cannot
+     * be padded that way (the engine's geometry is the weight's), so they are required whole. */
+    const int64_t Np = stored ? N : (N + LD_BN - 1) / LD_BN * LD_BN;
 
     /* The fragment offsets A reads with are 32-bit; the real model's largest band is 1.4e8
      * elements, so anything near the limit is a shape this kernel was not written for. */
@@ -440,49 +506,61 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
     const std::size_t dx_n = static_cast<std::size_t>(M * K);
     const std::size_t sc_n = static_cast<std::size_t>(Np * groups);
 
-    /* Staging: the tape's dy and weight are f64, the kernel's are bf16 (the weight's codes int8),
-     * so this call converts them on the way in and the answer on the way out. */
+    /* Staging: the tape's dy is f64 and the kernel's bf16, so this call converts it on the way in
+     * and the answer on the way out. The weight and its scale are staged the same way for the f64
+     * path (f64 codes -> int8, f64 scale -> bf16) and read in place for the stored one. */
     std::vector<unsigned short> host_dy(dy_n, 0);
     for (int64_t m = 0; m < M; ++m) {
         const double* src = dy.value.data() + static_cast<std::size_t>(m * N);
         unsigned short* dst = host_dy.data() + static_cast<std::size_t>(m * Np);
         for (int64_t n = 0; n < N; ++n) dst[n] = to_bf16(src[n]);
     }
-    std::vector<int8_t> host_code(quant ? w_n : 0, 0);
-    std::vector<unsigned short> host_w(quant ? 0 : w_n, 0);
-    for (int64_t n = 0; n < N; ++n)
-        for (int64_t k = 0; k < K; ++k) {
-            const std::size_t i = static_cast<std::size_t>(n * K + k);
-            if (quant) {
-                if (!to_code(b.value[i], &host_code[i])) return;
-            } else {
-                host_w[i] = to_bf16(b.value[i]);
-            }
-        }
-    std::vector<unsigned short> host_sc(quant ? sc_n : 0, to_bf16(1.0));
-    if (quant)
+    std::vector<int8_t> host_code;
+    std::vector<unsigned short> host_w;
+    std::vector<unsigned short> host_sc;
+    if (!stored) {
+        host_code.assign(quant ? w_n : 0, 0);
+        host_w.assign(quant ? 0 : w_n, 0);
         for (int64_t n = 0; n < N; ++n)
-            for (int64_t g = 0; g < groups; ++g)
-                host_sc[static_cast<std::size_t>(n * groups + g)] =
-                    to_bf16(scale_at(bs, n, g, N, groups));
+            for (int64_t k = 0; k < K; ++k) {
+                const std::size_t i = static_cast<std::size_t>(n * K + k);
+                if (quant) {
+                    if (!to_code(b.value[i], &host_code[i])) return;
+                } else {
+                    host_w[i] = to_bf16(b.value[i]);
+                }
+            }
+        host_sc.assign(quant ? sc_n : 0, to_bf16(1.0));
+        if (quant)
+            for (int64_t n = 0; n < N; ++n)
+                for (int64_t g = 0; g < groups; ++g)
+                    host_sc[static_cast<std::size_t>(n * groups + g)] =
+                        to_bf16(scale_at(bs, n, g, N, groups));
+    }
     std::vector<unsigned short> host_dx(dx_n);
 
     device::ScratchBlock dev_dy(static_cast<int64_t>(dy_n * 2));
-    device::ScratchBlock dev_w(static_cast<int64_t>(quant ? w_n : w_n * 2));
-    device::ScratchBlock dev_sc(static_cast<int64_t>(quant ? sc_n * 2 : 0));
+    device::ScratchBlock dev_w(static_cast<int64_t>(stored ? 0 : (quant ? w_n : w_n * 2)));
+    device::ScratchBlock dev_sc(static_cast<int64_t>(stored ? 0 : (quant ? sc_n * 2 : 0)));
     device::ScratchBlock dev_dx(static_cast<int64_t>(dx_n * 2));
-    if (!dev_dy || !dev_w || (quant && !dev_sc) || !dev_dx) return;
+    if (!dev_dy || (!stored && !dev_w) || (!stored && quant && !dev_sc) || !dev_dx) return;
 
     if (rad_memcpy_async(dev_dy.p, host_dy.data(), static_cast<int64_t>(dy_n * 2), stream) != 0)
         return;
-    if (rad_memcpy_async(dev_w.p, quant ? static_cast<const void*>(host_code.data())
-                                       : static_cast<const void*>(host_w.data()),
-                         static_cast<int64_t>(quant ? w_n : w_n * 2), stream) != 0)
-        return;
-    if (quant && rad_memcpy_async(dev_sc.p, host_sc.data(), static_cast<int64_t>(sc_n * 2), stream) != 0)
-        return;
+    if (!stored) {
+        if (rad_memcpy_async(dev_w.p, quant ? static_cast<const void*>(host_code.data())
+                                           : static_cast<const void*>(host_w.data()),
+                             static_cast<int64_t>(quant ? w_n : w_n * 2), stream) != 0)
+            return;
+        if (quant &&
+            rad_memcpy_async(dev_sc.p, host_sc.data(), static_cast<int64_t>(sc_n * 2), stream) != 0)
+            return;
+    }
 
-    const int rc = linear_dx_launch(quant, dev_dy.p, dev_w.p, quant ? dev_sc.p : nullptr, dev_dx.p,
+    /* The card's own planes for the stored pair; the staged copies otherwise. */
+    const void* const w_ptr = stored ? b.raw : dev_w.p;
+    const void* const sc_ptr = stored ? bs->raw : (quant ? dev_sc.p : nullptr);
+    const int rc = linear_dx_launch(quant, stored, dev_dy.p, w_ptr, sc_ptr, dev_dx.p,
                                     static_cast<int>(M), static_cast<int>(Np), static_cast<int>(K),
                                     static_cast<int>(groups), static_cast<hipStream_t>(stream));
     if (rc != 0) return;  // a failed launch leaves dc as the host row's would if it declined

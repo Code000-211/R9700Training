@@ -63,6 +63,32 @@ The host issues `gemm_nt_q` (not the fp8 `gemm_nt_q_gated` form) for `qwen35_w8a
 `gate_up.i8` disables that arch's gated fold and the two halves are two ordinary int8 linears. No
 gated form is registered here.
 
+### The plugin-private operands: `b` and `b_scale` on the card
+
+A `w8a8_fwht128` container does not hand the tape f64 values for the weight or its scale. Both
+operands arrive with the record's shape and a pointer into the engine's two stored planes
+(`AdValue::raw`, `include/r97/adjoint.h`) and no values at all: the engine decodes the layout in its
+kernel, so there is no f64 form to snapshot. The walk accepts such an operand -- one with neither
+values nor a pointer is still refused -- and the device row decodes it.
+
+The stored planes are the pin's (`third_party/radiance/libr4d/r4d_fp8_layout.cpp`,
+`libr4d/r4d_fp8_frag.h`):
+
+```text
+codes  int8 [N][K]   a (16 row, 64 k) tile of 1024 B as 32 lanes x 32 B; lane l's bytes 8t cover
+                     k = t*16 + (l>>4)*8 .. +7 of row l&15      ("r4d.i8h.w.frag64")
+scale  bf16           tile-major [N/16][K/128][16]: d[((r/16)*G + g)*16 + r%16] = s[r*G + g]
+                                                                 ("r4d.i8.s.t16")
+```
+
+`src/adjoint/device/linear.hip` reads them in place (`frag_go`, `t16_go`) and keeps the f64 path for
+a record whose operands do carry values, so a fixture and the container take the same row by the
+same `i8a8h` predicate. The decode is checked two ways: `tests/host/adjoint_private_weight.cpp`
+writes the planes the pin's way, reads them back with the kernel's inverse, and holds the f64 row's
+`dx` on the canonical weight to a plain f64 product of the decoded one (`1e-9` relative L2);
+`tests/gpu/adjoint_private_weight.cpp` hands the device row the same planes on the card and holds
+its `dx` to that product (bf16 tolerance).
+
 ## `logits_gemm`
 
 The vocabulary projection is the same product with the head weight:

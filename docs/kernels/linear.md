@@ -42,6 +42,18 @@ lane holds the eight scales its own fragment columns need.
 
 `gemm_nt` is the same kernel with the weight already bf16 and no scale to apply.
 
+### The stored planes
+
+A `w8a8_fwht128` container's weight and scale reach the tape as plugin-private operands: no f64
+values, one device pointer each. This row therefore reads them where the engine stores them instead
+of from a staged row-major copy -- the codes in frag64 order and the scale in the tile-major
+`[N/16][K/128][16]` plane (`frag_go`/`t16_go`, whose layout and source lines are in
+[`docs/adjoints/linear.md`](../adjoints/linear.md)). `STORED` is the kernel's template parameter for
+it, so the f64 path's staging and its row-major indexing are untouched for a record that carries
+values; only where `b` and `b_scale` are read changes. That path requires `N % 16 == 0` and
+`K % 128 == 0`, which every weight the `i8a8h` GEMM runs already satisfies, and it needs no staged
+copy of either plane, so its scratch is `dy` and `dx` alone.
+
 `gather_rows` is not a product: the forward picks rows of `x`, `y[i,:] = x[idx[i],:]` with a
 negative index a zero row, and the adjoint scatters the picked rows back,
 
