@@ -30,27 +30,45 @@ and `shared_snapshot_bytes` 1.394 GiB), `peak_cotangent_bytes 490864656` (0.46 G
 `gate_had_quant_i8g` served the tape's real layout (codes `[512, 6144]`, a 48-group scale,
 the bf16 output), which is the row the earlier runs stopped on.
 
-### Two caveats, stated as observations
+### The non-finite values: not the forward, the pull
 
 `all_finite false`, with
 `non_finite {op "rmsnorm", position 1458, operand "x", forward_operand "h",
 forward_operand_index 2, forward_value_index 62, from_row true}`, and
 `first_nonzero_a_finite false` / `first_nonzero_b_finite false`.
 
-Neither branch of the test asserts anything about finiteness (`:965-978`), so this is an
-observation, **not a case failure**. What it is: a finite loss (7371.5913) beside a
-non-finite forward value and non-finite gradient entries — the forward/backward mismatch
-pattern, not the zero signature this work set out to remove. It is an **open defect**,
-recorded here with its position so the next session starts from the tape rather than from
-the symptom.
+Neither branch of the test asserts anything about finiteness (`:965-978`), so this was an
+observation rather than a case failure — but it was a real defect, and it is **not in the
+forward**. A scan of every written operand at its issue, on the issuing lane, finds the head's
+values finite:
 
-**It is localized, not global.** The case's descent check passed on this run:
-`loss 7371.5913` before the step and `loss_after 6347.8839` after it, with
-`std::isfinite(after.loss)` holding. A NaN gradient would have taken the parameters to NaN
-and the loss with them. So the forward inf contaminates *some* leaves — `first_nonzero_a_finite`
-and `first_nonzero_b_finite` are false, i.e. the first non-zero leaf is one of them — while
-the step as a whole still descends. That bounds the defect: it is one column of one row
-reaching part of the adapter, not a broken walk.
+```
+DUMPFWD probe op=add pos=1457 buffer=x     count=2621440 maxabs=14720   nonfinite_at=-1
+DUMPFWD probe op=rmsnorm pos=1458 buffer=h count=2621440 maxabs=11.0625 nonfinite_at=-1
+DUMPFWD probe op=gather_rows pos=1459 buffer=h_out maxabs=11.0625      nonfinite_at=-1
+DUMPFWD probe op=logits_gemm_vocab pos=1460 buffer=logits maxabs=13.4599 nonfinite_at=-1
+```
+
+The pull the join performs **after `serve()` returns**, reading the same pointers and byte
+counts, finds something else:
+
+```
+DUMPPULL pos=1458 op=rmsnorm buffer=x operand=0 card=[-0.125 -0.160156 -7.86957e+33 ...] host=[same]
+DUMPPULL pos=1458 op=rmsnorm buffer=h operand=2 card=[-37.75 3.01562 42.25 ...]         host=[same]
+```
+
+Card and host agree with each other and disagree with the forward. **The engine overwrites the
+head's buffers after their ops issue and before the join reads them** — the block boundaries
+survive because the residual store keeps them, and the head has no such store. The host join is
+unaffected because `tape.keep_contents(true)` copies at issue.
+
+That also bounds the defect: the descent check passed (`loss 7371.5913` -> `6347.8839`, finite),
+which a globally NaN gradient could not do, so the staleness reaches the head's rows and part of
+the adapter rather than breaking the walk.
+
+**It is cured by capturing the head's operands at issue**, not by containing the symptom, and the
+criterion for "the head's records" is structural — every record issued after the tape has recorded
+`meta.layers` blocks — so it depends on no position and no count.
 
 ### Which run this is, and which one is still to come
 
