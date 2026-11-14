@@ -83,8 +83,15 @@ the rule, the analysis widens with a second case to design and test against, not
 ## Where it is threaded
 
 - `src/step_host.cpp` and `src/step_device.cpp` call `derive_read_sets` once for the head's walk
-  (with the seed buffers as `external_reads`) and once per block (with the block's incoming buffer
-  as `external_reads`), then point `BackwardOptions::read_rows` at the map before that walk.
+  and once per block (with the block's incoming buffer as `external_reads`), then point
+  `BackwardOptions::read_rows` at the map before that walk. The head walk's externals come from
+  `head_external_reads` (`src/read_set.h`): **the logits, the objective's buffer**, never the
+  walk's own input. Marking the input instead -- the device step did -- leaves the record that
+  writes the hidden state unprovable, and the rule degrades to everything-readable: the 512 step
+  then reported `0` zeroed, `0` readable, `0` refused over 1459 calls while a forward inf in a row
+  no consumer reads reached every gradient. The host path had always marked the objective's
+  buffer, and the two paths disagreeing is how it survived; the marking is one function now, and
+  `read_set_head_externals_are_the_logits_not_the_hidden_state` pins it.
 - `src/backward.cpp` looks the record's position up in the map and sets `call.read_rows` -- the
   record's list, or null when the map does not name it -- plus `call.row_count`.
 - The rmsnorm rows apply the rule: `rmsnorm_host_adjoint` (`src/adjoint/host/elementwise.cpp`) and
@@ -95,19 +102,28 @@ the rule, the analysis widens with a second case to design and test against, not
 
 ## The twin's gain
 
-`rmsnorm_twin` and `rmsnorm_host_adjoint` take the gain as **the first non-written operand after
-index 0** (`norm_gain`), not `operands[1]`. The plain record is `x, w, y`; the fused producer is
-`x, residual:inout?, w, q, scale, out?`. On the fused shape `operands[1]` is the residual, and the
-old code used a present residual's first row as the gain -- a silent wrong intermediate that the
-read set would have had no reason to catch. `norm_gain` is the same answer on both shapes, and it
-refuses (returns empty, so the record refuses) when a gain exists and does not cover a row.
+`rmsnorm_twin` and `rmsnorm_host_adjoint` take the gain as **the one non-written operand whose
+shape is a single row of `n` columns** (`norm_gain`), never by position. The plain record is
+`x, w{n}, y`; the fused producer is `x, residual:inout?, w{n}, q{rows,n}, scale{rows,n/128}, out?`.
+On the fused shape a positional rule lands on the residual (written -- a silently wrong gain), and
+whenever the gain's values are missing it falls through to `q` or `scale`: a wrong gain, which on
+the int8 fixture produced a non-finite gradient at layer 0's `in_proj_qkv.lora_A`. A gain the tape
+gave no values for is absent; the schema's `wadd` decides whether that is a refusal, so a plain
+norm still computes and a record that needs a gain refuses by name. A gain with some values but
+fewer than a row refuses by name too.
 
 ## Tests
 
 - `tests/host/read_set.cpp` (host tier, no card): a lone gather proves `{1}`; a non-gather consumer
   leaves the record unproven; an external read leaves it unproven; a missing index list leaves it
   unproven; the walk zeroes an unreadable non-finite row and differentiates the readable one with
-  the counts at 1/1/0; a non-finite row inside the read set refuses.
+  the counts at 1/1/0; a non-finite row inside the read set refuses; an empty proof is unproven
+  (window ending at a rewrite and at the tape's end alike); a zero-row gather is unproven; and the
+  head's externals are the logits, not the walk's input -- marked `{"h"}` proves nothing, marked
+  `{"logits"}` proves the norm and names the gather's single row.
 - `tests/gpu/device_step.cpp`'s `device_step_tape` (512 tokens, the real container) is the
   acceptance: the step's `row_seconds` must carry `rmsnorm` with `rows_zeroed_unreadable == 511`
-  and `rows_readable == 1`.
+  and `rows_readable == 1`. **The counters are the tell**: `0/0/0` is a gradient produced with no
+  read set at all (the 18:35 run, where the device path marked its own input), and the four
+  criteria alone cannot tell the two runs apart -- they differ only in `all_finite`. The head walk
+  prints its decision (`r97: head read set: N of M records proven [...]`) for the same reason.
