@@ -165,14 +165,19 @@ take the evidence with them.
 
 **What the failure does and does not say.** `after.loss` was *finite* and merely not lower
 (`std::isfinite(after.loss)` passed, `after.loss < result.loss` did not), so the 4096
-gradient was not NaN and the step did not ascend into a non-finite parameter. It is
-consistent with three things that are not yet distinguished: a wrong-but-finite gradient, lr
-overshoot on 400 rank-16 leaves at 1e-3, and the case's own zero-`A` contract at this start.
-Attributing it needs the numbers, which the fix above now guarantees.
+gradient was not NaN and the step did not ascend into a non-finite parameter. Three
+explanations were open: a wrong-but-finite gradient, lr overshoot on 400 rank-16 leaves at
+1e-3, and the case's own zero-`A` contract at this start.
 
-**The next run** is the 512 confirmation first (the forward inf below is the live defect),
-then this case again against its own contract — `a_all_zero`, `b_all_nonzero`,
-`a_changed == 0`, `b_changed == n_b` — with the wall clock.
+**The first of those now has a mechanism.** The device join was reading buffers the engine had
+already reused — the pull after `serve()` described in the 512 section above — so the head's
+cotangent was computed from values the forward never produced. A finite but wrong gradient is
+exactly the shape of a step that does not descend. If the at-issue capture cures the 512 case,
+this case is its confirmation; if it descends afterwards, the lr and zero-`A` explanations are
+both dead and should not be re-raised.
+
+**The next run** is this case against its own contract — `a_all_zero`, `b_all_nonzero`,
+`a_changed == 0`, `b_changed == n_b` — with the wall clock and the descent delta.
 
 ## The rows this run depended on
 
