@@ -488,9 +488,9 @@ void live_gate_shape() {
         } catch (const std::exception& e) {
             what = e.what();
         }
-        R97_CHECK(what.find("codes' cotangent") != std::string::npos);
+        R97_CHECK(what.find("codes cotangent") != std::string::npos);
         R97_CHECK(what.find(rec.op) != std::string::npos);
-        std::printf("gate_had_quant_i8g short codes' cotangent: %s\n", what.c_str());
+        std::printf("gate_had_quant_i8g short codes cotangent: %s\n", what.c_str());
     }
 }
 

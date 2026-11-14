@@ -578,7 +578,7 @@ void quant_adjoint(const AdjointCall& call, Part part) {
         short_operand("scale", scale.value.size(), rows * ngrp);
     // The codes' cotangent is the codes' own width (2n for the gated producer's gate_up).
     if ((int64_t)cot.value.size() < rows * codes_n)
-        short_operand("codes' cotangent", cot.value.size(), rows * codes_n);
+        short_operand("codes cotangent", cot.value.size(), rows * codes_n);
 
     // What the backprop reads: the elementwise operands' widths, and the slots it answers for.
     const int64_t arg_count = part == Part::quant ? 0
