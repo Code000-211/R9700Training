@@ -16,6 +16,7 @@
 #include "r97/adjoint.h"
 #include "r97/op.h"
 #include "rad_device.h"
+#include "rad_encoding.h"
 #include "support/device_check.h"
 #include "support/gpu_guard.h"
 #include "support/test.h"
@@ -25,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -160,7 +162,16 @@ R97_TEST(adjoint_private_weight_device_reads_the_stored_planes) {
     R97_CHECK(rad_stream_sync(stream) == 0);
 
     // The record the walk builds, and its operands exactly as the tape hands them: the weight and
-    // its scale carry a shape and a device pointer and no values.
+    // its scale carry a shape, a device pointer, no values, and the encoding the observer recorded
+    // (patch 0124). The encoding is what tells the row this pair is `codes=i8` -- the int8 reader's
+    // own layout -- rather than one of the sub-byte IQR forms; a record with no encoding is refused
+    // by name (`adjoint_private_weight_device_refuses_without_an_encoding` below).
+    RadEncoding enc;
+    rad_enc_clear(&enc);
+    rad_enc_copy_str(enc.scheme, "affine");
+    rad_enc_copy_str(enc.transform, "fwht128");
+    rad_enc_add_plane(&enc, "codes", RAD_I8, 1, 1);
+    rad_enc_add_plane(&enc, "scale", RAD_BF16, 1, 128);
     OpRecord rec;
     rec.op = "gemm_nt_q";
     rec.params = {{"M", M}, {"N", N}, {"K", K}, {"group", group}, {"dtype", "i8a8h"}};
@@ -181,9 +192,11 @@ R97_TEST(adjoint_private_weight_device_reads_the_stored_planes) {
     fwd[2].dtype = "w8a8_fwht128";
     fwd[2].shape = {N, K};
     fwd[2].raw = dev_codes;  // no values: the plugin-private operand the tape records
+    fwd[2].enc = &enc;
     fwd[3].dtype = "w8a8_fwht128";
     fwd[3].shape = {N, G};
     fwd[3].raw = dev_scales;
+    fwd[3].enc = &enc;
     fwd[4].dtype = "f32";
     fwd[4].shape = {M, N};
     fwd[4].value.assign(static_cast<std::size_t>(M * N), 0.0);
@@ -226,4 +239,82 @@ R97_TEST(adjoint_private_weight_device_reads_the_stored_planes) {
 
     rad_dev_free(dev_codes, RAD_MEM_DEVICE);
     rad_dev_free(dev_scales, RAD_MEM_DEVICE);
+}
+
+// The other half of the stored path's guard: a plugin-private operand with a pointer but *no*
+// encoding. Patch 0124 sets `enc` only for a weight-kind operand whose encoding it identified, and
+// `snapshot()` hands over a pointer for any dtype with no element size, so this record is reachable
+// (a vocabulary-table weight, or one whose encoding was not known). There is no form to decode and
+// nothing that says whether the plane is an int8 pair or 4.81 bpw, so the int8 reader must not run:
+// it would index N*K bytes into a plane that may be a fraction of that. The row refuses by name.
+R97_TEST(adjoint_private_weight_device_refuses_without_an_encoding) {
+    const r97test::GuardOptions o = device_check::guard_options(int64_t(64) << 20);
+    const r97test::DeviceGuard guard(o);
+    device_check::require_device(o.device);
+    (void)device_check::load_plugin();
+
+    const int64_t M = 2, N = 32, K = 256;
+    const int64_t group = 128, G = K / group;
+    void* const dev_plane = rad_dev_alloc(static_cast<int64_t>(N) * K, RAD_MEM_DEVICE);
+    R97_CHECK(dev_plane != nullptr);
+    OpRecord rec;
+    rec.op = "gemm_nt_q";
+    rec.params = {{"M", M}, {"N", N}, {"K", K}, {"group", group}, {"dtype", "i8a8h"}};
+    rec.operands = {
+        {"a", "i8", {M, K}, 0, M, false},
+        {"a_scale", "f32", {M, G}, 0, M, false},
+        {"b", "w8a8_fwht128", {N, K}, 0, N, false},
+        {"b_scale", "w8a8_fwht128", {N, K}, 0, N, false},
+        {"y", "f32", {M, N}, 0, M, true},
+    };
+    std::vector<AdValue> fwd(rec.operands.size());
+    fwd[0].dtype = "i8";
+    fwd[0].shape = {M, K};
+    fwd[0].value.assign(static_cast<std::size_t>(M * K), 0.0);
+    fwd[1].dtype = "f32";
+    fwd[1].shape = {M, G};
+    fwd[1].value.assign(static_cast<std::size_t>(M * G), 1.0);
+    fwd[2].dtype = "w8a8_fwht128";
+    fwd[2].shape = {N, K};
+    fwd[2].raw = dev_plane;  // a pointer and no encoding: the record this guard is for
+    fwd[3].dtype = "w8a8_fwht128";
+    fwd[3].shape = {N, K};
+    fwd[3].raw = dev_plane;
+    fwd[4].dtype = "f32";
+    fwd[4].shape = {M, N};
+    fwd[4].value.assign(static_cast<std::size_t>(M * N), 0.0);
+    std::vector<AdValue> cot(1);
+    cot[0].dtype = "f32";
+    cot[0].shape = {M, N};
+    cot[0].value.assign(static_cast<std::size_t>(M * N), 0.5);
+    std::vector<AdValue> dc(rec.operands.size());
+    for (std::size_t i = 0; i < dc.size(); ++i) {
+        dc[i].dtype = rec.operands[i].dtype;
+        dc[i].shape = rec.operands[i].shape;
+        dc[i].value.assign(static_cast<std::size_t>(numel(rec.operands[i].shape)), 0.0);
+    }
+
+    std::string why;
+    const AdjointFn device = adjoint_find("gemm_nt_q", Side::device, rec.params, &why);
+    R97_CHECK(device != nullptr);
+    if (device == nullptr) {
+        std::printf("adjoint_private_weight: no device row: %s\n", why.c_str());
+        return;
+    }
+    AdjointCall call{rec, fwd, cot, &dc, nullptr, ""};
+    std::string what;
+    bool threw = false;
+    try {
+        device(call);
+    } catch (const std::exception& e) {
+        threw = true;
+        what = e.what();
+    }
+    std::printf("adjoint_private_weight: no encoding: %s\n", threw ? what.c_str() : "NOT REFUSED");
+    R97_CHECK(threw);
+    R97_CHECK(what.find("iqr dx declined") != std::string::npos);
+    R97_CHECK(what.find("carries no encoding") != std::string::npos);
+    // The plane was never read: the refusal is before any launch, and dx is untouched.
+    R97_CHECK(dc[0].value == std::vector<double>(static_cast<std::size_t>(M * K), 0.0));
+    rad_dev_free(dev_plane, RAD_MEM_DEVICE);
 }

@@ -89,13 +89,16 @@ writes the planes the pin's way, reads them back with the kernel's inverse, and 
 `tests/gpu/adjoint_private_weight.cpp` hands the device row the same planes on the card and holds
 its `dx` to that product (bf16 tolerance).
 
-The stored pair is behind `R97_STORED_WEIGHTS=1` while the trunk's real encoding is still being
-identified. With the variable unset, `snapshot()` (`src/join_common.h`) returns the operand's shape
-and no pointer, and the walk refuses it by name
-(`tests/host/adjoint_private_weight.cpp:234`), which is what it did before the pointer was
-threaded. The gate is there because the container's plane is **not** the int8 pair above: its
+The stored pair is the default: `snapshot()` (`src/join_common.h`) hands the row the operand's
+pointer and encoding, and the row decodes the plane. `R97_NO_STORED_WEIGHTS=1` is the kill switch —
+the operand then has neither values nor a pointer and the walk refuses it by name
+(`tests/host/adjoint_private_weight.cpp`), which is what it did before the pointer was threaded.
+The default is the stored path because the container's plane is **not** the int8 pair above: its
 weights pool is 15.13 GiB over 27e9 parameters (4.81 bpw), and the first real run faulted 65.08 MiB
-into an 85 MiB `N*K` read, so the codes are narrower than a byte.
+into an 85 MiB `N*K` read, so the codes are narrower than a byte — an encoding the row must decode
+or refuse, never index as int8. A narrow encoding this build has no kernel for throws with its form
+in the message (`iqr_plane_narrow` / `iqr_decline`), because a zero `dx` on a stored plane is
+indistinguishable from a correct zero.
 
 ### The trunk's real plane: an IQR form, decoded by libr4d's own kernel
 

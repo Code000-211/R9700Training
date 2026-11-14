@@ -488,6 +488,15 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
     if (narrow && !iqr)
         iqr_decline("the weight's encoding is an IQR form this build cannot decode", call.rec, b, N,
                     K, groups);
+    /* A plugin-private operand with no encoding at all: patch 0124 sets `enc` only for a weight-kind
+     * operand whose encoding it knows, and `snapshot()` sets `raw` for any dtype with no element
+     * size -- a vocabulary-table weight, or a record whose encoding was not identified. There is no
+     * form to decode and no way to tell an int8 pair from a B-bit plane, so the int8 reader below
+     * must not run: it would index N*K bytes into a plane that may be 4.81 bpw. */
+    if (stored && b.enc == nullptr)
+        iqr_decline("the operand is plugin-private but the record carries no encoding, so the stored "
+                    "form is unknown",
+                    call.rec, b, N, K, groups);
     /* The operand extents, the write's shape and the record's M, N, K have to agree; a record that
      * does not is one this row was not written for, and returns. A *stored plane* the row cannot
      * decode is the other case: it throws, because a zero dx there is indistinguishable from a

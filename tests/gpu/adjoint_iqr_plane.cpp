@@ -284,10 +284,13 @@ void iqr_case(const Case& cs) {
             } else {
                 v = static_cast<int>(static_cast<int8_t>(W[static_cast<size_t>(aux_off + st)]));
             }
-            if (cs.lrb != 0) {  // rint(v * own / B): exact here, every scale a power of two
+            if (cs.lrb != 0) {  // rint(v * own / B), libquant's rb_round (r4d_selftest.cpp:6847-6849)
                 const double ratio = own[static_cast<size_t>(r * nkb + kb)] /
                                      fold[static_cast<size_t>(r * nkb + kb)];
-                v = static_cast<int>(std::llround(static_cast<double>(v) * ratio));
+                // Round half to even, not away from zero: the device's `rows` rounds the product
+                // with the hardware's nearest-even, and the two differ exactly on the halves
+                // (|v| = 1 at ratio 0.5), which is a handful of large elements rather than noise.
+                v = static_cast<int>(std::nearbyint(static_cast<double>(v) * ratio));
             }
             R97_CHECK(v >= -128 && v <= 127);
             code[static_cast<size_t>(r * K + k)] = static_cast<int8_t>(v);

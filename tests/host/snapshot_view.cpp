@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -110,17 +111,40 @@ R97_TEST(snapshot_keeps_no_values_for_a_dtype_with_no_element_size) {
     w.shape  = {16, 8};
     const void* ptr = reinterpret_cast<const void*>(static_cast<uintptr_t>(0x1000));
 
+    // The default is the stored path: no values, and the pointer (and the encoding, when the record
+    // carries one) so the row can decode the engine's own plane. `R97_NO_STORED_WEIGHTS=1` is the
+    // kill switch and takes both away, which is the state the walk refuses by name.
+    RadEncoding enc;
+    rad_enc_clear(&enc);
+    rad_enc_copy_str(enc.scheme, "trellis");
+    rad_enc_add_plane(&enc, "codes", RAD_U5, 1, 1);
+    w.enc = &enc;
+
     const r97::AdValue got = r97::snapshot(w, {ptr, 0, true}, "gemm_nt_q");
     R97_CHECK(got.shape == (std::vector<int64_t>{16, 8}));
     R97_CHECK(got.value.empty());
+    R97_CHECK(got.raw == ptr);
+    R97_CHECK(got.enc == &enc);
 
-    // The same when the observer describes it by a view: still no values, still no throw.
+    // The same when the observer describes it by a view: still no values, still no throw, still the
+    // pointer -- a plugin-private tensor's view is dense (the real dump's view_shape == shape).
     w.view_shape  = {16, 8};
     w.view_stride = {8, 1};
     w.view_off    = 0;
     const r97::AdValue viewed = r97::snapshot(w, {ptr, 0, true}, "gemm_nt_q");
     R97_CHECK(viewed.shape == (std::vector<int64_t>{16, 8}));
     R97_CHECK(viewed.value.empty());
+    R97_CHECK(viewed.raw == ptr);
+
+    setenv("R97_NO_STORED_WEIGHTS", "1", 1);
+    const r97::AdValue killed = r97::snapshot(w, {ptr, 0, true}, "gemm_nt_q");
+    unsetenv("R97_NO_STORED_WEIGHTS");
+    R97_CHECK(killed.value.empty());
+    R97_CHECK(killed.raw == nullptr);
+    R97_CHECK(killed.enc == nullptr);
+    // ... and the default is back once the switch is unset, so a test cannot leave the run in it.
+    const r97::AdValue again = r97::snapshot(w, {ptr, 0, true}, "gemm_nt_q");
+    R97_CHECK(again.raw == ptr);
 }
 
 // The gate stays: a readable operand the tape handed a pointer for but could not span is refused by

@@ -228,12 +228,18 @@ R97_TEST(adjoint_private_weight_stored_layout_matches_the_f64_row) {
     R97_CHECK(rel < rel_tol);
 }
 
-// The gate: with R97_STORED_WEIGHTS unset the stored decode is off, so a plugin-private operand
-// carries neither values nor a pointer and the walk refuses it by name -- the behaviour before the
-// pointer was threaded, and what keeps a layout this row does not know from being read. One operand
-// is unspannable (`b`) and its scale is readable, so the refusal names `b` deterministically even
-// though the guard's units run in parallel.
-R97_TEST(adjoint_private_weight_refused_without_the_gate) {
+// The kill switch: with R97_NO_STORED_WEIGHTS=1 `snapshot()` gives a plugin-private operand neither
+// values nor a pointer, so the walk refuses it by name -- the behaviour before the pointer was
+// threaded, kept as the way to take the stored path out of a run. One operand is unspannable (`b`)
+// and its scale is readable, so the refusal names `b` deterministically even though the guard's
+// units run in parallel.
+//
+// The *default* path's loud decline -- an encoding that classifies but has no kernel built, or a
+// plugin-private operand with no encoding at all -- is the device row's, so it is covered where the
+// row runs: `adjoint_iqr_plane_unbuilt_form_refuses` and
+// `adjoint_private_weight_device_refuses_without_an_encoding` in tests/gpu/. A host test cannot
+// reach `linear.hip`: the row lives in libr97.so, not in libr97.a.
+R97_TEST(adjoint_private_weight_kill_switch_refuses_by_name) {
     const int64_t M = 2, N = 32, K = 256;
     const int64_t group = 128, G = K / group;
     OpRecord rec;
@@ -252,8 +258,13 @@ R97_TEST(adjoint_private_weight_refused_without_the_gate) {
         v.dtype = rec.operands[i].dtype;
         v.shape = rec.operands[i].shape;
         v.value.assign(static_cast<std::size_t>(numel(v.shape)), 0.0);
-        // What snapshot() returns with the gate unset: the shape, no values, no pointer.
-        if (rec.operands[i].buffer == "b") v.value.clear();
+        if (rec.operands[i].buffer == "b") {
+            // What snapshot() returns with the kill switch set: the shape, no values, no pointer
+            // (tests/host/snapshot_view.cpp asserts that against snapshot() itself, including the
+            // pointer the default path hands over).
+            v.value.clear();
+            v.raw = nullptr;
+        }
         snaps.set(rec.position, i, std::move(v));
     }
     BoundaryNames names;
