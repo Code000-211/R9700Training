@@ -637,9 +637,13 @@ void card_case(const char* test, int64_t n, bool probe) {
         after = step(batch, params, nullptr);
         after_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
-    R97_CHECK(after.scored == result.scored);
-    R97_CHECK(std::isfinite(after.loss));
-    R97_CHECK(after.loss < result.loss);  // the step descended
+    // Deferred to the end of this function, after the results file and the attribution prints.
+    // A failure here must not discard them: two 90-minute 4096-token windows were spent
+    // re-learning a single line because these threw before anything was written, and the one
+    // line that says where a bad number came from was unreachable exactly when it was needed.
+    const bool after_scored_same = after.scored == result.scored;
+    const bool after_finite = std::isfinite(after.loss);
+    const bool descended = after.loss < result.loss;
 
     // ---- the results
 
@@ -841,6 +845,16 @@ void card_case(const char* test, int64_t n, bool probe) {
                  std::to_string(n_b) + ")";
     std::printf("%s: zero-gradient leaves: lora_A %s, lora_B %s\n", test, zero_a.c_str(),
                 zero_b.c_str());
+    // The descent, last: the step's own loss is the pre-step reference (the same params the
+    // forward-only call ran), and one AdamW step at the config's default lr must leave it lower.
+    // A sign or scale error in the walk leaves it up, and a non-finite gradient leaves it
+    // non-finite; both are named here with the numbers, after the file is on disk.
+    std::printf("%s: descent: loss %.9g -> %.9g (%+.6g) after %.1f s | scored %lld -> %lld\n", test,
+                result.loss, after.loss, after.loss - result.loss, after_seconds,
+                (long long)result.scored, (long long)after.scored);
+    R97_CHECK(after_scored_same);
+    R97_CHECK(after_finite);
+    R97_CHECK(descended);
 }
 
 }  // namespace
