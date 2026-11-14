@@ -288,11 +288,15 @@ if(NOT R97_WITH_HIP STREQUAL "OFF")
     if(R97_DEVICE_KERNEL_SOURCES STREQUAL "")
       message(FATAL_ERROR "r97: src/adjoint/device/ holds no kernels; libr97 needs add.hip")
     endif()
+    # libr4d's IQR decoder is a header of device functions the forward's own kernel includes
+    # (libr4d/r4d_iqr_dec.h, r4d_gemm_iqr.hip:24); the backward calls that same arithmetic rather
+    # than carry a second trellis, so the plugin compiles against the header (iqr_plane.hip).
     rad_add_plugin(libr97 kernels
       SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/src/adjoint/device/plugin.hip
       HIP_SOURCES ${R97_DEVICE_KERNEL_SOURCES}
       GPU_TARGETS ${RAD_GPU_TARGETS}
-      INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+      INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+                  ${R97_RADIANCE_COPY}/libr4d)
     set_target_properties(libr97 PROPERTIES
       HIP_STANDARD 20
       HIP_STANDARD_REQUIRED ON)

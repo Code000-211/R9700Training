@@ -89,6 +89,48 @@ writes the planes the pin's way, reads them back with the kernel's inverse, and 
 `tests/gpu/adjoint_private_weight.cpp` hands the device row the same planes on the card and holds
 its `dx` to that product (bf16 tolerance).
 
+The stored pair is behind `R97_STORED_WEIGHTS=1` while the trunk's real encoding is still being
+identified. With the variable unset, `snapshot()` (`src/join_common.h`) returns the operand's shape
+and no pointer, and the walk refuses it by name
+(`tests/host/adjoint_private_weight.cpp:234`), which is what it did before the pointer was
+threaded. The gate is there because the container's plane is **not** the int8 pair above: its
+weights pool is 15.13 GiB over 27e9 parameters (4.81 bpw), and the first real run faulted 65.08 MiB
+into an 85 MiB `N*K` read, so the codes are narrower than a byte.
+
+### The trunk's real plane: an IQR form, decoded by libr4d's own kernel
+
+`build/r97train info` reports the container's `quant` as `w8a8_fwht128`, but that is the header's
+metadata string, not the trunk's per-weight encoding: the weights are IQR forms
+(`libr4d/r4d_iqr.h`) -- a tail-biting trellis or a table at B bits a value, a state carried across a
+128-K unit, and a scale form of its own (`kBf16`, `kE4m3Tensor`, `kE4m3Row`, `kRowF32`). The engine
+selected `gemm_iqr_nt_m64` for these GEMMs (`libr4d/r4d_rows.cpp:8808`, layout
+`r4d_rad_layout_iqr` at `:8819`), whose contract is "i8 A with an f32 scale per (row, 128 K), W an
+IQR form's codes, decoding to int8 values".
+
+The form is a function of the weight's `RadEncoding`, and patch
+`patches/training/0124-encoding-on-record.patch` puts that encoding on the tape record
+(`RadIssueOperand::enc`) for the same operand that already carries the view -- a dtype with no
+element size. It is not a stored form word: libr4d *derives* the form from the encoding's planes
+(`libr4d/r4d_iqr_layout.cpp:83-158`), so the core cannot compute one and does not try. `AdValue::enc`
+carries it beside `raw`, and `R97_DUMP_SNAP=1` prints the planes, so a form the row derives is
+checkable against what the layout hook saw.
+
+`src/adjoint/device/iqr_plane.hip` decodes the plane **with the forward's own arithmetic**:
+`r4d_iqr_dec.h` is a header of `__device__` functions that the forward's kernel includes
+(`libr4d/r4d_gemm_iqr.hip:24`), and the decode is its `Dec::fetch`/`rows`/`unzero` then
+`frag(w, tr, lane, s)` -- the sequence `r4d_gemm_iqr.hip:728-732` runs. r97 therefore carries no
+second trellis: a wrong `dx` disagrees with the forward rather than agreeing with itself. What r97
+does state is the *classification* (which form an encoding is), ported rule for rule from
+`r4d_iqr_layout.cpp:31-158` with the lines cited, and the *addressing* (`walk_tile`,
+`r4d_iqr_layout.cpp:261-282`), whose constants are header-exposed. One wave decodes one unit into
+the int8 fragment order `frag_go` already reads (`plane_index.h`), so the linear row's `dx` runs
+unchanged over a decoded plane.
+
+The piece still to land is the **scale plane**: the `dx` kernel reads a bf16 per (row, 128 K) in
+tile-major order (`t16_go`), and an IQR form's scale is `kRowF32`, E4M3 with a second level, or that
+bf16 -- each with its own stored order, taken from the layout hook. Until that is written and held
+to the f64 row, the row declines an IQR encoding and the gate stays closed on the container.
+
 ## `logits_gemm`
 
 The vocabulary projection is the same product with the head weight:

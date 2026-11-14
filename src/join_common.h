@@ -22,6 +22,7 @@
 #include <variant>
 #include <vector>
 
+#include "rad_encoding.h"  // the stored form a plugin-private weight's decode derives (0124)
 #include "rad_planes.h"  // the joined form a quantised lm_head reaches the tape in
 #include "r97/adjoint.h"
 #include "r97/backward.h"
@@ -176,6 +177,23 @@ inline AdValue snapshot(const Operand& op, const OperandContent& content,
                          op_name, op.buffer.c_str(), op.dtype.c_str(), sh.c_str(), content.bytes,
                          static_cast<int>(content.named), content.data, vs.c_str(), vst.c_str(),
                          static_cast<long long>(op.view_off));
+            // The stored form's inputs (patch 0124): the engine's own planes, so a form the row
+            // derives is checkable against what the layout hook saw.
+            if (op.enc != nullptr) {
+                const RadEncoding* e = static_cast<const RadEncoding*>(op.enc);
+                std::string pl;
+                for (uint32_t k = 0; k < e->n_planes; ++k) {
+                    const RadEncPlane& p = e->plane[k];
+                    char one[160];
+                    std::snprintf(one, sizeof one, " [%s kind=%u dtype=%u e=%lld,%lld b=%lld,%lld]",
+                                  p.role, (unsigned)p.kind, (unsigned)p.dtype,
+                                  (long long)p.extent[0], (long long)p.extent[1],
+                                  (long long)p.block[0], (long long)p.block[1]);
+                    pl += one;
+                }
+                std::fprintf(stderr, "DUMPSNAP   enc=%p transform=%s n_planes=%u%s\n",
+                             op.enc, e->transform, (unsigned)e->n_planes, pl.c_str());
+            }
             std::fflush(stderr);
         }
     }
@@ -190,8 +208,10 @@ inline AdValue snapshot(const Operand& op, const OperandContent& content,
     // values nor a pointer, and the walk refuses it by name exactly as it did before.
     if (content.bytes == 0 && content.named && elem_size(op.dtype) == 0) {
         v.shape = op.view_shape.empty() ? op.shape : op.view_shape;
-        if (const char* on = std::getenv("R97_STORED_WEIGHTS"); on != nullptr && on[0] == '1')
+        if (const char* on = std::getenv("R97_STORED_WEIGHTS"); on != nullptr && on[0] == '1') {
             v.raw = content.data;
+            v.enc = op.enc;
+        }
         return v;
     }
     // A strided or narrowed read -- the q norm and the gate read the two halves of the q|gate

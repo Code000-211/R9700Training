@@ -41,6 +41,7 @@
 #include "rad_device.h"
 
 #include "scratch.h"
+#include "plane_index.h"
 
 #include <hip/hip_runtime.h>
 
@@ -145,20 +146,9 @@ __device__ __forceinline__ v8bf scale8(v8bf x, const float* s) {
 // row's, in the tile's row slot. K is a multiple of 128 (the scale grid's block) and N of 16 (the
 // fragment's rows) for any weight the i8a8h GEMM runs, so neither index leaves its plane.
 
-// The byte offset of the 8-byte fragment that starts at column `k` (k % 8 == 0) of `row`.
-__device__ __forceinline__ size_t frag_go(int K, int row, int k) {
-    const int kk = k & 63;
-    const int lane = (row & 15) + 16 * ((kk & 15) >> 3);
-    return ((static_cast<size_t>(row >> 4) * static_cast<size_t>(K >> 6) +
-             static_cast<size_t>(k >> 6)) * 32u + static_cast<size_t>(lane)) * 32u +
-           static_cast<size_t>((kk >> 4) * 8);
-}
-
-// The element index of (row, block `g` of K) in the tile-major bf16 scale plane.
-__device__ __forceinline__ size_t t16_go(int G, int row, int g) {
-    return (static_cast<size_t>(row >> 4) * static_cast<size_t>(G) + static_cast<size_t>(g)) * 16u +
-           static_cast<size_t>(row & 15);
-}
+// The byte offset of the 8-byte fragment that starts at column `k` (k % 8 == 0) of `row`, and the
+// element index of (row, block `g` of K) in the tile-major bf16 scale plane, are plane_index.h --
+// shared with the IQR decode, which writes this same order into a staging plane.
 
 // ------------------------------------------------------------------ the kernel
 

@@ -30,6 +30,11 @@ struct Operand {
     std::vector<int64_t> view_shape;
     std::vector<int64_t> view_stride;
     int64_t view_off = 0;
+    // The weight's stored encoding (radiance's RadEncoding, patch 0124), when its dtype has no
+    // element size: the planes a decoder derives the stored form from -- the code width, a
+    // trellis's state bits and run, the scale's form, a grid's log2. Null for every operand whose
+    // bytes are one span. The engine owns it, and it outlives the issue.
+    const void* enc = nullptr;
 };
 
 struct OpRecord {

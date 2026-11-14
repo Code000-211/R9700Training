@@ -61,6 +61,11 @@ struct AdValue {
     // shape is still the op's, so a row that decodes the bytes owns the layout and one that needs
     // f64 must decline. A row never adds to a gradient through this pointer.
     const void* raw = nullptr;
+    // The stored encoding the tape carried beside `raw` (radiance's RadEncoding, patch 0124): the
+    // planes the engine's layout hook itself derived the stored form from. A row that decodes the
+    // bytes derives the form from this, never from a second classification of its own, so the form
+    // travels with the operand exactly as the pointer does and a wrong one is visible in the dump.
+    const void* enc = nullptr;
 };
 
 // One call of an adjoint.

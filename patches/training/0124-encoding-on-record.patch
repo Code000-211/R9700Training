@@ -1,0 +1,41 @@
+Concern: the issue observer carries the weight's stored encoding when its dtype has no element size
+Upstream: not-submitted
+
+0123 gives a plugin-private operand its shape and view, but a consumer that must decode the stored
+bytes still has nothing to decode them with: the form a weight is stored in -- the code width, a
+trellis's state bits and run, the scale's form, a grid's log2 -- is a function of the weight's
+RadEncoding, which the core holds per weight and the record does not name. The form is not a stored
+word: libr4d derives it from the encoding's planes (r4d_iqr_layout.cpp's classify), so the core
+cannot compute it and must not. This hands the encoding over instead. The same condition that
+produces the view -- a dtype with no element size -- also sets `enc`, and a consumer derives the
+form from the planes exactly as the layout hook did. `enc` is null for every operand whose bytes a
+consumer can read packed, and it points into the program, which outlives every issue.
+
+--- a/abi/rad_runtime.h
++++ b/abi/rad_runtime.h
+@@ -944,6 +944,11 @@
+     int64_t  view_shape[RAD_MAX_RANK];
+     int64_t  view_stride[RAD_MAX_RANK];
+     int64_t  view_off;
++    /* The weight's stored encoding, when its dtype has no element size: the planes a consumer
++     * derives the stored form from (the code width, a trellis's state bits and run, the scale's
++     * form, a grid's log2), as the layout hook saw them. Null when the operand's bytes are one
++     * span a consumer may read packed. Points into the program, which outlives every issue. */
++    const RadEncoding* enc;
+     uint8_t  written;      /* 1 for RAD_OPD_OUT and RAD_OPD_INOUT, 0 otherwise */
+     uint8_t  inout;        /* 1 for RAD_OPD_INOUT, whose previous value the kernel also reads */
+ } RadIssueOperand;
+--- a/core/runtime/issue.cpp
++++ b/core/runtime/issue.cpp
+@@ -1380,6 +1380,11 @@
+                 e.view_off = ((const uint8_t*)t[i].data - (const uint8_t*)full->data) / es;
+             else
+                 e.view_off = o.offset;  /* no byte address: the element offset as issued */
++            /* The encoding a consumer derives the stored form from, for the one operand kind
++             * whose bytes are not a span a consumer may read. */
++            if (o.kind == RAD_OPK_WEIGHT && es == 0 && program_ &&
++                o.handle < program_->weights.size() && program_->weights[o.handle].enc_known)
++                e.enc = &program_->weights[o.handle].enc;
+         }
+         if (o.kind != RAD_OPK_WTAB && rad_tensor_is_contiguous(&t[i]))
+             e.bytes = rad_dtype_bytes(t[i].dtype, rad_tensor_numel(&t[i]));

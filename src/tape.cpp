@@ -168,6 +168,9 @@ void Tape::record(const RadIssueOp& issue) {
         }
         op.written = o.written != 0;
         op.in_place = o.inout != 0;
+        // The stored encoding a decoder derives the form from (patch 0124): set for a weight whose
+        // dtype has no element size, null for every operand whose bytes are one span.
+        op.enc = o.enc;
         rec.operands.push_back(std::move(op));
         if (keep_ && o.data != nullptr) {
             // bytes is 0 where the ABI says the operand is not one span: an op that views its
