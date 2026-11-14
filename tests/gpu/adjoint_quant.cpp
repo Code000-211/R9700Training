@@ -246,6 +246,119 @@ void wrong_quant_adjoint(const AdjointCall& call) {
     for (size_t i = 0; i < dx.value.size(); ++i) dx.value[i] += call.cot.at(0).value[i];
 }
 
+// The live tape's fused producers: the elementwise output is a third write beside the codes and the
+// scale, and `rmsnorm_had_quant_i8g`'s record carries a phantom write ahead of them. The row must
+// find the roles by dtype and shape -- the codes' cotangent is cot[1] there, not cot[0] -- sum the
+// output's own cotangent in, and refuse a count it does not serve by name. Each of those was a
+// silent zero on the real container (399 of 400 leaves), so they are pinned here on the tape's
+// shapes, not the schema's.
+void fused_tape_shapes() {
+    const int64_t rows = 4, n = 128, group = 128, ngrp = n / group, total = rows * n;
+    uint64_t seed = 0x5eed1234ull;
+    struct Spec {
+        Part part;
+        const char* op;
+        bool phantom;
+    };
+    const Spec specs[] = {{Part::rmsnorm, "rmsnorm_had_quant_i8g", true},
+                          {Part::silu_mul, "gated_had_quant_i8g", false},
+                          {Part::sigmoid_mul, "gate_had_quant_i8g", false}};
+    for (const Spec& sp : specs) {
+        OpRecord rec;
+        rec.op = sp.op;
+        rec.params = {{"M", rows}, {"n", n}, {"group", group}, {"dtype", std::string("bf16")}};
+        if (sp.part == Part::rmsnorm) {
+            rec.params.push_back({"eps", std::string("1e-6")});
+            rec.params.push_back({"wadd", std::string("0.0")});
+        }
+        if (sp.part == Part::sigmoid_mul) rec.params.push_back({"act", std::string("sigmoid")});
+        std::vector<AdValue> fwd;
+        if (sp.part == Part::rmsnorm) {
+            rec.operands.push_back(read_operand("x", rows, n));
+            rec.operands.push_back(Operand{"none:1", "invalid", {}, 0, 0, true});
+            rec.operands.push_back(Operand{"w", "bf16", {n}, 0, 1, false});
+            fwd.push_back(device_check::random_value("bf16", {rows, n}, &seed));
+            fwd.emplace_back();
+            fwd.push_back(device_check::random_value("bf16", {n}, &seed));
+        } else if (sp.part == Part::silu_mul) {
+            rec.operands.push_back(read_operand("gate_up", rows, 2 * n));
+            fwd.push_back(device_check::random_value("bf16", {rows, 2 * n}, &seed));
+        } else {
+            rec.operands.push_back(read_operand("gate", rows, n));
+            rec.operands.push_back(read_operand("x", rows, n));
+            fwd.push_back(device_check::random_value("bf16", {rows, n}, &seed));
+            fwd.push_back(device_check::random_value("bf16", {rows, n}, &seed));
+        }
+        rec.operands.push_back(Operand{"q", "i8", {rows, n}, 0, rows, true});
+        AdValue codes;
+        codes.dtype = "i8";
+        codes.shape = {rows, n};
+        codes.value.resize((size_t)total);
+        for (int64_t i = 0; i < total; ++i)
+            codes.value[(size_t)i] = double((i * 37) % 255) - 127.0;
+        fwd.push_back(std::move(codes));
+        rec.operands.push_back(Operand{"scale", "f32", {rows, ngrp}, 0, rows, true});
+        AdValue scale;
+        scale.dtype = "f32";
+        scale.shape = {rows, ngrp};
+        scale.value.resize((size_t)(rows * ngrp));
+        for (int64_t i = 0; i < rows * ngrp; ++i) scale.value[(size_t)i] = 1.0 + 0.01 * (i % 7);
+        fwd.push_back(std::move(scale));
+        // The elementwise output the fused producer also writes, and its consumers' cotangent.
+        rec.operands.push_back(Operand{"out_bf16", "bf16", {rows, n}, 0, rows, true});
+        fwd.push_back(device_check::random_value("bf16", {rows, n}, &seed));
+        std::vector<AdValue> cot;
+        // One cotangent per write, in the record's write order: the walk hands the row exactly
+        // that, so the phantom write's slot is a hole the codes' cotangent must not land in.
+        for (const Operand& o : rec.operands) {
+            if (!o.written) continue;
+            if (o.buffer == "q")
+                cot.push_back(device_check::random_value("f32", {rows, n}, &seed));
+            else if (o.buffer == "scale")
+                cot.push_back(device_check::random_value("f32", {rows, ngrp}, &seed));
+            else if (o.buffer == "out_bf16")
+                cot.push_back(device_check::random_value("f32", {rows, n}, &seed));
+            else
+                cot.emplace_back();
+        }
+        std::vector<AdValue> dc;
+        for (const Operand& o : rec.operands) {
+            AdValue v;
+            v.dtype = o.dtype;
+            v.shape = o.shape;
+            v.value.assign((size_t)numel(o.shape), 0.0);
+            dc.push_back(std::move(v));
+        }
+        AdjointCall call{rec, fwd, cot, &dc, nullptr, ""};
+        AdjointFn fn = adjoint_find(rec.op, Side::device, rec.params, nullptr);
+        R97_CHECK(fn != nullptr);
+        fn(call);
+        double sum = 0.0;
+        for (double v : dc.at(0).value) sum += std::fabs(v);
+        R97_CHECK(sum > 0.0);
+        std::printf("%s fused shape (%lld operands, phantom %d): dc[0] non-zero, |sum| %.6g\n",
+                    rec.op.c_str(), (long long)rec.operands.size(), (int)sp.phantom, sum);
+
+        // A count the row does not serve refuses by name instead of returning a zero gradient.
+        OpRecord wrong = rec;
+        wrong.operands.push_back(Operand{"extra", "bf16", {rows, n}, 0, rows, true});
+        std::vector<AdValue> wfwd = fwd, wcot = cot, wdc = dc;
+        wfwd.emplace_back();
+        wcot.emplace_back();
+        wdc.emplace_back();
+        AdjointCall wcall{wrong, wfwd, wcot, &wdc, nullptr, ""};
+        std::string what;
+        try {
+            fn(wcall);
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        R97_CHECK(!what.empty());
+        R97_CHECK(what.find(rec.op) != std::string::npos);
+        std::printf("%s wrong count: %s\n", rec.op.c_str(), what.c_str());
+    }
+}
+
 void run() {
     const auto options = device_check::guard_options(int64_t(1) << 30);
     const r97test::DeviceGuard guard(options);
@@ -303,6 +416,9 @@ void run() {
         R97_CHECK(wrong.first_slot == 0);
         std::printf("rejected the wrong kernel: %s\n", wrong.note.c_str());
     }
+
+    // The live tape's shapes, which the schema's count check used to refuse in silence.
+    fused_tape_shapes();
 }
 
 }  // namespace

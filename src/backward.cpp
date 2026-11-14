@@ -679,23 +679,7 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                              rec.operands[j].buffer.c_str(), shape_text(dc[j].shape).c_str(),
                              static_cast<int>(sized[j]), static_cast<long long>(nonzero),
                              static_cast<long long>(nonfinite), maxabs,
-                             fwd_non_finite[j]);
-            }
-            std::fflush(stderr);
-        }
-        // R97_DUMP_DC=1, second list: every forward value the walk met that was not finite, in
-        // walk (reverse) order. The last line of it is the earliest record in forward order that
-        // carried a NaN -- the producer's neighbourhood, not the first reader the report names.
-        if (const char* d = std::getenv("R97_DUMP_DC"); d != nullptr && d[0] == '1') {
-            static long n_nf = 0;
-            for (size_t j = 0; j < rec.operands.size(); ++j) {
-                if (fwd_non_finite[j] < 0) continue;
-                if (n_nf < 200) {
-                    ++n_nf;
-                    std::fprintf(stderr, "DUMPNF op=%s pos=%s buffer=%s at=%lld\n",
-                                 rec.op.c_str(), std::to_string(rec.position).c_str(),
-                                 rec.operands[j].buffer.c_str(), fwd_non_finite[j]);
-                }
+                             static_cast<long long>(fwd_non_finite[j]));
             }
             std::fflush(stderr);
         }

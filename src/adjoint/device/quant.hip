@@ -316,12 +316,12 @@ bool intermediate(const AdjointCall& call, Part part, std::vector<AdValue>* y) {
 
 // The mask and the rotation: uploads what the decision reads, launches the one kernel, and keeps
 // nothing. `d_rotated` is the caller's `rows * n` f32 buffer.
-bool mask_and_rotate(const AdjointCall& call, Part part, int64_t rows, int64_t n, int64_t group,
-                     int64_t ngrp, const std::vector<double>& y, RadStream s, void* d_rotated) {
-    const size_t reads = part_reads(part);
-    const AdValue& codes = call.fwd[reads];
-    const AdValue& scale = call.fwd[reads + 1];
-    const AdValue& cot = call.cot[0];
+// The operands are the roles the caller found, not positions: the live tape's fused records carry a
+// phantom write ahead of the codes, so the codes' cotangent is cot[1] there and cot[0] on the
+// schema's two-write shape.
+bool mask_and_rotate(const AdValue& codes, const AdValue& scale, const AdValue& cot, int64_t rows,
+                     int64_t n, int64_t group, int64_t ngrp, const std::vector<double>& y,
+                     RadStream s, void* d_rotated) {
     const int64_t total = rows * n;
 
     std::vector<double> h_y((size_t)total), h_scale((size_t)(rows * ngrp));
@@ -361,24 +361,113 @@ void add_back(unsigned short* d_out, int64_t count, AdValue& into, RadStream s) 
     for (int64_t i = 0; i < count; ++i) into.value[(size_t)i] += bf16_to_f32(h[(size_t)i]);
 }
 
+// The elementwise output's own cotangent, summed into the one the codes' path produced: the fused
+// producer writes that output beside the codes, so its consumers' cotangent is a second term of the
+// same gradient. `+=`, never an assignment -- a slot the codes' path already wrote keeps its term.
+__global__ void add_into_kernel(float* dst, const float* src, int64_t n) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] += src[i];
+}
+
+const char* part_name(Part part) {
+    switch (part) {
+        case Part::quant: return "quant";
+        case Part::rmsnorm: return "rmsnorm";
+        case Part::gated: return "gated";
+        case Part::gate: return "gate";
+    }
+    return "unknown";
+}
+
+// The cotangent slot of a written operand: the walk's `cot` holds one entry per write, in the
+// record's write order.
+int64_t cot_slot(const OpRecord& rec, int64_t operand) {
+    int64_t at = 0;
+    for (int64_t j = 0; j < (int64_t)rec.operands.size(); ++j) {
+        if (!rec.operands[j].written) continue;
+        if (j == operand) return at;
+        ++at;
+    }
+    return -1;
+}
+
 void quant_adjoint(const AdjointCall& call, Part part) {
     if (!call.dc || call.cot.size() < 2) return;
-    size_t reads = 0;
+    const int64_t operands = (int64_t)call.rec.operands.size();
+    int64_t reads = 0;
     for (const Operand& o : call.rec.operands)
         if (!o.written) ++reads;
-    if (reads != part_reads(part) || call.rec.operands.size() != reads + 2) return;
-    if (call.fwd.size() != call.rec.operands.size() || call.dc->size() < reads) return;
+    // Every operand, reads included: `dc` is indexed by the record's schema position, and a slot
+    // shorter than that would be read out of bounds once the writes' roles are used.
+    if (call.fwd.size() != (size_t)operands || (int64_t)call.dc->size() < operands) return;
 
     const double n_d = param_num(call.rec, "n", 0.0);
     const double group_d = param_num(call.rec, "group", 0.0);
     if (n_d <= 0.0 || group_d <= 0.0 || group_d > 1024.0) return;
     const int64_t n = (int64_t)n_d, group = (int64_t)group_d;
     if ((group & (group - 1)) != 0 || n % group != 0) return;
-
-    const AdValue& codes = call.fwd[reads];
-    const AdValue& scale = call.fwd[reads + 1];
-    const AdValue& cot = call.cot[0];
     const int64_t ngrp = n / group;
+
+    // The written operands' roles, by dtype and shape, never by position. `out` is the elementwise
+    // output the live tape's fused producers write beside the codes -- a real consumer of the same
+    // gradient -- and `phantom` is the write `rmsnorm_had_quant_i8g`'s record carries with neither a
+    // dtype nor a shape.
+    int64_t codes_at = -1, scale_at = -1, writes = 0, phantom = 0;
+    for (int64_t j = 0; j < operands; ++j) {
+        const Operand& o = call.rec.operands[(size_t)j];
+        if (!o.written) continue;
+        ++writes;
+        if (o.dtype.empty() || o.dtype == "invalid" || o.shape.empty()) {
+            ++phantom;
+            continue;
+        }
+        if (o.dtype == "i8" || o.dtype == "fp8_e4m3" || o.dtype == "fp8_e5m2") {
+            if (codes_at < 0) codes_at = j;
+            continue;
+        }
+        if ((int64_t)o.shape.size() == 2 && o.shape[1] == ngrp) {
+            if (scale_at < 0) scale_at = j;
+            continue;
+        }
+    }
+    // The layouts this row serves, named per part and enumerated -- never a relaxed count, which
+    // would let the row index operands on a layout it never verified. The schema's elementwise part
+    // plus quantiser is two writes; the live tape's fused producers write the elementwise output
+    // beside the codes as well (three), and `rmsnorm_had_quant_i8g` writes the normed value twice --
+    // in place over its input and again as `h` (four). Anything else refuses by name, with the
+    // writes listed, instead of returning a zero gradient.
+    const int64_t served = part == Part::quant ? 2 : 3;
+    const bool layout = writes == 2 || writes == served ||
+                        (part != Part::quant && writes == served + 1 && phantom <= 1);
+    if (reads != (int64_t)part_reads(part) || !layout) {
+        std::string list;
+        for (int64_t j = 0; j < operands; ++j) {
+            const Operand& o = call.rec.operands[(size_t)j];
+            if (!o.written) continue;
+            list += " [";
+            list += o.buffer + " " + o.dtype;
+            for (int64_t d : o.shape) list += " " + std::to_string(d);
+            list += "]";
+        }
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "': a " +
+                                 part_name(part) + " record with " + std::to_string(operands) +
+                                 " operands (" + std::to_string(reads) + " reads, " +
+                                 std::to_string(writes) + " writes, " + std::to_string(phantom) +
+                                 " phantom) is not a layout this row serves; its writes:" + list);
+    }
+    if (codes_at < 0 || scale_at < 0)
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "': the " +
+                                 part_name(part) + " record's " + std::to_string(writes) +
+                                 " writes carry no " +
+                                 (codes_at < 0 ? "codes (i8/fp8)" : "group scale") + " operand");
+
+    const AdValue& codes = call.fwd[(size_t)codes_at];
+    const AdValue& scale = call.fwd[(size_t)scale_at];
+    const int64_t cot_at = cot_slot(call.rec, codes_at);
+    if (cot_at < 0 || (size_t)cot_at >= call.cot.size())
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
+                                 "': the codes' write has no cotangent slot");
+    const AdValue& cot = call.cot[(size_t)cot_at];
     if (codes.shape.size() != 2 || codes.shape[1] != n) return;
     if (scale.shape.size() != 2 || scale.shape[1] != ngrp) return;
     const int64_t rows = codes.shape[0];
@@ -404,15 +493,85 @@ void quant_adjoint(const AdjointCall& call, Part part) {
     if (part == Part::gate && (int64_t)call.dc->at(1).value.size() < total) return;
 
     std::vector<AdValue> y;
-    if (!intermediate(call, part, &y)) return;
-    if ((int64_t)y[0].value.size() != total) return;
+    // The elementwise part's twin is what makes this row's rotation the same numbers as the host
+    // reference. A twin that is missing or refuses the record used to return here -- a zero gradient
+    // that agreed with nothing. It is a named refusal now.
+    if (!intermediate(call, part, &y))
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "': no " +
+                                 std::string(part_op(part) ? part_op(part) : "elementwise") +
+                                 " twin could serve this record, so the " + part_name(part) +
+                                 " value the quantiser rotated cannot be rebuilt");
+    if ((int64_t)y[0].value.size() != total)
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "': its " +
+                                 part_name(part) + " intermediate carries " +
+                                 std::to_string(y[0].value.size()) + " values, not " +
+                                 std::to_string(total));
 
     RadStream s = adjoint_stream();
     if (!s) return;
 
     device::ScratchBlock d_rotated(total * (int64_t)sizeof(float));
     if (!d_rotated) return;
-    if (!mask_and_rotate(call, part, rows, n, group, ngrp, y[0].value, s, d_rotated.p)) return;
+    if (!mask_and_rotate(codes, scale, cot, rows, n, group, ngrp, y[0].value, s, d_rotated.p))
+        return;
+
+    // The elementwise output's own cotangent, summed in before the back kernel. Every write that is
+    // not the codes or the scale is the elementwise output: `total` values join the rotated
+    // cotangent on the card; a write the size of the elementwise input over a buffer the record also
+    // reads is the direct path and is added to that read's slot. Both are `+=`, never an assignment
+    // -- a slot the codes' path already wrote keeps its term.
+    //
+    // One scratch block for the fused output's cotangent, alive across the whole loop: a launch is
+    // asynchronous, so a block declared inside the loop is freed while the kernel still reads it --
+    // that faulted the card inside add_into_kernel (src a recycled 10 MiB range, queue stopped).
+    // Reusing one block is safe: every memcpy and launch below is on `s`, in program order.
+    device::ScratchBlock d_out_cot(total * (int64_t)sizeof(float));
+    for (int64_t j = 0; j < operands; ++j) {
+        if (!call.rec.operands[(size_t)j].written || j == codes_at || j == scale_at) continue;
+        const int64_t at = cot_slot(call.rec, j);
+        if (at < 0 || (size_t)at >= call.cot.size())
+            throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
+                                     "': the fused output write '" +
+                                     call.rec.operands[(size_t)j].buffer +
+                                     "' has no cotangent slot");
+        const AdValue& oc = call.cot[(size_t)at];
+        const int64_t out_values = (int64_t)oc.value.size();
+        if (out_values == 0) continue;  // a write with no consumers: nothing to add
+        // The engine's no-value placeholder (`none:3@1453` in the live gated record) is written as
+        // one scalar. It cannot be the elementwise output -- that is millions of values -- so it is
+        // skipped rather than refused.
+        if (out_values == 1) continue;
+        if (out_values == total) {
+            std::vector<float> h_out((size_t)total);
+            for (int64_t i = 0; i < total; ++i) h_out[(size_t)i] = (float)oc.value[(size_t)i];
+            if (!d_out_cot) return;
+            if (rad_memcpy_async(d_out_cot.p, h_out.data(), total * 4, s) != 0) return;
+            hipLaunchKernelGGL(add_into_kernel, dim3((unsigned int)blocks(total)), dim3(256), 0,
+                               (hipStream_t)s, (float*)d_rotated.p,
+                               (const float*)d_out_cot.p, total);
+            continue;
+        }
+        int64_t read_at = -1;
+        for (int64_t k = 0; k < operands && read_at < 0; ++k)
+            if (!call.rec.operands[(size_t)k].written &&
+                call.rec.operands[(size_t)k].buffer == call.rec.operands[(size_t)j].buffer)
+                read_at = k;
+        if (read_at < 0 || out_values != out_slot)
+            throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
+                                     "': the fused output write '" +
+                                     call.rec.operands[(size_t)j].buffer + "' carries " +
+                                     std::to_string(out_values) + " values, not " +
+                                     std::to_string(total) + " or the read's " +
+                                     std::to_string(out_slot));
+        AdValue& into = call.dc->at((size_t)read_at);
+        if ((int64_t)into.value.size() != out_values)
+            throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
+                                     "': the direct path's slot for '" +
+                                     call.rec.operands[(size_t)read_at].buffer +
+                                     "' is not the size of its cotangent");
+        for (int64_t i = 0; i < out_values; ++i)
+            into.value[(size_t)i] += oc.value[(size_t)i];
+    }
 
     // The elementwise part's own operands, at f32: they carry a smooth derivative, not a decision.
     device::ScratchBlock d_arg(arg_count * (int64_t)sizeof(float));
