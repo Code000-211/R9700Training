@@ -90,13 +90,13 @@ shares a stage across its threads without changing a digit.
 - **The gain is frozen.** `rmsnorm_had_quant_i8g` registers as `R97_REGISTER_ADJOINT_IF_F(..., 1)`,
   matching `R97_REGISTER_ADJOINT_F("rmsnorm", host, ..., 1)`: `w`'s slot stays zero, and the test
   checks the row's frozen list is `{1}`.
-- **A short operand refuses; it does not return a zero.** A record whose layout, widths or
-  parameters do not fit refuses by name, listing every write the record carried; a slot the walk
-  hands back short refuses naming the operand and both counts (`operand 'dc[1]' has 3145727
-  values, the row needs 3145728`), and a part whose twin refuses the record is a refusal too. Only a
-  record the row cannot index at all -- `fwd`/`dc` shorter than the schema, a width that does not
-  divide -- still returns untouched: a zero there is indistinguishable from a gradient, which is
-  the failure this row exists to remove.
+- **Every decline names itself; none returns a zero.** A record whose layout, widths or parameters
+  do not fit refuses by name, listing every write the record carried; a value the tape or the walk
+  hands back short refuses naming the operand and both counts (`operand 'scale' has 95 values, the
+  row needs 96`); a scratch block the card refuses names its byte count; a failed upload or read-back
+  names the copy and the runtime's error string; and a part whose twin refuses the record is a
+  refusal too. There is no `return;` left in `quant_adjoint`, `mask_and_rotate` or `add_back` -- a
+  zero there is indistinguishable from a gradient, which is the failure this row exists to remove.
 
 `plugin.hip` gains a `twin_find` fallback beside its `adjoint_register` and scratch ones: the plugin
 references a registry function for the first time, and without the fallback it would fail to load
@@ -126,7 +126,7 @@ tests the executable's definition wins, as `ENABLE_EXPORTS` intends.
 | `2024 x 5120` | a batch of unequal lengths (300 + 700 + 1024) |
 | `4096 x 5120` | the real hidden size, the longest sequence |
 | the live tape's shapes | `fused_tape_shapes`: the fused producers' three- and four-write records, the phantom `none:1` write ahead of the codes, and a write count past every served layout refusing by name |
-| the live gate record | `live_gate_shape`: `gate_had_quant_i8g` as the tape carries it -- params `n = 256 group = 128`, codes `[4, 6144]`, scale `[4, 48]`, output `[4, 6144]` -- so the roles are found from the shapes and the params are not believed; and a `dc[1]` or `fwd[0]` one value short refusing by name instead of returning a zero |
+| the live gate record | `live_gate_shape`: `gate_had_quant_i8g` as the tape carries it -- params `n = 256 group = 128`, codes `[4, 6144]`, scale `[4, 48]`, output `[4, 6144]` -- so the roles are found from the shapes and the params are not believed; and a `dc[1]`, a `fwd[0]`, a `scale` or the codes' cotangent one value short refusing by name instead of returning a zero |
 
 The reference is `docs/kernels/README.md`'s `HostRef`: the quantiser's host adjoint on the
 intermediate, then the elementwise part's host adjoint, in the order the kernel undoes them, and the
@@ -137,8 +137,8 @@ that the RMS norm's row freezes the gain, that `gated_had_quant_i8g` with `act =
 row, and that the harness rejects a wrong kernel -- one that hands the cotangent back without the
 mask and the inverse rotation.
 
-Two of those cases are the ones a silent return used to hide behind: the fused record's write count,
-and a slot the walk hands back short.
+Three of those cases are the ones a silent return used to hide behind: the fused record's write
+count, a slot the walk hands back short, and the tape's own scale one value short.
 
 ## Timing and scratch
 

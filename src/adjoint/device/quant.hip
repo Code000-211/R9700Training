@@ -314,12 +314,18 @@ bool intermediate(const AdjointCall& call, Part part, std::vector<AdValue>* y) {
     return !y->empty();
 }
 
+// The name of the last HIP error, so a refusal says which copy failed and what the runtime called
+// it. The radiance calls return their own code; this is the name behind the failure.
+std::string hip_error_name() {
+    return hipGetErrorString(hipGetLastError());
+}
+
 // The mask and the rotation: uploads what the decision reads, launches the one kernel, and keeps
 // nothing. `d_rotated` is the caller's `rows * n` f32 buffer.
 // The operands are the roles the caller found, not positions: the live tape's fused records carry a
 // phantom write ahead of the codes, so the codes' cotangent is cot[1] there and cot[0] on the
 // schema's two-write shape.
-bool mask_and_rotate(const AdValue& codes, const AdValue& scale, const AdValue& cot, int64_t rows,
+void mask_and_rotate(const AdValue& codes, const AdValue& scale, const AdValue& cot, int64_t rows,
                      int64_t n, int64_t group, int64_t ngrp, const std::vector<double>& y,
                      RadStream s, void* d_rotated) {
     const int64_t total = rows * n;
@@ -338,11 +344,26 @@ bool mask_and_rotate(const AdValue& codes, const AdValue& scale, const AdValue& 
     device::ScratchBlock d_scale(rows * ngrp * (int64_t)sizeof(double));
     device::ScratchBlock d_codes(total);
     device::ScratchBlock d_cot(total * (int64_t)sizeof(float));
-    if (!d_y || !d_scale || !d_codes || !d_cot) return false;
-    if (rad_memcpy_async(d_y.p, h_y.data(), total * 8, s) != 0) return false;
-    if (rad_memcpy_async(d_scale.p, h_scale.data(), rows * ngrp * 8, s) != 0) return false;
-    if (rad_memcpy_async(d_codes.p, h_codes.data(), total, s) != 0) return false;
-    if (rad_memcpy_async(d_cot.p, h_cot.data(), total * 4, s) != 0) return false;
+    if (!d_y || !d_scale || !d_codes || !d_cot)
+        throw std::runtime_error("r97: quant adjoint: the mask pass could not take its scratch (" +
+                                 std::to_string(total * 8) + " + " +
+                                 std::to_string(rows * ngrp * 8) + " + " + std::to_string(total) +
+                                 " + " + std::to_string(total * 4) + " bytes)");
+    if (rad_memcpy_async(d_y.p, h_y.data(), total * 8, s) != 0)
+        throw std::runtime_error("r97: quant adjoint: the mask pass could not upload the rotated "
+                                 "activation (" + std::to_string(total * 8) + " bytes, " +
+                                 hip_error_name() + ")");
+    if (rad_memcpy_async(d_scale.p, h_scale.data(), rows * ngrp * 8, s) != 0)
+        throw std::runtime_error("r97: quant adjoint: the mask pass could not upload the scale (" +
+                                 std::to_string(rows * ngrp * 8) + " bytes, " + hip_error_name() +
+                                 ")");
+    if (rad_memcpy_async(d_codes.p, h_codes.data(), total, s) != 0)
+        throw std::runtime_error("r97: quant adjoint: the mask pass could not upload the codes (" +
+                                 std::to_string(total) + " bytes, " + hip_error_name() + ")");
+    if (rad_memcpy_async(d_cot.p, h_cot.data(), total * 4, s) != 0)
+        throw std::runtime_error("r97: quant adjoint: the mask pass could not upload the "
+                                 "cotangent (" + std::to_string(total * 4) + " bytes, " +
+                                 hip_error_name() + ")");
 
     const size_t shared = (size_t)(group * ((int64_t)sizeof(double) + (int64_t)sizeof(float)));
     hipLaunchKernelGGL(mask_rotate_kernel, dim3((unsigned int)(rows * ngrp)),
@@ -350,7 +371,9 @@ bool mask_and_rotate(const AdValue& codes, const AdValue& scale, const AdValue& 
                        (const signed char*)d_codes.p, (const double*)d_y.p,
                        (const double*)d_scale.p, (const float*)d_cot.p, (float*)d_rotated,
                        (int)n, (int)group, (int)ngrp);
-    return rad_stream_sync(s) == 0;
+    if (rad_stream_sync(s) != 0)
+        throw std::runtime_error("r97: quant adjoint: the mask pass's kernel did not finish (" +
+                                 hip_error_name() + ")");
 }
 
 // The tape's cotangents are f64 and are added to, never overwritten: other ops share them.
@@ -361,8 +384,12 @@ bool mask_and_rotate(const AdValue& codes, const AdValue& scale, const AdValue& 
 void add_back(unsigned short* d_out, int64_t count, AdValue& into, RadStream s, int64_t rows_per = 0,
               const std::vector<int64_t>* read_rows = nullptr) {
     std::vector<unsigned short> h((size_t)count);
-    if (rad_memcpy_async(h.data(), d_out, count * 2, s) != 0) return;
-    if (rad_stream_sync(s) != 0) return;
+    if (rad_memcpy_async(h.data(), d_out, count * 2, s) != 0)
+        throw std::runtime_error("r97: quant adjoint: could not read back the gradient (" +
+                                 std::to_string(count) + " bf16 values, " + hip_error_name() + ")");
+    if (rad_stream_sync(s) != 0)
+        throw std::runtime_error("r97: quant adjoint: the back kernel did not finish (" +
+                                 hip_error_name() + ")");
     for (int64_t i = 0; i < count; ++i) {
         if (rows_per > 0 && !row_readable(read_rows, i / rows_per)) continue;
         into.value[(size_t)i] += bf16_to_f32(h[(size_t)i]);
@@ -400,14 +427,24 @@ int64_t cot_slot(const OpRecord& rec, int64_t operand) {
 }
 
 void quant_adjoint(const AdjointCall& call, Part part) {
-    if (!call.dc || call.cot.size() < 2) return;
+    if (!call.dc)
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
+                                 "': the caller handed no gradient slots");
+    if (call.cot.size() < 2)
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "': " +
+                                 std::to_string(call.cot.size()) +
+                                 " cotangents for a record that writes at least two operands");
     const int64_t operands = (int64_t)call.rec.operands.size();
     int64_t reads = 0;
     for (const Operand& o : call.rec.operands)
         if (!o.written) ++reads;
     // Every operand, reads included: `dc` is indexed by the record's schema position, and a slot
     // shorter than that would be read out of bounds once the writes' roles are used.
-    if (call.fwd.size() != (size_t)operands || (int64_t)call.dc->size() < operands) return;
+    if (call.fwd.size() != (size_t)operands || (int64_t)call.dc->size() < operands)
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "': " +
+                                 std::to_string(call.fwd.size()) + " forward values and " +
+                                 std::to_string(call.dc->size()) + " gradient slots for a record of " +
+                                 std::to_string(operands) + " operands");
 
     // The row width, the group count and the group size come from the operands, never from the
     // record's `n`/`group` params: the live `gate_had_quant_i8g` record declares n=256 group=128
@@ -449,7 +486,12 @@ void quant_adjoint(const AdjointCall& call, Part part) {
             break;
         }
     }
-    if (n <= 0 || codes_n % n != 0) return;
+    if (n <= 0 || codes_n % n != 0)
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "': the " +
+                                 part_name(part) + " record's codes are " +
+                                 std::to_string(codes_n) +
+                                 " wide and no write of theirs names a row width that divides it "
+                                 "(n=" + std::to_string(n) + ")");
     // The group scale is the one f32 write of `[rows, k]` whose k divides the codes' width.
     for (int64_t j = 0; j < operands; ++j) {
         const Operand& o = call.rec.operands[(size_t)j];
@@ -510,6 +552,15 @@ void quant_adjoint(const AdjointCall& call, Part part) {
                                                                         std::to_string(ngrp) + ")") +
                                  " operand; its writes:" + writes_list());
 
+    // Every refusal that names an operand uses this: the operand, what it has, what the row needs.
+    // Declared here because the value counts are checked before the slots are sized.
+    const auto short_operand = [&](const char* what, size_t have, int64_t need) {
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "' at " +
+                                 std::to_string(call.rec.position) + ": operand '" + what +
+                                 "' has " + std::to_string(have) + " values, the row needs " +
+                                 std::to_string(need));
+    };
+
     const AdValue& codes = call.fwd[(size_t)codes_at];
     const AdValue& scale = call.fwd[(size_t)scale_at];
     const int64_t cot_at = cot_slot(call.rec, codes_at);
@@ -518,10 +569,16 @@ void quant_adjoint(const AdjointCall& call, Part part) {
                                  "': the codes' write has no cotangent slot");
     const AdValue& cot = call.cot[(size_t)cot_at];
     const int64_t total = rows * n;
-    if (rows <= 0 || (int64_t)codes.value.size() != rows * codes_n) return;
-    if ((int64_t)scale.value.size() != rows * ngrp) return;
+    if (rows <= 0)
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
+                                 "': the codes' first dimension is " + std::to_string(rows));
+    if ((int64_t)codes.value.size() < rows * codes_n)
+        short_operand("codes", codes.value.size(), rows * codes_n);
+    if ((int64_t)scale.value.size() < rows * ngrp)
+        short_operand("scale", scale.value.size(), rows * ngrp);
     // The codes' cotangent is the codes' own width (2n for the gated producer's gate_up).
-    if ((int64_t)cot.value.size() != rows * codes_n) return;
+    if ((int64_t)cot.value.size() < rows * codes_n)
+        short_operand("codes' cotangent", cot.value.size(), rows * codes_n);
 
     // What the backprop reads: the elementwise operands' widths, and the slots it answers for.
     const int64_t arg_count = part == Part::quant ? 0
@@ -541,15 +598,7 @@ void quant_adjoint(const AdjointCall& call, Part part) {
         throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "': a " +
                                  part_name(part) + " record with no second read");
     // A short operand is a refusal by name, never a return: a silent return here is a zero
-    // gradient that agrees with nothing, which is the signature this row exists to remove. Each
-    // check says which operand came up short and by how much, so a real record names its hole
-    // instead of showing a leaf of zeros.
-    const auto short_operand = [&](const char* what, size_t have, int64_t need) {
-        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "' at " +
-                                 std::to_string(call.rec.position) + ": operand '" + what +
-                                 "' has " + std::to_string(have) + " values, the row needs " +
-                                 std::to_string(need));
-    };
+    // gradient that agrees with nothing, which is the signature this row exists to remove.
     if (part == Part::rmsnorm && (int64_t)call.fwd[0].value.size() != total)
         short_operand("fwd[0]", call.fwd[0].value.size(), total);
     if (part == Part::rmsnorm && (int64_t)call.fwd[(size_t)second_at].value.size() < n)
@@ -617,15 +666,19 @@ void quant_adjoint(const AdjointCall& call, Part part) {
     }
 
     RadStream s = adjoint_stream();
-    if (!s) return;
+    if (!s)
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
+                                 "': the device stream could not be created (" + hip_error_name() +
+                                 ")");
 
     // The rotation covers the codes' whole width -- gate_up's both halves for the gated producer --
     // so the buffer is sized by the codes, not by the elementwise output's `total`.
     device::ScratchBlock d_rotated(rows * codes_n * (int64_t)sizeof(float));
-    if (!d_rotated) return;
-    if (!mask_and_rotate(codes, scale, cot, rows, codes_n, group, ngrp, y[0].value, s,
-                         d_rotated.p))
-        return;
+    if (!d_rotated)
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
+                                 "': the rotated cotangent's scratch (" +
+                                 std::to_string(rows * codes_n * 4) + " bytes) was refused");
+    mask_and_rotate(codes, scale, cot, rows, codes_n, group, ngrp, y[0].value, s, d_rotated.p);
 
     // R97_DUMP_QUANT=1: what the row's stages produced, so a zero names its stage instead of the
     // whole row. `cot` and `y` are the host inputs; `rotated` is read back off the card.
@@ -673,8 +726,15 @@ void quant_adjoint(const AdjointCall& call, Part part) {
         if (out_values == total) {
             std::vector<float> h_out((size_t)total);
             for (int64_t i = 0; i < total; ++i) h_out[(size_t)i] = (float)oc.value[(size_t)i];
-            if (!d_out_cot) return;
-            if (rad_memcpy_async(d_out_cot.p, h_out.data(), total * 4, s) != 0) return;
+            if (!d_out_cot)
+                throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
+                                         "': the output cotangent's scratch (" +
+                                         std::to_string(total * 4) + " bytes) was refused");
+            if (rad_memcpy_async(d_out_cot.p, h_out.data(), total * 4, s) != 0)
+                throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
+                                         "': could not upload the output cotangent (" +
+                                         std::to_string(total * 4) + " bytes, " +
+                                         hip_error_name() + ")");
             hipLaunchKernelGGL(add_into_kernel, dim3((unsigned int)blocks(total)), dim3(256), 0,
                                (hipStream_t)s, (float*)d_rotated.p,
                                (const float*)d_out_cot.p, total);
@@ -704,7 +764,10 @@ void quant_adjoint(const AdjointCall& call, Part part) {
 
     // The elementwise part's own operands, at f32: they carry a smooth derivative, not a decision.
     device::ScratchBlock d_arg(arg_count * (int64_t)sizeof(float));
-    if (arg_count > 0 && !d_arg) return;
+    if (arg_count > 0 && !d_arg)
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
+                                 "': the elementwise operands' scratch (" +
+                                 std::to_string(arg_count * 4) + " bytes) was refused");
     if (arg_count > 0) {
         std::vector<float> h_arg((size_t)arg_count);
         // The gated producer's first operand is gate_up, both halves of it; the others' is one
@@ -718,11 +781,18 @@ void quant_adjoint(const AdjointCall& call, Part part) {
             for (int64_t i = 0; i < count; ++i)
                 h_arg[(size_t)(total + i)] = (float)second.value[(size_t)i];
         }
-        if (rad_memcpy_async(d_arg.p, h_arg.data(), arg_count * 4, s) != 0) return;
+        if (rad_memcpy_async(d_arg.p, h_arg.data(), arg_count * 4, s) != 0)
+            throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
+                                     "': could not upload the elementwise operands (" +
+                                     std::to_string(arg_count * 4) + " bytes, " + hip_error_name() +
+                                     ")");
     }
 
     device::ScratchBlock d_out(out_count * (int64_t)sizeof(unsigned short));
-    if (!d_out) return;
+    if (!d_out)
+        throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
+                                 "': the gradient's scratch (" + std::to_string(out_count * 2) +
+                                 " bytes) was refused");
 
     const float* rotated = (const float*)d_rotated.p;
     const float* arg = (const float*)d_arg.p;

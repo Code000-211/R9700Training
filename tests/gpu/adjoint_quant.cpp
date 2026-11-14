@@ -461,6 +461,37 @@ void live_gate_shape() {
         R97_CHECK(what.find("fwd[0]") != std::string::npos);
         std::printf("gate_had_quant_i8g short fwd[0]: %s\n", what.c_str());
     }
+    // The tape's own values short, not the walk's slots: a scale snapshot one value short is what
+    // produced 399 zeros on the real container, and the codes' cotangent short is the other half of
+    // the same silence. Both refuse by name, before any scratch is taken.
+    {
+        std::vector<AdValue> short_fwd = fwd;
+        short_fwd.at(3).value.resize((size_t)(rows * ngrp - 1));
+        AdjointCall ss{rec, short_fwd, cot, &dc, nullptr, ""};
+        std::string what;
+        try {
+            fn(ss);
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        R97_CHECK(what.find("operand 'scale'") != std::string::npos);
+        R97_CHECK(what.find(rec.op) != std::string::npos);
+        std::printf("gate_had_quant_i8g short scale: %s\n", what.c_str());
+    }
+    {
+        std::vector<AdValue> short_cot = cot;
+        short_cot.at(0).value.resize((size_t)(total - 1));
+        AdjointCall sc2{rec, fwd, short_cot, &dc, nullptr, ""};
+        std::string what;
+        try {
+            fn(sc2);
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        R97_CHECK(what.find("codes' cotangent") != std::string::npos);
+        R97_CHECK(what.find(rec.op) != std::string::npos);
+        std::printf("gate_had_quant_i8g short codes' cotangent: %s\n", what.c_str());
+    }
 }
 
 void run() {
