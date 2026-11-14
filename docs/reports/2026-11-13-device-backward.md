@@ -102,6 +102,24 @@ the section is filled from the case's JSON when it lands, and not before. Its fi
 `docs/reports/2026-11-12-device-forward.md`'s 34682.089228 / 8.469375 for the same batch),
 `loss_after`, the gradient norm, the store and VRAM peaks, the phase split, and tokens a second.
 
+**How to read that run, so it is not read the wrong way.** Two facts have to be held apart:
+
+1. Its binary predates the `r97: head read set:` diagnostic, so **a `0/0/0` counter reading there is
+   the old marking, not evidence about the diagnostic** — the two runs would otherwise look like
+   they contradict each other.
+2. Its contract is the opposite of the 512's (`a_all_zero`, `b_all_nonzero`, `b_changed == n_b`),
+   and at seed-0 `dA` is exactly zero only because it is a product with `B = 0`. **`0 × NaN = NaN`**,
+   and `part == 0.0` reads NaN as non-zero — so if the forward's inf reaches A, `a_all_zero` goes
+   **false**. Therefore:
+   - `a_all_zero` **false** ⇒ the inf reached A, i.e. the read set is still not firing. The run's
+     numbers are then not a 4096 finding, and the 4096 path must not be "fixed" from them.
+   - `a_all_zero` **true** ⇒ A's row is short-circuited on `B == 0` and the cotangent never reaches
+     it: the inf is contained on that path and the failure, if any, is elsewhere.
+
+   Neither outcome is a pass or a fail of the 4096 case until the read set fires; together with the
+   `head read set:` line they bracket the question, and separately each is ambiguous.
+
+
 ## The device rows and the head's kernels
 
 `ctest -R '^gpu_tests$'` — the container-free device suite, 751.67 s, all cases passed. The rows
