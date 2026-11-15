@@ -1226,6 +1226,69 @@ a wrong adjoint that this test could not see. On this container it is 1e-6 and t
 bite -- but it is a place where the test's two sides share an assumption with each other and not with
 the model.
 
+### The in-place read is handled correctly, and the arithmetic does not close
+
+The op is in place -- `gdn_gated_rmsnorm` takes `{w.o, w.z}` and writes `{w.o}` -- so the obvious next
+suspect is that the walk hands it its own output (max 278) rather than the scan's (max 0.42). **It
+does not.** `src/step_device.cpp` keeps a `before` map per block (`:1075`), each op's write sets
+`before[operand.buffer]` to what it produced (`:1276`), and a reader that is not the writer of the
+same buffer resolves through `before.find(read.buffer)` (`:1171`) -- so `gdn_gated_rmsnorm`'s read of
+`w.o` gets `gdn_chunk_scan`'s output, which is the value the op saw. **The aliasing hypothesis is
+eliminated.**
+
+**And the size does not close.** The GDN path supplies **~1.1e3 per GDN layer**, and this block
+layout is three GDN layers to one attention layer (the `gdn_o` positions run 21, 21, 48 apart), so
+that is `1.1e3^3` per four blocks -- about **190x per block**. The walk-versus-FD table needs **~1.8e3
+per block** (block 63 is 249x too small, block 60 is 6.9e7 too big, and that is 9.76 decades over
+three blocks). **The gap is a factor of ~10, so the GDN norm is not the whole of the spurious
+growth.** The other within-block transitions in the ranking table are the place to look for the rest:
+`gdn_k` `gdn_kkt_solve` -> `gdn_chunk_scan` at 1.5e4 - 4.8e4, `h.q8` `gemm_nt_q` -> `lora_shrink` at
+2.66e4, and `ffn.q8` `gemm_nt_q` -> `lora_shrink` at 9.1e3 - 9.2e3 are all per-layer, and each is
+large enough to matter at that budget.
+
+**So the honest state is: one row of this family is provably correct and documented, the aliasing
+route is closed, and the spurious growth is spread across more than one row.** The FD test that
+cleared `gdn_gated_rmsnorm` is the pattern to repeat for the other three -- each is a host-tier twin
+comparison that needs no container.
+
+### Every row in the ranking is individually FD-verified, so the defect is compositional
+
+The four rows the ranking table named are each covered by a host-tier twin-versus-adjoint finite
+difference, and **every one of them passes**:
+
+| row | test | result |
+|---|---|---|
+| `gdn_gated_rmsnorm` | `gdn_gradient_probe_gated_rmsnorm_matches_the_ops_own_derivative` | `adj/fd +1.000000` at `m = 1e-06` |
+| `gdn_kkt_solve` | `adjoint_gdn_kkt` | rel err 5.5e-10, 7.0e-10, 2.4e-10, 3.6e-10, 3.6e-10 |
+| `gdn_chunk_scan` | `gdn_gradient_probe_chunk_scan_matches_the_ops_own_derivative` | passes; its wrong-`dy` control reads exactly 2.000000 |
+| `lora_shrink` / `lora_expand` | `lora_shrink_adjoint_matches_finite_differences`, `lora_expand_...` | pass |
+| the i8g producers | `adjoint_i8g_producers_agree_with_finite_differences` | pass |
+| `gemm_nt_q`'s activation scale | `scale_factor_probe_keeps_the_activation_scale` | mean adj/fd 1.0000, worst 4.19e-09 |
+
+**So no row's local derivative is wrong.** Each row is right about the cotangent it is handed and the
+operand it is handed it with. **The walk's 1e35 is therefore produced by the composition -- which
+cotangent reaches which row -- and not by any row's arithmetic.** That is a different claim from the
+ones this report has made before, and it is the one the evidence now supports: the earlier work
+localised *where* the growth happens (the GDN norm, the `had_quant` family) and read that as a row
+defect, but a row that matches its own twin's finite difference at the magnitudes in play cannot be
+the origin.
+
+**Two compositional routes are now closed as well.** The in-place read is served from the `before`
+map and is correct (above), and the staging's one silent fallback -- `src/step_device.cpp:1244-1248`,
+which keeps the live arena pull when a writer's capture cannot express a reader's view -- **never
+fires in any retained log** (the string `live pull kept` appears in none of `/tmp/r97-fwd.log`,
+`/tmp/r97-head.log`, `/tmp/r97-hwab.log`, `/tmp/r97-dumpdc3.log`, `/tmp/r97-dstep-4096b.log`), so no
+read is silently answered from a reused arena.
+
+**What is left is the row windows.** `tighten_rows` (`src/join_common.h:400-409`), `first_rows` and
+`pick_boundary` (`:350-364`) decide which rows of a buffer each row's adjoint is given, and the
+block-63 anomaly already points at them: block 63 is the only block seeded from `d_hout` rather than
+a previous block's `InputCotangent`, and it is 249x too *small* while block 60 is 6.9e7 too *big* --
+a sign flip in the error between two adjacent blocks, which is what a row-window mismatch between
+what a row wrote and what the next row reads looks like. **That is the next thing to measure**, and
+it is measurable on the host tier: the walk's own cotangent for one named buffer, against the same
+buffer's cotangent from a twin built at the same rows.
+
 ### The host walk is not an available arbiter on this container
 
 `R97_HOST_WALK_AB=1 R97_DUMP_DC=1` was run on the 512-token case to settle device-rows-versus-plumbing
