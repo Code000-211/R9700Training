@@ -13,21 +13,24 @@ Both cases are `tests/gpu/device_step.cpp`; the assertions quoted below are that
 > measurements arrived and quote rates that later runs replaced. **The authoritative
 > numbers are these**, and any conflicting figure further down is superseded:
 >
-> - One decoder layer is **90 records** (`rope` repeats every 90 positions) and contains
->   exactly **three** `gdn_gated_rmsnorm` records, spaced `[21, 21, 49]`.
-> - The walk's cotangent grows **~0.14 decades per record (~1.38x)**, flat across both the
->   21- and the 49-record gaps: **~1.8e13 per decoder layer** (12.744 decades, mean of two
->   complete layer transitions).
-> - The true gradient grows **1.24x per decoder layer**, so the walk carries **~1.5e13 too
->   much per layer**. That is #55's defect.
-> - The walk clips at f32's ceiling `3.4e38` about **2.8 layers** below the window's top
->   record; everything below reads NaN because it saturated, not because growth stopped.
-> - **Retracted, do not reintroduce:** `~984x per block`, `~1.6e3 per block`,
->   `~2.70x per block`, `~3.9x per block`, `~250x per-block excess`, `365x`, `2e33`, `~76`,
->   and "no per-block factor exists". The `~984x` and `~1.6e3` figures both came from
->   comparing two *different* quantities rather than one buffer through one op.
+> - The container has **64 decoder layers** and the walk covers **1458 positions**, so one
+>   layer is **22.78 records**. The dump corroborates it: 48 `gdn_gated_rmsnorm` (linear)
+>   + 16 `rope` layers (full) = 64, a 3:1 hybrid.
+> - The walk's cotangent grows **~0.140 decades per record (~1.38x)**, flat across both the
+>   21- and the 49-record gaps: **~1.55e3 per decoder layer** (3.190 decades).
+> - The true gradient grows **1.24x per decoder layer**, so the walk carries **~1.25e3 too
+>   much per layer**. That is #55's defect. Compounded over the 11 layers from block 40 to
+>   block 51 it gives 1.19e34 against a measured over-statement of 6.9e31 -- the same order.
+> - The walk clips at f32's ceiling `3.4e38` **11.1 layers** below the window's top record
+>   (measured: 12.0); everything below reads NaN because it saturated, not because growth
+>   stopped.
+> - **Retracted, do not reintroduce:** `~984x per block`, `~2.70x per block`,
+>   `~3.9x per block`, `~250x per-block excess`, `365x`, `2e33`, `~76`, "no per-block factor
+>   exists", and the brief `~1.8e13 per layer`. The `~984x` came from dividing a logit-space
+>   cotangent by a weight-space gradient; the `~1.8e13` from calling a 4-layer `rope` period
+>   one layer. `~1.6e3` was right; the derivations behind it were not.
 >
-> The measurement itself is in "The per-layer factor, measured: ~1.8e13, and it is real".
+> The measurement itself is in "The per-layer factor, measured: ~1.6e3, and it is real".
 
 ## 512 tokens, seeded start
 
@@ -605,7 +608,7 @@ not merely the same rule. The grids agree at all four live widths (5120/40, 5120
 the same rule in f64 (`host/quant.cpp:365` divides, `host/linear.cpp:244` and `host/lora.cpp:312`
 multiply).
 
-### The per-layer factor, measured: ~1.8e13, and it is real
+### The per-layer factor, measured: ~1.6e3, and it is real
 
 **Two measurements, and they say different things -- which is the whole point.**
 
@@ -626,27 +629,43 @@ multiply).
 | **1143** | **3.38953e+38** | 2560 | 3.408 | 49 |
 | 1122 | 0 (all non-finite) | -- | -- | 21 |
 
-**The `[21, 21, 49]` spacing is a decoder layer, not a transition.** `rope` repeats every 90 records
-(`src/backward.cpp` positions, `R97_DUMP_DC=1`), and every 90-record layer contains exactly **three**
-`gdn_gated_rmsnorm` records, at offsets 21, 21 and 49. So the table's nine rows are **three layers**,
-and a 49-record gap is the layer boundary.
+**The rate is flat per record, and that is the strongest single fact here.** 0.1506 decades/record over
+the six 21-record gaps, 0.1336 over the first two 49-record gaps (the third is clipped, see below):
+**~0.140 decades per record, i.e. ~1.38x, holding across both gap sizes.** Whatever makes it is applied
+once per record.
 
-**Per record the rate is flat, and that is the strongest single fact here.** 0.1506 decades/record
-over the six 21-record gaps, 0.1336 decades/record over the first two 49-record gaps (the third is
-clipped, see below): **~0.14 decades per record, i.e. ~1.38x, holding across both gap sizes.** Whatever
-makes it is applied once per record, not once per layer.
+**One decoder layer is 22.78 records, so the per-layer rate is ~1.6e3.** The container's own artifact
+reports `layers 64` (`device_step_tape.json`, the same 800-leaf `ParamSet` this report is about), and
+the walk covers 1458 positions, so **1458/64 = 22.78 records per layer**. The dump corroborates the
+count independently: `gdn_gated_rmsnorm` appears 48 times and `rope` 32 times, i.e. 48 linear-attention
+plus 16 full-attention layers -- **48 + 16 = 64**, a 3:1 hybrid, and the 91-record `rope` period divided
+by 22.78 records per layer is **3.99**.
 
-**Per layer it is therefore ~1.8e13.** Over the two complete layer transitions the walk grows
-**12.929** and **12.559** decades (1.18e13 and 2.76e13); mean **12.744 decades = 1.8e13 per decoder
-layer**. Against a true gradient that grows **1.24x** per layer (876.06 at block 40 to 9073.83 at block
-51, 10.4x over 11 layers), the walk carries **~1.5e13 too much per layer**.
+So:
+
+| | |
+|---|---|
+| per record | 0.140 decades = **1.38x** |
+| per decoder layer (0.140 x 22.78) | 3.190 decades = **1.55e3** |
+
+and a 21-record gap is one layer (3.162 decades, mean of six) while a 49-record gap is two (3.274,
+mean of two) -- consistent to 4%, which is the second independent check on the layer size.
+
+**Against the truth, that is an excess of ~1.25e3 per layer.** The true gradient grows **1.24x** per
+layer (876.06 at block 40 to 9073.83 at block 51, 10.4x over 11 layers), so the walk's excess is
+1.55e3/1.2373 = **1.25e3 per layer, 3.098 decades**. Compounded over the 11 layers from block 40 to
+block 51 that is **1.19e34**, against a measured over-statement of **6.9e31** at the block-51 leaf --
+the same order. **Three independent facts agree on the same per-layer rate**, which is what the earlier
+`~984x` never had.
 
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
 the rate itself**: the last transition spans 3.408 decades where a 49-record gap had been running 6.4
-to 6.7, i.e. it ran out of exponent range roughly halfway through. The residual stream's own cotangent
-(`h`) shows the same growth and the same clipping.
+to 6.7, i.e. it ran out of exponent range roughly halfway through. And the position agrees: at 3.190
+decades per layer, f32's `3.4e38` is **11.1 layers** below position 1416, and the measured clip at
+position 1143 is **12.0 layers** below it. The residual stream's own cotangent (`h`) shows the same
+growth and the same clipping.
 
 **The true gradient, from the central difference at two leaves:**
 
@@ -656,17 +675,16 @@ to 6.7, i.e. it ran out of exponent range roughly halfway through. The residual 
 | `model.layers.40.linear_attn.in_proj_qkv.lora_A` | **NaN** | **876.06** | unbounded |
 | `model.layers.0.linear_attn.in_proj_qkv.lora_A` | NaN | -- | (first leaf in param order) |
 
-The truth grows **1.24x per layer** (876.06 at block 40 to 9073.83 at block 51, 10.4x over 11 layers):
-a well-behaved O(1e3) number at every depth, against a walk that multiplies by ~1.8e13 per layer. That
-is the defect, and it is now measured on one buffer through one op rather than divided out of a
-logit-space ratio.
+The truth is a well-behaved O(1e3) number at every depth, against a walk that multiplies by ~1.6e3 per
+layer. That is the defect, and it is now measured on one buffer through one op rather than divided out
+of a logit-space ratio.
 
-**Which explains the NaN leaves without contradicting the rate.** At 12.744 decades per layer, f32's
-`3.4e38` is 2.8 layers below the window's top record -- and the measured clip is at position 1143,
-which is two layer boundaries down. Leaves at block 40 and block 0 are far *below* that crossing, so
-they read NaN -- not because the growth stops, but because it saturated long before. An earlier draft
-of this section read that saturation as evidence that no per-layer factor existed; that reading was
-wrong, and the buffer trace above is what corrects it.
+**Which explains the NaN leaves without contradicting the rate.** At 3.190 decades per layer, f32's
+`3.4e38` is 11 layers below the window's top record -- and the measured clip is 12 layers down. Leaves
+at block 40 and block 0 are far *below* that crossing, so they read NaN -- not because the growth
+stops, but because it saturated long before. An earlier draft of this section read that saturation as
+evidence that no per-layer factor existed; that reading was wrong, and the buffer trace above is what
+corrects it.
 
 **What remains unexplained is why it is ~1.38x per record.** A quantiser hop contributes `1/s ~ 5`;
 the `1/s` audit above shows all eight producer x consumer pairs balanced at product exactly 1.0, so it
@@ -824,7 +842,7 @@ only that the walk reached the leaf".
 schema's 800 leaves with matching names and shapes; the forward is all finite, so the container, the
 loader and the forward are ruled out as the source of any non-finite value; the first non-finite value
 is at `model.layers.0.linear_attn.in_proj_qkv.lora_A`; and **96 % of the 2946 s step is the backward**
-(2832.8 s), which is what an adjoint amplifying by ~1.8e13 per decoder layer costs in time as well as
+(2832.8 s), which is what an adjoint amplifying by ~1.6e3 per decoder layer costs in time as well as
 correctness.
 
 **What it does not establish, and an earlier draft of this section claimed.** That "127 of the 400 `A`
@@ -854,4 +872,4 @@ hold at the issue's own size.
 4096 positions the backward takes 47 minutes and produces the same non-finite leaf at the same
 place, so the defect is in the walk's arithmetic and not in a corner the short case happened to take.
 It also puts a number on what the defect costs: **96 % of the step is the backward**, which is what
-an adjoint amplifying by ~1.8e13 per decoder layer costs in time as well as in correctness.
+an adjoint amplifying by ~1.6e3 per decoder layer costs in time as well as in correctness.
