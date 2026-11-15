@@ -9,6 +9,26 @@ exactly zero.
 Both cases are `tests/gpu/device_step.cpp`; the assertions quoted below are that file's
 (`:965-978`), not a reviewer's.
 
+> **Superseding summary (2026-11-15).** Several sections below were written as the
+> measurements arrived and quote rates that later runs replaced. **The authoritative
+> numbers are these**, and any conflicting figure further down is superseded:
+>
+> - One decoder layer is **90 records** (`rope` repeats every 90 positions) and contains
+>   exactly **three** `gdn_gated_rmsnorm` records, spaced `[21, 21, 49]`.
+> - The walk's cotangent grows **~0.14 decades per record (~1.38x)**, flat across both the
+>   21- and the 49-record gaps: **~1.8e13 per decoder layer** (12.744 decades, mean of two
+>   complete layer transitions).
+> - The true gradient grows **1.24x per decoder layer**, so the walk carries **~1.5e13 too
+>   much per layer**. That is #55's defect.
+> - The walk clips at f32's ceiling `3.4e38` about **2.8 layers** below the window's top
+>   record; everything below reads NaN because it saturated, not because growth stopped.
+> - **Retracted, do not reintroduce:** `~984x per block`, `~1.6e3 per block`,
+>   `~2.70x per block`, `~3.9x per block`, `~250x per-block excess`, `365x`, `2e33`, `~76`,
+>   and "no per-block factor exists". The `~984x` and `~1.6e3` figures both came from
+>   comparing two *different* quantities rather than one buffer through one op.
+>
+> The measurement itself is in "The per-layer factor, measured: ~1.8e13, and it is real".
+
 ## 512 tokens, seeded start
 
 `/tmp/r97-dstep-device_step_tape-23nofj/device_step_tape.json`, written 2026-11-14
@@ -265,7 +285,7 @@ An earlier draft of this section claimed the opposite -- that a per-group mechan
 that buffer" because all 20480 groups would have to be degenerate. **That was wrong and is
 retracted**: the row-wide reduction carries a single group's overflow across the whole row.
 
-### The measurement: ~984x per block on average, and accelerating
+### The measurement: ~984x per block on average, and accelerating  [SUPERSEDED — see the summary at the top]
 
 > **Confirmed in substance, corrected in number.** The curve is real: tracking one buffer across blocks
 > (`gdn_in`, blocks 62 to 58) measures **~1.6e3 per block**, and that is why the walk saturates to
@@ -585,35 +605,48 @@ not merely the same rule. The grids agree at all four live widths (5120/40, 5120
 the same rule in f64 (`host/quant.cpp:365` divides, `host/linear.cpp:244` and `host/lora.cpp:312`
 multiply).
 
-### The per-block factor, measured at last: ~1.6e3, and it is real
+### The per-layer factor, measured: ~1.8e13, and it is real
 
 **Two measurements, and they say different things -- which is the whole point.**
 
-**The walk's cotangent in one buffer through one op, tracked across nine block transitions**
-(`gdn_o` at the `gdn_gated_rmsnorm` record, `R97_DUMP_DC=1`):
+**The walk's cotangent in one buffer through one op** (`gdn_o` at the `gdn_gated_rmsnorm` record,
+`R97_DUMP_DC=1`), with every ratio recomputed from the dump rather than transcribed:
 
-| position | maxabs | x since previous | gap |
-|---|---|---|---|
-| 1416 | 1128 | -- | -- |
-| 1395 | 1.663e+06 | 1474 | 21 |
-| 1374 | 2.030e+09 | 1221 | 21 |
-| 1325 | 9.570e+15 | 4714 | 49 |
-| 1304 | 7.962e+18 | 832 | 21 |
-| 1283 | 1.306e+22 | 1640 | 21 |
-| 1234 | 3.466e+28 | 2654 | 49 |
-| 1213 | 4.976e+31 | 1435 | 21 |
-| 1192 | 1.324e+35 | 2661 | 21 |
-| **1143** | **3.390e+38** | 2560 | 49 |
+| position | maxabs | x since previous | decades | record gap |
+|---|---|---|---|---|
+| 1416 | 1128 | -- | -- | -- |
+| 1395 | 1.66298e+06 | 1474 | 3.169 | 21 |
+| 1374 | 2.03004e+09 | 1221 | 3.087 | 21 |
+| 1325 | 9.57015e+15 | **4.714e+06** | 6.673 | 49 |
+| 1304 | 7.96236e+18 | 832.0 | 2.920 | 21 |
+| 1283 | 1.30603e+22 | 1640 | 3.215 | 21 |
+| 1234 | 3.46623e+28 | **2.654e+06** | 6.424 | 49 |
+| 1213 | 4.97553e+31 | 1435 | 3.157 | 21 |
+| 1192 | 1.32404e+35 | 2661 | 3.425 | 21 |
+| **1143** | **3.38953e+38** | 2560 | 3.408 | 49 |
+| 1122 | 0 (all non-finite) | -- | -- | 21 |
 
-**~1e3 to 2.7e3 per step, and a 21-record gap is the one that means "one layer" here** (a block's
-delta-net chain is about that many records), so the two 49-record gaps reading 4714 and 2654 vanish
-at the same rate per layer. **Geometric mean over the nine transitions: ~1.6e3 per layer** -- one
-buffer through one op, not a ratio of two different quantities.
+**The `[21, 21, 49]` spacing is a decoder layer, not a transition.** `rope` repeats every 90 records
+(`src/backward.cpp` positions, `R97_DUMP_DC=1`), and every 90-record layer contains exactly **three**
+`gdn_gated_rmsnorm` records, at offsets 21, 21 and 49. So the table's nine rows are **three layers**,
+and a 49-record gap is the layer boundary.
+
+**Per record the rate is flat, and that is the strongest single fact here.** 0.1506 decades/record
+over the six 21-record gaps, 0.1336 decades/record over the first two 49-record gaps (the third is
+clipped, see below): **~0.14 decades per record, i.e. ~1.38x, holding across both gap sizes.** Whatever
+makes it is applied once per record, not once per layer.
+
+**Per layer it is therefore ~1.8e13.** Over the two complete layer transitions the walk grows
+**12.929** and **12.559** decades (1.18e13 and 2.76e13); mean **12.744 decades = 1.8e13 per decoder
+layer**. Against a true gradient that grows **1.24x** per layer (876.06 at block 40 to 9073.83 at block
+51, 10.4x over 11 layers), the walk carries **~1.5e13 too much per layer**.
 
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
-reaches `3.390e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
-position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). The residual stream's
-own cotangent (`h`) shows the same growth and the same clipping.
+reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
+position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
+the rate itself**: the last transition spans 3.408 decades where a 49-record gap had been running 6.4
+to 6.7, i.e. it ran out of exponent range roughly halfway through. The residual stream's own cotangent
+(`h`) shows the same growth and the same clipping.
 
 **The true gradient, from the central difference at two leaves:**
 
@@ -623,46 +656,38 @@ own cotangent (`h`) shows the same growth and the same clipping.
 | `model.layers.40.linear_attn.in_proj_qkv.lora_A` | **NaN** | **876.06** | unbounded |
 | `model.layers.0.linear_attn.in_proj_qkv.lora_A` | NaN | -- | (first leaf in param order) |
 
-The truth grows **1.24x per block** (876.06 at block 40 to 9073.83 at block 51, 10.4x over 11 blocks):
-a well-behaved O(1e3) number at every depth. **So the walk carries ~1e3 too much per block and the
-truth carries ~1.24x** -- and the per-block factor the earlier sections argued for is real, it is just
-**~1.6e3 rather than ~984**, and it is measured now rather than divided out of a logit-space ratio.
+The truth grows **1.24x per layer** (876.06 at block 40 to 9073.83 at block 51, 10.4x over 11 layers):
+a well-behaved O(1e3) number at every depth, against a walk that multiplies by ~1.8e13 per layer. That
+is the defect, and it is now measured on one buffer through one op rather than divided out of a
+logit-space ratio.
 
-**The rate also predicts where the walk clips.** From 1128 at position 1416, crossing f32's `3.4e38`
-at `1.6e3` per layer takes `log10(3.4e38/1128) / 3.2` = **11 layers**, and the measured clip is at
-position 1143, nine transitions down the same list. That the two agree to within the two-block gaps is
-what makes the rate credible rather than fitted.
+**Which explains the NaN leaves without contradicting the rate.** At 12.744 decades per layer, f32's
+`3.4e38` is 2.8 layers below the window's top record -- and the measured clip is at position 1143,
+which is two layer boundaries down. Leaves at block 40 and block 0 are far *below* that crossing, so
+they read NaN -- not because the growth stops, but because it saturated long before. An earlier draft
+of this section read that saturation as evidence that no per-layer factor existed; that reading was
+wrong, and the buffer trace above is what corrects it.
 
-**Which also explains the NaN leaves without contradicting the rate.** The walk's cotangent grows
-geometrically until it crosses the f32 ceiling, then stays non-finite. Leaves at block 40 and block 0
-are *downstream* of that crossing, so they read NaN -- not because the per-block growth stops, but
-because it has already saturated. An earlier draft of this section read that saturation as evidence
-that no per-block factor existed; that reading was wrong, and the buffer trace above is what corrects
-it.
+**What remains unexplained is why it is ~1.38x per record.** A quantiser hop contributes `1/s ~ 5`;
+the `1/s` audit above shows all eight producer x consumer pairs balanced at product exactly 1.0, so it
+is not the quantiser scales. **It is a per-record factor of ~1.38x made somewhere the scale audit does
+not cover**, and `R97_DUMP_DC` at real magnitudes is the instrument that narrows it.
 
-**What remains unexplained is why the rate is ~1.6e3.** A quantiser hop contributes `1/s ~ 5` and
-there are ~5 per block, so a *balanced* chain contributes ~1; an unbalanced one at every hop would
-give 5^5 ~ 3e3, which is the right size. The `1/s` audit above shows all eight producer x consumer
-pairs balanced at product exactly 1.0, so it is not the quantiser scales. **It is a per-block factor
-of ~1.6e3 made somewhere the scale audit does not cover**, and the instrument that now narrows it is
-`R97_DUMP_DC` at real magnitudes -- which is what the pass above demonstrates works.
+**And it is not inside a single record's row.** Within one layer the cotangents are ordinary: `gdn_in`
+reads 0.527 at `gdn_conv_prep`@1413, 0.652 at `gdn_gated_rmsnorm`@1416 and 0.652 at
+`lora_expand`@1411. The `gdn_o` span of 0.105 at `had_quant_act_i8g`@1417 to 1128 at
+`gdn_gated_rmsnorm`@1416 is **not** a per-call factor -- those are different roles, a read and a write,
+so the two numbers are not one row's input and output. What the cross-layer trace establishes is the
+rate; what it does not yet establish is which record applies it.
 
-**And it is not inside a row.** Within one block the cotangents are ordinary: `gdn_in` reads 0.527 at
-`gdn_conv_prep`@1413, 0.652 at `gdn_gated_rmsnorm`@1416 and 0.652 at `lora_expand`@1411, and `gdn_o`
-spans 0.105 at `had_quant_act_i8g`@1417 to 1128 at `gdn_gated_rmsnorm`@1416 -- which is the `1/rms`
-conditioning the host reproduces, a factor of 1.07e4 that does **not** accumulate because the next
-layer starts again at a small value. The growth is carried *between* layers, not made inside one.
+**That instrument is now permanent.** `R97_DUMP_DC`'s op list (`src/backward.cpp:751-768`) covers
+`rope`, `lora_expand`, `lora_shrink`, `rmsnorm`, `rmsnorm_had_quant_i8g`, `add`, `gdn_chunk_scan`,
+`gdn_kkt_solve`, `gdn_conv_prep` and `gdn_gated_rmsnorm`, and its window is positions 1300..1458, so
+complete layers sit inside it. The table above is that run.
 
-**That probe was then run, and the instrument is now permanent.** `R97_DUMP_DC`'s op list
-(`src/backward.cpp:751-768`) covers `rope`, `lora_expand`, `lora_shrink`, `rmsnorm`,
-`rmsnorm_had_quant_i8g`, `add`, `gdn_chunk_scan`, `gdn_kkt_solve`, `gdn_conv_prep` and
-`gdn_gated_rmsnorm`, and its window is positions 1300..1458 instead of 1390..1458, so an adjacent
-pair of layers is inside the window rather than straddling its edge. The table above is that run.
-
-**What it does not yet answer is *which* record introduces the factor.** The growth is visible in
-`gdn_o`, `gdn_in` and `h` at every layer, and no single record's own `dx`/`dy` ratio stands out in
-the window -- so the next narrowing is a per-record comparison of what a row was handed against what
-it left, at one layer boundary, rather than a wider window.
+**The next narrowing is a per-record handed-vs-left comparison at one layer boundary**, not a wider
+window: the growth is visible in `gdn_o`, `gdn_in` and `h` at every layer, and no single record's own
+`dx`/`dy` ratio stands out.
 
 **Two mechanical findings came out of the audit and are acted on.** The f32 row reductions: the
 report's own f64 fix landed at one of three sites on this path, and the other two
@@ -799,7 +824,7 @@ only that the walk reached the leaf".
 schema's 800 leaves with matching names and shapes; the forward is all finite, so the container, the
 loader and the forward are ruled out as the source of any non-finite value; the first non-finite value
 is at `model.layers.0.linear_attn.in_proj_qkv.lora_A`; and **96 % of the 2946 s step is the backward**
-(2832.8 s), which is what a per-op adjoint amplifying by ~250x per block costs in time as well as
+(2832.8 s), which is what an adjoint amplifying by ~1.8e13 per decoder layer costs in time as well as
 correctness.
 
 **What it does not establish, and an earlier draft of this section claimed.** That "127 of the 400 `A`
@@ -829,4 +854,4 @@ hold at the issue's own size.
 4096 positions the backward takes 47 minutes and produces the same non-finite leaf at the same
 place, so the defect is in the walk's arithmetic and not in a corner the short case happened to take.
 It also puts a number on what the defect costs: **96 % of the step is the backward**, which is what
-a per-op adjoint that amplifies by ~250x per block costs in time as well as in correctness.
+an adjoint amplifying by ~1.8e13 per decoder layer costs in time as well as in correctness.
