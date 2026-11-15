@@ -417,16 +417,24 @@ inline FdReport check_adjoint(const OpRecord& rec, const std::vector<AdValue>& i
 
     // Random cotangent for every written operand.
     //
-    // Magnitude knob, the one that matters for a saturation defect. The note above is right that an
-    // adjoint which is *linear* in its cotangent is unaffected by scaling it -- both sides of the
-    // comparison scale together. It stops being right the moment a row puts the cotangent through a
-    // narrow type: `src/adjoint/host/quant.cpp:386` rounds it through
-    // `rad_bf16_to_f32(rad_f32_to_bf16((float)x))` and `src/adjoint/device/quant.hip:345-349` casts
-    // the whole buffer to f32 before any kernel runs. Past f32's 3.4e38 ceiling those are Inf, the
-    // adjoint's answer becomes Inf while the f64 central difference stays finite and scales linearly,
-    // and the check fails -- which is exactly the walk's failure (`#145`; the real walk reaches
-    // 4.27042e+41). So R97_FD_COT scales `cot` while R97_FD_AMP scales the inputs: two different
-    // axes, and this is the one the walk's defect lives on.
+    // Magnitude knob, so that a saturation defect has an axis to fail on. The note above is right
+    // that an adjoint which is *linear* in its cotangent is unaffected by scaling it -- both sides
+    // of the comparison scale together -- and that is exactly what this knob measured: 1e39 and
+    // 1e45 leave this suite at 281 tests, 0 failed.
+    //
+    // That null result is the point, and it corrects a first guess worth recording so nobody
+    // repeats it. The guess was that the host quant adjoint narrows the cotangent and would
+    // overflow. It does not: `src/adjoint/host/quant.cpp:386`'s
+    // `rad_bf16_to_f32(rad_f32_to_bf16((float)x))` is applied to *forward activations*, never to
+    // `cot`, and `cot` stays f64 end to end here. No host tier arm can reach the failure at any
+    // cotangent magnitude, because no host row makes `cot` f32. The narrowing is on the device:
+    // `src/adjoint/device/quant.hip:345-349` casts the whole buffer to f32 before any kernel runs.
+    // Nothing in `tests/gpu/` uses this header, so there is no device arm to carry that -- the knob
+    // is kept as the axis for a future one, and inert by default.
+    //
+    // For `#145`, the site is the divide at `quant.hip:199`, not that cast: the quant rows'
+    // per-element cotangent peaks at 2.65846e+36, which fits f32, but `:199` divides it by a group
+    // scale measured as low as 5.95831e-05, giving 4.462e+40 -- past f32's 3.4e38.
     uint64_t s = seed;
     const double cot_amp = [] {
         const char* e = std::getenv("R97_FD_COT");

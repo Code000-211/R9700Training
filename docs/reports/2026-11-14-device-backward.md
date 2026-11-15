@@ -1330,25 +1330,36 @@ inverse rotation and the elementwise backprop as a whole-row event. `R97_DUMP_QU
 **It ran on a 512-token step and the scale is never extreme.** The complete log holds **256 reports**;
 the smallest scale anywhere in the walk is **5.95831e-05** (the five smallest are 5.95831e-05 /
 6.37644e-05 / 8.98981e-05 / 0.000143236 / 0.000148421), and **`below1e-32=0` at every single
-report.** So no group stores a scale near the f32 floor and the divide has no reason to overflow *on
-its own*.
+report.** So no group stores a scale near the f32 floor -- which rules out one reading of the divide
+and forces a different one, as the next paragraph shows: the scale does not have to be extreme for the
+quotient to overflow, because the cotangent it divides is already enormous.
 
-**But something in this family does overflow at the far end of the walk, and it is the f64-to-f32
-downcast, not the divide.** The largest cotangent the probe sees is **4.27042e+41** and f32's ceiling is
-3.4e38, so it cannot be represented. `mask_rotate_kernel` (`quant.hip:171`) takes
-`const float* cot` -- the cotangent arrives **already f32** -- and the cast is on the host:
-`std::vector<float> h_cot((size_t)total); ... h_cot[(size_t)i] = (float)cot.value[(size_t)i];`
-(**`quant.hip:345-349`**). The tape holds f64 (`AdValue.value` is `std::vector<double>`), so
-`(float)4.27e41` is **`Inf` before any kernel runs**, and `:199`'s divide then computes `Inf / s` on it.
-**The divide is not the mechanism** -- it is linear in `cot` and would be exact. **The cast is, and it
-has no guard**, though the same file guards f32 overflow elsewhere (`:254`, on
-`rotated_cot * x * (w + wadd)`). The walk goes non-finite at **report 55 of 256**; the last finite
-cotangent is 4.27042e+41 at report 54 and **201 of the 256 reports are NaN**, while the forward `y`
-stays finite throughout (2.0e6 to 2.9e6). **So this is a consequence of the growth, not the cause of
-it** -- but it means a complete fix has two independent parts: the growth itself, and making the quant
-rows refuse or report a cotangent they cannot represent, the way `quant.hip:686-697` already refuses a
-non-finite activation rather than silently zeroing a live row's gradient. The cause remains the
-per-block growth below.
+**But this family does overflow at the far end of the walk, and the site is the divide, not the
+cast.** A caution first, because it is easy to get wrong: **the probe's `cot=4.27042e+41` is a SUM of
+absolute values over the output buffer** (`quant.hip:718-720`), not an element. Reading it as an
+element overstates the row by six decades and points at the wrong line. The per-element figure comes
+from `R97_DUMP_DC`'s `maxabs` (`backward.cpp:771-787`), and for the quant rows it is
+**2.65846e+36** -- `rmsnorm_had_quant_i8g` at pos 1148, with `nonfinite=0`.
+
+**2.66e36 fits f32, so the f64-to-f32 downcast is not the mechanism.** `mask_rotate_kernel`'s
+argument is `const float* cot` (`quant.hip:171`) and the host casts the buffer at `quant.hip:345-349`
+-- an unguarded cast, but a harmless one at this magnitude.
+
+**The divide is.** `mask_rotate_kernel` computes `d[tid] = cot[base+tid] / (float)s` (`:199`) in f32,
+against a group scale that the same run measures as low as **5.95831e-05** (five smallest:
+5.95831e-05, 6.37644e-05, 8.98981e-05, 0.000143236, 0.000148421, all from `R97_DUMP_QUANT`'s
+SCALERANGE). **2.65846e+36 / 5.95831e-05 = 4.462e+40**, which is past f32's 3.4e38 ceiling -- so the
+quotient is `Inf` even though its numerator is not. The same holds for `3.97625e-03` and below: any
+group whose scale is under about **7.8e-03** overflows this numerator, and four of the five smallest
+measured scales are two to five decades under that.
+
+**This is reachable on a 512-token step, and it is where the walk dies.** The walk goes non-finite at
+**report 55 of 256** and **201 of the 256 reports are NaN**, while the forward `y` stays finite
+throughout (2.0e6 to 2.9e6). **So this is a consequence of the growth, not the cause of it** -- but a
+complete fix has two independent parts: the growth itself, and making the quant rows refuse or report
+a quotient they cannot represent, the way `quant.hip:686-697` already refuses a non-finite
+activation rather than silently zeroing a live row's gradient. The cause remains the per-block growth
+below.
 
 **The probe also records the forward and the cotangent of every op it touches, and it confirms the
 rate a second way.** Two cautions on reading it: the printed `cot` and `y` are **sums of absolute
@@ -1444,7 +1455,7 @@ disables the checks.
 **A magnitude knob on the inputs does find something, but a different thing.** `R97_FD_AMP`, which
 scales the operands instead, takes the suite from 0 to 9 failures at 10x (0 -> 8 excluding the
 `libquant` skip; 11 at 100x, 18 at 1000x, 21 at 10000x). Naming them splits the set: **six of the nine
-are the knob's own damage** -- it multiplies *every* read operand, so in four tests it scales a rope
+are the knob's own damage** -- it multiplies *every* read operand, so in three tests it scales a rope
 position, a kv-store slot or a select row and the test throws out of range before any adjoint runs
 (`rope_registry_row_...`, `kv_store_registry_row_...`, `reference_op_select_rows`), and three more are
 the *twin* refusing the fixture (`twin produced 0 outputs`). **Two are real, and both are in the
