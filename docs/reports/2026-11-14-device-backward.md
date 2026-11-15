@@ -1334,46 +1334,46 @@ report.** So no group stores a scale near the f32 floor -- which rules out one r
 and forces a different one, as the next paragraph shows: the scale does not have to be extreme for the
 quotient to overflow, because the cotangent it divides is already enormous.
 
-**But this family does overflow at the far end of the walk, and the site is the divide, not the
-cast.** A caution first, because it is easy to get wrong: **the probe's `cot=4.27042e+41` is a SUM of
-absolute values over the output buffer** (`quant.hip:718-720`), not an element. Reading it as an
-element overstates the row by six decades and points at the wrong line. The per-element figure comes
-from `R97_DUMP_DC`'s `maxabs` (`backward.cpp:771-787`), and for the quant rows it is
-**2.65846e+36** -- `rmsnorm_had_quant_i8g` at pos 1148, with `nonfinite=0`.
+**What actually clips first is the raw f32 ceiling, in `gdn_o`, and it is not a quant row.** Two
+cautions, both of which earlier drafts of this section got wrong, so they are worth stating plainly.
 
-**Not the downcast, because 2.66e36 fits f32.** `mask_rotate_kernel`'s argument is `const float* cot`
-(`quant.hip:171`) and the host casts the buffer at `quant.hip:345-349` -- an unguarded cast, but a
-harmless one at this magnitude.
+**First, the probe's `cot=4.27042e+41` is a SUM of absolute values** over the output buffer
+(`quant.hip:718-720`), not an element; reading it as an element overstates the row by six decades and
+points at the wrong line. The per-element figure is `R97_DUMP_DC`'s `maxabs`
+(`backward.cpp:771-787`), and the largest on any quant row is **2.65846e+36** (`rmsnorm_had_quant_i8g`,
+pos 1148, `nonfinite=0`) -- **below f32's ceiling, so the f64-to-f32 downcast at `quant.hip:345-349`
+is not what overflows**, though it is unguarded and worth guarding.
 
-**The divide is, and the argument does not need those two numbers to come from the same group.**
-`mask_rotate_kernel` computes `d[tid] = cot[base+tid] / (float)s` (`:199`) in f32. The downcast
-overflows when an element itself exceeds **3.4e38**; the divide overflows when `cot > 3.4e38 x s`. A
-group's scale is its amax over the format's top (`q8_group`; `amax/448` for E4M3), so **`s < 1` for
-every group whose amax is below 448**, and the run measures group scales as low as **5.95831e-05**
-(five smallest: 5.95831e-05, 6.37644e-05, 8.98981e-05, 0.000143236, 0.000148421, from
-`R97_DUMP_QUANT`'s SCALERANGE). **For any such group the divide's threshold sits one to four decades
-below the downcast's, so the divide necessarily fires first:** by the time any element arrives at
-3.4e38, the quotient has long since been `Inf` for every group with `s < 1`. That is a structural
-ordering, not an arithmetic coincidence between two sampled numbers.
+**Second, the quant path is not where the walk first dies.** The first non-finite value appears in
+**`gdn_o`**, at position **1143**, where its max reaches **3.38953e38** -- 0.3% under f32's 3.4e38 --
+with **1196561 of 3145728 values already non-finite**, and every value non-finite from position 1122
+down. `gdn_o` is not a quantised row: it has no group scale and no `/s`, so its only ceiling is the
+raw one, and the clip lands on it. **The quant rows die later, at position 1134**, which is downstream
+of 1143 in walk order.
 
-**The transition is consistent with either, and does not discriminate -- worth saying plainly.** On
-the quant rows the DC dump goes from entirely finite to entirely non-finite in one step: the largest
-finite per-element cotangent anywhere on a quant row is **2.65846e+36** (`rmsnorm_had_quant_i8g`,
-pos 1148, `nonfinite=0`), and the next observation of that op is `maxabs=0` with `sized>0`, which --
-`maxabs` skipping non-finite values -- means **every element non-finite at once**. The cotangent grows
-about 1600x per block, so in one step 2.6e36 becomes 4.2e39, past the downcast's 3.4e38 *and* past any
-group's quotient ceiling: **both mechanisms cross in the same block, and both would kill the buffer
-whole.** So this pattern rules out neither. The discriminator is not the shape of the transition but
-the ordering of the two thresholds, which `s < 1` fixes as argued above -- and that is why the divide
-is the site and the cast is not.
+**So the site of the observed clip is plain f32 saturation in the `gdn_o` path**, reached because the
+cotangent grows 3.2 decades per block. The layer arithmetic that agrees with it (`:1696-1703`) is
+measuring exactly that: 3.4e38 is 11.1 layers below position 1416 at 3.190 decades per layer, and the
+clip is measured 12.0 layers below.
+
+**The divide at `quant.hip:199` is a second, latent site -- not the observed one.** It overflows when
+`cot > 3.4e38 x s`, and since `s = amax/448` is below 1 for every group whose amax is under 448 (the
+run measures group scales down to **5.95831e-05**), **its threshold sits one to four decades below the
+raw ceiling wherever a small-scale group carries a large cotangent.** On this run that had not
+happened by position 1143: 9.47594e+34 is finite at 1155 and 2.65846e+36 at 1147, which requires those
+groups' scales to exceed 2.8e-04 and 7.8e-03, so the five smallest scales were not carrying the large
+values yet. **It is a hazard that will fire once the cotangent reaches it in a group that small; it is
+not what fired here, and an earlier draft of this section asserted that it was.**
+
+**A complete fix therefore has three parts:** the growth itself (the cause), a guard on the `gdn_o`
+path so a saturating f32 value is refused or reported rather than silently propagated, and the same
+guard on the quant quotient, which has the lower of the two thresholds and so is the more dangerous of
+the sites.
 
 **This is reachable on a 512-token step, and it is where the walk dies.** The walk goes non-finite at
 **report 55 of 256** and **201 of the 256 reports are NaN**, while the forward `y` stays finite
-throughout (2.0e6 to 2.9e6). **So this is a consequence of the growth, not the cause of it** -- but a
-complete fix has two independent parts: the growth itself, and making the quant rows refuse or report
-a quotient they cannot represent, the way `quant.hip:686-697` already refuses a non-finite
-activation rather than silently zeroing a live row's gradient. The cause remains the per-block growth
-below.
+throughout (2.0e6 to 2.9e6). **So this is a consequence of the growth, not the cause of it.** The cause
+remains the per-block growth below.
 
 **The probe also records the forward and the cotangent of every op it touches, and it confirms the
 rate a second way.** Two cautions on reading it: the printed `cot` and `y` are **sums of absolute
@@ -1477,11 +1477,14 @@ quantised-GEMM family, the same family as the cast:** `reference_linear_gemm_nt_
 `adjoint_i8g_producers_agree_with_finite_differences` (`-60.393119` vs `-67.708964`, ratio 1.12).
 
 **So the honest tally of what the existing harness can reach is: input magnitude, two rows, both in
-the quantised-GEMM family; cotangent magnitude, nothing at all on the host.** The mechanism itself --
-the unguarded f64-to-f32 cotangent transfer at `quant.hip:345-349` -- is beyond the reach of every
-test in the repository, which is the specific reason it was not caught. Reproducing it needs a
-device-tier arm, and **no `tests/gpu/*.cpp` uses `adjoint_check.h`** (checked), so the FD harness is
-host-only and there is no place to point it at the device rows today.
+the quantised-GEMM family; cotangent magnitude, nothing at all on the host.** And the thing that
+actually clips the walk -- an f32 value reaching its ceiling in the `gdn_o` path, with the quant
+quotient at `quant.hip:199` as the lower-threshold second site -- is beyond the reach of every test in
+the repository, which is the specific reason it was not caught. **The reason is the dtype of the
+transfer, not the magnitude:** on the host the cotangent stays f64 end to end, so no host arm can
+saturate anything, at any cotangent scale. Reproducing it needs a device-tier arm, and **no
+`tests/gpu/*.cpp` uses `adjoint_check.h`** (checked), so the FD harness is host-only and there is no
+place to point it at the device rows today.
 
 ### The host walk is not an available arbiter on this container
 
