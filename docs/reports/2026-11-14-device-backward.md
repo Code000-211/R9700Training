@@ -629,10 +629,12 @@ multiply).
 | **1143** | **3.38953e+38** | 2560 | 3.408 | 49 |
 | 1122 | 0 (all non-finite) | -- | -- | 21 |
 
-**The rate is flat per record, and that is the strongest single fact here.** 0.1506 decades/record over
-the six 21-record gaps, 0.1336 over the first two 49-record gaps (the third is clipped, see below):
-**~0.140 decades per record, i.e. ~1.38x, holding across both gap sizes.** Whatever makes it is applied
-once per record.
+**Per record the rate is 1.2x to 1.5x, and the per-layer rate is the robust quantity.** 0.1506
+decades/record over the six 21-record gaps, 0.1336 over the first two 49-record gaps (the third is
+clipped, see below): **~0.140 decades per record, i.e. ~1.38x.** It is not perfectly flat -- on the `h`
+trace below the per-record rate runs **1.23x on the 20-record segments, 1.37x on the 13-record ones and
+1.51x on the 8-record ones**, i.e. shorter segments carry more per record -- so the per-record figure is
+an average over a within-period modulation, and **the per-layer figure is the one to quote.**
 
 **One decoder layer is 22.78 records, so the per-layer rate is ~1.6e3.** The container's own artifact
 reports `layers 64` (`device_step_tape.json`, the same 800-leaf `ParamSet` this report is about), and
@@ -696,6 +698,20 @@ record (1.384x)** and **3.22 decades per layer (1.67e3)**. Its hops are exactly 
 grows at that rate, so **the factor is inside the per-op adjoints on the `h` path, not in the scale
 bookkeeping.** That is a third independent measurement and it agrees with the `gdn_o` trace to within
 1% per record and 1% per layer.
+
+**And it is uneven within a period.** The 27 occurrences fall into segments of 8, 13 and 20 records
+(period 91, which is the four-layer `rope` period again, with eight occurrences per period):
+
+| segment length | n | decades/record | x/record |
+|---|---|---|---|
+| 8 records | 13 | 0.1787 | **1.51x** |
+| 13 records | 9 | 0.1353 | **1.37x** |
+| 20 records | 4 | 0.0895 | **1.23x** |
+
+**Shorter segments carry more per record**, so the per-record figure is an average over a modulation and
+the per-layer figure is the one to quote. What the modulation does rule out is a single record doing all
+the work: no one step in any segment accounts for the decade, so the factor is smeared across the ops
+rather than concentrated.
 
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
