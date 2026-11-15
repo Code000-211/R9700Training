@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -78,6 +79,71 @@ int64_t required(const OpRecord& rec, const char* key) {
 int64_t optional(const OpRecord& rec, const char* key, int64_t fallback) {
     const int64_t* v = int_param(rec, key);
     return v != nullptr ? *v : fallback;
+}
+
+// -- the fused producers' predicates -----------------------------------------
+//
+// The rows of the int8 trunk's three fused producers are keyed by a predicate on the record's
+// parameters: the rotation the record can take and, for the two gated ones, the activation it
+// serves. The device side keys its rows with the same three (src/adjoint/device/quant.hip), so one
+// record reaches one row on both sides. A predicate reads the parameters only, because the row
+// lookup has no record.
+
+// A numeric parameter: an int, or a decimal string that is the whole of the string. Missing or
+// non-numeric leaves false rather than throwing -- a lookup refuses a record it cannot judge.
+bool num_param(const std::vector<OpParam>& params, const char* name, double* out) {
+    for (const OpParam& p : params) {
+        if (p.first != name) continue;
+        if (const int64_t* i = std::get_if<int64_t>(&p.second)) {
+            *out = static_cast<double>(*i);
+            return true;
+        }
+        const std::string* s = std::get_if<std::string>(&p.second);
+        if (s == nullptr || s->empty()) return false;
+        char* end = nullptr;
+        const double v = std::strtod(s->c_str(), &end);
+        if (end == nullptr || *end != '\0') return false;
+        *out = v;
+        return true;
+    }
+    return false;
+}
+
+// The rotation and the per-group scale are the record's `n` and `group`: a power of two that
+// divides the width, no wider than one block's threads. A record outside that is refused at the
+// row lookup rather than served approximately.
+bool rotated(const std::vector<OpParam>& params) {
+    double n = 0.0, group = 0.0;
+    if (!num_param(params, "n", &n) || !num_param(params, "group", &group)) return false;
+    if (n <= 0.0 || n != std::floor(n)) return false;
+    if (group <= 0.0 || group != std::floor(group) || group > 1024.0) return false;
+    const int64_t g = static_cast<int64_t>(group);
+    if ((g & (g - 1)) != 0 || static_cast<int64_t>(n) % g != 0) return false;
+    return true;
+}
+
+// The gated producer's activation: silu, its documented first mode and the one the card's swiglu
+// sites issue. The sigmoid form would take a different second half and is not served yet.
+bool serves_gated(const std::vector<OpParam>& params) {
+    if (!rotated(params)) return false;
+    for (const OpParam& p : params) {
+        if (p.first != "act") continue;
+        const std::string* act = std::get_if<std::string>(&p.second);
+        return act != nullptr && *act == "silu";
+    }
+    return true;
+}
+
+// The gate's activation: sigmoid, the mode the card's narrow-head gate issues. It is required,
+// because the record's default is the schema's to say, not this row's to guess.
+bool serves_gate(const std::vector<OpParam>& params) {
+    if (!rotated(params)) return false;
+    for (const OpParam& p : params) {
+        if (p.first != "act") continue;
+        const std::string* act = std::get_if<std::string>(&p.second);
+        return act != nullptr && *act == "sigmoid";
+    }
+    return false;
 }
 
 // The shapes of one call, read the way the kernel reads them.
@@ -752,6 +818,215 @@ void gated_quant_fp8_adjoint(const AdjointCall& call) {
     }
 }
 
+// -- the fused int8 producers ------------------------------------------------
+//
+// The int8 trunk's norm and its gates round inside the producer: `rmsnorm_had_quant_i8g`,
+// `gated_had_quant_i8g` and `gate_had_quant_i8g` apply an elementwise part and hand the result to
+// the quantiser above. Their forward is the parts' forwards composed and their adjoint the parts'
+// host adjoints composed, in the order the kernel undoes them (docs/adjoints/quant.md). The parts
+// are the elementwise family's rows (src/adjoint/host/elementwise.cpp) and the quantiser's own
+// under `had_quant_act_i8g`, found through the registry so there is one definition of each.
+
+// The elementwise op a fused producer applies before the rotation.
+enum class Part { rmsnorm, silu_mul, sigmoid_mul };
+
+const char* part_op(Part p) {
+    switch (p) {
+        case Part::rmsnorm: return "rmsnorm";
+        case Part::silu_mul: return "silu_mul";
+        case Part::sigmoid_mul: return "act_mul";
+    }
+    return "";
+}
+
+int64_t numel(const std::vector<int64_t>& shape) {
+    int64_t n = 1;
+    for (int64_t d : shape) n *= d;
+    return shape.empty() ? 0 : n;
+}
+
+// The quantiser's own record over the part's output: the fused producer's intermediate is the
+// quantiser's activation, so the part is served by the family's existing twin and adjoint under
+// had_quant_act_i8g. Under `<op>_ste` the quantiser's own linearised row is used instead, and its
+// schema is the activation, the base point it was linearised at, the codes, the scale
+// (`quant_twin` reads the base point as the record's second operand, :296).
+OpRecord had_quant_record(int64_t rows, int64_t n, int64_t group, bool linearised) {
+    OpRecord q;
+    q.op = linearised ? "had_quant_act_i8g_ste" : "had_quant_act_i8g";
+    q.params = {{"M", rows}, {"n", n}, {"group", group}, {"dtype", std::string("bf16")}};
+    q.operands = {
+        Operand{"x", "bf16", {rows, n}, 0, rows, false},
+    };
+    if (linearised)
+        q.operands.push_back(Operand{"base", "bf16", {rows, n}, 0, rows, false});
+    q.operands.push_back(Operand{"q", "i8", {rows, n}, 0, rows, true});
+    q.operands.push_back(Operand{"scale", "f32", {rows, n / group}, 0, rows, true});
+    return q;
+}
+
+// The codes and the scale among the record's writes, found by dtype and shape as the device row
+// finds them (`src/adjoint/device/quant.hip:492-523`). A position would be wrong under `_ste`,
+// whose base point is appended after the writes and so moves what counting the reads returns.
+void written_codes_and_scale(const AdjointCall& call, int64_t* codes_at, int64_t* scale_at) {
+    *codes_at = -1;
+    *scale_at = -1;
+    const std::vector<Operand>& ops = call.rec.operands;
+    for (int64_t j = 0; j < (int64_t)ops.size(); ++j) {
+        const Operand& o = ops[(size_t)j];
+        if (!o.written || o.dtype.empty() || o.shape.empty()) continue;
+        if (*codes_at < 0 && (o.dtype == "i8" || o.dtype == "fp8_e4m3" || o.dtype == "fp8_e5m2") &&
+            o.shape.size() == 2)
+            *codes_at = j;
+        else if (*scale_at < 0 && o.dtype == "f32" && o.shape.size() == 2)
+            *scale_at = j;
+    }
+}
+
+// The forward of each fused producer, as the parts' twins composed: the elementwise part over the
+// record's read operands, then the quantiser over its output.
+void fused_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
+                std::vector<AdValue>* out, Part part) {
+    const int64_t n = required(rec, "n");
+    const int64_t group = required(rec, "group");
+    const bool linearised = is_linearised(rec.op);
+
+    std::vector<AdValue> y;
+    TwinFn elem = twin_find(part_op(part), rec.params, nullptr);
+    if (elem == nullptr)
+        throw std::invalid_argument(std::string("quant: no twin for ") + part_op(part));
+    elem(rec, operands, &y);
+    if (y.empty() || y[0].shape.size() != 2)
+        throw std::invalid_argument(std::string("quant: ") + part_op(part) +
+                                    " wrote no [rows, n] intermediate for the quantiser");
+    // The quantiser's record is built from the parameters, so the intermediate's width must be
+    // the record's `n`. The live tape's gate record carries a wider codes plane than its `n`
+    // names; a width this row cannot build a record for refuses rather than computing another op.
+    if (y[0].shape[1] != n)
+        throw std::invalid_argument(std::string("quant: ") + part_op(part) + " wrote a " +
+                                    std::to_string(y[0].shape[1]) +
+                                    "-wide intermediate and the record's 'n' is " +
+                                    std::to_string(n));
+    const int64_t rows = y[0].shape[0];
+
+    const OpRecord q = had_quant_record(rows, n, group, linearised);
+    TwinFn quant = twin_find(q.op, q.params, nullptr);
+    if (quant == nullptr)
+        throw std::invalid_argument(std::string("quant: no twin for ") + q.op);
+    // The linearised quantiser reads its base point as the second operand; the fused record names
+    // it last, and `operands` arrives in read order, so it is `operands.back()`.
+    std::vector<AdValue> qin = {y[0]};
+    if (linearised) {
+        if (operands.size() < 2 || operands.back().value.size() != y[0].value.size())
+            throw std::invalid_argument(std::string("quant: ") + rec.op +
+                                        ": the base point does not have the activation's shape");
+        qin.push_back(operands.back());
+    }
+    quant(q, qin, out);
+}
+
+// The adjoint of each fused producer: the parts' host adjoints, in the order the kernel undoes
+// them. One read operand's cotangent is the quantiser's output cotangent; the elementwise part's
+// adjoint then folds it into the read operands' slots, which is where the device kernel must land
+// too.
+void fused_adjoint(const AdjointCall& call, Part part) {
+    const bool linearised = is_linearised(call.rec.op);
+    size_t reads = 0;
+    for (const Operand& o : call.rec.operands)
+        if (!o.written) ++reads;
+    if (reads == 0 || call.fwd.size() < reads + 2)
+        throw std::invalid_argument(
+            "quant: the record must read the activation and write the codes and the scale");
+    if (call.cot.size() < 2)
+        throw std::invalid_argument(
+            "quant: the record writes the codes and the scale, so the walk hands two cotangents");
+    if (call.dc == nullptr || call.dc->size() < reads)
+        throw std::invalid_argument("quant: the walk handed no room for the activation's cotangent");
+    const int64_t n = required(call.rec, "n");
+    const int64_t group = required(call.rec, "group");
+    // The codes and the scale by dtype and shape, never by position -- under `_ste` the base point
+    // is appended after the writes, so counting the reads lands one slot past the codes.
+    int64_t codes_at = -1, scale_at = -1;
+    written_codes_and_scale(call, &codes_at, &scale_at);
+    if (codes_at < 0 || scale_at < 0)
+        throw std::invalid_argument(std::string("quant: ") + call.rec.op +
+                                    ": the record does not write the codes and the scale");
+    const AdValue& codes = call.fwd[static_cast<size_t>(codes_at)];
+    const AdValue& scale = call.fwd[static_cast<size_t>(scale_at)];
+
+    // The intermediate the elementwise part wrote, which the quantiser's adjoint differentiates.
+    std::vector<AdValue> y;
+    TwinFn elem = twin_find(part_op(part), call.rec.params, nullptr);
+    if (elem == nullptr)
+        throw std::invalid_argument(std::string("quant: no twin for ") + part_op(part));
+    elem(call.rec, call.fwd, &y);
+    if (y.empty() || y[0].shape.size() != 2 || codes.shape.size() != 2)
+        throw std::invalid_argument(std::string("quant: ") + call.rec.op + ": the " +
+                                    part_op(part) + " intermediate and the codes must be [rows, n]");
+    // As in fused_twin: the quantiser's record is built from the parameters, so the codes' width
+    // must be the record's `n`, and a record whose codes are another width refuses by name.
+    if (codes.shape[1] != n)
+        throw std::invalid_argument(std::string("quant: ") + call.rec.op + ": the codes are " +
+                                    std::to_string(codes.shape[1]) +
+                                    " wide and the record's 'n' is " + std::to_string(n));
+
+    const OpRecord q = had_quant_record(codes.shape[0], n, group, linearised);
+    std::vector<AdValue> qfwd = {y[0]};
+    if (linearised) {
+        if (call.fwd.empty() || call.fwd.back().value.size() != y[0].value.size())
+            throw std::invalid_argument(std::string("quant: ") + call.rec.op +
+                                        ": the base point does not have the activation's shape");
+        qfwd.push_back(call.fwd.back());
+    }
+    qfwd.push_back(codes);
+    qfwd.push_back(scale);
+    std::vector<AdValue> qcot = {call.cot[0], call.cot[1]};
+    std::vector<AdValue> qdc;
+    for (const Operand& o : q.operands) {
+        AdValue v;
+        v.dtype = o.dtype;
+        v.shape = o.shape;
+        v.value.assign(static_cast<size_t>(numel(o.shape)), 0.0);
+        qdc.push_back(std::move(v));
+    }
+    AdjointCall qcall{q, qfwd, qcot, &qdc, nullptr, ""};
+    AdjointFn quant = adjoint_find(q.op, Side::host, q.params, nullptr);
+    if (quant == nullptr)
+        throw std::invalid_argument("quant: no host adjoint for had_quant_act_i8g");
+    quant(qcall);
+
+    // The elementwise adjoint takes the parts' operands and the intermediate they wrote; it adds
+    // its cotangents into the slots the parts' read operands hold. The two-way rule lives in that
+    // row, so the read set the caller proved travels with it, as the device row hands its own.
+    std::vector<AdValue> efwd(call.fwd.begin(),
+                              call.fwd.begin() + static_cast<std::ptrdiff_t>(reads));
+    efwd.push_back(y[0]);
+    std::vector<AdValue> ecot = {qdc[0]};
+    AdjointCall ecall{call.rec, efwd, ecot, call.dc, nullptr, ""};
+    ecall.read_rows = call.read_rows;
+    ecall.row_count = call.row_count;
+    AdjointFn elem_adj = adjoint_find(part_op(part), Side::host, call.rec.params, nullptr);
+    if (elem_adj == nullptr)
+        throw std::invalid_argument(std::string("quant: no host adjoint for ") + part_op(part));
+    elem_adj(ecall);
+}
+
+void rmsnorm_had_quant_i8g_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
+                                std::vector<AdValue>* out) {
+    fused_twin(rec, operands, out, Part::rmsnorm);
+}
+void gated_had_quant_i8g_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
+                              std::vector<AdValue>* out) {
+    fused_twin(rec, operands, out, Part::silu_mul);
+}
+void gate_had_quant_i8g_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
+                             std::vector<AdValue>* out) {
+    fused_twin(rec, operands, out, Part::sigmoid_mul);
+}
+
+void rmsnorm_had_quant_i8g_adjoint(const AdjointCall& call) { fused_adjoint(call, Part::rmsnorm); }
+void gated_had_quant_i8g_adjoint(const AdjointCall& call) { fused_adjoint(call, Part::silu_mul); }
+void gate_had_quant_i8g_adjoint(const AdjointCall& call) { fused_adjoint(call, Part::sigmoid_mul); }
+
 }  // namespace
 
 // The family registers one twin and one adjoint function under each op's name, and the linearised
@@ -766,6 +1041,31 @@ R97_REGISTER_ADJOINT("quant_act_i8g", host, quant_adjoint)
 R97_REGISTER_TWIN("had_quant_act_i8g", quant_twin)
 R97_REGISTER_ADJOINT("had_quant_act_i8g", host, quant_adjoint)
 
+// The fused int8 producers: the parts' twins and host adjoints composed, keyed by the same
+// predicates the device side keys its rows with (src/adjoint/device/quant.hip). The norm's gain is
+// frozen (schema position 1), so the walk asks for x's cotangent only, as the elementwise row
+// does.
+R97_REGISTER_TWIN_IF("rmsnorm_had_quant_i8g", rmsnorm_had_quant_i8g_twin, rotated)
+R97_REGISTER_ADJOINT_IF_F("rmsnorm_had_quant_i8g", host, rmsnorm_had_quant_i8g_adjoint, rotated, 1)
+R97_REGISTER_TWIN_IF("gated_had_quant_i8g", gated_had_quant_i8g_twin, serves_gated)
+R97_REGISTER_ADJOINT_IF("gated_had_quant_i8g", host, gated_had_quant_i8g_adjoint, serves_gated)
+R97_REGISTER_TWIN_IF("gate_had_quant_i8g", gate_had_quant_i8g_twin, serves_gate)
+R97_REGISTER_ADJOINT_IF("gate_had_quant_i8g", host, gate_had_quant_i8g_adjoint, serves_gate)
+
+// The three producers' linearised rows, for the finite-difference check. The base point is the
+// activation the quantiser saw -- the part's own output -- appended after the codes and the scale,
+// so one frozen index is that appended operand's schema position: 4 for the norm (`x, w, codes,
+// scale, base`), 3 for the gated one (`gate_up, codes, scale, base`), 4 for the gate (`a, b, codes,
+// scale, base`). The norm also freezes its gain at 1, as the plain row above does: the walk never
+// asks for it, so the row leaves that cotangent at zero and the finite differences must not measure
+// it either (`check_adjoint` skips frozen slots). The quantiser the composition reaches is then its
+// own `_ste` row, which reads the base point as its second operand.
+R97_REGISTER_TWIN_IF("rmsnorm_had_quant_i8g_ste", rmsnorm_had_quant_i8g_twin, rotated)
+R97_REGISTER_ADJOINT_IF_F("rmsnorm_had_quant_i8g_ste", host, rmsnorm_had_quant_i8g_adjoint, rotated, 1, 4)
+R97_REGISTER_TWIN_IF("gated_had_quant_i8g_ste", gated_had_quant_i8g_twin, serves_gated)
+R97_REGISTER_ADJOINT_IF_F("gated_had_quant_i8g_ste", host, gated_had_quant_i8g_adjoint, serves_gated, 3)
+R97_REGISTER_TWIN_IF("gate_had_quant_i8g_ste", gate_had_quant_i8g_twin, serves_gate)
+R97_REGISTER_ADJOINT_IF_F("gate_had_quant_i8g_ste", host, gate_had_quant_i8g_adjoint, serves_gate, 4)
 R97_REGISTER_TWIN("rmsnorm_quant_fp8", rmsnorm_quant_fp8_twin)
 R97_REGISTER_ADJOINT("rmsnorm_quant_fp8", host, rmsnorm_quant_fp8_adjoint)
 R97_REGISTER_TWIN("gated_quant_fp8", gated_quant_fp8_twin)

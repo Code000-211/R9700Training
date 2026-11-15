@@ -516,3 +516,59 @@ it is the named next step.
 - `src/adjoint/device/quant.hip:359-377`: the `SCALERANGE ...` instrumentation used to print 256 lines
   per window unconditionally; it is now gated behind `R97_DUMP_QUANT=1` like the two existing sites
   in that file. The range hazard it reports is real and is #140.
+
+## The 4096-token step, run to completion
+
+The run the issue asks for was made on one card against `/srv/models/rad/qwen3.8-27i-iq5r-s-v4.rad`.
+It completes: 4096 tokens, one AdamW update, 800 leaves (400 `lora_A`, 400 `lora_B`), 4095 scored
+positions, `names_match` and `shapes_match` both true and `n_other` zero, so the join hands back
+exactly the schema's leaves.
+
+| | |
+|---|---|
+| step | **2946.41 s** (49 min) |
+| forward | 104.17 s |
+| backward | **2832.82 s** (47 min -- 96 % of the step) |
+| head | 6.33 s, 64 chunks, 4095 rows |
+| after (the AdamW update) | 105.47 s |
+| throughput | 1.39 tok/s |
+| `loss` -> `loss_after` | 34682.09 -> 50870.03 |
+| VRAM at load / peak | 27.83 / **30.08 GiB** of 31.86 |
+| peak snapshot / cotangent | 17.50 / 3.93 GB |
+
+**The forward is finite; the backward is not.** `non_finite.forward_all_finite` is `true`, so every
+non-finite value in the result is produced on the way back. That is the same shape the 512-token case
+reported, and it rules the container, the loader and the forward out as the source.
+
+### The start-split contract fails
+
+The case's structural check is independent of magnitude: a perturbation confined to the start must
+leave the `A` leaves untouched and move every `B` leaf.
+
+| check | required | measured |
+|---|---|---|
+| `a_all_zero` | true | **false** |
+| `a_changed` | 0 | **127** of 400 |
+| `n_zero_a` | 400 | **273** |
+| `b_all_nonzero` | true | true |
+| `b_changed` | 400 | **330** |
+| `n_zero_b` | 0 | 0 |
+| `all_finite` | true | **false** |
+
+So 127 of the 400 `A` leaves moved when the contract says none may, and 70 of the 400 `B` leaves
+stayed at zero when the contract says all must move. The first non-finite leaf is
+`model.layers.0.linear_attn.in_proj_qkv.lora_A`, and the first `A` leaf that stayed zero is
+`model.layers.20.linear_attn.out_proj.lora_A` -- a different layer, and a high one, which is where
+the per-block growth of "The measurement" would put it.
+
+**This is the issue's acceptance criterion, and it is not met.** The join runs, the schema is right,
+the forward is clean and the step completes -- but the adapter gradient is not the adapter gradient:
+it is non-finite at block 0, and its structural split is wrong at both ends. That is the same defect
+the 512-token case localised to a ~2e33 excess growth over the backward walk, now shown to hold at
+the issue's own size.
+
+**What the 4096 case adds beyond the 512:** the failure is not an artefact of a short sequence. With
+4096 positions the backward takes 47 minutes and produces the same non-finite leaf at the same
+place, so the defect is in the walk's arithmetic and not in a corner the short case happened to take.
+It also puts a number on what the defect costs: **96 % of the step is the backward**, which is what
+a per-op adjoint that amplifies by ~365x per block costs in time as well as in correctness.

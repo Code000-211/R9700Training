@@ -297,6 +297,35 @@ a slope; holding it where the adjoint reads it keeps the row affine and the chec
 128 columns and at two groups of 32, to `check_adjoint` through that row, and to the two records it
 must refuse (an activation, or a base point, that is not `rows * n` values).
 
+### The int8 fused producers
+
+The int8 trunk issues three more producers of this shape: `rmsnorm_had_quant_i8g`,
+`gated_had_quant_i8g` and `gate_had_quant_i8g`. Each is an elementwise part -- the RMS norm, the
+silu-mul, or the sigmoid-mul -- composed with `had_quant_act_i8g`, which is the quantiser of section
+3 with the rotation applied to the activation first. Their host twins and host adjoints are that
+composition and nothing else: the part's twin over the record's read operands, then the quantiser's
+twin over a synthetic `had_quant_act_i8g` record built from the fused record's `n` and `group`; and
+on the way back the quantiser's adjoint, whose output cotangent the part's adjoint then folds into
+the read slots (`src/adjoint/host/quant.cpp`).
+
+The row is keyed by the same predicates the device side keys its rows with, so one record selects
+one row on both sides: `n` and `group` numeric, `n` a multiple of `group`, `group` a power of two no
+larger than 1024; `gated_had_quant_i8g` serves only `act` absent or `"silu"`, and
+`gate_had_quant_i8g` only `act == "sigmoid"`. `rmsnorm_had_quant_i8g`'s gain is frozen at schema
+position 1, as the device row freezes it.
+
+These three also have the linearised rows the finite-difference harness needs, under
+`rmsnorm_had_quant_i8g_ste`, `gated_had_quant_i8g_ste` and `gate_had_quant_i8g_ste`. Their forward
+rounds, so a difference quotient against the plain twin would differentiate a step rather than
+measure a slope; the linearised rows make it affine instead. The base point is the part's own
+output -- the activation the quantiser saw -- appended to the schema after the codes and the scale,
+at position 4 for the norm (`x, w, codes, scale, base`), 3 for the gated one (`gate_up, codes,
+scale, base`) and 4 for the gate (`a, b, codes, scale, base`), which is the index the frozen list
+names. Unlike the fp8 producers above, whose rows do the linearisation themselves, these reach the
+quantiser's own `had_quant_act_i8g_ste` row, so the base point is the second operand of the
+quantiser's record rather than of the fused one. `tests/host/adjoint_quant.cpp` holds all three to
+`check_adjoint` through those rows, at the trunk's two shapes.
+
 ## 7. What this does not cover
 
 - **Only the host kernel is the reference**, as the issue says. The device kernels of these ops are

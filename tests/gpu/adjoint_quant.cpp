@@ -14,10 +14,9 @@
 // parts. A fused producer's record is the quantiser's (a had_quant_act_i8g record over the
 // elementwise part's output) and the elementwise op's, so `reference()` runs those two host
 // adjoints in the order the kernel undoes them, and the twin the harness builds the forward with
-// is the same composition of the parts' twins. The fused producers have no host twin yet
-// (docs/adjoints/quant.md: an op that turns up later belongs there, not here); this test registers
-// the composition so the forward values, the device adjoint's recomputed intermediate and the
-// reference all read one definition of it.
+// is the same composition of the parts' twins. The host family registers that composition under
+// each producer's name (src/adjoint/host/quant.cpp), so the forward values, the device adjoint's
+// recomputed intermediate and the reference all read one definition of it.
 //
 // Needs one R9700 (gfx1201, 32 GB) or similar; runs under the GPU test guard. No container is
 // read: the real shapes are numbers from the design, so this test does not carry the `model` label.
@@ -84,38 +83,6 @@ OpRecord quant_record(int64_t rows, int64_t n, int64_t group) {
         Operand{"scale", "f32", {rows, n / group}, 0, rows, true},
     };
     return q;
-}
-
-// The forward of each fused producer, as the composition of the parts' twins: the elementwise part
-// over the record's read operands, then the quantiser over its output.
-void fused_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
-                std::vector<AdValue>* out, Part part) {
-    const int64_t n = int_param(rec.params, "n");
-    const int64_t group = int_param(rec.params, "group");
-
-    std::vector<AdValue> y;
-    if (part == Part::none) {
-        y = {operands.at(0)};
-    } else {
-        TwinFn elem = twin_find(part_op(part), rec.params, nullptr);
-        if (!elem) throw std::runtime_error(std::string("no twin for ") + part_op(part));
-        elem(rec, operands, &y);
-    }
-    const int64_t rows = y.at(0).shape.at(0);
-    const OpRecord q = quant_record(rows, n, group);
-    TwinFn quant = twin_find(q.op, q.params, nullptr);
-    if (!quant) throw std::runtime_error("no twin for had_quant_act_i8g");
-    quant(q, y, out);
-}
-
-void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector<AdValue>* out) {
-    fused_twin(rec, op, out, Part::rmsnorm);
-}
-void gated_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector<AdValue>* out) {
-    fused_twin(rec, op, out, Part::silu_mul);
-}
-void gate_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector<AdValue>* out) {
-    fused_twin(rec, op, out, Part::sigmoid_mul);
 }
 
 // -- the reference: the parts' host adjoints, in the order the kernel undoes them -------------
@@ -561,10 +528,3 @@ void run() {
 }  // namespace
 
 R97_TEST(adjoint_quant_device) { run(); }
-
-// The fused producers' twins: the parts' twins composed, registered here because the host family
-// has no twin for them yet. They carry no predicate (a device test's records are the ones it
-// builds), and they are what the harness and the reference build a case's forward with.
-R97_REGISTER_TWIN("rmsnorm_had_quant_i8g", rmsnorm_twin)
-R97_REGISTER_TWIN("gated_had_quant_i8g", gated_twin)
-R97_REGISTER_TWIN("gate_had_quant_i8g", gate_twin)
