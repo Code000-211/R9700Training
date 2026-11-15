@@ -803,14 +803,29 @@ Every row's magnitude agrees to 1-3% and the row sums to 1%, while the elementwi
 scalar explanation at once -- a scale, a gain, `wadd`, `eps` -- and it is what a rotation applied
 differently on the two sides looks like.
 
-The gated producers agree elementwise to 0.5%, so their rotation matches. The norm's does not. The
-single extra rotation `DUMPROT` applies does **not** fix it (99.4% of codes still differ), so the
-difference is not "rotated versus not rotated" but **the rotation's width or its placement**: the twin
-rotates over `group = n / scale.shape[1] = 128`, and if the kernel rotates over a different span the
-two produce the same magnitudes and different elements -- exactly what is measured.
+The gated producers agree elementwise to 0.5%, so their rotation matches; the norm's does not.
 
-That is the next test, and it is cheap: rotate the twin's activation over a range of candidate widths
-and see which one collapses `deq_rel` to the gated producers' 0.005.
+**It is not the quantiser's rotation.** `deq_vs_write = 0.0003` at 1449 proves the unrotation is
+correct -- `fwht(codes * scale) / group` reproduces the kernel's stored output -- so `deq` and `y` are
+both in the original domain and the difference is between them, not a domain mismatch. The single
+extra rotation `DUMPROT` applies does not help either (99.4% of codes still differ), which is
+consistent with the same conclusion.
+
+**What is left is a rotation inside the norm itself.** A fused kernel that normalises, rotates,
+applies the gain in the rotated domain and then quantises computes
+
+```
+deq = R^-1( (w + 1) * R(x * s) )
+```
+
+while the twin computes `y = (w + 1) * x * s`. A Hadamard preserves the L2 norm and, for
+near-random signs, the L1 magnitude to a few percent -- which is exactly what `row_ratio` shows -- while
+moving every element, which is exactly what `deq_rel` shows. It also explains why the gain, `wadd` and
+`eps` all check out and change nothing: they are the same on both sides; only the order is different.
+
+That is the next test and it is cheap: compare `fwht(y)` against `fwht(deq)` elementwise and see
+whether their ratio is the gain vector `w + 1`. If it is, the twin must apply the gain *after* the
+rotation rather than before it.
 
 ## The quotient's guard## The quotient's guard
 
