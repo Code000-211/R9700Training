@@ -1333,13 +1333,22 @@ the smallest scale anywhere in the walk is **5.95831e-05** (the five smallest ar
 report.** So no group stores a scale near the f32 floor and the divide has no reason to overflow *on
 its own*.
 
-**But it does overflow at the far end of the walk, and that is the NaN mechanism.** The largest
-cotangent the probe sees is **4.27042e+41**, and 4.27e41 / 5.96e-05 = **7.2e45** -- past f32's 3.4e38
-ceiling by seven orders. The walk goes non-finite at **report 55 of 256**; the last finite cotangent
-is 4.27042e+41 at report 54 and **201 of the 256 reports are NaN**, while the forward `y` stays finite
-throughout (2.0e6 to 2.9e6). **So the divide is a consequence of the growth, not the cause of it: once
-the cotangent has grown past ~2e43 the quotient cannot be represented, and everything downstream is
-NaN.** The cause is still the per-block growth below.
+**But something in this family does overflow at the far end of the walk, and it is the f64-to-f32
+downcast, not the divide.** The largest cotangent the probe sees is **4.27042e+41** and f32's ceiling is
+3.4e38, so it cannot be represented. `mask_rotate_kernel` (`quant.hip:171`) takes
+`const float* cot` -- the cotangent arrives **already f32** -- and the cast is on the host:
+`std::vector<float> h_cot((size_t)total); ... h_cot[(size_t)i] = (float)cot.value[(size_t)i];`
+(**`quant.hip:345-349`**). The tape holds f64 (`AdValue.value` is `std::vector<double>`), so
+`(float)4.27e41` is **`Inf` before any kernel runs**, and `:199`'s divide then computes `Inf / s` on it.
+**The divide is not the mechanism** -- it is linear in `cot` and would be exact. **The cast is, and it
+has no guard**, though the same file guards f32 overflow elsewhere (`:254`, on
+`rotated_cot * x * (w + wadd)`). The walk goes non-finite at **report 55 of 256**; the last finite
+cotangent is 4.27042e+41 at report 54 and **201 of the 256 reports are NaN**, while the forward `y`
+stays finite throughout (2.0e6 to 2.9e6). **So this is a consequence of the growth, not the cause of
+it** -- but it means a complete fix has two independent parts: the growth itself, and making the quant
+rows refuse or report a cotangent they cannot represent, the way `quant.hip:686-697` already refuses a
+non-finite activation rather than silently zeroing a live row's gradient. The cause remains the
+per-block growth below.
 
 **The probe also records the forward and the cotangent of every op it touches, and it confirms the
 rate a second way.** Two cautions on reading it: the printed `cot` and `y` are **sums of absolute
