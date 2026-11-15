@@ -419,7 +419,8 @@ void iqr_case(const Case& cs) {
         // whether the codes or the scale is what disagrees, without going through dx.
         using DecodeFn = bool (*)(const void*, uint32_t, uint32_t, const void*, const void*, void*,
                                   void*);
-        void* const lib = dlopen(R97_DEVICE_PLUGIN, RTLD_NOW | RTLD_NOLOAD);
+        void* const lib = dlopen(r97::device_check::plugin_path().c_str(),
+                                 RTLD_NOW | RTLD_NOLOAD);
         auto dec = lib == nullptr
                        ? static_cast<DecodeFn>(nullptr)
                        : reinterpret_cast<DecodeFn>(
