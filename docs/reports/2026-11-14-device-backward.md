@@ -794,7 +794,33 @@ neither dump, and `/tmp/r97-fwd-hunt.log` gives `36` forward and `0` snapshot --
 which is exactly why the pair proves nothing. It also confirms the old build printed no `pos` (every
 `snap-only` key has `pos=None`).
 
-**That is a cheaper and more decisive test than any further census, and it is the named next step.**
+**The probe was run, and it refutes the snapshot hypothesis.** `/tmp/r97-snap-probe.log`, window
+09:08:42-09:16:52 (490 s), the 512-token case with `R97_DUMP_FWD=2 R97_DUMP_SNAP=2` in one process:
+**4558** `DUMPFWD` probe lines and **6775** `DUMPSNAP` lines, with **2274** `(op, pos, buffer)` keys
+present in both. Of the snapshot lines that have a forward counterpart, **2530 agree with a forward
+`maxabs` for the same key and 0 agree with none.** The saved forward is not stale and not
+mismatched: the walk is handed exactly the values the forward computed.
+
+**Two things had to be got right to read that, and the first attempt got both wrong.** The pointer is
+**not** comparable -- `DUMPFWD` prints the device address (`0x7448...`, the card's space) and
+`DUMPSNAP` the host address of the copied-back bytes (`0x64d4...`), so every pair "differs" and means
+nothing. And the forward runs **two or three times per step** (the step's own forward, the pre-step
+reference, the post-step forward), so one key has several `DUMPFWD` lines and a snapshot is only
+comparable against the pass that produced it. A naive pairwise join reported **one** disagreement --
+`lora_shrink`@3, `lora.t.r32.lane0`, snapshot `maxabs` 28.6302 against a forward `maxabs` 0 -- and that
+pairing was an artefact: the key has three forward lines, two reading 28.6302 and the third, the
+post-step pass over a rank-32 lane this rank-16 model never uses, reading 0. The test is set
+membership, not pairwise equality. With that, **0 mismatches**.
+
+**So the composition hypothesis as stated is dead, and that is the useful part.** The argument was: if
+every per-op adjoint is FD-correct at the container's real shapes, and every accumulation is correct,
+and the snapshot is the forward's own value, then the walk is the exact gradient of the true function
+-- and it is not. Two of those three premises have now been checked directly. **The one that has not
+is the first: the FD tests run at the right *shapes* (`K=5120`, `N=12288`, `K=17408`, `M=4096`, hidden
+17408) but on small synthetic *values*.** A shape-correct, magnitude-dependent defect -- an f32
+intermediate that overflows inside a kernel, or a `1/s` that underflows -- is exactly what an FD test
+at O(1) values cannot see, and it is the only premise left standing. **That is the next probe: the
+same per-op FD at the container's real magnitudes, not just its real shapes.**
 
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
