@@ -1341,17 +1341,31 @@ element overstates the row by six decades and points at the wrong line. The per-
 from `R97_DUMP_DC`'s `maxabs` (`backward.cpp:771-787`), and for the quant rows it is
 **2.65846e+36** -- `rmsnorm_had_quant_i8g` at pos 1148, with `nonfinite=0`.
 
-**2.66e36 fits f32, so the f64-to-f32 downcast is not the mechanism.** `mask_rotate_kernel`'s
-argument is `const float* cot` (`quant.hip:171`) and the host casts the buffer at `quant.hip:345-349`
--- an unguarded cast, but a harmless one at this magnitude.
+**Not the downcast, because 2.66e36 fits f32.** `mask_rotate_kernel`'s argument is `const float* cot`
+(`quant.hip:171`) and the host casts the buffer at `quant.hip:345-349` -- an unguarded cast, but a
+harmless one at this magnitude.
 
-**The divide is.** `mask_rotate_kernel` computes `d[tid] = cot[base+tid] / (float)s` (`:199`) in f32,
-against a group scale that the same run measures as low as **5.95831e-05** (five smallest:
-5.95831e-05, 6.37644e-05, 8.98981e-05, 0.000143236, 0.000148421, all from `R97_DUMP_QUANT`'s
-SCALERANGE). **2.65846e+36 / 5.95831e-05 = 4.462e+40**, which is past f32's 3.4e38 ceiling -- so the
-quotient is `Inf` even though its numerator is not. The same holds for `3.97625e-03` and below: any
-group whose scale is under about **7.8e-03** overflows this numerator, and four of the five smallest
-measured scales are two to five decades under that.
+**The divide is, and the argument does not need those two numbers to come from the same group.**
+`mask_rotate_kernel` computes `d[tid] = cot[base+tid] / (float)s` (`:199`) in f32. The downcast
+overflows when an element itself exceeds **3.4e38**; the divide overflows when `cot > 3.4e38 x s`. A
+group's scale is its amax over the format's top (`q8_group`; `amax/448` for E4M3), so **`s < 1` for
+every group whose amax is below 448**, and the run measures group scales as low as **5.95831e-05**
+(five smallest: 5.95831e-05, 6.37644e-05, 8.98981e-05, 0.000143236, 0.000148421, from
+`R97_DUMP_QUANT`'s SCALERANGE). **For any such group the divide's threshold sits one to four decades
+below the downcast's, so the divide necessarily fires first:** by the time any element arrives at
+3.4e38, the quotient has long since been `Inf` for every group with `s < 1`. That is a structural
+ordering, not an arithmetic coincidence between two sampled numbers.
+
+**The transition is consistent with either, and does not discriminate -- worth saying plainly.** On
+the quant rows the DC dump goes from entirely finite to entirely non-finite in one step: the largest
+finite per-element cotangent anywhere on a quant row is **2.65846e+36** (`rmsnorm_had_quant_i8g`,
+pos 1148, `nonfinite=0`), and the next observation of that op is `maxabs=0` with `sized>0`, which --
+`maxabs` skipping non-finite values -- means **every element non-finite at once**. The cotangent grows
+about 1600x per block, so in one step 2.6e36 becomes 4.2e39, past the downcast's 3.4e38 *and* past any
+group's quotient ceiling: **both mechanisms cross in the same block, and both would kill the buffer
+whole.** So this pattern rules out neither. The discriminator is not the shape of the transition but
+the ordering of the two thresholds, which `s < 1` fixes as argued above -- and that is why the divide
+is the site and the cast is not.
 
 **This is reachable on a 512-token step, and it is where the walk dies.** The walk goes non-finite at
 **report 55 of 256** and **201 of the 256 reports are NaN**, while the forward `y` stays finite
