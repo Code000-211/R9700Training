@@ -832,6 +832,32 @@ order change. The remaining candidates are the norm's `s` (a per-row scalar, whi
 multiset shape intact and is not excluded by `sort_rel` if the rows are compared as sorted *within* a
 row) and the input's row indexing.
 
+### `none:5` is an operand the tape says has no buffer
+
+`src/tape.cpp:61` maps `RAD_OPK_NONE` to `"none:" + std::to_string(index)`, so `none:5` at 1454 is not
+a mis-named weight: it is the tape's own name for an operand whose kind is `NONE`. The zero the walk
+sees is the documented behaviour of an operand the tape did not name (`join_common.h:502` treats
+`none:` as "no buffer"), not a failed snapshot.
+
+So `gemm_nt_q`'s row cannot be FD'd at live scale for the same class of reason as the norm's twin: the
+tape does not carry the tensor the adjoint needs. Resolving it is a tape-encoding change, not a walk
+fix.
+
+### The oracle for the quantised producers is the tape's own codes
+
+The finite difference cannot check a producer whose activation is a step function, so the oracle for
+those rows is the reconstruction this section already uses:
+
+- **`deq_rel`** -- the twin's activation against `fwht(codes * scale) / group`, the kernel's own output
+  recovered from what it stored. It reads 0.005 and 0.008 on the two gated producers, which is the
+  quantisation floor, so the oracle works where the twin is right.
+- **`sort_rel`** -- the same comparison after sorting each row, which separates an arrangement
+  difference from a value difference.
+- **`hist`** -- the code-difference histogram, which separates a sub-LSB mismatch from a structural one.
+
+Those three together are the decision: the FD is not usable on these rows, and nothing in this report
+quotes an FD number for a quantised producer.
+
 ## The quotient's guard## The quotient's guard## The quotient's guard
 
 The mask pass divides each code's cotangent by its group scale, and the quotient is exact only
