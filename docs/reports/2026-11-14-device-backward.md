@@ -770,6 +770,17 @@ decades per layer, f32's `3.4e38` is **11.1 layers** below position 1416, and th
 position 1143 is **12.0 layers** below it. The residual stream's own cotangent (`h`) shows the same
 growth and the same clipping.
 
+**And the same rate accounts for the block-51 over-statement end to end**, which is the check that ties
+the two halves of this section together. Block 51 is **12 layers** below the last layer (64 layers, so
+63 - 51). At 3.190 decades per layer the walk grows **38.3 decades** over that span while the truth
+grows **1.11**, predicting an excess of **37.2 decades**; the measured over-statement at that leaf is
+**31.84 decades** (6.2827e35 against -9073.83). Same order, within a factor of 5.
+
+Two independent consequences of one rate therefore agree: the clip lands at **12.1 layers** below the
+top by prediction and **13.8** by position, and the leaf twelve layers down is over-stated by 31.8
+decades against 37.2 predicted. Over the whole model the rate gives **64 x 3.190 = 204 decades** of walk
+growth against f32's 38.5, which is why everything below the twelfth layer reads NaN.
+
 **The true gradient, from the central difference at two leaves:**
 
 | leaf | walk's gradient | true (central, bf16 step) | over-statement |
