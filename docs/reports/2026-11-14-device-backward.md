@@ -1111,6 +1111,14 @@ which is the experiment below rather than more reading.
 
 ### A repeated ~1e4 amplification on the GDN path
 
+**One accounting fact that has been read as a conditioning anomaly and is not one.** `h`'s DUMPDC rows
+report `nonzero=2616320` of `2621440` (`/tmp/r97-dumpdc.log` at positions 1458, 1457, 1456, 1451, 1450,
+1449, 1448, 1431, 1430) -- **exactly 5120 short, i.e. exactly one 5120-wide row of the 512 is all
+zero.** The step's `scored` is **511 of 512**, so the missing row is the padding row and the zero is
+the forward's own masking, not a row the model degenerated on. **A max-over-buffer statistic on `h` is
+therefore not "dominated by a degenerate row"**, and no reading of this log should treat that zero row
+as a conditioning trigger.
+
 Ranking every same-buffer cotangent step in `/tmp/r97-fwd.log` **by the block each position belongs
 to** -- not by a position gap -- gives 100 steps above 2x. **An earlier reading of this used a
 position gap of 25 and was wrong:** blocks are 17 to 22 positions wide (block 63 is 1429..1456, 62 is
