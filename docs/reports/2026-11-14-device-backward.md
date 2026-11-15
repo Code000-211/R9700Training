@@ -271,8 +271,8 @@ uniform**, so it is worth reading as a sequence of intervals rather than as one 
 | 1267 | 52 | 3.2e24 |
 | **1176** | **51** | **1.214e37** -- and the next row produces non-finite |
 
-The curve is **not uniform**, and that matters -- an earlier draft averaged it into "~2500 per layer",
-which is neither the net nor constant:
+Read as intervals, the acceleration is explicit -- and the "~2500 per layer" an earlier draft quoted
+was an average of them, neither the net nor a constant:
 
 | interval | blocks | ratio | x per block |
 |---|---|---|---|
@@ -289,8 +289,10 @@ is **~984x per block** (1377x to block 51's last finite value), against a **true
 (76 / 1.9e-4 = 4e5 over the same 13 steps). That is a **~365x per-block excess**, and
 365^13 = 2e33 -- the over-statement, reached without assuming any uniform factor.
 
-Within a block the largest single contributor is `gdn_chunk_scan` (x1e4); each quantised row adds
-~1e2; `gemm_nt_q` adds none. From position **1175** onward, **817 records** report a non-finite
+Within a block the largest single contributor is `gdn_gated_rmsnorm` -- its Jacobian grows ~1e4 when a
+row's `mean(x^2)` approaches `eps`, and it both reads and writes `gdn_o` (opnd 0 and opnd 3), which is
+what made the jump look like the scan's; each quantised row adds ~1e2; `gemm_nt_q` adds none. From
+position **1175** onward, **817 records** report a non-finite
 *incoming* cotangent -- the non-finite values propagated from 1176 and never became finite again.
 
 `maxabs` counts finite values only (`src/backward.cpp:610`), so a fully non-finite vector reports the
