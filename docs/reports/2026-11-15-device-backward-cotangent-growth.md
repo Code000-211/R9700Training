@@ -998,6 +998,24 @@ With the compacted record, `norm_gain` sees `{h (read), weight (read), y (writte
 intermediate and takes the weight. The intermediate's own slot has no fused counterpart, so its
 cotangent is dropped rather than misrouted into the weight's slot.
 
+**The device row already had this right, and its comment says so.** `src/adjoint/device/quant.hip:709-716`
+finds the elementwise part's second operand as the first **non-written** operand after 0:
+
+```cpp
+int64_t second_at = -1;
+for (int64_t k = 1; k < operands && second_at < 0; ++k)
+    if (!call.rec.operands[(size_t)k].written) second_at = k;
+```
+
+and its comment claims "the host row's scan lands on the same operand" -- which was **false** until this
+fix: the host row landed on the intermediate. So the host A/B and the device row were differentiating
+the norm with different gains, and the A/B's agreement on the gated producers (94% exact) came from
+records whose read operands happen to be a prefix. The fix makes the two sides agree.
+
+**The device row's gain was therefore never the growth's cause**, and this fix does not by itself move
+the device numbers. What it does is make the host A/B a valid gate: before it, the two sides were
+differentiating different functions at every fused norm.
+
 **Two earlier diagnoses were wrong and are withdrawn.** The schema-rank preference in `norm_gain`
 could not have helped: `call.fwd` held no rank-1 candidate at all. And the `[512, 5120]` snapshot was
 never a tape view -- `VIEW` prints nothing at 1449, so `view_shape` is empty and the tape's record
