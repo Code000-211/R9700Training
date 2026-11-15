@@ -926,9 +926,23 @@ better to take.
 the growing quantity with the wrong gain. The gradient stays finite (48.6156) -- this is a wrong
 derivative, not a blow-up -- which is why it never showed as a NaN.
 
-The fix is not in `norm_gain`: it is that the adjoint's operand vector should carry the same snapshot
-the twin gets. That is a snapshot/record-plumbing change in `backward.cpp`'s `fwd` construction, not a
-lookup preference.
+**The fix is not in `norm_gain`, and not in `fwd` alone.** `backward.cpp:467` refuses any snapshot
+whose shape differs from the record's declared operand shape, so the adjoint can only be receiving
+`[512,5120]` because **the raw record declares the gain that way**. Handing `fwd` the rank-1 snapshot
+would be refused, not accepted. `tighten_operand` (`join_common.h:371`) only narrows `shape[0]` to the
+row count; it never changes the rank, so tightening is not the difference either.
+
+The two callers get their operands from different places:
+
+- the twin from its own caller (`rmsnorm_had_quant_i8g_twin(rec, operands, out)` -> `fused_twin`), which
+  supplies a `[5120]` gain;
+- the adjoint from `call.fwd`, built in `backward.cpp` from `snapshots.at(rec.position, k)`, whose shape
+  must equal the record's declared one -- `[512,5120]`.
+
+So **the tape declares the gain as a per-row tensor and the twin's caller supplies it as a vector**,
+for the same buffer at the same position. The reconciliation is between the record's declared gain
+shape and the shape the twin's caller uses, or between the two snapshots the store holds -- not a
+lookup preference in `norm_gain`.
 
 ## The quotient's guard## The quotient's guard## The quotient's guard
 
