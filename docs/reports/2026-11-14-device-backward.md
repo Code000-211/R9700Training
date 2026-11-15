@@ -1344,16 +1344,25 @@ points at the wrong line. The per-element figure is `R97_DUMP_DC`'s `maxabs`
 pos 1148, `nonfinite=0`) -- **below f32's ceiling, so the f64-to-f32 downcast at `quant.hip:345-349`
 is not what overflows**, though it is unguarded and worth guarding.
 
-**Second, the quant path is not where the walk first dies.** The first non-finite value appears in
-**`gdn_o`**, at position **1143**, where its max reaches **3.38953e38** -- 0.3% under f32's 3.4e38 --
-with **1196561 of 3145728 values already non-finite**, and every value non-finite from position 1122
-down. `gdn_o` is not a quantised row: it has no group scale and no `/s`, so its only ceiling is the
-raw one, and the clip lands on it. **The quant rows die later, at position 1134**, which is downstream
-of 1143 in walk order.
+**Second, the quant path is not where the walk first dies.** With the two f64 row fixes in place, the
+first non-finite value in the walk is at position **1143**, in **`gdn_gated_rmsnorm`** -- the op that
+writes the `gdn_o` buffer -- where the largest still-finite element is **3.38953e38** (99.6% of
+`FLT_MAX`) with **1187495 of 3145728 elements already non-finite**, and every element non-finite from
+position 1122 down. **Before those fixes the first non-finite was `lora_shrink`@1150** (`:1768-1771`),
+so 1143 is the *post-fix* marker: the range fixes moved the instrument further down the walk, they did
+not change the growth. **The quant rows die later still, at position 1134**, downstream of 1143.
 
-**So the site of the observed clip is plain f32 saturation in the `gdn_o` path**, reached because the
-cotangent grows 3.2 decades per block. The layer arithmetic that agrees with it (`:1696-1703`) is
-measuring exactly that: 3.4e38 is 11.1 layers below position 1416 at 3.190 decades per layer, and the
+**And it is not the row's arithmetic that saturates.** `gated_rmsnorm_adjoint_kernel`'s two reductions
+are already carried in f64, deliberately -- `gdn_prep.hip:636-642` says why: "`d_o` -- `gdn_o`'s
+cotangent -- reaches 1e35..1e38 by block 51 of the real container. An f32 `dot` crosses 3.4e38 there
+and an f64 one does not, so the width is a device-versus-reference divergence, not a tolerance."
+**What reaches the ceiling is the stored f32 buffer value, not a sum**: the cotangent is written and
+read as f32, so once the value itself passes `FLT_MAX` there is nowhere left for it to go. Naming the
+row's arithmetic as the site would be wrong twice over -- it is f64, and it is not what saturates.
+
+**So the observed clip is a stored f32 value arriving at `FLT_MAX` in the `gdn_o` buffer**, carried
+there by 3.2 decades per block of growth. The layer arithmetic that agrees with it (`:1696-1703`)
+measures exactly that: 3.4e38 is 11.1 layers below position 1416 at 3.190 decades per layer, and the
 clip is measured 12.0 layers below.
 
 **The divide at `quant.hip:199` is a second, latent site -- not the observed one.** It overflows when
@@ -1794,7 +1803,9 @@ backward, by the row, not inherited from a poisoned forward.
 seen here as `h.q8`) and `code` is the int8 code (up to 127). One product is already `1e38`; summing
 128 of them in f32 lands on the ceiling and stays there. The host row does this sum in `double`
 (`host/reference_lora.cpp:292`, `s_cot->value[ge] += g * a->value[e]`). **This is the fourth instance
-of the same class on this path, and it is the site of the first non-finite in the whole walk.**
+of the same class on this path, and it was the site of the first non-finite in the whole walk** -- with
+this row's reduction in f64, the first non-finite moves down the walk to `gdn_gated_rmsnorm`@1143
+(`:1768-1771`), which is what a range fix buys and is not a change in the growth.
 
 ### The fix, and what it is and is not
 
