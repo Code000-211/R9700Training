@@ -416,7 +416,23 @@ inline FdReport check_adjoint(const OpRecord& rec, const std::vector<AdValue>& i
     }
 
     // Random cotangent for every written operand.
+    //
+    // Magnitude knob, the one that matters for a saturation defect. The note above is right that an
+    // adjoint which is *linear* in its cotangent is unaffected by scaling it -- both sides of the
+    // comparison scale together. It stops being right the moment a row puts the cotangent through a
+    // narrow type: `src/adjoint/host/quant.cpp:386` rounds it through
+    // `rad_bf16_to_f32(rad_f32_to_bf16((float)x))` and `src/adjoint/device/quant.hip:345-349` casts
+    // the whole buffer to f32 before any kernel runs. Past f32's 3.4e38 ceiling those are Inf, the
+    // adjoint's answer becomes Inf while the f64 central difference stays finite and scales linearly,
+    // and the check fails -- which is exactly the walk's failure (`#145`; the real walk reaches
+    // 4.27042e+41). So R97_FD_COT scales `cot` while R97_FD_AMP scales the inputs: two different
+    // axes, and this is the one the walk's defect lives on.
     uint64_t s = seed;
+    const double cot_amp = [] {
+        const char* e = std::getenv("R97_FD_COT");
+        const double v = e != nullptr ? std::atof(e) : 0.0;
+        return v != 0.0 ? v : 1.0;
+    }();
     std::vector<AdValue> cot;
     cot.reserve(out_spec.size());
     for (size_t o = 0; o < out_spec.size(); ++o) {
@@ -424,7 +440,7 @@ inline FdReport check_adjoint(const OpRecord& rec, const std::vector<AdValue>& i
         int64_t n = 1;
         for (int64_t d : c.shape) n *= d;
         c.value.resize((size_t)n);
-        for (double& v : c.value) v = urand(&s);
+        for (double& v : c.value) v = urand(&s) * cot_amp;
         cot.push_back(std::move(c));
     }
 
