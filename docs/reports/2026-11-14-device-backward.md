@@ -548,11 +548,59 @@ at 1e34..1e37 would never fire on the fixture. **An earlier draft named the devi
 here and that is wrong** -- the quotient is safe where it is taken (`1.25e34 / 0.19 = 6.6e34`, under
 f32's 3.4e38); see the re-scoped #140.
 
-The live lead is the **`1/s` round-trip**: a quantiser's adjoint divides the codes' cotangent by the
-group scale and its consumer must multiply it back, and at `s ~ 0.19` that is `5` per hop. ~5 such
-hops per block at `5` each is the measured order, so **a single hop missing its balance would not do
-it -- ~3 of them would.** That is an audit of which rows divide and which multiply, not a range
-question.
+### The `1/s` round-trip, audited and refuted
+
+The obvious candidate was the `1/s` round-trip: a quantiser's adjoint divides the codes' cotangent by
+the group scale, its consumer must multiply it back, and at `s ~ 0.19` that is `5` per hop -- with
+~5 hops per block, a few unbalanced hops would be the measured order. **It is balanced, on both
+families, at every hop.** Audited against the retained `R97_DUMP_POS=all` dump of a contiguous
+895-record walk (`/tmp/r97-dstep-512q.log`), so the hop inventory is measured rather than assumed:
+
+| | |
+|---|---|
+| ops that write a code plane | `rmsnorm_had_quant_i8g` 78, `gated_had_quant_i8g` 39, `had_quant_act_i8g` 29, `gate_had_quant_i8g` 10 |
+| ops that read one | `gemm_nt_q` **177**, `lora_shrink` **177** -- and each reads the matching scale 177 times |
+| not a hop | `lora_expand` (its input `t` is f32); `gemm_nt` (bf16 family, no `a_scale`) |
+
+Four producers, one divide site (`device/quant.hip:199`, all four share `mask_rotate_kernel`), two
+multiply sites (`device/linear.hip:657`, `device/lora.hip:296`). **All eight producer x consumer pairs
+have product exactly 1.0**, and the multiplier is *the operand the producer wrote* -- the same values,
+not merely the same rule. The grids agree at all four live widths (5120/40, 5120/40, 4096/32,
+17408/136 -- all 128), which is where a "balanced rule, wrong grid" bug would live. The host twins are
+the same rule in f64 (`host/quant.cpp:365` divides, `host/linear.cpp:244` and `host/lora.cpp:312`
+multiply).
+
+### So what is left, and the one measurement that would settle it
+
+**The per-block decomposition itself is the thing that is not measured.** "~984x measured against
+~3.9x true" divides a **logit-space** cotangent (1.9e-4) into a **weight-space** gradient (-9073.8)
+over 13 blocks, and between those two sit the head's linear map, the leaf's own contraction over 512
+tokens, and every within-block factor -- which the dump measures at **8.0e5 inside block 63 alone**.
+At position 1449 the fused producer's bf16-output cotangent is 1.31e-07 and its code path's is
+1.05e-01 in value space, through `ffn_down`'s dx, the gated activation and `gate_up`'s dx; the host's
+f64 row produces the same factor, so it is the norms' `1/rms` conditioning, not a defect. **A single
+averaged "x per block" cannot come out of that division**, so 3.9 and 250 are both derived.
+
+What stands measured: the leaf over-statement (**walk 6.2827e35 against `central_bf16` -9073.8**) and
+the finite growth curve. **The next measurement is one central difference at a leaf in an earlier
+block** -- `q_proj.lora_A` in block ~40 -- which turns the per-block figure into a measured one. It is
+a two-line extension of the `central` block already in the harness, needing no new instrument.
+
+**Three mechanical findings came out of the audit and are acted on.** The f32 row reductions: the
+report's own f64 fix landed at one of three sites on this path, and the other two
+(`gated_rmsnorm_adjoint_kernel`'s `float dot` over 5120, `rmsnorm_adjoint_kernel`'s `float tt`) plus
+`l2_backward_kernel`'s `float dot` over 128 are now f64 with their shared memory widened to match,
+their host twins' widths. The device fused producers add the bf16 output's own cotangent
+(`device/quant.hip:743-795`) where `fused_adjoint` drops it (`host/quant.cpp:982,1003`), so the two
+rows are *different functions* and device-vs-host plus host-vs-FD does not exclude them -- measured
+negligible here (live in 1 of 78 records, one part in 8.0e5), and it is the last place a factor could
+hide. And every retained log has **zero** `R97_DUMP_DC` lines, so **no device row has ever been
+checked per-hop at the container's real magnitudes**; an `R97_DUMP_DC=1` run is the cheapest new
+instrument.
+
+**A limit on all of it:** an f32 reduction that crosses the ceiling yields `+-Inf` and then NaN, so
+these fixes explain `all_finite false` and restore the first-non-finite position as a diagnostic.
+They do **not** explain a *finite* multiplier on the finite stretch.
 
 ### Two defects found in passing
 
