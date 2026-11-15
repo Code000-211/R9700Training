@@ -664,9 +664,16 @@ of the same class on this path, and it is the site of the first non-finite in th
 
 ### The fix, and what it is and is not
 
-`src/adjoint/device/lora.hip`'s `shrink_dx_kernel` is now f64 end to end -- `g`'s reduction over `R`,
-the per-column product, the shared staging and the per-group sum, with only the store narrowing, and
-the two scratch buffers and the download widened to match. It builds clean on gfx1201
+Two rows from the same table are now f64 end to end, each against an f64 host twin:
+
+- `shrink_dx_kernel` -- `g`'s reduction over `R`, the per-column product, the shared staging and the
+  per-group sum, with only the store narrowing.
+- `expand_dt_kernel` -- its sum over the projection's `N` columns, **17408 of them on the live
+  trunk**. At position 1138 the whole of `lora.t.r32.lane0` came out non-finite (16384 of 16384),
+  which is this reduction landing on the ceiling; the host accumulates it in double
+  (`host/reference_lora.cpp:435`).
+
+Both have their scratch buffers and their download widened to match. They build clean on gfx1201
 (`atomicAdd(double*)` is available) and the GPU tier stays green.
 
 **What it fixes is the non-finiteness, and it is worth being exact about that.** The magnitude at

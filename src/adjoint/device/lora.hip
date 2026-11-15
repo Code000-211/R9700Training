@@ -355,20 +355,26 @@ __global__ void shrink_da_kernel(const float* __restrict__ a, const float* __res
 // projection's columns in order, so a warp reads B's rows as runs.
 __global__ void expand_dt_kernel(const float* __restrict__ cy, const float* __restrict__ lb,
                                  const float* __restrict__ sc, const int* __restrict__ slot,
-                                 float* __restrict__ dt, int64_t M, int64_t N, int64_t R) {
+                                 double* __restrict__ dt, int64_t M, int64_t N, int64_t R) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= M * R) return;
     const int64_t m = i / R, j = i - m * R;
     const int64_t s = slot[m];
     if (s < 0) {
-        dt[i] = 0.0f;  // a base row: no cotangent
+        dt[i] = 0.0;  // a base row: no cotangent
         return;
     }
     const float* cy_row = cy + m * N;
     const float* sc_row = sc + s * N;
     const float* B = lb + s * N * R + j;
-    float acc = 0.0f;
-    for (int64_t n = 0; n < N; ++n) acc += cy_row[n] * sc_row[n] * B[n * R];
+    // f64: this is a reduction over the projection's N columns -- 17408 of them on the live trunk
+    // -- where the host accumulates in double (`host/reference_lora.cpp:435`). At block 50's
+    // magnitudes, a y-cotangent of 1e36 against a scale of 0.19, the f32 sum lands on the ceiling:
+    // the whole of `lora.t.r32.lane0` came out non-finite at position 1138 (16384 of 16384)
+    // before this was widened.
+    double acc = 0.0;
+    for (int64_t n = 0; n < N; ++n)
+        acc += (double)cy_row[n] * (double)sc_row[n] * (double)B[n * R];
     dt[i] = acc;
 }
 
@@ -535,7 +541,7 @@ void lora_expand_device_adjoint(const AdjointCall& call) {
     device::ScratchBlock d_lb(f32_bytes(ex.S * ex.N * ex.R));
     device::ScratchBlock d_sc(f32_bytes(ex.S * ex.N));
     device::ScratchBlock d_slot((int64_t)(ex.M * (int64_t)sizeof(int)));
-    device::ScratchBlock d_dt(f32_bytes(ex.M * ex.R));
+    device::ScratchBlock d_dt(f64_bytes(ex.M * ex.R));
     if (!d_cy || !d_t || !d_lb || !d_sc || !d_slot || !d_dt) return;
 
     std::vector<float> h_cy, h_t, h_lb, h_sc;
@@ -544,12 +550,12 @@ void lora_expand_device_adjoint(const AdjointCall& call) {
     if (!upload_f32(*ex.lb, d_lb.p, ex.S * ex.N * ex.R, &h_lb, stream)) return;
     if (!upload_f32(*ex.sc, d_sc.p, ex.S * ex.N, &h_sc, stream)) return;
     if (!upload_slots(slots, d_slot.p, stream)) return;
-    if (rad_memset_async(d_dt.p, 0, f32_bytes(ex.M * ex.R), stream) != 0) return;
+    if (rad_memset_async(d_dt.p, 0, f64_bytes(ex.M * ex.R), stream) != 0) return;
 
     hipLaunchKernelGGL(expand_dt_kernel, dim3((unsigned int)blocks(ex.M * ex.R)),
                        dim3(kBlock), 0, (hipStream_t)stream, (const float*)d_cy.p,
                        (const float*)d_lb.p, (const float*)d_sc.p, (const int*)d_slot.p,
-                       (float*)d_dt.p, ex.M, ex.N, ex.R);
+                       (double*)d_dt.p, ex.M, ex.N, ex.R);
     const int64_t b_cols = call.fused_slots ? ex.S * ex.R : ex.R;
     for (int64_t s = 0; s < ex.S; ++s) {
         if (!d_db[(size_t)s]) continue;
@@ -560,8 +566,8 @@ void lora_expand_device_adjoint(const AdjointCall& call) {
     }
     if (rad_stream_sync(stream) != 0) return;
 
-    std::vector<float> h_dt;
-    if (!download_add_f32(&t_cot, d_dt.p, &h_dt, stream)) return;
+    std::vector<double> h_dt;
+    if (!download_add_f64(&t_cot, d_dt.p, &h_dt, stream)) return;
 }
 
 }  // namespace
