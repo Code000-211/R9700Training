@@ -713,6 +713,29 @@ the per-layer figure is the one to quote. What the modulation does rule out is a
 the work: no one step in any segment accounts for the decade, so the factor is smeared across the ops
 rather than concentrated.
 
+**And the segments differ in a way that names the suspect.** Every segment shares the same opening
+chain, and the short ones are almost nothing but it:
+
+| segment | op chain |
+|---|---|
+| 8 records | `rmsnorm_had_quant_i8g -> lora_expand -> lora_shrink` (+ `gemm_nt_q -> gated_had_quant_i8g`) |
+| 13 records | the same, then `gdn_gated_rmsnorm -> gdn_chunk_scan -> gdn_kkt_solve -> gdn_conv_prep` |
+| 20 records | the same, then `rope -> rmsnorm` (the full-attention layer) |
+
+**The shortest segments are the fastest per record, and they are the ones that are nearly only the
+`lora_expand -> lora_shrink` core**: 8 records at 1.51x each is 15.0x for the segment, while 20 records
+at 1.23x is 127x -- so adding twelve records of gdn or attention work contributes only 127/15 = 8.5x.
+The core carries the bulk of the per-record factor.
+
+**`lora_shrink` is therefore the prime suspect, and the independent per-record sequence agrees.** In the
+`R97_DUMP_POS=all` walk, the op with by far the most jumps above 1.2x is `lora_shrink` -- **57 of 391
+ratios**, against 26 for `gated_had_quant_i8g`, 26 for `rmsnorm_had_quant_i8g`, 24 for `gdn_conv_prep`
+and 13 for `lora_expand`. It is also one of the two rows this report already widened to f64 because its
+128-term sum was crossing `3.4e38`.
+
+**This is a suspect, not a verdict.** It needs the per-op finite difference -- `lora_shrink`'s own
+adjoint against its own central difference at the real magnitudes -- which is the probe below.
+
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
