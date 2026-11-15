@@ -1236,7 +1236,7 @@ a wrong adjoint that this test could not see. On this container it is 1e-6 and t
 bite -- but it is a place where the test's two sides share an assumption with each other and not with
 the model.
 
-### The in-place read is handled correctly, and the arithmetic closes
+### The in-place read is handled correctly, and the arithmetic nearly closes
 
 The op is in place -- `gdn_gated_rmsnorm` takes `{w.o, w.z}` and writes `{w.o}` -- so the obvious next
 suspect is that the walk hands it its own output (max 278) rather than the scan's (max 0.42). **It
@@ -1248,19 +1248,24 @@ eliminated.** The cotangent side is the same shape and is also right: `cot` hold
 *written* operand (`src/backward.cpp:511-515`), copied out of the version store before the row runs,
 so the row is handed its incoming cotangent and not one it has already produced.
 
-**And the size closes, once the per-layer figure is right.** The GDN path supplies **~1e4 per GDN
-layer** (the top five within-block steps above), and this layout is three GDN layers to one attention
-layer. Between block 63 and block 57 there are five GDN layers (the `gdn_o` rows at blocks 62, 61,
-60, 58 and 57), so the path supplies **5 x 4.0 = 20 decades** across those seven blocks. The
-walk-versus-FD table needs **9.76 decades over three blocks (63 -> 60)**, i.e. **3.25 decades per
-block, or 22.8 over seven** -- and the two agree to **12%**. **An earlier reading of this compared
-1.1e3 per GDN layer against 1.8e3 per block, called the gap a factor of 10, and concluded the growth
-was spread across several rows. That was wrong on both the per-layer figure and the comparison, and
-it is withdrawn: the GDN norm accounts for the walk's entire spurious growth, and it is the only row
-in the walk whose within-block step is anywhere near this size.**
+**And the size nearly closes, once the per-layer figure is right.** The `gdn_o` series gives a clean
+per-block rate: the `had_quant_act_i8g` level is 0.105469 (block 62), 153 (61), 220160 (60) and
+7.81684e11 (58), i.e. **x1451, x1439 and x3.55e6 over two blocks -- 3.162, 3.158 and 3.275 decades
+per block**, and 3.217 decades/block over the whole 62 -> 58 span. **The walk-versus-FD table's own
+rate is 3.413 (63 -> 60), 3.124 (63 -> 55) and 3.081 (63 -> 51) decades per block** -- the same rate,
+inside the spread of the walk's own three estimates. Five of the seven blocks from 57 to 63 are GDN
+(62, 61, 60, 58, 57), so the GDN path supplies **5 x 3.217 = 16.09 decades of the 18.48** the walk's
+rate implies over those six blocks: **87%.**
 
-**So the honest state is: the row that carries the whole growth is FD-verified correct, is documented
-by the container's own architecture, and is handed the right values on both sides.** Those three
+**So the GDN norm accounts for most of the spurious growth, and the rest is not attributed.** An
+earlier reading compared 1.1e3 per GDN layer against 1.8e3 per block, called the gap a factor of 10,
+and concluded the growth was spread across several rows; that was wrong on the per-layer figure and on
+the comparison, and it is withdrawn. **But "the GDN norm is the whole of it" would be an overclaim
+too** -- 13% of the growth is still unaccounted for, and the three rows whose steps crossed a block
+boundary are not evidence either way, because their ratios were the block-to-block growth re-measured.
+
+**So the honest state is: the row that carries most of the growth is FD-verified correct, is
+documented by the container's own architecture, and is handed the right values on both sides.** Those
 facts cannot all hold together with a wrong gradient unless the defect is compositional -- which is
 the next section.
 
