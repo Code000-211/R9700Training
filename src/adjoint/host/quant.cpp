@@ -1112,9 +1112,59 @@ void fused_adjoint(const AdjointCall& call, Part part) {
                         if (d > rot_err) rot_err = d;
                     }
             }
-            std::fprintf(stderr, "DUMPROT pos=%lld op=%s rot_err=%.6g rot_bad=%lld/%zu\n",
+            // The kernel's own activation, reconstructed from its codes and scale: `codes * scale` is
+            // the rotated activation and `fwht` is unnormalised (H*H = n*I), so the inverse is
+            // `fwht(.)/group`. Comparing this to `y[0]` tests the twin's *activation* without going
+            // through the twin's quantiser at all, which is what separates "the norm is wrong" from
+            // "the quantiser's scale is wrong".
+            double deq_err = 0.0, deq_scale = 0.0;
+            {
+                const int64_t ngrp = n / group;
+                std::vector<double> dq(codes.value.size());
+                for (size_t i = 0; i < dq.size(); ++i) dq[i] = (double)codes.value[i];
+                for (int64_t r = 0; r < rows; ++r)
+                    for (int64_t gi = 0; gi < ngrp; ++gi) {
+                        const int64_t k0 = gi * group;
+                        const double sc = scale.value[(size_t)(r * ngrp + gi)];
+                        for (int64_t i = 0; i < group; ++i)
+                            dq[(size_t)(r * n + k0 + i)] *= sc;
+                        fwht(dq.data() + r * n + k0, group);
+                        for (int64_t i = 0; i < group; ++i)
+                            dq[(size_t)(r * n + k0 + i)] /= (double)group;
+                    }
+                for (size_t i = 0; i < dq.size() && i < y[0].value.size(); ++i) {
+                    const double d = std::fabs(dq[i] - y[0].value[i]);
+                    if (d > deq_err) deq_err = d;
+                    if (std::fabs(dq[i]) > deq_scale) deq_scale = std::fabs(dq[i]);
+                }
+                // The kernel's activation against the tensors around it: its own input (`op[0]`) and
+                // the in-place write. Whichever it matches names what the kernel actually computed,
+                // and whichever it does not names the snapshot the twin should have been given.
+                double vs_in = 0.0, vs_wr = 0.0, in_vs_wr = 0.0, in_scale = 0.0;
+                for (size_t i = 0; i < dq.size() && i < call.fwd[0].value.size(); ++i) {
+                    const double a = std::fabs(dq[i] - call.fwd[0].value[i]);
+                    if (a > vs_in) vs_in = a;
+                    if (std::fabs(call.fwd[0].value[i]) > in_scale)
+                        in_scale = std::fabs(call.fwd[0].value[i]);
+                    if (i < call.fwd.back().value.size()) {
+                        const double b = std::fabs(dq[i] - call.fwd.back().value[i]);
+                        if (b > vs_wr) vs_wr = b;
+                        const double c = std::fabs(call.fwd[0].value[i] - call.fwd.back().value[i]);
+                        if (c > in_vs_wr) in_vs_wr = c;
+                    }
+                }
+                std::fprintf(stderr,
+                             "DEQORACLE pos=%lld deq_vs_in=%.6g deq_vs_write=%.6g in_vs_write=%.6g "
+                             "in_max=%.6g\n",
+                             (long long)call.rec.position,
+                             in_scale > 0.0 ? vs_in / in_scale : vs_in,
+                             in_scale > 0.0 ? vs_wr / in_scale : vs_wr,
+                             in_scale > 0.0 ? in_vs_wr / in_scale : in_vs_wr, in_scale);
+            }
+            std::fprintf(stderr, "DUMPROT pos=%lld op=%s rot_err=%.6g rot_bad=%lld/%zu deq_rel=%.6g\n",
                          (long long)call.rec.position, call.rec.op.c_str(), rot_err,
-                         (long long)rot_bad, codes.value.size());
+                         (long long)rot_bad, codes.value.size(),
+                         deq_scale > 0.0 ? deq_err / deq_scale : deq_err);
             if (twin_out.size() > 1 && twin_out[1].value.size() == scale.value.size())
                 for (size_t i = 0; i < scale.value.size(); ++i) {
                     const double t = std::fabs(twin_out[1].value[i] - scale.value[i]);

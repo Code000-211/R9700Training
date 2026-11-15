@@ -676,6 +676,46 @@ holds, and the twin does not hold a per-row tensor.
 the norm's twin is its quantiser's scale or rounding, or the tape's snapshot of `h`; the histogram
 says the difference is structural (a broad spread to 128), not a rounding artefact.
 
+### The kernel's activation, reconstructed, and a tape defect at 1429
+
+`DUMPROT` now also reconstructs the kernel's own activation from its codes and scale --
+`fwht(codes * scale) / group`, since `fwht` is unnormalised (`H*H = n*I`) -- and compares it to the
+twin's output. That bypasses the twin's quantiser entirely:
+
+| pos | op | `deq_rel` (twin's activation vs the kernel's) |
+|---|---|---|
+| 1453 | `gated_had_quant_i8g` | **0.005** |
+| 1445 | `gate_had_quant_i8g` | **0.008** |
+| 1449 | `rmsnorm_had_quant_i8g` | **1.364** |
+| 1429 | `rmsnorm_had_quant_i8g` | **0.628** |
+
+The gated twins reproduce the kernel's activation to 0.5-0.8%, so the twin machinery is sound. The
+norm's are 63-136% off, so the defect is in the **norm's activation**, not its quantiser.
+
+`DEQORACLE` then puts the reconstructed activation beside the tensors around it:
+
+| pos | `deq_vs_in` | `deq_vs_write` | `in_vs_write` |
+|---|---|---|---|
+| 1453 gated | 21.76 | 0.906 | 0.083 |
+| 1449 norm | 0.996 | **0.0003** | 0.996 |
+| 1429 norm | 0.0055 | 0.0055 | **0** |
+
+Two results:
+
+- **The oracle is sound.** At 1449 the reconstructed activation matches the in-place write to
+  **0.03%**, so `dequant(codes, scale)` is exactly what the kernel stored.
+- **At 1429 the tape records the same value for the read operand and the in-place write**
+  (`in_vs_write = 0`). A read that is also written in place must be snapshotted at its *pre*-write
+  value; here the twin is handed the post-write value and normalises its own output. That is a tape
+  defect, and it makes the 1429 twin meaningless.
+
+At 1449 the snapshots do differ (`in_vs_write = 0.996`), so that defect is absent there -- yet the
+twin is still 136% off. A relative error of 1.364 with a `scale_rel` of 1.014 is consistent with the
+twin's activation being about 2x the kernel's, which is the size of a `(w+1)/w` factor when the
+zero-centred gain sits near 1; but forcing `wadd=0` moved `act_rel` only to 1.044, so a single gain
+factor does not explain it either. What is established is the direction: the norm's twin computes a
+different activation, and at 1429 the tape hands it the wrong snapshot outright.
+
 ## The quotient's guard## The quotient's guard
 
 The mask pass divides each code's cotangent by its group scale, and the quotient is exact only
