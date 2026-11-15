@@ -1135,6 +1135,31 @@ host walk now running will show whether the host row does the same -- if it does
 shared and the FD is what says it is wrong; if it does not, it is a device-row defect and the host
 walk's per-block cotangents will show it directly.
 
+### The host walk is not an available arbiter on this container
+
+`R97_HOST_WALK_AB=1 R97_DUMP_DC=1` was run on the 512-token case to settle device-rows-versus-plumbing
+(`/tmp/r97-hwab.log`, 416 s, `bg_343`). **It cannot run, and it fails structurally, not by timing:**
+
+```
+device_step_tape: threw: r97: host adjoint: op 'gemm_nt_q': operand 'b' is
+stored in a plugin-private encoding the host row cannot read
+```
+
+`ab_host_walk` is `null` in the artifact and the case reports `1 tests, 1 failed`. **The host
+`gemm_nt_q` row refuses an IQR weight by construction** (`refuse_stored`), and every `gemm_nt_q` in
+this container has one. The host walk therefore dies on the first such record and the A/B never
+produces a gradient.
+
+**So the whole-walk host A/B is not a usable instrument for `iq5r`**, and the "run `R97_HOST_WALK_AB`
+to attribute device-versus-host" step that this report has repeatedly named is closed -- not
+expensive, *impossible* on this container. The device-versus-host question has to be asked per op, on
+the host tier, with fixtures that give the row a weight it can read: that is what
+`tests/gpu/adjoint_linear.cpp` and `tests/host/adjoint_quant.cpp` already do, and it is why
+`scale_factor_probe_keeps_the_activation_scale` could be run and this could not.
+
+**This is the second instrument assumed available and refused** -- the first was `R97_DUMP_FWD=1`
+probing only the head. Both were caught before a conclusion rested on them.
+
 ### The gain is per block, multiplicative, and uniform: ~1600x every block
 
 **Which slot, exactly, because a block has two.** Every block carries **two** `lora_expand` rows that
