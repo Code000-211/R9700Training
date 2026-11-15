@@ -813,6 +813,85 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             std::fflush(stderr);
         }
 
+        // R97_FD_REC=<pos>[,<pos>...]: a live-scale finite difference of the row that just ran, on
+        // the tape's own operands and cotangents. Every row check in the suite runs at O(1)
+        // synthetic values (`tests/support/adjoint_check.h` seeds with `urand`), and the quantisers'
+        // clamp masks are scale-dependent, so a row can pass there and be wrong where the walk
+        // actually is. This compares `dc[i][e]` against the twin's own derivative of
+        // `<twin, cot>` at that element, at the tape's magnitude, for the largest few elements of
+        // each read. Host arm only: the device rows round their cotangents to bf16, so there the
+        // comparison would be measuring the rounding.
+        if (const char* fr = std::getenv("R97_FD_REC"); fr != nullptr && options.side == Side::host) {
+            const std::string list(fr);
+            const std::string pos = std::to_string(rec.position);
+            bool want = false;
+            for (size_t at = 0; at <= list.size();) {
+                const size_t comma = list.find(',', at);
+                const std::string piece =
+                    list.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                if (piece == pos) want = true;
+                if (comma == std::string::npos) break;
+                at = comma + 1;
+            }
+            if (want) {
+                std::string terr;
+                TwinFn twin = twin_find(rec.op, rec.params, &terr);
+                if (twin == nullptr) {
+                    std::fprintf(stderr, "FDREC pos=%s op=%s no twin: %s\n", pos.c_str(),
+                                 rec.op.c_str(), terr.c_str());
+                } else {
+                    std::vector<size_t> read_at;
+                    std::vector<AdValue> reads;
+                    for (size_t i = 0; i < rec.operands.size(); ++i) {
+                        const bool inout = rec.operands[i].written && sized[i];
+                        if (rec.operands[i].written && !inout) continue;
+                        read_at.push_back(i);
+                        reads.push_back(fwd[i]);
+                    }
+                    const auto loss_at = [&](const std::vector<AdValue>& x) {
+                        std::vector<AdValue> y;
+                        twin(rec, x, &y);
+                        double sum = 0.0;
+                        for (size_t o = 0; o < y.size() && o < cot.size(); ++o)
+                            for (size_t e = 0; e < y[o].value.size() && e < cot[o].value.size(); ++e)
+                                sum += y[o].value[e] * cot[o].value[e];
+                        return sum;
+                    };
+                    for (size_t k = 0; k < reads.size(); ++k) {
+                        const size_t i = read_at[k];
+                        if (!sized[i] || dc[i].value.empty()) continue;
+                        // The elements that matter: the largest |dc| and the largest |value| in
+                        // this read. A row whose adjoint departs at magnitude shows it on both.
+                        size_t by_dc = 0, by_val = 0;
+                        for (size_t e = 1; e < dc[i].value.size(); ++e) {
+                            if (std::fabs(dc[i].value[e]) > std::fabs(dc[i].value[by_dc])) by_dc = e;
+                            if (e < reads[k].value.size() &&
+                                std::fabs(reads[k].value[e]) > std::fabs(reads[k].value[by_val]))
+                                by_val = e;
+                        }
+                        for (const size_t e : {by_dc, by_val}) {
+                            if (e >= reads[k].value.size() || e >= dc[i].value.size()) continue;
+                            const double x0 = reads[k].value[e];
+                            const double eps = 1e-6 * std::max(1.0, std::fabs(x0));
+                            std::vector<AdValue> xp = reads, xm = reads;
+                            xp[k].value[e] += eps;
+                            xm[k].value[e] -= eps;
+                            const double numeric = (loss_at(xp) - loss_at(xm)) / (2.0 * eps);
+                            const double analytic = dc[i].value[e];
+                            const double scale = std::max(std::fabs(analytic), std::fabs(numeric));
+                            std::fprintf(stderr,
+                                         "FDREC pos=%s op=%s read=%zu buffer=%s elem=%zu x=%.6g "
+                                         "analytic=%.6g numeric=%.6g ratio=%.6g\n",
+                                         pos.c_str(), rec.op.c_str(), i,
+                                         rec.operands[i].buffer.c_str(), e, x0, analytic, numeric,
+                                         scale > 0.0 ? analytic / numeric : 0.0);
+                        }
+                    }
+                }
+                std::fflush(stderr);
+            }
+        }
+
         // R97_DUMP_REC=1: one line per record, the whole chain in walk order. `cot` is the largest
         // magnitude the record was handed (its writes' incoming cotangents), `dc` the largest it
         // left on its reads; `ratio` is the record's effective Jacobian. A row whose own adjoint is

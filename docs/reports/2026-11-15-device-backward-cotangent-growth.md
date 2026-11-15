@@ -356,35 +356,79 @@ against 1.95e-05 host).
 ## Where the growth is, record by record
 
 `R97_DUMP_REC=1` on the same walk, block 63, the largest ratio each record applies to the cotangent it
-is handed (`ratio` is the largest element's, `sum_ratio` the sum's):
+is handed (`ratio` is the largest element's, `sum_ratio` the sum's, and `dc_slot` names which of the
+record's reads the largest `dc` landed on):
 
-| pos | op | cot_max | dc_max | ratio | sum_ratio |
+| pos | op | cot_max | dc_max | ratio | sum_ratio | dc_slot |
+|---|---|---|---|---|---|---|
+| 1456 | lora_expand | 1.31e-07 | 1.22e-06 | **9.29** | 1.07 | 0 |
+| 1452 | lora_expand | 1.28e-05 | 1.14e-04 | **8.91** | 1.06 | 0 |
+| 1448 | lora_expand | 7.24e-06 | 8.01e-05 | **11.07** | 1.06 | 0 |
+| 1438 | lora_expand | 3.81e-05 | 1.79e-04 | **4.68** | 1.16 | 0 |
+| 1435 | lora_expand | 1.19e-04 | 7.27e-04 | **6.10** | 1.34 | 0 |
+| 1432 | lora_expand | 8.06e-05 | 4.24e-04 | **5.26** | 1.07 | 0 |
+| 1444 | attn_paged | 4.63e-05 | 2.88e-04 | 6.23 | 4.62 | 1 |
+| 1454/1446/1436/1433/1430 | gemm_nt_q | -- | -- | 0.008-1.85 | 0.02-4.5 | 0 |
+| 1458/1440/1439/1449/1429 | rmsnorm, rmsnorm_had_quant_i8g | -- | -- | 7e-4-0.42 | 0.18-2.65 | 0 |
+| 1453 | gated_had_quant_i8g | 1.88e-05 | 1.28e-05 | 0.68 | 4.50 | 0 |
+| 1445 | gate_had_quant_i8g | 1.47e-03 | 8.06e-05 | 0.055 | 1.53 | 0 |
+| 1455/1451/1447/1437/1434/1431 | lora_shrink | -- | -- | 15-36 | 31-416 | **1** |
+
+**The `lora_shrink` rows are not the record's value-space ratio.** Every one of them has `dc_slot=1`,
+and the `dc_max` there equals the record's `h.s8` (scale) cotangent to the digit -- 0.0063392 at pos
+1437, 0.0181934 at 1434, 0.00831351 at 1431, the same numbers `DUMPDC` prints for `h.s8` at those
+positions. The scale's cotangent is *dead*: the quantiser's adjoint treats the scale as a constant
+(the straight-through rule, `src/adjoint/host/quant.cpp:341` drops `cot[1]`), so nothing reads it.
+On the slot that does travel -- the codes, `h.q8` -- the record **shrinks**: 1.79e-04 in, 4.23e-06
+out at pos 1437 (0.024); 7.27e-04 in, 2.03e-05 out at 1434 (0.028); 4.24e-04 in, 6.71e-06 out at
+1431 (0.016).
+
+So the only record that multiplies on a live slot is **`lora_expand`**, at 4.7-11.1 per instance, and
+its magnitude is its own matrix: `dx = B^T dy` over 5120 channel terms with `B` of order 1e-3, which
+is what the container's own `lora_A` elements measure (1.0e-03 and 1.1e-02 in the finite-difference
+arm). The earlier version of this section read the scale slot as if it were the value slot and
+concluded the multiplier was `lora_shrink` with "`A` of order one"; both were wrong, and the sampled
+elements are two decades below order one.
+
+Every other record shrinks or passes through. So no record is out of line with its siblings, and the
+growth is the branch's Jacobian product -- but the only factor in it that is above one is the LoRA
+expansion's `B^T`, at 4.7-11.1, and `B`'s entries are measured rather than inferred.
+
+## The live-scale finite difference: the amplifying rows are exact
+
+Every row check in the suite runs at O(1) synthetic values (`tests/support/adjoint_check.h` seeds with
+`urand`), and the quantisers' clamp masks are scale-dependent, so a row can pass there and be wrong
+where the walk actually is. `R97_FD_REC=<pos>` closes that gap: it runs the row's twin at the tape's
+own operands and compares `dc[i][e]` against the twin's derivative of `<twin, cot>` at that element,
+at the walk's magnitude. Host arm, one block, block 63's chain:
+
+| pos | op | read | analytic | numeric | ratio |
 |---|---|---|---|---|---|
-| 1455 | lora_shrink | 1.22e-06 | 1.88e-05 | 15.4 | 351 |
-| 1451 | lora_shrink | 1.14e-04 | 2.49e-03 | 21.9 | 31.3 |
-| 1447 | lora_shrink | 8.01e-05 | 1.47e-03 | 18.4 | 49.5 |
-| 1437 | lora_shrink | 1.79e-04 | 6.34e-03 | 35.5 | 43.9 |
-| 1434 | lora_shrink | 7.27e-04 | 1.82e-02 | 25.0 | 39.3 |
-| 1431 | lora_shrink | 4.24e-04 | 8.31e-03 | 19.6 | 42.7 |
-| 1427 | lora_shrink | 7.63e-03 | 8.53e-02 | 11.2 | 416 |
-| 1423 | lora_shrink | 5.27e-01 | 1.41e+01 | 26.7 | 31.6 |
-| 1450/1446/1436/1433/1430 | gemm_nt_q | -- | -- | 0.008-2.2 | 0.02-4.5 |
-| 1452/1448/1438/1435/1432 | lora_expand | -- | -- | 4.7-11.6 | 1.06-1.34 |
-| 1449/1429 | rmsnorm_had_quant_i8g | -- | -- | 0.003/0.04 | 0.23/2.65 |
+| 1456 | lora_expand | `lane0` | -1.22004e-06 | -1.22004e-06 | **1** |
+| 1448 | lora_expand | `lane0` | -1.3156e-04 | -1.3156e-04 | **1** |
+| 1455 | lora_shrink | `ffn.q8` | 1.2534e-06 | 1.2534e-06 | **1** |
+| 1455 | lora_shrink | `ffn.s8` | 1.8775e-05 | 1.8775e-05 | **1** |
+| 1444 | attn_paged | `attn_q` | 2.51058e-04 | 2.51058e-04 | **1** |
+| 1444 | attn_paged | `kv:1` | -3.9499e-04 | -3.9499e-04 | **1** |
 
-`lora_shrink` is the only record that multiplies on every instance, by 11-36 per element and 30-400 in
-sum. Its `sum_ratio` is the shape: the record's output carries one value per (row, rank) with rank 16
-and its input one per (row, channel) with 5120 channels, so a sum over 320 times as many elements
-returns 320 times as much. Its `ratio` is the matrix: `dx = A^T dy` over 16 rank terms reaches 15-36
-times `max|dy|` when `A`'s entries are of order one, which is what a trained LoRA's `A` is, and its
-`lora_expand` sibling (`dx = B^T dy` over 5120 channel terms) shows 4.7-11.6 for `B` of order 1e-3.
-Neither is a wrong transpose: they are the two halves of a rank-16 factorisation whose factors have
-different scales, and the adjoint of each is the other's transpose.
+**Every well-posed slot is exact to the printed digits**, at magnitudes from 1e-07 to 1e-04. So the
+4.7-11.1x that `lora_expand` applies is the *true* Jacobian of `B^T` at the walk's own operating
+point, not a row defect, and the growth is the product of those true factors. That is what earns the
+"branch Jacobian" reading, which until this run was an inference from ratios that could equally have
+been a row error at scale.
 
-So no single record is out of line with its siblings, which is what the growth would need. The branch's
-Jacobian is simply much worse conditioned than its forward: the forward's normed `h` is 6.5 at block
-63 and 11.06 at the top (flat), while the backward's `h` cotangent gains 1.6 decades per block. That
-is possible for a non-symmetric Jacobian and it is what an ill-conditioned block does.
+Three rows cannot be checked this way, and each says why:
+
+- **`gemm_nt_q`**: its weight is an unresolved `none:` operand in the host walk's snapshot, so the twin
+  is fed a zero matrix and reports `numeric=0` against a nonzero `analytic`. The *row* has the weight
+  (it resolves it through `stored_weight`); the twin does not.
+- **`rmsnorm_had_quant_i8g`'s activation**: its output is quantised, so the twin is a step function and
+  its central difference is 0 almost everywhere while the straight-through row reports `cot/s`. The FD
+  is the wrong oracle for a quantiser by construction, at any scale.
+- **its weight**: frozen by design (`nW`), so `analytic=0` against the FD's true -0.0072 is the walk
+  deliberately not training it.
+
+`R97_FD_REC` stays in the tree as the instrument for the two rows that remain open at live scale.
 
 ## What the device cannot hold
 
@@ -412,16 +456,19 @@ and the residual stream's cotangent is 1.31316e-07 at every block boundary, befo
 **Measured.** The branch's `h` cotangent grows 1.60 decades per block over thirteen blocks (40.1x,
 geometric mean), down from 3.3 before the fix. The host arm grows at the same rate (1.9 decades on the
 one block both arms measured), and the two arms agree to a factor of 2.7 at block 63. No record's
-ratio is out of line with its siblings: `lora_shrink`'s 11-36 per element is `A^T` over sixteen rank
-terms with `A` of order one, `lora_expand`'s 4.7-11.6 is `B^T` over 5120 terms with `B` of order 1e-3,
-and every other record shrinks.
+*live* ratio is out of line with its siblings: the only one above one is `lora_expand`'s 4.7-11.1,
+which is `B^T` over 5120 terms with `B` of order 1e-3 (measured: 1.0e-03, 1.1e-02), and every other
+record shrinks. `lora_shrink`'s larger `DUMPREC` ratios are its *scale* slot, which the quantiser's
+straight-through adjoint drops -- dead cotangent, not the row's Jacobian.
 
-**Not resolved: whether that 1.60 decades is the true Jacobian.** The only oracle that could say so is
-the central difference, and the arm that computes it cannot resolve this gradient: at block 63 the same
-weight moves the loss +0.080 at 1% and -0.213 at 10%, a sign flip where a linear response gives +0.797,
-and the loss's bf16 storage resolves ~29 absolute against a ~0.2 response. A valid FD needs a forward
-whose loss responds above its own quantisation -- f32 activations, or many more tokens -- and the
-container is bf16 throughout. Until then the growth is *characterised*, not *explained*.
+**Resolved for the rows that amplify; open for two.** The loss-level central difference in
+`device_step_tape` cannot adjudicate this gradient -- at block 63 the same weight moves the loss +0.080
+at 1% and -0.213 at 10%, a sign flip where a linear response gives +0.797 -- but the *row-level*
+`R97_FD_REC` can, and it says every well-posed slot is exact at the walk's own magnitudes (table
+above). So the 4.7-11.1x the branch applies is its true Jacobian, and the growth is the product of true
+factors. What stays open is `gemm_nt_q` (its weight is an unresolved `none:5@1454`/`none:6@1454` operand in the
+host snapshot, so its twin sees zeros) and the quantised producers (a step function, which no central
+difference describes). Those two are the remaining live-scale unknowns.
 
 **A consequence, not a second defect.** The device path stores cotangents as bf16 (all nine device row
 files call `f32_to_bf16`); the host keeps f64. At block 54 the branch cotangent is 3.79e+09 and the
@@ -435,11 +482,13 @@ growth's being real is exactly what is unresolved.
 
 The earlier hypothesis in this report -- that a factor of 1e4 per gemm was a `1/scale` applied once
 instead of twice -- is dead, and the per-record chain is what kills it. `gemm_nt_q`'s ratio is 0.008 to
-2.2, a *shrink*, because `dx = W^T dy` carries the weight matrix's own magnitude; the quantised
-producer's `1/scale` and the gemm's `scale` do cancel, which is the algebra at `src/adjoint/host/quant.cpp`
-line 365: the tape hands back the codes' cotangent, `gemm_nt_q` has already multiplied by `s` on its
-way to it, and dividing by `s` restores `W^T dy`. `lora_shrink` is the one record that multiplies, and
-its factor is its own matrix: `A^T` over sixteen rank terms with `A` of order one.
+1.85, a *shrink* on every instance but one, because `dx = W^T dy` carries the weight matrix's own
+magnitude; the quantised producer's `1/scale` and the gemm's `scale` do cancel, which is the algebra at
+`src/adjoint/host/quant.cpp` line 365: the tape hands back the codes' cotangent, `gemm_nt_q` has
+already multiplied by `s` on its way to it, and dividing by `s` restores `W^T dy`. `lora_expand` is
+the one record that multiplies on a live slot, by 4.7-11.1, and its factor is its own matrix: `B^T`
+over 5120 channel terms with `B` of order 1e-3, measured from the container's own `lora_A` elements
+(1.0e-03, 1.1e-02).
 
 So the growth is the branch's Jacobian, not a misapplied scale, and it is present in both arms at the
 same rate. Whether it is the *true* Jacobian is the one question this work could not answer, because
