@@ -828,9 +828,21 @@ a fit. **Neither a permutation nor a gain-after-rotation explains the norm's twi
 
 What is established is the shape of the disagreement: the twin's activation carries the right
 magnitude per row and the wrong values elementwise, and it is neither a permutation nor a rotation
-order change. The remaining candidates are the norm's `s` (a per-row scalar, which would leave the
-multiset shape intact and is not excluded by `sort_rel` if the rows are compared as sorted *within* a
-row) and the input's row indexing.
+order change.
+
+**A per-row `s` is not a candidate, and `row_ratio` rules it out.** If the twin's row scalar differed
+from the kernel's by `c_r`, that row's magnitude ratio would *be* `|c_r|`; `row_ratio` bounds every row
+to [0.989, 1.034], so `c_r` is within 3.4% of 1 everywhere. A per-row scalar also scales the row's
+sorted multiset uniformly, so it cannot move `sort_rel` at all -- let alone to 0.42.
+
+That leaves two candidates, and the first is sharper than the earlier entries suggest:
+
+- **the gain's values.** The gain was exonerated on buffer, shape, rank, `wadd` and `eps`, but **never
+  on the values it carries**: `GAINPOS` shows two snapshots of `blk.63.ffn_norm.weight` at the same
+  position, and the twin takes the rank-1 one without any check that its numbers are the container's
+  weight. A gain vector whose L1 is close but whose entries differ is exactly what `row_ratio` within
+  3% plus `sort_rel` of 0.42 looks like.
+- **a row mismatch** -- the input's rows indexed differently on the two sides.
 
 ### `none:5` is an operand the tape says has no buffer
 
