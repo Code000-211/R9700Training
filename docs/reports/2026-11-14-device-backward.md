@@ -941,6 +941,24 @@ rate. Measuring the cotangent where the loss hands it to the head -- `R97_DUMP_D
 own boundary -- is the narrowest remaining question, and it is upstream of everything the bisect
 measured.
 
+**What the head actually does, since that is now the target.** There is no device adjoint for
+`logits_gemm`: `adjoint_find(..., Side::device, ...)` has no row for it, and the head is not walked as
+ordinary records. `src/step_device.cpp:640-688` builds `d_hout` directly -- a dedicated on-card
+transposed product (`vocab_head_transpose`, `src/adjoint/device/vocab_head.hip:181`) that decodes the
+head's IQR-quantised weight and multiplies the CE gradient by it -- and that becomes the seed the
+head's remaining records walk from (`:1007`). The CE gradient itself is right:
+`src/adjoint/device/head.hip:61-90` writes `softmax - onehot` times `grad_scale`, and `grad_scale` is
+`1.0 / scored` (`src/step_device.cpp:621`), the mean. The forward's loss agrees with the FD's base to
+six figures (7371.591348), so the decode the transpose shares with the forward is not mis-scaled
+either.
+
+**And the top of the walk is measurable in the retained dump.** `/tmp/r97-dumpdc3.log`'s first record
+is `op=rmsnorm pos=1458 buffer=x ... maxabs=1.31316e-07` -- the cotangent the head hands the output
+norm, i.e. `d_hout` itself. The report's 1128 at position 1416 is 8.7e9 above it over 42 records,
+0.216 decades per record, the same order as the 0.140 measured across the blocks. So the cotangent
+grows from the top at the same rate everywhere, and block 63's -5.11 decades is that rate applied to
+the ~1.6 layers between position 1458 and block 63's own leaves.
+
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
