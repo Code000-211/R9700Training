@@ -21,6 +21,8 @@
 // gdn_kkt_solve's adjoint.
 #include "r97/adjoint.h"
 
+#include "parallel.h"
+
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +33,10 @@
 
 namespace r97 {
 namespace {
+
+/* The unit the parallel for cuts the scan into: one (sequence, head) unit, a row of the state. A
+ * call with fewer units than this stays on the calling thread. */
+constexpr int64_t kRowChunk = 2;
 
 /* gdn_chunk_scan's schema positions, in schema order. */
 enum : int {
@@ -419,13 +425,32 @@ void gdn_chunk_scan_twin(const OpRecord& rec, const std::vector<AdValue>& op,
         ht.value.size() < (size_t)(g.ht_slots * g.H * g.V * g.K))
         return;
 
-    std::vector<double> S0, S1, qc, kc, vc, Ac, gc, bc, W, Vp, orow;
+    // The scan's work is one (sequence, value head) unit: a unit writes that head's output rows and
+    // its own state block and reads only its own entering state. A batch whose `state_idx` points
+    // two sequences at one state slot writes the same block twice, so it runs on the calling
+    // thread, where the record's order decides which sequence's state survives.
+    std::vector<int64_t> bos_of((size_t)g.N, 0), len_of((size_t)g.N, 0), slot_of((size_t)g.N, -1);
     for (int64_t n = 0; n < g.N; ++n) {
-        const int64_t bos = (int64_t)op[(size_t)rCu].value[(size_t)n];
-        const int64_t slen = (int64_t)op[(size_t)rCu].value[(size_t)(n + 1)] - bos;
-        if (slen <= 0) continue;
-        const int64_t slot = state_slot(rec, op, rSidx, n);
-        if (slot < 0 || slot >= g.ht_slots) continue;
+        bos_of[(size_t)n] = (int64_t)op[(size_t)rCu].value[(size_t)n];
+        len_of[(size_t)n] = (int64_t)op[(size_t)rCu].value[(size_t)(n + 1)] - bos_of[(size_t)n];
+        if (len_of[(size_t)n] <= 0) continue;
+        const int64_t s = state_slot(rec, op, rSidx, n);
+        if (s < 0 || s >= g.ht_slots) continue;
+        slot_of[(size_t)n] = s;
+    }
+    bool aliased = false;
+    for (int64_t a = 0; a < g.N && !aliased; ++a)
+        for (int64_t b = a + 1; b < g.N; ++b)
+            if (slot_of[(size_t)a] >= 0 && slot_of[(size_t)a] == slot_of[(size_t)b]) aliased = true;
+
+    const auto unit = [&](int64_t u) {
+        const int64_t n = u / g.H;
+        const int64_t h = u % g.H;
+        const int64_t slot = slot_of[(size_t)n];
+        if (slot < 0) return;
+        const int64_t bos = bos_of[(size_t)n];
+        const int64_t slen = len_of[(size_t)n];
+        std::vector<double> S0, S1, qc, kc, vc, Ac, gc, bc, W, Vp, orow;
         for (int64_t h = 0; h < g.H; ++h) {
             load_state(g, op[(size_t)rH0], slot, h, &S0);
             for (int64_t c0 = 0; c0 < slen; c0 += g.chunk) {
@@ -446,6 +471,12 @@ void gdn_chunk_scan_twin(const OpRecord& rec, const std::vector<AdValue>& op,
                         ht.value[(size_t)(base + e * g.K + d)] =
                             S0[(size_t)(d * g.V + e)];
         }
+    };
+    const int64_t units = g.N * g.H;
+    if (aliased) {
+        for (int64_t u = 0; u < units; ++u) unit(u);
+    } else {
+        parallel_for(units, kRowChunk, unit);
     }
     out->clear();
     out->push_back(std::move(o));
@@ -470,16 +501,28 @@ void gdn_chunk_scan_host_adjoint(const AdjointCall& call) {
     AdValue& dg = call.dc->at(kG);
     AdValue& db = call.dc->at(kBeta);
 
-    std::vector<double> S0, S1, qc, kc, vc, Ac, gc, bc, W, Vp, orow;
-    std::vector<double> dqc, dkc, dvc, dAc, dgc, dbc, dS0, St1;
-    std::vector<std::vector<double>> S0s;
+    // A unit is one (sequence, key head): it writes that head's q and k rows and the v, A, g and
+    // beta rows of the value heads it serves, and no two units touch one row. A key head's value
+    // heads run in the record's order inside the unit, so a shared q/k row keeps its sum order.
+    std::vector<int64_t> bos_of((size_t)g.N, 0), len_of((size_t)g.N, 0), slot_of((size_t)g.N, -1);
     for (int64_t n = 0; n < g.N; ++n) {
-        const int64_t bos = (int64_t)f[(size_t)rCu].value[(size_t)n];
-        const int64_t slen = (int64_t)f[(size_t)rCu].value[(size_t)(n + 1)] - bos;
-        if (slen <= 0) continue;
-        const int64_t slot = state_slot(call.rec, f, kSidx, n);
-        if (slot < 0) continue;
-        for (int64_t h = 0; h < g.H; ++h) {
+        bos_of[(size_t)n] = (int64_t)f[(size_t)rCu].value[(size_t)n];
+        len_of[(size_t)n] = (int64_t)f[(size_t)rCu].value[(size_t)(n + 1)] - bos_of[(size_t)n];
+        if (len_of[(size_t)n] <= 0) continue;
+        slot_of[(size_t)n] = state_slot(call.rec, f, kSidx, n);
+    }
+    const auto unit = [&](int64_t u) {
+        const int64_t n = u / g.Hg;
+        const int64_t hk = u % g.Hg;
+        const int64_t slot = slot_of[(size_t)n];
+        if (slot < 0) return;
+        const int64_t bos = bos_of[(size_t)n];
+        const int64_t slen = len_of[(size_t)n];
+        std::vector<double> S0, S1, qc, kc, vc, Ac, gc, bc, W, Vp, orow;
+        std::vector<double> dqc, dkc, dvc, dAc, dgc, dbc, dS0, St1;
+        std::vector<std::vector<double>> S0s;
+        const int64_t hend = (hk + 1) * g.grp < g.H ? (hk + 1) * g.grp : g.H;
+        for (int64_t h = hk * g.grp; h < hend; ++h) {
             /* Every chunk's entering state, one head at a time. The adjoint
              * needs them; the forward operands alone do not carry them. */
             S0s.clear();
@@ -533,7 +576,8 @@ void gdn_chunk_scan_host_adjoint(const AdjointCall& call) {
             }
             /* The first chunk's dS0 is h0's, and h0 is a frozen zero state. */
         }
-    }
+    };
+    parallel_for(g.N * g.Hg, kRowChunk, unit);
 }
 
 }  // namespace

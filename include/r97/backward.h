@@ -97,6 +97,17 @@ struct BackwardOptions {
     // [S*R, K] (A) / [N, S*R] (B) gradient under the record's prefix, for a caller that splits it
     // afterwards. False keeps each slot under `prefix` or `slot_prefix`.
     bool fused_slots = false;
+    // When the requested side has no row for an op, take the host side's row for it instead of
+    // refusing. The device join sets this: a device row is an optimisation, the host row is the
+    // same arithmetic in f64, and the join already pulls every operand back for the walk. The
+    // step's coverage names the ops that took the host path.
+    bool allow_host_fallback = false;
+    // The rows of a record's output that any consumer reads, when the caller proved them
+    // (r97/adjoint.h's AdjointCall::read_rows): record position -> sorted row indices. A position
+    // absent from the map is unproven, and the walk hands that record null -- unknown is never
+    // unreadable. The map outlives the walk; the join derives it from the whole tape
+    // (src/read_set.h's derive_read_sets) and points this at the walk's own list.
+    const std::map<int64_t, std::vector<int64_t>>* read_rows = nullptr;
 };
 
 // The cotangent of one of the block's inputs: a buffer the block read but never wrote. It is dense
@@ -109,13 +120,67 @@ struct InputCotangent {
     std::vector<double> value;       // row_hi * cols values, row-major
 };
 
+// One op's share of one block's walk: the adjoint row calls the walk made for it and the wall
+// time around them. A device row owns the bus inside the call -- its upload, launch and
+// download -- so the split across op names says where the block's backward seconds went.
+struct OpTiming {
+    std::string op;       // the op name the row was resolved under
+    int64_t calls = 0;    // the row calls the walk made for the op
+    double seconds = 0.0; // wall time around them
+    // Which side served them. Without it a slow op cannot be attributed: the host row is f64
+    // arithmetic that `parallel_for` spreads over the cores, the device row is a launch and a sync
+    // with the card mostly idle, and the two want opposite fixes.
+    bool host = false;
+    // The op's slots whose cotangent held a non-finite value (a NaN or an inf) when the walk was
+    // about to hand it on: one per slot, the scan stopping at the slot's first such value. A
+    // non-zero count names the op a NaN was born at instead of bisecting the step blind; the
+    // report's first_non_finite_* says which slot and whether the row produced it.
+    int64_t non_finite = 0;
+    // The two-way rule's outcome, summed over the calls (r97/adjoint.h's AdjointCall::RowCount): the
+    // rows the row left zero because the read set proves nothing reads them, the rows it
+    // differentiated, and the rows it refused because they are read and their value was not finite.
+    // A step that zeroes a live row or serves a dead one is wrong, and these are the numbers that
+    // say which happened -- 511 zeroed and 1 readable for the head's norm at 512 tokens.
+    int64_t rows_zeroed_unreadable = 0;
+    int64_t rows_readable = 0;
+    int64_t rows_refused_non_finite = 0;
+};
+
 // What the walk held at once, in bytes of tensor payload (values, not shapes or names): the
 // forward values of one op (the only snapshots the core holds itself, beside the provider the
 // caller holds), and the cotangents -- the live version store, the block-input accumulators, and
-// the cot/dc vectors of the op being adjointed.
+// the cot/dc vectors of the op being adjointed. `ops` splits the walk's time across the rows it
+// called, sorted by op name; a row the walk never reached (off the path, behind a stop) names
+// nothing.
 struct BackwardReport {
     int64_t peak_snapshot_bytes = 0;
     int64_t peak_cotangent_bytes = 0;
+    std::vector<OpTiming> ops;
+
+    // The first non-finite cotangent the walk saw in a value it was about to hand on, named so a
+    // single run attributes a NaN instead of bisecting the step blind. Empty `first_non_finite_op`
+    // means the walk saw none. The op is the name its row was resolved under (the prepared
+    // record's, when the caller prepares one); the operand is the tape's buffer name and its index
+    // in the record's schema; `first_non_finite_position` is the record's position in the step and
+    // `first_non_finite_index` the value's offset in that operand's payload. `from_row` says the
+    // row produced it; false says the walk handed it in already non-finite -- a seed, the
+    // cotangent from above, or a record later in the forward that the walk has already walked.
+    std::string first_non_finite_op;
+    std::string first_non_finite_operand;
+    int64_t first_non_finite_operand_index = -1;
+    int64_t first_non_finite_position = -1;
+    int64_t first_non_finite_index = -1;
+    bool first_non_finite_from_row = false;
+
+    // The same question asked of the forward: whether every operand value the walk read was
+    // finite. A NaN born in the forward is a different bug from one born in the walk, and a
+    // gradient is only as good as the values it differentiates. `forward_first_*` name the first
+    // operand the walk met that was not, in the walk's order (the block's last record first).
+    bool forward_all_finite = true;
+    std::string forward_first_non_finite_operand;
+    int64_t forward_first_non_finite_operand_index = -1;
+    int64_t forward_first_non_finite_position = -1;
+    int64_t forward_first_non_finite_index = -1;
 };
 
 struct BackwardResult {

@@ -19,6 +19,12 @@
 //   * the shapes the standard names: ranks 4 and 16 on the real widths, 1024 and 4096 tokens, one
 //     sequence and a batch of unequal lengths (the adapter sees a batch of unequal lengths as its
 //     total token count, so 448 + 320 + 256 is the 1024-token row at the ffn's widths);
+//   * the pool the join trains, under the walk's naming of a pool's factors (docs/BACKWARD.md
+//     "Slot names"): the record's slots name two of three pool rows, and the card's leaves match
+//     the host row's under each naming -- the fused factor the join splits afterwards, one leaf
+//     per named slot, and the one leaf the record's slots sum into -- with the row the record
+//     never names zero in the factor and leafless; and the two-row pool the engine serves, both
+//     of its rows named, under both pool namings, with the worst figures printed;
 //   * the adapter that has not moved off its start -- B = 0 -- gives dA = 0, and the harness
 //     rejects a deliberately wrong reference rather than accepting anything plausible.
 //
@@ -65,12 +71,15 @@ constexpr double kOneBf16 = 1.0 / 256.0;
 /* One site of the adapter pool as an op call: a row band of M tokens, the trunk's K in, N out,
  * rank R (the pool's packed columns), S pool rows, and the int8 trunk's scale group width.
  * `packed` is the real packing: two modules of R/2 in one pool, each row of B carrying only its
- * own module's columns's halves and zero elsewhere (docs/ADAPTER.md 2.1). */
+ * own module's columns's halves and zero elsewhere (docs/ADAPTER.md 2.1). `pooled` is the pool
+ * the join trains: S rows, one per module of a fused weight, the record's slots naming two of
+ * them and leaving the third unnamed. */
 struct Site {
     const char* name;
     const char* module;  // the PEFT module path the gradients are named after
     int64_t M, K, N, R, S, group;
     bool packed;
+    bool pooled = false;
 };
 
 const Site sites[] = {
@@ -83,6 +92,13 @@ const Site sites[] = {
     // A pool wider than a token's row of shared memory: the row comes from global memory instead,
     // and the kernel still answers.
     {"tiny_q_proj r2048", "model.layers.0.self_attn.q_proj", 5, 128, 128, 2048, 1, 128, false},
+    // The pool the join trains: three pool rows of which the record's slots name two, the third
+    // the fused factor's zero region and the per-slot naming's leafless row.
+    {"tiny_q_proj pool3 r16", "model.layers.0.self_attn.q_proj", 6, 128, 128, 16, 3, 128, false,
+     true},
+    // The pool the engine serves: two rows, one per module of a fused weight, both named.
+    {"tiny_q_proj pool2 r16", "model.layers.0.self_attn.q_proj", 6, 128, 128, 16, 2, 128, false,
+     true},
     // The real model: hidden 5120, q_proj out 12288, ffn_down in 17408, ffn_gate_up out 34816.
     {"q_proj r16 1024 tok, one sequence", "model.layers.13.self_attn.q_proj", 1024, 5120, 12288, 16,
      1, 128, false},
@@ -104,9 +120,11 @@ const Site& site_named(const char* name) {
 
 /* Row m's adapter. Row 1 is a base row spelled -1 and row 2 one spelled past the pool (S), the two
  * spellings a record uses, so the base-row rule is exercised wherever there is room for it. Real
- * rows all take the one pool row a delta layer's site carries. */
+ * rows all take the one pool row a delta layer's site carries. The pooled site names its pool rows
+ * 0 and 1 and leaves row 2 unnamed, the fused factor's zero region. */
 int32_t slot_of(const Site& s, int64_t m) {
     if (s.M > 16) return 0;
+    if (s.pooled) return m == 0 ? 0 : m == 1 ? -1 : m == 2 ? (int32_t)s.S : m == 3 ? 0 : 1;
     if (m == 1) return -1;
     if (m == 2) return (int32_t)s.S;
     return (int32_t)(m % s.S);
@@ -260,10 +278,14 @@ const Param* param_named(const ParamSet& set, const std::string& name) {
 }
 
 /* Runs both rows with a ParamSet and holds the leaves the card wrote to the host row's, entry by
- * entry. `zero_a` asks that dA be exactly zero, which is what the adapter that has not moved off
- * its start gives (B = 0 above it, so nothing asks for its input's cotangent).
+ * entry. `fused` and `slot_named` state the walk's naming of the pool's factors (the call's
+ * fused_slots and slot_prefix, docs/BACKWARD.md "Slot names"): the one factor the slots' blocks
+ * share under the prefix, or one leaf per named slot. `zero_a` asks that dA be exactly zero,
+ * which is what the adapter that has not moved off its start gives (B = 0 above it, so nothing
+ * asks for its input's cotangent).
  */
-GradReport check_grads(const Case& c, const char* prefix, bool zero_a) {
+GradReport check_grads(const Case& c, const char* prefix, bool zero_a, bool fused = false,
+                       bool slot_named = false) {
     GradReport g;
     std::string err;
     AdjointFn device = adjoint_find(c.rec.op, Side::device, c.rec.params, &err);
@@ -284,6 +306,11 @@ GradReport check_grads(const Case& c, const char* prefix, bool zero_a) {
     ParamSet device_grads;
     device_call.grads = &device_grads;
     device_call.prefix = prefix;
+    device_call.fused_slots = fused;
+    if (slot_named)
+        device_call.slot_prefix = [prefix](int64_t s) {
+            return std::string(prefix) + ".site" + std::to_string(s);
+        };
     device(device_call);
 
     // The call leaves the step's total on the card: the walk's ParamSet is untouched until the step
@@ -310,6 +337,11 @@ GradReport check_grads(const Case& c, const char* prefix, bool zero_a) {
     for (AdValue& v : host_dc) std::fill(v.value.begin(), v.value.end(), 0.0);
     ParamSet host_grads;
     AdjointCall host_call{c.rec, device_fwd, c.cot, &host_dc, &host_grads, prefix};
+    host_call.fused_slots = fused;
+    if (slot_named)
+        host_call.slot_prefix = [prefix](int64_t s) {
+            return std::string(prefix) + ".site" + std::to_string(s);
+        };
     host(host_call);
 
     if (device_grads.size() != host_grads.size()) {
@@ -521,6 +553,96 @@ void run_fixture() {
             require(g);
             std::printf("%s: gradients device == host, worst %.2g of the block\n", c.label.c_str(),
                         g.worst_rel);
+        }
+    }
+
+    // The pool the join trains, under each of the walk's namings of a pool's factors: the host
+    // row is the reference for all three, and a slot's block lands where the naming says -- the
+    // entry-by-entry comparison against the host pins it, a block written to the wrong offset
+    // fails the compare.
+    {
+        const Site& pool = site_named("tiny_q_proj pool3 r16");
+        for (const char* op : {"lora_shrink", "lora_expand"}) {
+            const Case c = make_case(pool, op, false, false);
+            const Report r = device_check::check(c);
+            device_check::require(r);
+            std::printf("%s: device == host, pool of three rows\n", c.label.c_str());
+            require(check_grads(c, pool.module, false));
+            require(check_grads(c, pool.module, false, /*fused=*/true));
+            require(check_grads(c, pool.module, false, /*fused=*/false, /*slot_named=*/true));
+            std::printf("%s: gradients device == host, default, fused and per-slot named\n",
+                        c.label.c_str());
+        }
+    }
+
+    // The step's leaves under the pool's namings, the way the walk will split them: the fused
+    // factor under the record's prefix, with the pool row the record never names zero in it, and
+    // one leaf per named slot, no leaf for the row the record does not name.
+    {
+        const Site& pool = site_named("tiny_q_proj pool3 r16");
+        const Case c = make_case(pool, "lora_shrink", false, false);
+        std::vector<AdValue> fwd, dc;
+        AdjointCall call = device_check::make_call(c, &fwd, &dc);
+        ParamSet grads;
+        call.grads = &grads;
+        call.prefix = pool.module;
+        call.fused_slots = true;
+        adjoint_find("lora_shrink", Side::device, c.rec.params, nullptr)(call);
+        R97_CHECK(device::grad_stage_flush(&grads));
+        R97_CHECK(device::grad_stage_bytes() == 0);
+        R97_CHECK(grads.size() == 1);
+        R97_CHECK(grads[0].name == std::string(pool.module) + ".lora_A");
+        R97_CHECK(grads[0].shape == std::vector<int64_t>({pool.S * pool.R, pool.K}));
+        const size_t unnamed = (size_t)2 * pool.R * pool.K;  // the pool row no token names
+        size_t zero = 0, named = 0;
+        for (size_t i = 0; i < grads[0].value.size(); ++i) {
+            if (i < unnamed) named += grads[0].value[i] != 0.0f ? 1 : 0;
+            else zero += grads[0].value[i] == 0.0f ? 1 : 0;
+        }
+        R97_CHECK(zero == (size_t)pool.R * pool.K);  // the unnamed row's block stays zero
+        R97_CHECK(named * 2 >= unnamed);             // and the named slots' blocks are filled
+        std::printf("the fused factor is [%lld, %lld] and the unnamed pool row is zero in it\n",
+                    (long long)grads[0].shape[0], (long long)grads[0].shape[1]);
+
+        std::vector<AdValue> fwd2, dc2;
+        AdjointCall named_call = device_check::make_call(c, &fwd2, &dc2);
+        ParamSet by_slot;
+        named_call.grads = &by_slot;
+        named_call.prefix = pool.module;
+        named_call.slot_prefix = [mod = pool.module](int64_t s) {
+            return std::string(mod) + ".site" + std::to_string(s);
+        };
+        adjoint_find("lora_shrink", Side::device, c.rec.params, nullptr)(named_call);
+        R97_CHECK(device::grad_stage_flush(&by_slot));
+        R97_CHECK(device::grad_stage_bytes() == 0);
+        R97_CHECK(by_slot.size() == 2);
+        const Param* s0 = param_named(by_slot, std::string(pool.module) + ".site0.lora_A");
+        const Param* s1 = param_named(by_slot, std::string(pool.module) + ".site1.lora_A");
+        R97_CHECK(s0 && s1);
+        R97_CHECK(s0->shape == std::vector<int64_t>({pool.R, pool.K}));
+        R97_CHECK(s1->shape == std::vector<int64_t>({pool.R, pool.K}));
+        R97_CHECK(param_named(by_slot, std::string(pool.module) + ".site2.lora_A") == nullptr);
+        require_filled(by_slot);
+        std::printf("the per-slot naming makes one leaf per named slot and none for the rest\n");
+    }
+
+    // The two-row pool the engine serves, under both of the walk's pool namings: the card's
+    // cotangents and gradients against the host rows' over the same values, the figures the doc
+    // quotes.
+    {
+        const Site& pool = site_named("tiny_q_proj pool2 r16");
+        for (const char* op : {"lora_shrink", "lora_expand"}) {
+            const Case c = make_case(pool, op, false, false);
+            const Report r = device_check::check(c);
+            device_check::require(r);
+            const GradReport fused_g = check_grads(c, pool.module, false, /*fused=*/true);
+            require(fused_g);
+            const GradReport slot_g =
+                check_grads(c, pool.module, false, /*fused=*/false, /*slot_named=*/true);
+            require(slot_g);
+            std::printf("%s: device == host, two-row pool; gradients fused worst %.2g, per-slot "
+                        "worst %.2g of the block's largest\n",
+                        c.label.c_str(), fused_g.worst_rel, slot_g.worst_rel);
         }
     }
 

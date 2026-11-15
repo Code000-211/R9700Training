@@ -82,6 +82,9 @@ public:
     using IssueHook = std::function<void(const Tape& tape, const OpRecord& op,
                                          const std::vector<OperandContent>& operands)>;
     void set_issue_hook(IssueHook hook);
+    // The hook a later set would replace. A reader that must also see every issue -- a diagnostic
+    // that cannot take the recorder's one slot -- reads this and wraps it rather than replacing it.
+    const IssueHook& issue_hook() const { return issue_hook_; }
 
     const std::vector<OpRecord>& ops() const { return ops_; }
     const std::vector<Block>& blocks() const { return blocks_; }

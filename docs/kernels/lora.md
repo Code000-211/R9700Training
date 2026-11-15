@@ -76,6 +76,9 @@ buffer with `atomicAdd` — the staging is zeroed first, which is what lets a gr
 `shrink_da_kernel` is `dA[j, k] = sum_{m valid} cot_t[m, j] · x[m, k]`: one thread per column,
 its R row sums in a register array (`kMaxJ` at a time, so any `R` works), a chunk of 64 token rows
 per block, and `atomicAdd` into an f32 staging buffer for the chunks that share a column.
+The row launches it once per pool row it names, filtering the tokens to that row's, so a launch
+writes only the rows its slot's own — a slot's own leaf, its block of the fused factor, or the
+shared leaf the record's slots sum into — and never another slot's.
 
 `expand_dt_kernel` is the cotangent of the expand's input:
 
@@ -85,6 +88,9 @@ per block, and `atomicAdd` into an f32 staging buffer for the chunks that share 
 
     dB[n, j] = sum_{m valid} cot_y[m, n] * scale[s, n] * t[m, j]
 
+The row launches it once per pool row it names, into that slot's columns of the buffer (`cols` of
+them per row, the slot's block of the fused factor when the call has one).
+
 `shrink_da_kernel` and `expand_db_kernel` write into the *step's* accumulator rather than into a
 buffer of the call's: the shrink's `atomicAdd` and the expand's one-thread-per-entry add both
 accumulate into the f32 buffer `grad_stage.h` holds for that leaf, so a later call of the same step
@@ -93,10 +99,18 @@ between them.
 
 ## The gradients
 
-`dA` is the leaf `<prefix>.lora_A`, shape `{R, K}`; `dB` is `<prefix>.lora_B`, shape `{N, R}`.
-Those are the names and shapes the host rows use (`docs/adjoints/lora.md` §4), and each token's
-contribution lands in its own pool row's block — for the model's pools, which have one slot, that
-is the whole leaf.
+The leaves are named and shaped the way the host rows name them for the walk's naming of the
+pool's factors (`docs/adjoints/lora.md` §3.1 for the record's prefix, `docs/BACKWARD.md` "Slot
+names" for the two pool namings):
+
+| the call gives | the leaves, per op | where a token's contribution lands |
+|---|---|---|
+| the record's `prefix` | `<prefix>.lora_A` `{R, K}`, `<prefix>.lora_B` `{N, R}` | the one leaf the pool's slots sum into |
+| `fused_slots` | `<prefix>.lora_A` `{S*R, K}`, `<prefix>.lora_B` `{N, S*R}` | its pool row's block: the slot's `s*R` rows of A, its `s*R` columns of B — one factor the caller splits afterwards |
+| `slot_prefix` | `<slot_prefix(s)>.lora_A` `{R, K}`, `<slot_prefix(s)>.lora_B` `{N, R}` | the slot's own leaf, one per pool row the record's rows name |
+
+A pool row the record's rows never name gets nothing of its own: its block of a fused factor
+stays zero, and the per-slot naming makes no leaf for it.
 
 The step's sum runs on the card, and the leaf stays off it. `dA` and `dB` are host memory by the
 contract (`include/r97/params.h`), so a row that copied a call's sum into the leaf when the call
@@ -113,10 +127,12 @@ other way to end a step, for a walk whose gradients nobody wants. Both belong to
 the row: the stage's lifetime is the step's, so a walk that ends no step would have the next step's
 first call add to the old total.
 
-The staging costs the card `4 · R · K` and `4 · N · R` bytes — 320 KiB and 768 KiB for the model's
-`q_proj` at rank 16 — and that is the same for every call of the step. It is not the call's scratch:
-a call's scratch is freed when the call ends, while the stage lives until the step does, so it has
-its own count rather than a line in the scratch ledger.
+The staging costs the card `4` times each leaf's factor — `4 · R · K` and `4 · N · R` under the
+record's prefix (320 KiB and 768 KiB for the model's `q_proj` at rank 16), `4 · S*R*K` and
+`4 · N*S*R` for the fused factor, and one of the first pair per named slot — and that is the same
+for every call of the step. It is not the call's scratch: a call's scratch is freed when the call
+ends, while the stage lives until the step does, so it has its own count rather than a line in the
+scratch ledger.
 
 With `B = 0` — the adapter at its start (`docs/ADAPTER.md` §4) — nothing above the expand asks
 for its input's cotangent, so `dt` is zero, and the shrink, handed that zero, gives `dA = 0`. `dB`
@@ -161,11 +177,16 @@ and 4 with 1024 and 4096 tokens, `down_proj` (K 17408, N 5120) with a batch of u
 448 + 320 + 256, which the adapter sees as its total token count of 1024, since it has no
 per-sequence structure — and `ffn_gate_up` (N 34816, rank 32: two modules of 16 in one pool, with
 the zero regions `docs/ADAPTER.md` §2 describes).
+The fixture also carries the pool the join trains — three pool rows of which the record's slots
+name two — checked under each of the walk's namings of a pool's factors against the host row
+(`docs/BACKWARD.md` "Slot names").
 
 It also asserts the teeth: `dA` is named, shaped and filled in (not zero by accident); a step's
 tokens in two calls leave the `ParamSet` untouched until the walk ends it, put one accumulator on
 the card (the second call does not make a second one) and come out as twice the one-call step, to
-within that step's one rounding; a `lora_shrink` record of the float trunk
+within that step's one rounding; the fused factor comes out under the record's prefix with the
+pool row the record never names zero in it, and the per-slot naming makes one leaf per named
+slot, no leaf for the row the record does not name; a `lora_shrink` record of the float trunk
 (`dtype` with no `a_scale`) has no device row; a deliberately wrong reference that drops the coded
 record's scale is rejected rather than accepted; and with `B = 0`, `dt` and `dA` are exactly zero
 while `dB` is filled.

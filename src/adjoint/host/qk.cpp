@@ -2,12 +2,19 @@
 // every formula; this file is the executable form of that note.
 #include "qk.h"
 
+#include "parallel.h"
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
 namespace r97::adjoint::qk {
 namespace {
+
+// The unit the parallel for cuts a token loop into (a call with fewer tokens than this stays on the
+// calling thread). A token owns one row of the rope operand, or one row of the pool cotangent's
+// token side, so the partition writes nothing a neighbour reads.
+constexpr int64_t kTokenChunk = 2;
 
 void require(bool condition, const char* what) {
     if (!condition) throw std::invalid_argument(what);
@@ -79,7 +86,7 @@ void rope_forward_f64(const double* qkv, const int32_t* positions, const RopeSha
     if (shape.tokens == 0 || row == 0) return;
 
     const int64_t half = shape.rotary_dim / 2;
-    for (int64_t t = 0; t < shape.tokens; ++t) {
+    parallel_for(shape.tokens, kTokenChunk, [&](int64_t t) {
         const int64_t p = positions[t];
         require(p >= 0 && p < table.rows, "qk: rope position outside the table");
         const double* cs = table.at(p);
@@ -101,7 +108,7 @@ void rope_forward_f64(const double* qkv, const int32_t* positions, const RopeSha
         for (int64_t h = rotated_heads; h < shape.n_head + 2 * shape.n_head_kv; ++h)
             for (int64_t i = 0; i < shape.head_dim; ++i)
                 out[base + h * shape.head_dim + i] = qkv[base + h * shape.head_dim + i];
-    }
+    });
 }
 
 void rope_adjoint_f64(const double* d_out, const int32_t* positions, const RopeShape& shape,
@@ -114,7 +121,7 @@ void rope_adjoint_f64(const double* d_out, const int32_t* positions, const RopeS
     if (shape.tokens == 0 || row == 0) return;
 
     const int64_t half = shape.rotary_dim / 2;
-    for (int64_t t = 0; t < shape.tokens; ++t) {
+    parallel_for(shape.tokens, kTokenChunk, [&](int64_t t) {
         const int64_t p = positions[t];
         require(p >= 0 && p < table.rows, "qk: rope position outside the table");
         const double* cs = table.at(p);
@@ -136,7 +143,7 @@ void rope_adjoint_f64(const double* d_out, const int32_t* positions, const RopeS
         for (int64_t h = rotated_heads; h < shape.n_head + 2 * shape.n_head_kv; ++h)
             for (int64_t i = 0; i < shape.head_dim; ++i)
                 d_qkv[base + h * shape.head_dim + i] = d_out[base + h * shape.head_dim + i];
-    }
+    });
 }
 
 // ------------------------------------------------------------------ kv_store
@@ -156,9 +163,18 @@ void kv_store_forward_f64(const double* k, const double* v, const int32_t* slot,
     require(k && v && slot && pool, "qk: null kv_store buffer");
     const int64_t head_values = checked_mul(shape.kv_heads, shape.head_dim);
     const int64_t slots = checked_mul(shape.n_blocks, shape.block_size);
-    for (int64_t t = 0; t < shape.tokens; ++t) {
+    // A token writes the pool row its slot names, so two tokens that name one slot write the same
+    // row and the record's own order decides which survives. The pass splits over tokens only when
+    // the slots are distinct; a record that repeats one keeps the serial order that defines it.
+    std::vector<int32_t> seen;
+    seen.reserve((size_t)shape.tokens);
+    for (int64_t t = 0; t < shape.tokens; ++t)
+        if (slot[t] >= 0) seen.push_back(slot[t]);
+    std::sort(seen.begin(), seen.end());
+    const bool distinct = std::adjacent_find(seen.begin(), seen.end()) == seen.end();
+    const auto copy_token = [&](int64_t t) {
         const int64_t s = slot[t];
-        if (s < 0) continue;
+        if (s < 0) return;
         require(s < slots, "qk: kv_store slot outside the pool");
         const int64_t row = t * head_values;
         for (int64_t h = 0; h < shape.kv_heads; ++h) {
@@ -169,6 +185,11 @@ void kv_store_forward_f64(const double* k, const double* v, const int32_t* slot,
                 pool[base + shape.head_dim + d] = v[src + d];
             }
         }
+    };
+    if (distinct) {
+        parallel_for(shape.tokens, kTokenChunk, copy_token);
+    } else {
+        for (int64_t t = 0; t < shape.tokens; ++t) copy_token(t);
     }
 }
 
@@ -180,9 +201,9 @@ void kv_store_adjoint_f64(const double* d_pool, const int32_t* slot, const KvSto
     const int64_t slots = checked_mul(shape.n_blocks, shape.block_size);
     std::fill(d_k, d_k + checked_mul(shape.tokens, head_values), 0.0);
     std::fill(d_v, d_v + checked_mul(shape.tokens, head_values), 0.0);
-    for (int64_t t = 0; t < shape.tokens; ++t) {
+    parallel_for(shape.tokens, kTokenChunk, [&](int64_t t) {
         const int64_t s = slot[t];
-        if (s < 0) continue;
+        if (s < 0) return;  // a padded row: no cotangent
         require(s < slots, "qk: kv_store slot outside the pool");
         const int64_t row = t * head_values;
         for (int64_t h = 0; h < shape.kv_heads; ++h) {
@@ -194,7 +215,7 @@ void kv_store_adjoint_f64(const double* d_pool, const int32_t* slot, const KvSto
                 d_v[dst + d] += d_pool[base + shape.head_dim + d];
             }
         }
-    }
+    });
 }
 
 // ------------------------------------------------------------------ the gate

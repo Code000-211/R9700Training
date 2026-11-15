@@ -281,7 +281,8 @@ void elementwise_test() {
 /* A record the op cannot compute is refused on both sides: the twin writes no value and the
  * adjoint adds nothing to any read operand's cotangent. A guard that stops refusing fails here
  * instead of passing quietly. */
-void expect_refusal(const OpRecord& rec, const Case& v, const char* why) {
+void expect_refusal(const OpRecord& rec, const Case& v, const char* why,
+                    bool adjoint_refuses = false) {
     std::string err;
     const TwinFn twin = twin_find(rec.op, rec.params, &err);
     const AdjointFn adj = adjoint_find(rec.op, Side::host, rec.params, &err);
@@ -312,16 +313,33 @@ void expect_refusal(const OpRecord& rec, const Case& v, const char* why) {
         for (double& x : cot.back().value) x = urand(&seed);
     }
     const AdjointCall call{rec, fwd, cot, &dc, nullptr, "test"};
-    adj(call);
+    // A record the op cannot compute is refused, not passed quietly: where the guard covers the
+    // adjoint too, the row refuses by name (rmsnorm's gain is the case below) and the caller asks
+    // for that with `adjoint_refuses`. Everywhere else the adjoint still runs and must leave the
+    // reads untouched -- a silent zero on a read's cotangent is the failure this checks.
+    bool threw = false;
+    try {
+        adj(call);
+    } catch (const std::exception& e) {
+        if (!adjoint_refuses)
+            throw std::runtime_error(std::string(rec.op) + " refuses " + why +
+                                     ": the adjoint threw where it must leave the reads untouched: " +
+                                     e.what());
+        threw = true;
+    }
 
     double moved = 0.0;
     for (size_t i = 0; i < rec.operands.size(); ++i)
         if (!rec.operands[i].written)
             for (double x : dc[i].value) moved += std::fabs(x);
 
-    std::printf("%s refuses %s: %zu of %zu values written, |dc| %g\n", rec.op.c_str(), why,
-                produced.size(), v.out.size(), moved);
+    std::printf("%s refuses %s: %zu of %zu values written, |dc| %g, adjoint %s\n", rec.op.c_str(),
+                why, produced.size(), v.out.size(), moved, threw ? "refused" : "ran");
     R97_CHECK(produced.empty());
+    if (adjoint_refuses) {
+        R97_CHECK(threw);
+        return;
+    }
     R97_CHECK(moved == 0.0);
 }
 
@@ -352,7 +370,10 @@ void refusals_test() {
         const OpRecord rec = rmsnorm_rec(s, "bf16", "f32", "1", "1");
         Case v = make_case(rec, 0x5eed);
         v.in[1].value.clear();
-        expect_refusal(rec, v, "wadd without a gain");
+        // The gain's values are gone: the twin writes nothing, and the adjoint refuses by name
+        // rather than leaving the input's cotangent at zero (a silent zero where the analytic
+        // answer is not zero -- the class of bug this whole path exists to make loud).
+        expect_refusal(rec, v, "wadd without a gain", /*adjoint_refuses=*/true);
     }
 
     /* `mul`'s one broadcast rule refused, on the twin's side only: a `b` that is neither all of a

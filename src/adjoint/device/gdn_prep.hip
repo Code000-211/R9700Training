@@ -261,7 +261,12 @@ __global__ void conv_acc_kernel(const float* x, const float* w, const float* bia
 /* Phase 2: q and k through the l2 norm, one block per (token, head). With u the pre-norm value and
  * inv = rsqrt(ss + eps), du_d = inv*dout_d - inv^3*u_d*dot, and the silu between it and the conv
  * row scales it by silu'(acc). Every channel of the conv row belongs to exactly one of q, k and v,
- * so the phases store into dacc rather than adding to it. */
+ * so the phases store into dacc rather than adding to it.
+ *
+ * `ss` and `dot` are f64, as the host twin carries them (host/gdn_prep.cpp:386-387): `dout` is a
+ * cotangent that reaches 1e35..1e38 by block 51 of the real container, and over K=128 an f32 sum
+ * crosses 3.4e38 above a mean term of 2.7e36. A width the reference does not have is a
+ * divergence, not a tolerance. */
 __global__ void l2_backward_kernel(const float* acc, const float* dout, float* dacc, int64_t Hg,
                                    int64_t K, int64_t conv_dim, int64_t chan0, float eps) {
     const int64_t b = (int64_t)blockIdx.x;
@@ -269,18 +274,18 @@ __global__ void l2_backward_kernel(const float* acc, const float* dout, float* d
     const int64_t h = b - row * Hg;
     const int tid = (int)threadIdx.x;
     const int nthr = (int)blockDim.x;
-    extern __shared__ float sh[];
-    float* s_ss = sh;
-    float* s_dot = sh + nthr;
+    extern __shared__ char sh_raw[];
+    double* s_ss = reinterpret_cast<double*>(sh_raw);
+    double* s_dot = s_ss + nthr;
 
     const int64_t base = row * conv_dim + chan0 + h * K;
     const int64_t obase = (row * Hg + h) * K;
-    float ss = 0.0f;
-    float dot = 0.0f;
+    double ss = 0.0;
+    double dot = 0.0;
     for (int64_t d = tid; d < K; d += nthr) {
-        const float u = siluf(acc[base + d]);
+        const double u = (double)siluf(acc[base + d]);
         ss += u * u;
-        dot += u * dout[obase + d];
+        dot += u * (double)dout[obase + d];
     }
     s_ss[tid] = ss;
     s_dot[tid] = dot;
@@ -292,14 +297,14 @@ __global__ void l2_backward_kernel(const float* acc, const float* dout, float* d
         }
         __syncthreads();
     }
-    const float inv = rsqrtf(s_ss[0] + eps);
-    const float inv3 = inv * inv * inv;
-    const float all = s_dot[0];
+    const double inv = 1.0 / sqrt(s_ss[0] + (double)eps);
+    const double inv3 = inv * inv * inv;
+    const double all = s_dot[0];
     for (int64_t d = tid; d < K; d += nthr) {
         const int64_t i = base + d;
-        const float u = siluf(acc[i]);
-        const float du = inv * dout[obase + d] - inv3 * u * all;
-        dacc[i] = du * silu_gradf(acc[i]);
+        const double u = (double)siluf(acc[i]);
+        const double du = inv * (double)dout[obase + d] - inv3 * u * all;
+        dacc[i] = (float)(du * (double)silu_gradf(acc[i]));
     }
 }
 
@@ -515,11 +520,11 @@ void gdn_conv_prep_device_adjoint(const AdjointCall& call) {
         while ((int64_t)blk < g.K && blk < 512) blk <<= 1;
         const int64_t l2_blocks = g.T * g.Hg;
         hipLaunchKernelGGL(l2_backward_kernel, dim3((unsigned int)l2_blocks), dim3((unsigned)blk),
-                           (size_t)(2 * blk) * sizeof(float), (hipStream_t)stream,
+                           (size_t)(2 * blk) * sizeof(double), (hipStream_t)stream,
                            (const float*)d_acc.p, (const float*)d_dq.p, (float*)d_dacc.p, g.Hg,
                            g.K, g.conv_dim, (int64_t)0, kL2Eps);
         hipLaunchKernelGGL(l2_backward_kernel, dim3((unsigned int)l2_blocks), dim3((unsigned)blk),
-                           (size_t)(2 * blk) * sizeof(float), (hipStream_t)stream,
+                           (size_t)(2 * blk) * sizeof(double), (hipStream_t)stream,
                            (const float*)d_acc.p, (const float*)d_dk.p, (float*)d_dacc.p, g.Hg,
                            g.K, g.conv_dim, g.Hg * g.K, kL2Eps);
         const int64_t v_total = g.T * g.H * g.V;
@@ -625,28 +630,36 @@ void gdn_conv_prep_device_adjoint(const AdjointCall& call) {
 
 /* One block per row. sc = rsqrt(mean(x^2) + eps) needs the row's sum of squares and dx needs
  *   A = sum_e (x_e * w_e * g(z_e) * do_e),
- * both reductions in f32, then the row is written once:
- *   dx_i = w_i*g(z_i)*sc*do_i - x_i*sc^3/ch*A,   dz_i = do_i*x_i*sc*w_i*g'(z_i). */
+ * both carried in f64, then the row is written once:
+ *   dx_i = w_i*g(z_i)*sc*do_i - x_i*sc^3/ch*A,   dz_i = do_i*x_i*sc*w_i*g'(z_i).
+ *
+ * The two reductions are f64 for the reason `rmsnorm_back_kernel` is (device/quant.hip:248-290):
+ * the host twin accumulates `double ss, dot` (host/gdn_prep.cpp:543-544) over the same 5120
+ * columns, and `d_o` -- `gdn_o`'s cotangent -- reaches 1e35..1e38 by block 51 of the real
+ * container. An f32 `dot` crosses 3.4e38 there and an f64 one does not, so the width is a
+ * device-versus-reference divergence, not a tolerance. `ss` rides the same reduction because
+ * the shared term uses `sc^3`. The operands stay the f32 ones the record carries, so the sum
+ * differs from the host's only in its width. */
 __global__ void gated_rmsnorm_adjoint_kernel(const float* x, const float* z, const float* w,
                                              const float* d_o, unsigned short* dx,
                                              unsigned short* dz, int64_t ch, int sig, float eps) {
     const int64_t row = (int64_t)blockIdx.x;
     const int tid = (int)threadIdx.x;
     const int nthr = (int)blockDim.x;
-    extern __shared__ float sh[];
-    float* s_ss = sh;
-    float* s_dot = sh + nthr;
+    extern __shared__ char sh_raw[];
+    double* s_ss = reinterpret_cast<double*>(sh_raw);
+    double* s_dot = s_ss + nthr;
     const int64_t base = row * ch;
 
-    float ss = 0.0f;
-    float dot = 0.0f;
+    double ss = 0.0;
+    double dot = 0.0;
     for (int64_t i = tid; i < ch; i += nthr) {
         const int64_t e = base + i;
-        const float xv = x[e];
+        const double xv = (double)x[e];
         const float zv = z[e];
-        const float gate = sig ? sigmoidf(zv) : siluf(zv);
+        const double gate = (double)(sig ? sigmoidf(zv) : siluf(zv));
         ss += xv * xv;
-        dot += xv * d_o[e] * w[i] * gate;
+        dot += xv * (double)d_o[e] * (double)w[i] * gate;
     }
     s_ss[tid] = ss;
     s_dot[tid] = dot;
@@ -658,19 +671,19 @@ __global__ void gated_rmsnorm_adjoint_kernel(const float* x, const float* z, con
         }
         __syncthreads();
     }
-    const float sc = rsqrtf(s_ss[0] / (float)ch + eps);
-    const float all = s_dot[0];
-    const float inv_ch = 1.0f / (float)ch;
+    const double sc = 1.0 / sqrt(s_ss[0] / (double)ch + (double)eps);
+    const double all = s_dot[0];
+    const double inv_ch = 1.0 / (double)ch;
     for (int64_t i = tid; i < ch; i += nthr) {
         const int64_t e = base + i;
-        const float xv = x[e];
+        const double xv = (double)x[e];
         const float zv = z[e];
-        const float wi = w[i];
+        const double wi = (double)w[i];
         const float gate = sig ? sigmoidf(zv) : siluf(zv);
-        const float dgate = sig ? gate * (1.0f - gate) : silu_gradf(zv);
-        const float do_e = d_o[e];
-        dx[e] = f32_to_bf16(wi * gate * sc * do_e - xv * sc * sc * sc * inv_ch * all);
-        dz[e] = f32_to_bf16(do_e * xv * sc * wi * dgate);
+        const double dgate = (double)(sig ? gate * (1.0f - gate) : silu_gradf(zv));
+        const double do_e = (double)d_o[e];
+        dx[e] = f32_to_bf16((float)(wi * gate * sc * do_e - xv * sc * sc * sc * inv_ch * all));
+        dz[e] = f32_to_bf16((float)(do_e * xv * sc * wi * dgate));
     }
 }
 
@@ -716,7 +729,7 @@ void gdn_gated_rmsnorm_device_adjoint(const AdjointCall& call) {
     const int sig = str_param(rec, "act", "silu") == "sigmoid" ? 1 : 0;
     const unsigned blk = 256;
     hipLaunchKernelGGL(gated_rmsnorm_adjoint_kernel, dim3((unsigned int)rows), dim3(blk),
-                       (size_t)(2 * blk) * sizeof(float), (hipStream_t)stream,
+                       (size_t)(2 * blk) * sizeof(double), (hipStream_t)stream,
                        (const float*)d_x.p, (const float*)d_z.p, (const float*)d_w.p,
                        (const float*)d_do.p, (unsigned short*)d_dx.p, (unsigned short*)d_dz.p, ch,
                        sig, kRmsEps);

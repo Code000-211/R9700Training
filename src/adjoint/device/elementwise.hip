@@ -29,6 +29,12 @@
 // The contract gives a device adjoint f64 operands, not device buffers, so this call owns every
 // device buffer it touches. They are scratch, freed before it returns; the harness reports the
 // high-water mark.
+//
+// The rmsnorm row applies the two-way rule (r97/adjoint.h's AdjointCall::read_rows): a row no
+// consumer reads is left zero and counted, a row a consumer reads is differentiated and refuses if
+// its activation is not finite, and a row handed no set counts nothing. The rule lives here as
+// well as on the host and in quant.hip's Part::rmsnorm because the head's final norm is this op:
+// the plain `rmsnorm`, not the fused producer.
 #include "r97/adjoint.h"
 
 #include "scratch.h"
@@ -240,22 +246,29 @@ __global__ void act_mul_adjoint_kernel(const float* a, const float* b, const flo
     b_dc.set(i, d * act_value(act, a[i]));
 }
 
-// One pass over the row sums both x^2 (the rms) and dy*x*c (the shared term), in f32; the row's
-// gain is formed here, at f32, before the store's one rounding.
+// One pass over the row sums both x^2 (the rms) and dy*x*c (the shared term); the row's gain is
+// formed here before the store's one rounding.
+//
+// Both sums are f64 for the reason `rmsnorm_back_kernel` is (device/quant.hip:248-290): the host
+// twin accumulates `double ss` and `double t` over the same row (host/elementwise.cpp:480-487),
+// and the cotangent this row is handed reaches 1e35..1e38 by block 51 of the real container. An
+// f32 `tt` over 5120 terms crosses 3.4e38 there and an f64 one does not, so the width is a
+// device-versus-reference divergence, not a tolerance. `ss` rides the same reduction because the
+// shared term uses `s^3`. The operands stay the f32 ones the record carries.
 __global__ void rmsnorm_adjoint_kernel(const float* x, const float* w, const float* y_cot,
                                        OutStore x_dc, int64_t n, float eps, float wadd, float mult) {
-    __shared__ float sum_sq[256];
-    __shared__ float sum_t[256];
+    __shared__ double sum_sq[256];
+    __shared__ double sum_t[256];
     const int64_t row = blockIdx.x;
     const int64_t base = row * n;
     const int t = (int)threadIdx.x;
     const int str = (int)blockDim.x;
-    float ss = 0.0f, tt = 0.0f;
+    double ss = 0.0, tt = 0.0;
     for (int64_t i = t; i < n; i += str) {
-        const float xi = x[base + i];
-        const float c = w ? w[i] + wadd : 1.0f;
+        const double xi = (double)x[base + i];
+        const double c = w ? (double)w[i] + (double)wadd : 1.0;
         ss += xi * xi;
-        tt += y_cot[base + i] * xi * c;
+        tt += (double)y_cot[base + i] * xi * c;
     }
     sum_sq[t] = ss;
     sum_t[t] = tt;
@@ -267,15 +280,16 @@ __global__ void rmsnorm_adjoint_kernel(const float* x, const float* w, const flo
         }
         __syncthreads();
     }
-    const float inv_n = 1.0f / (float)n;
-    const float s = rsqrtf(sum_sq[0] * inv_n + eps);
-    const float t_shared = sum_t[0];
-    const float s3 = s * s * s;
+    const double inv_n = 1.0 / (double)n;
+    const double s = 1.0 / sqrt(sum_sq[0] * inv_n + (double)eps);
+    const double t_shared = sum_t[0];
+    const double s3 = s * s * s;
+    const double mult_d = (double)mult;
     for (int64_t i = t; i < n; i += str) {
-        const float xi = x[base + i];
-        const float c = w ? w[i] + wadd : 1.0f;
-        const float shared = s3 * xi * t_shared * inv_n;
-        x_dc.set(base + i, mult * (s * c * y_cot[base + i] - shared));
+        const double xi = (double)x[base + i];
+        const double c = w ? (double)w[i] + (double)wadd : 1.0;
+        const double shared = s3 * xi * t_shared * inv_n;
+        x_dc.set(base + i, (float)(mult_d * (s * c * (double)y_cot[base + i] - shared)));
     }
 }
 
@@ -377,6 +391,37 @@ bool download_add(AdValue& slot, const void* d, int64_t n, RadStream s) {
     if (rad_memcpy_async(h.data(), d, bytes, s) != 0) return false;
     if (rad_stream_sync(s) != 0) return false;
     for (int64_t i = 0; i < n; ++i) slot.value[(size_t)i] += (double)bf16_to_f32(h[(size_t)i]);
+    return true;
+}
+
+/* Adds a kernel's result back into the tape, row by row: a row the read set does not admit is
+ * skipped, so the value the kernel left there -- an artefact of the formula over a row nothing
+ * reads -- never reaches the cotangent. A null or empty set admits every row, exactly as
+ * row_readable says, so the unfiltered path is the same loop. */
+bool download_add_rows(AdValue& slot, const void* d, int64_t rows, int64_t n, RadStream s,
+                       const std::vector<int64_t>* read_rows) {
+    if (rows <= 0 || n <= 0) return true;
+    const int64_t count = rows * n;
+    if (slot.dtype == "f32") {
+        std::vector<float> h((size_t)count);
+        if (rad_memcpy_async(h.data(), d, f32_bytes(count), s) != 0) return false;
+        if (rad_stream_sync(s) != 0) return false;
+        for (int64_t r = 0; r < rows; ++r) {
+            if (!row_readable(read_rows, r)) continue;
+            for (int64_t i = 0; i < n; ++i)
+                slot.value[(size_t)(r * n + i)] += (double)h[(size_t)(r * n + i)];
+        }
+        return true;
+    }
+    std::vector<unsigned short> h((size_t)count);
+    const int64_t bytes = count * (int64_t)sizeof(unsigned short);
+    if (rad_memcpy_async(h.data(), d, bytes, s) != 0) return false;
+    if (rad_stream_sync(s) != 0) return false;
+    for (int64_t r = 0; r < rows; ++r) {
+        if (!row_readable(read_rows, r)) continue;
+        for (int64_t i = 0; i < n; ++i)
+            slot.value[(size_t)(r * n + i)] += (double)bf16_to_f32(h[(size_t)(r * n + i)]);
+    }
     return true;
 }
 
@@ -617,6 +662,37 @@ void rmsnorm_device_adjoint(const AdjointCall& call) {
     AdValue& x_dc = call.dc->at(0);
     if ((int64_t)x_dc.value.size() < rows * n) return;
 
+    // The two-way rule (r97/adjoint.h's AdjointCall::read_rows): a row a consumer reads is
+    // differentiated, and a non-finite activation in it refuses -- the analytic `0 * inf` over a
+    // live row is a bug, not a gradient. A row no consumer reads is provably dead, so it is left
+    // zero and counted: the zero is the correct cotangent for a value nothing reads. When the
+    // caller could not prove the read set every row is readable, and the refusal is what it was
+    // before the read set existed. This row is the plain `rmsnorm` the head's final norm is (the
+    // fused `rmsnorm_had_quant_i8g` producer is quant.hip's Part::rmsnorm): without it the head's
+    // norm never consulted the set, so the 512 step's counters read 0/0/0 whether the rule fired
+    // or not and a forward inf in a row no consumer reads reached every gradient.
+    int64_t zeroed = 0, admitted = 0, refused = 0;
+    for (int64_t r = 0; r < rows; ++r) {
+        if (!row_readable(call, r)) {
+            ++zeroed;
+            continue;
+        }
+        ++admitted;
+        const int64_t b = r * n;
+        double ss = 0.0;
+        for (int64_t i = 0; i < n && std::isfinite(ss); ++i)
+            ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
+        if (!std::isfinite(ss)) ++refused;
+    }
+    count_read_rows(call.row_count, call.read_rows, zeroed, admitted, refused);
+    if (refused > 0)
+        throw std::runtime_error(
+            "r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +
+            std::to_string(call.rec.position) + ": " + std::to_string(refused) + " of " +
+            std::to_string(admitted) +
+            " rows a consumer reads have a non-finite activation; refusing rather than zeroing a "
+            "live row's gradient");
+
     RadStream stream = adjoint_stream();
     if (!stream) return;
 
@@ -632,7 +708,7 @@ void rmsnorm_device_adjoint(const AdjointCall& call) {
                        (hipStream_t)stream, (const float*)d_x.p,
                        w ? (const float*)d_w.p : nullptr, (const float*)d_y_cot.p,
                        store_in(x_dc, d_x_dc.p), n, eps, wadd, mult);
-    download_add(x_dc, d_x_dc.p, rows * n, stream);
+    download_add_rows(x_dc, d_x_dc.p, rows, n, stream, call.read_rows);
 }
 
 }  // namespace

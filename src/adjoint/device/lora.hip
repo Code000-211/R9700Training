@@ -29,7 +29,10 @@
 // kernel adds dA and dB into the step's f32 accumulators on the card (grad_stage.h), over every
 // token of every call of the step, and touches no leaf of the ParamSet. The step's total leaves the
 // card when the walk ends it, rounded once to bf16 -- the dtype a gradient has on the card -- by
-// grad_stage_flush.
+// grad_stage_flush. The leaves are named and shaped the way the host rows name them for the call's
+// naming of the pool's factors (grad_dest below, docs/BACKWARD.md "Slot names"): one factor the
+// pool rows' blocks share under the prefix, one leaf per named pool row, or the one leaf the
+// record's rows sum into.
 //
 // What the caller hands each call (the record's operand order, reads first):
 //
@@ -111,6 +114,45 @@ std::string grad_name(const char* prefix, const char* leaf) {
     return std::string(prefix) + "." + leaf;
 }
 
+// The slot's trainable factor goes under the record's fused name when the caller splits a fused
+// factor afterwards, under the slot's module when the walk names modules, and under the record's
+// prefix otherwise. The host rows of docs/adjoints/lora.md name it the same way.
+std::string factor_grad_name(const AdjointCall& call, const char* leaf, int64_t slot) {
+    if (call.fused_slots) return grad_name(call.prefix, leaf);
+    if (call.slot_prefix) return grad_name(call.slot_prefix(slot).c_str(), leaf);
+    return grad_name(call.prefix, leaf);
+}
+
+// The step's accumulator a pool row's rows land in, one per pool row: the row's block of the
+// fused factor, the row's own leaf, or the one leaf the record's rows sum into. A pool row the
+// record's rows never name gets no accumulator -- the host rows make no leaf for it, and the
+// step's flush would make one out of the stage. `stride` is the distance in elements between two
+// pool rows' blocks of the fused factor (R*K for A, R for B); 0 outside the fused naming. A slot
+// the step's stage refused comes out nullptr, and the row's launch skips it.
+std::vector<float*> grad_dest(const AdjointCall& call, const char* leaf, int64_t S,
+                              const std::vector<char>& present, const std::vector<int64_t>& shape,
+                              int64_t stride) {
+    std::vector<float*> dest((size_t)S, nullptr);
+    if (!call.grads) return dest;
+    if (call.fused_slots) {
+        float* base = device::grad_stage_slot(factor_grad_name(call, leaf, 0), shape);
+        for (int64_t s = 0; base && s < S; ++s)
+            if (present[(size_t)s]) dest[(size_t)s] = base + (size_t)s * (size_t)stride;
+        return dest;
+    }
+    if (call.slot_prefix) {
+        for (int64_t s = 0; s < S; ++s) {
+            if (!present[(size_t)s]) continue;
+            dest[(size_t)s] = device::grad_stage_slot(factor_grad_name(call, leaf, s), shape);
+        }
+        return dest;
+    }
+    float* base = device::grad_stage_slot(factor_grad_name(call, leaf, 0), shape);
+    for (int64_t s = 0; base && s < S; ++s)
+        if (present[(size_t)s]) dest[(size_t)s] = base;
+    return dest;
+}
+
 // One stream for every device adjoint call in this process: upload, launch and download are one
 // queue's worth of work, which is what the bench times.
 RadStream adjoint_stream() {
@@ -125,6 +167,7 @@ RadStream adjoint_stream() {
 int64_t blocks(int64_t n) { return (n + kBlock - 1) / kBlock; }
 
 int64_t f32_bytes(int64_t n) { return n * (int64_t)sizeof(float); }
+int64_t f64_bytes(int64_t n) { return n * (int64_t)sizeof(double); }
 
 // The record's operands, in the schema's order: a, a_scale, slot, lora_a, t. Only the coded form is
 // this row's: a float activation leaves `a_scale` absent, in place, and has no device row.
@@ -224,8 +267,8 @@ void fill_slots(const AdValue& slot, int64_t S, std::vector<int>* out) {
 // the shared row reads it from global, which costs the reads and keeps the row served.
 __global__ void shrink_dx_kernel(const float* __restrict__ a, const float* __restrict__ as,
                                  const float* __restrict__ ct, const float* __restrict__ la,
-                                 const int* __restrict__ slot, float* __restrict__ dx,
-                                 float* __restrict__ sct, int64_t M, int64_t K, int64_t R,
+                                 const int* __restrict__ slot, double* __restrict__ dx,
+                                 double* __restrict__ sct, int64_t M, int64_t K, int64_t R,
                                  int64_t groups, int64_t group, int64_t row_in_shared) {
     const int64_t m = blockIdx.x;
     if (m >= M) return;
@@ -233,7 +276,7 @@ __global__ void shrink_dx_kernel(const float* __restrict__ a, const float* __res
     if (s < 0) return;  // a base row: no cotangent
     const int t = threadIdx.x;
     extern __shared__ float sh[];   // R, the token's cotangent, when it fits
-    __shared__ float sh_p[kBlock];  // one column's product with its code
+    __shared__ double sh_p[kBlock]; // one column's product with its code
     const float* ct_row = ct + m * R;
     if (row_in_shared) {
         for (int64_t j = t; j < R; j += blockDim.x) sh[j] = ct_row[j];
@@ -243,16 +286,21 @@ __global__ void shrink_dx_kernel(const float* __restrict__ a, const float* __res
     const float* scale_row = as + m * groups;
     const float* A = la + s * R * K;
     const float* a_row = a + m * K;
-    float* dx_row = dx + m * K;
-    float* sct_row = sct + m * groups;
+    double* dx_row = dx + m * K;
+    double* sct_row = sct + m * groups;
+    // f64 throughout, as the host row is (`host/reference_lora.cpp:292`): the cotangents this row
+    // is handed reach 1e36 at block 50, where a group's sum of `g * code` over 128 columns lands
+    // on f32's 3.4e38 ceiling and saturates -- measured as the first non-finite in the whole walk
+    // (`lora_shrink`, operand `h.s8`, position 1150, maxabs 3.40178e+38). `g` is a reduction over
+    // R and is the same argument one level down; the codes' own output `dx` sat at 1.6e36.
     for (int64_t base = 0; base < K; base += blockDim.x) {
         const int64_t k = base + t;
-        float p = 0.0f;
+        double p = 0.0;
         if (k < K) {
-            float g = 0.0f;
-            for (int64_t j = 0; j < R; ++j) g += ct_row[j] * A[j * K + k];
-            dx_row[k] = g * scale_row[k / group];
-            p = g * a_row[k];
+            double g = 0.0;
+            for (int64_t j = 0; j < R; ++j) g += (double)ct_row[j] * (double)A[j * K + k];
+            dx_row[k] = g * (double)scale_row[k / group];
+            p = g * (double)a_row[k];
         }
         sh_p[t] = p;
         __syncthreads();
@@ -265,7 +313,7 @@ __global__ void shrink_dx_kernel(const float* __restrict__ a, const float* __res
         for (int64_t g = g_first + t; g <= g_last; g += blockDim.x) {
             const int64_t lo = (g * group > k0 ? g * group : k0) - k0;
             const int64_t hi = min(k1, min((g + 1) * group, K)) - k0;
-            float sum = 0.0f;
+            double sum = 0.0;
             for (int64_t i = lo; i < hi; ++i) sum += sh_p[i];
             atomicAdd(&sct_row[g], sum);
         }
@@ -274,11 +322,14 @@ __global__ void shrink_dx_kernel(const float* __restrict__ a, const float* __res
 }
 
 // dA = sum over the step's valid rows of cot t[m, j] * x[m, k]: one thread per column, its rows'
-// sums in registers, its partials added to the f32 staging once per row chunk.
+// sums in registers, its partials added to the f32 staging once per row chunk. The row launches
+// it once per pool row it names, filtering the tokens to that row's, so a launch writes only the
+// rows its slot's own: the buffer the row asked the step's stage for, at the slot's block of the
+// fused factor when the call has one.
 __global__ void shrink_da_kernel(const float* __restrict__ a, const float* __restrict__ as,
                                  const float* __restrict__ ct, const int* __restrict__ slot,
                                  float* __restrict__ dA, int64_t M, int64_t K, int64_t R,
-                                 int64_t groups, int64_t group, int64_t rows_chunk) {
+                                 int64_t groups, int64_t group, int64_t rows_chunk, int s) {
     const int64_t k = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= K) return;
     const int64_t m0 = (int64_t)blockIdx.y * rows_chunk;
@@ -289,7 +340,7 @@ __global__ void shrink_da_kernel(const float* __restrict__ a, const float* __res
         float acc[kMaxJ];
         for (int i = 0; i < kMaxJ; ++i) acc[i] = 0.0f;
         for (int64_t m = m0; m < m1; ++m) {
-            if (slot[m] < 0) continue;
+            if (slot[m] != s) continue;
             const float xv = a[m * K + k] * as[m * groups + grp];
             const float* ctm = ct + m * R + j0;
             for (int64_t i = 0; i < jn; ++i) acc[i] += ctm[i] * xv;
@@ -304,38 +355,47 @@ __global__ void shrink_da_kernel(const float* __restrict__ a, const float* __res
 // projection's columns in order, so a warp reads B's rows as runs.
 __global__ void expand_dt_kernel(const float* __restrict__ cy, const float* __restrict__ lb,
                                  const float* __restrict__ sc, const int* __restrict__ slot,
-                                 float* __restrict__ dt, int64_t M, int64_t N, int64_t R) {
+                                 double* __restrict__ dt, int64_t M, int64_t N, int64_t R) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= M * R) return;
     const int64_t m = i / R, j = i - m * R;
     const int64_t s = slot[m];
     if (s < 0) {
-        dt[i] = 0.0f;  // a base row: no cotangent
+        dt[i] = 0.0;  // a base row: no cotangent
         return;
     }
     const float* cy_row = cy + m * N;
     const float* sc_row = sc + s * N;
     const float* B = lb + s * N * R + j;
-    float acc = 0.0f;
-    for (int64_t n = 0; n < N; ++n) acc += cy_row[n] * sc_row[n] * B[n * R];
+    // f64: this is a reduction over the projection's N columns -- 17408 of them on the live trunk
+    // -- where the host accumulates in double (`host/reference_lora.cpp:435`). At block 50's
+    // magnitudes, a y-cotangent of 1e36 against a scale of 0.19, the f32 sum lands on the ceiling:
+    // the whole of `lora.t.r32.lane0` came out non-finite at position 1138 (16384 of 16384)
+    // before this was widened.
+    double acc = 0.0;
+    for (int64_t n = 0; n < N; ++n)
+        acc += (double)cy_row[n] * (double)sc_row[n] * (double)B[n * R];
     dt[i] = acc;
 }
 
 // dB[n, j] = sum over the step's valid rows of cot y[m, n] * scale[s, n] * t[m, j]: one thread per
-// (row of the projection, j), each its own output, the tokens walked in order.
+// (row of the projection, j), each its own output, the tokens walked in order. The row launches
+// it once per pool row it names, into that slot's columns of the buffer the row asked the step's
+// stage for (`cols` of them per row, the slot's block of the fused factor when the call has one).
 __global__ void expand_db_kernel(const float* __restrict__ cy, const float* __restrict__ t,
                                  const float* __restrict__ sc, const int* __restrict__ slot,
-                                 float* __restrict__ db, int64_t M, int64_t N, int64_t R) {
+                                 float* __restrict__ db, int64_t M, int64_t N, int64_t R,
+                                 int64_t cols, int s) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N * R) return;
     const int64_t n = i / R, j = i - n * R;
+    const float* sc_row = sc + s * N;
     float acc = 0.0f;
     for (int64_t m = 0; m < M; ++m) {
-        const int64_t s = slot[m];
-        if (s < 0) continue;
-        acc += cy[m * N + n] * sc[s * N + n] * t[m * R + j];
+        if (slot[m] != s) continue;
+        acc += cy[m * N + n] * sc_row[n] * t[m * R + j];
     }
-    db[i] += acc;  // the step's accumulator: this call's sum adds to the calls before it
+    db[n * cols + j] += acc;  // the step's accumulator: this call's sum adds to the calls before it
 }
 
 // -- the plumbing ------------------------------------------------------------
@@ -362,6 +422,18 @@ bool download_add_f32(AdValue* slot, void* src, std::vector<float>* stage, RadSt
     return true;
 }
 
+// The same for an f64 buffer: the rows that can carry a cotangent past f32's ceiling stage in
+// double, so a sum that would overflow f32 is taken before anything is narrowed.
+bool download_add_f64(AdValue* slot, void* src, std::vector<double>* stage, RadStream stream) {
+    if (!slot) return true;
+    const int64_t n = (int64_t)slot->value.size();
+    stage->resize((size_t)n);
+    if (rad_memcpy_async(stage->data(), src, f64_bytes(n), stream) != 0) return false;
+    if (rad_stream_sync(stream) != 0) return false;
+    for (int64_t i = 0; i < n; ++i) slot->value[(size_t)i] += (*stage)[(size_t)i];
+    return true;
+}
+
 // The shrink's adjoint: the coded form only. The row of cot t in shared memory when the pool's
 // width fits it, and one block per token for the value-space cotangent.
 void lora_shrink_device_adjoint(const AdjointCall& call) {
@@ -380,22 +452,29 @@ void lora_shrink_device_adjoint(const AdjointCall& call) {
 
     // dA belongs to the step, not to the call: this row adds the call's sum into the f32
     // accumulator the step is holding on the card, and the walk copies the step's total out when
-    // the step ends (grad_stage.h). Nothing of the leaf is touched here.
-    float* d_da = nullptr;
-    if (call.grads) d_da = device::grad_stage_slot(grad_name(call.prefix, "lora_A"), {sh.R, sh.K});
+    // the step ends (grad_stage.h). Nothing of the leaf is touched here. The accumulator is the
+    // one the naming gives the slot (grad_dest), one per pool row the record's rows name, and
+    // each launch below writes the rows its slot's own.
+    std::vector<int> slots;
+    fill_slots(*sh.slot, sh.S, &slots);
+    std::vector<char> present((size_t)sh.S, 0);
+    for (int v : slots)
+        if (v >= 0) present[(size_t)v] = 1;
+    const std::vector<int64_t> a_shape = call.fused_slots
+                                             ? std::vector<int64_t>{sh.S * sh.R, sh.K}
+                                             : std::vector<int64_t>{sh.R, sh.K};
+    std::vector<float*> d_da = grad_dest(call, "lora_A", sh.S, present, a_shape, sh.R * sh.K);
+    for (int64_t s = 0; call.grads && s < sh.S; ++s)
+        if (present[(size_t)s] && !d_da[(size_t)s]) return;  // the step's stage refused the leaf
 
     device::ScratchBlock d_a(f32_bytes(sh.M * sh.K));
     device::ScratchBlock d_as(f32_bytes(sh.M * sh.groups));
     device::ScratchBlock d_ct(f32_bytes(sh.M * sh.R));
     device::ScratchBlock d_la(f32_bytes(sh.S * sh.R * sh.K));
     device::ScratchBlock d_slot((int64_t)(sh.M * (int64_t)sizeof(int)));
-    device::ScratchBlock d_dx(f32_bytes(sh.M * sh.K));
-    device::ScratchBlock d_sct(f32_bytes(sh.M * sh.groups));
+    device::ScratchBlock d_dx(f64_bytes(sh.M * sh.K));
+    device::ScratchBlock d_sct(f64_bytes(sh.M * sh.groups));
     if (!d_a || !d_as || !d_ct || !d_la || !d_slot || !d_dx || !d_sct) return;
-    if (call.grads && !d_da) return;
-
-    std::vector<int> slots;
-    fill_slots(*sh.slot, sh.S, &slots);
 
     std::vector<float> h_a, h_as, h_ct, h_la;
     if (!upload_f32(*sh.a, d_a.p, sh.M * sh.K, &h_a, stream)) return;
@@ -403,28 +482,30 @@ void lora_shrink_device_adjoint(const AdjointCall& call) {
     if (!upload_f32(t_cot, d_ct.p, sh.M * sh.R, &h_ct, stream)) return;
     if (!upload_f32(*sh.la, d_la.p, sh.S * sh.R * sh.K, &h_la, stream)) return;
     if (!upload_slots(slots, d_slot.p, stream)) return;
-    if (rad_memset_async(d_dx.p, 0, f32_bytes(sh.M * sh.K), stream) != 0) return;
-    if (rad_memset_async(d_sct.p, 0, f32_bytes(sh.M * sh.groups), stream) != 0) return;
+    if (rad_memset_async(d_dx.p, 0, f64_bytes(sh.M * sh.K), stream) != 0) return;
+    if (rad_memset_async(d_sct.p, 0, f64_bytes(sh.M * sh.groups), stream) != 0) return;
 
     const int64_t row_in_shared = sh.R <= kMaxRShared ? 1 : 0;
     const int64_t shared = row_in_shared ? sh.R * (int64_t)sizeof(float) : 0;
     hipLaunchKernelGGL(shrink_dx_kernel, dim3((unsigned int)sh.M), dim3(kBlock),
                        (size_t)shared, (hipStream_t)stream, (const float*)d_a.p,
                        (const float*)d_as.p, (const float*)d_ct.p, (const float*)d_la.p,
-                       (const int*)d_slot.p, (float*)d_dx.p, (float*)d_sct.p, sh.M, sh.K, sh.R,
+                       (const int*)d_slot.p, (double*)d_dx.p, (double*)d_sct.p, sh.M, sh.K, sh.R,
                        sh.groups, sh.group, row_in_shared);
-    if (d_da) {
-        const int64_t chunks = (sh.M + kRowsChunk - 1) / kRowsChunk;
+    const int64_t chunks = (sh.M + kRowsChunk - 1) / kRowsChunk;
+    for (int64_t s = 0; s < sh.S; ++s) {
+        if (!d_da[(size_t)s]) continue;
         hipLaunchKernelGGL(shrink_da_kernel, dim3((unsigned int)blocks(sh.K), (unsigned int)chunks),
                            dim3(kBlock), 0, (hipStream_t)stream, (const float*)d_a.p,
                            (const float*)d_as.p, (const float*)d_ct.p, (const int*)d_slot.p,
-                           d_da, sh.M, sh.K, sh.R, sh.groups, sh.group, kRowsChunk);
+                           d_da[(size_t)s], sh.M, sh.K, sh.R, sh.groups, sh.group, kRowsChunk,
+                           (int)s);
     }
     if (rad_stream_sync(stream) != 0) return;
 
-    std::vector<float> h_dx, h_sct;
-    if (!download_add_f32(&a_cot, d_dx.p, &h_dx, stream)) return;
-    if (!download_add_f32(&s_cot, d_sct.p, &h_sct, stream)) return;
+    std::vector<double> h_dx, h_sct;
+    if (!download_add_f64(&a_cot, d_dx.p, &h_dx, stream)) return;
+    if (!download_add_f64(&s_cot, d_sct.p, &h_sct, stream)) return;
 }
 
 // The expand's adjoint: the cotangent of t over the projection's columns, and dB over the tokens.
@@ -440,20 +521,28 @@ void lora_expand_device_adjoint(const AdjointCall& call) {
     RadStream stream = adjoint_stream();
     if (!stream) return;
 
-    float* d_db = nullptr;
-    if (call.grads) d_db = device::grad_stage_slot(grad_name(call.prefix, "lora_B"), {ex.N, ex.R});
+    // dB belongs to the step, not to the call, the way dA does (grad_stage.h): the accumulator
+    // the naming gives the slot (grad_dest), one per pool row the record's rows name, and each
+    // launch below writes the columns its slot's own.
+    std::vector<int> slots;
+    fill_slots(*ex.slot, ex.S, &slots);
+    std::vector<char> present((size_t)ex.S, 0);
+    for (int v : slots)
+        if (v >= 0) present[(size_t)v] = 1;
+    const std::vector<int64_t> b_shape = call.fused_slots
+                                             ? std::vector<int64_t>{ex.N, ex.S * ex.R}
+                                             : std::vector<int64_t>{ex.N, ex.R};
+    std::vector<float*> d_db = grad_dest(call, "lora_B", ex.S, present, b_shape, ex.R);
+    for (int64_t s = 0; call.grads && s < ex.S; ++s)
+        if (present[(size_t)s] && !d_db[(size_t)s]) return;  // the step's stage refused the leaf
 
     device::ScratchBlock d_cy(f32_bytes(ex.M * ex.N));
     device::ScratchBlock d_t(f32_bytes(ex.M * ex.R));
     device::ScratchBlock d_lb(f32_bytes(ex.S * ex.N * ex.R));
     device::ScratchBlock d_sc(f32_bytes(ex.S * ex.N));
     device::ScratchBlock d_slot((int64_t)(ex.M * (int64_t)sizeof(int)));
-    device::ScratchBlock d_dt(f32_bytes(ex.M * ex.R));
+    device::ScratchBlock d_dt(f64_bytes(ex.M * ex.R));
     if (!d_cy || !d_t || !d_lb || !d_sc || !d_slot || !d_dt) return;
-    if (call.grads && !d_db) return;
-
-    std::vector<int> slots;
-    fill_slots(*ex.slot, ex.S, &slots);
 
     std::vector<float> h_cy, h_t, h_lb, h_sc;
     if (!upload_f32(y_cot, d_cy.p, ex.M * ex.N, &h_cy, stream)) return;
@@ -461,21 +550,24 @@ void lora_expand_device_adjoint(const AdjointCall& call) {
     if (!upload_f32(*ex.lb, d_lb.p, ex.S * ex.N * ex.R, &h_lb, stream)) return;
     if (!upload_f32(*ex.sc, d_sc.p, ex.S * ex.N, &h_sc, stream)) return;
     if (!upload_slots(slots, d_slot.p, stream)) return;
-    if (rad_memset_async(d_dt.p, 0, f32_bytes(ex.M * ex.R), stream) != 0) return;
+    if (rad_memset_async(d_dt.p, 0, f64_bytes(ex.M * ex.R), stream) != 0) return;
 
     hipLaunchKernelGGL(expand_dt_kernel, dim3((unsigned int)blocks(ex.M * ex.R)),
                        dim3(kBlock), 0, (hipStream_t)stream, (const float*)d_cy.p,
                        (const float*)d_lb.p, (const float*)d_sc.p, (const int*)d_slot.p,
-                       (float*)d_dt.p, ex.M, ex.N, ex.R);
-    if (d_db)
+                       (double*)d_dt.p, ex.M, ex.N, ex.R);
+    const int64_t b_cols = call.fused_slots ? ex.S * ex.R : ex.R;
+    for (int64_t s = 0; s < ex.S; ++s) {
+        if (!d_db[(size_t)s]) continue;
         hipLaunchKernelGGL(expand_db_kernel, dim3((unsigned int)blocks(ex.N * ex.R)),
                            dim3(kBlock), 0, (hipStream_t)stream, (const float*)d_cy.p,
-                           (const float*)d_t.p, (const float*)d_sc.p, (const int*)d_slot.p, d_db,
-                           ex.M, ex.N, ex.R);
+                           (const float*)d_t.p, (const float*)d_sc.p, (const int*)d_slot.p,
+                           d_db[(size_t)s], ex.M, ex.N, ex.R, b_cols, (int)s);
+    }
     if (rad_stream_sync(stream) != 0) return;
 
-    std::vector<float> h_dt;
-    if (!download_add_f32(&t_cot, d_dt.p, &h_dt, stream)) return;
+    std::vector<double> h_dt;
+    if (!download_add_f64(&t_cot, d_dt.p, &h_dt, stream)) return;
 }
 
 }  // namespace

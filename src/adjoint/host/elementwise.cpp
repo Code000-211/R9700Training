@@ -23,6 +23,8 @@
 // registered with the frozen operand, so the walk never asks them for a cotangent.
 #include "r97/adjoint.h"
 
+#include "parallel.h"
+
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -33,6 +35,10 @@
 
 namespace r97 {
 namespace {
+// The unit a flat elementwise pass splits into, and the unit a row-wise pass uses: one output
+// element, or one output row. A call below the row threshold runs on the calling thread.
+constexpr int64_t kElemChunk = 4096;
+constexpr int64_t kRowChunk = 2;
 
 /* ------------------------------------------------------------------ reading a record */
 
@@ -170,7 +176,9 @@ void mul_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector<A
     if (nb == 0) return;
 
     AdValue y = write_value(rec, 2, a.shape);
-    for (size_t i = 0; i < (size_t)na; ++i) y.value[i] = a.value[i] * b.value[row ? i % nb : i];
+    parallel_for(na, kElemChunk, [&](int64_t i) {
+        y.value[(size_t)i] = a.value[(size_t)i] * b.value[row ? (size_t)(i % nb) : (size_t)i];
+    });
     out->push_back(std::move(y));
 }
 
@@ -181,10 +189,21 @@ void mul_host_adjoint(const AdjointCall& call) {
     const size_t na = dy.value.size(), nb = b.value.size();
     if (nb == 0 || nb > na) return;
 
-    for (size_t i = 0; i < na; ++i) {
-        da.value[i] += dy.value[i] * b.value[nb == na ? i : i % nb];
-        db.value[nb == na ? i : i % nb] += dy.value[i] * a.value[i];
+    if (nb == na) {
+        parallel_for((int64_t)na, kElemChunk, [&](int64_t i) {
+            da.value[(size_t)i] += dy.value[(size_t)i] * b.value[(size_t)i];
+            db.value[(size_t)i] += dy.value[(size_t)i] * a.value[(size_t)i];
+        });
+        return;
     }
+    /* b is one row every row of a multiplies: db[j] sums the rows, so the pass splits over its
+     * columns, each keeping the rows serial -- the sum's order is the rows' own. */
+    parallel_for((int64_t)nb, kElemChunk, [&](int64_t j) {
+        for (size_t i = (size_t)j; i < na; i += nb) {
+            da.value[i] += dy.value[i] * b.value[(size_t)j];
+            db.value[(size_t)j] += dy.value[i] * a.value[i];
+        }
+    });
 }
 
 /* ------------------------------------------------------------------ scale: y = x * s[0] */
@@ -194,7 +213,9 @@ void scale_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector
     const AdValue& x = op[0];
     const double s = op[1].value[0];
     AdValue y = write_value(rec, 2, x.shape);
-    for (size_t i = 0; i < y.value.size(); ++i) y.value[i] = x.value[i] * s;
+    parallel_for((int64_t)y.value.size(), kElemChunk, [&](int64_t i) {
+        y.value[(size_t)i] = x.value[(size_t)i] * s;
+    });
     out->push_back(std::move(y));
 }
 
@@ -203,7 +224,9 @@ void scale_host_adjoint(const AdjointCall& call) {
         return;
     const double s = call.fwd[1].value[0];
     AdValue& dx = call.dc->at(0);
-    for (size_t i = 0; i < call.cot[0].value.size(); ++i) dx.value[i] += call.cot[0].value[i] * s;
+    parallel_for((int64_t)call.cot[0].value.size(), kElemChunk, [&](int64_t i) {
+        dx.value[(size_t)i] += call.cot[0].value[(size_t)i] * s;
+    });
 }
 
 /* ------------------------------------------------------------------ sigmoid: y = 1/(1+e^-x) */
@@ -212,7 +235,9 @@ void sigmoid_twin(const OpRecord&, const std::vector<AdValue>& op, std::vector<A
     if (op.size() < 1) return;
     const AdValue& x = op[0];
     AdValue y = x;
-    for (size_t i = 0; i < y.value.size(); ++i) y.value[i] = sigmoid(x.value[i]);
+    parallel_for((int64_t)y.value.size(), kElemChunk, [&](int64_t i) {
+        y.value[(size_t)i] = sigmoid(x.value[(size_t)i]);
+    });
     out->push_back(std::move(y));
 }
 
@@ -220,8 +245,9 @@ void sigmoid_host_adjoint(const AdjointCall& call) {
     if (call.cot.empty() || call.fwd.size() < 2 || call.dc->empty()) return;
     const AdValue &y = call.fwd[1], &dy = call.cot[0];  /* y, the op's own output */
     AdValue& dx = call.dc->at(0);
-    for (size_t i = 0; i < dy.value.size(); ++i)
-        dx.value[i] += dy.value[i] * y.value[i] * (1.0 - y.value[i]);
+    parallel_for((int64_t)dy.value.size(), kElemChunk, [&](int64_t i) {
+        dx.value[(size_t)i] += dy.value[(size_t)i] * y.value[(size_t)i] * (1.0 - y.value[(size_t)i]);
+    });
 }
 
 /* ------------------------------------------------------------------ silu: y = x * sigmoid(x) */
@@ -230,7 +256,9 @@ void silu_twin(const OpRecord&, const std::vector<AdValue>& op, std::vector<AdVa
     if (op.size() < 1) return;
     const AdValue& x = op[0];
     AdValue y = x;
-    for (size_t i = 0; i < y.value.size(); ++i) y.value[i] = act_value(kSilu, x.value[i]);
+    parallel_for((int64_t)y.value.size(), kElemChunk, [&](int64_t i) {
+        y.value[(size_t)i] = act_value(kSilu, x.value[(size_t)i]);
+    });
     out->push_back(std::move(y));
 }
 
@@ -238,8 +266,9 @@ void silu_host_adjoint(const AdjointCall& call) {
     if (call.cot.empty() || call.fwd.empty() || call.dc->empty()) return;
     const AdValue &x = call.fwd[0], &dy = call.cot[0];
     AdValue& dx = call.dc->at(0);
-    for (size_t i = 0; i < dy.value.size(); ++i)
-        dx.value[i] += dy.value[i] * act_slope(kSilu, x.value[i]);
+    parallel_for((int64_t)dy.value.size(), kElemChunk, [&](int64_t i) {
+        dx.value[(size_t)i] += dy.value[(size_t)i] * act_slope(kSilu, x.value[(size_t)i]);
+    });
 }
 
 /* ------------------------------------------------------------------ silu_mul: y = silu(g) * u */
@@ -254,12 +283,12 @@ void silu_mul_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vec
     if (n <= 0 || rows <= 0) return;
 
     AdValue y = write_value(rec, 1, {rows, n});
-    for (int64_t r = 0; r < rows; ++r) {
+    parallel_for(rows, kRowChunk, [&](int64_t r) {
         const int64_t xb = r * 2 * n, yb = r * n;
         for (int64_t i = 0; i < n; ++i)
             y.value[(size_t)(yb + i)] = act_value(kSilu, x.value[(size_t)(xb + i)]) *
                                         x.value[(size_t)(xb + n + i)];
-    }
+    });
     out->push_back(std::move(y));
 }
 
@@ -271,7 +300,7 @@ void silu_mul_host_adjoint(const AdjointCall& call) {
     if (n <= 0 || rows <= 0 || rows_of(dy, n) != rows) return;
 
     AdValue& dx = call.dc->at(0);
-    for (int64_t r = 0; r < rows; ++r) {
+    parallel_for(rows, kRowChunk, [&](int64_t r) {
         const int64_t xb = r * 2 * n, yb = r * n;
         for (int64_t i = 0; i < n; ++i) {
             const double g = x.value[(size_t)(xb + i)], u = x.value[(size_t)(xb + n + i)];
@@ -279,7 +308,7 @@ void silu_mul_host_adjoint(const AdjointCall& call) {
             dx.value[(size_t)(xb + i)] += d * u * act_slope(kSilu, g);
             dx.value[(size_t)(xb + n + i)] += d * act_value(kSilu, g);
         }
-    }
+    });
 }
 
 /* ------------------------------------------------------------------ act_mul: y = act(a) * b */
@@ -291,8 +320,9 @@ void act_mul_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
     if (!name || !act_of(*name, &act) || op[0].value.size() != op[1].value.size()) return;
 
     AdValue y = write_value(rec, 2, op[0].shape);
-    for (size_t i = 0; i < y.value.size(); ++i)
-        y.value[i] = act_value(act, op[0].value[i]) * op[1].value[i];
+    parallel_for((int64_t)y.value.size(), kElemChunk, [&](int64_t i) {
+        y.value[(size_t)i] = act_value(act, op[0].value[(size_t)i]) * op[1].value[(size_t)i];
+    });
     out->push_back(std::move(y));
 }
 
@@ -304,10 +334,13 @@ void act_mul_host_adjoint(const AdjointCall& call) {
 
     const AdValue &a = call.fwd[0], &b = call.fwd[1], &dy = call.cot[0];
     AdValue &da = call.dc->at(0), &db = call.dc->at(1);
-    for (size_t i = 0; i < dy.value.size() && i < a.value.size() && i < b.value.size(); ++i) {
-        da.value[i] += dy.value[i] * act_slope(act, a.value[i]) * b.value[i];
-        db.value[i] += dy.value[i] * act_value(act, a.value[i]);
-    }
+    size_t len = dy.value.size();
+    if (a.value.size() < len) len = a.value.size();
+    if (b.value.size() < len) len = b.value.size();
+    parallel_for((int64_t)len, kElemChunk, [&](int64_t i) {
+        da.value[(size_t)i] += dy.value[(size_t)i] * act_slope(act, a.value[(size_t)i]) * b.value[(size_t)i];
+        db.value[(size_t)i] += dy.value[(size_t)i] * act_value(act, a.value[(size_t)i]);
+    });
 }
 
 /* ------------------------------------------------------------------ cast: y = x in to */
@@ -324,19 +357,43 @@ void cast_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector<
 void cast_host_adjoint(const AdjointCall& call) {
     if (call.cot.empty() || call.dc->empty()) return;
     AdValue& dx = call.dc->at(0);
-    for (size_t i = 0; i < call.cot[0].value.size(); ++i) dx.value[i] += call.cot[0].value[i];
+    parallel_for((int64_t)call.cot[0].value.size(), kElemChunk, [&](int64_t i) {
+        dx.value[(size_t)i] += call.cot[0].value[(size_t)i];
+    });
 }
 
 /* ------------------------------------------------------------------ rmsnorm */
 
+/* The rmsnorm family's gain: the one non-written operand after x whose shape is a single row of
+ * `n` columns. The plain record is x, w{n}, y; the engine's fused producer is
+ * x, residual?:inout, w{n}, q{rows,n}, scale{rows,n/128}, out?. Picking by shape is what makes
+ * both work: operand 1 is the residual on the fused shape (written -- a silently wrong gain if
+ * used), and a merely positional rule falls through to q or scale whenever the gain's values are
+ * missing, which is a wrong gain (or a non-finite gradient) instead of a refusal. A gain the tape
+ * gave no values for is absent: the schema's `wadd` says whether the record needs one at all, so a
+ * plain norm still computes and a record that needs a gain refuses by name. */
+const AdValue* norm_gain(const OpRecord& rec, const std::vector<AdValue>& op, int64_t n) {
+    const size_t count = std::min(op.size(), rec.operands.size());
+    for (size_t j = 1; j < count; ++j) {
+        if (rec.operands[j].written) continue;
+        const std::vector<int64_t>& shape = op[j].shape;
+        if (shape.size() != 1 || shape[0] != n) continue;
+        if (op[j].value.empty()) return nullptr;  // named, but the tape could not give it
+        return &op[j];
+    }
+    return nullptr;
+}
+
 /* y[r, i] = x[r, i] * rsqrt(mean(x[r]^2) + eps) * (w[i] + wadd) * mult, the gain formed in f64
  * (the kernel forms it in f32, before the store's rounding). `wadd` without a gain is refused by
- * the kernel and left to nothing here. */
+ * the kernel and left to nothing here. A gain the record names but the tape could not give values
+ * for cannot be served: the twin would compute a different norm, and a wrong intermediate is worse
+ * than a refusal. */
 void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector<AdValue>* out) {
     if (op.empty()) return;
     const AdValue& x = op[0];
-    const AdValue* w = op.size() > 1 && !op[1].value.empty() ? &op[1] : nullptr;
     const int64_t n = width_of(rec, x.shape);
+    const AdValue* w = norm_gain(rec, op, n);
     const int64_t rows = rows_of(x, n);
     if (rows <= 0) return;
     if (w && (int64_t)w->value.size() < n) return;
@@ -346,7 +403,7 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
     if (!w && wadd != 0.0) return;
 
     AdValue y = write_value(rec, 2, x.shape);
-    for (int64_t r = 0; r < rows; ++r) {
+    parallel_for(rows, kRowChunk, [&](int64_t r) {
         const int64_t b = r * n;
         double ss = 0.0;
         for (int64_t i = 0; i < n; ++i) ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
@@ -354,30 +411,71 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
         for (int64_t i = 0; i < n; ++i)
             y.value[(size_t)(b + i)] =
                 x.value[(size_t)(b + i)] * s * (w ? w->value[(size_t)i] + wadd : 1.0) * mult;
-    }
+    });
     out->push_back(std::move(y));
 }
 
 /* dx_j = mult * (s * c_j * dy_j - (s^3 x_j / n) * sum_i dy_i x_i c_i), c = (w + wadd).
  *
  * The second term is the row's shared rms: every element of the row moves it, so every dy_i
- * weights x_j. */
+ * weights x_j.
+ *
+ * The two-way rule (r97/adjoint.h's AdjointCall::read_rows): a row a consumer reads is
+ * differentiated, and a non-finite value in it refuses -- the analytic `0 * inf` over a live row
+ * is a bug, not a gradient. A row no consumer reads is provably dead, so it is left zero and
+ * counted: the zero is the correct cotangent for a value nothing reads. When the caller could not
+ * prove the read set every row is readable, and the refusal is what it was before the read set
+ * existed. */
 void rmsnorm_host_adjoint(const AdjointCall& call) {
     if (call.cot.empty() || call.fwd.empty() || call.dc->empty()) return;
     const AdValue& x = call.fwd[0];
-    const AdValue* w = call.fwd.size() > 1 && !call.fwd[1].value.empty() ? &call.fwd[1] : nullptr;
     const AdValue& dy = call.cot[0];
     const int64_t n = width_of(call.rec, x.shape);
+    const AdValue* w = norm_gain(call.rec, call.fwd, n);
     const int64_t rows = rows_of(x, n);
     if (rows <= 0) return;
-    if (w && (int64_t)w->value.size() < n) return;
+    // A gain the record names but the tape could not give values for cannot be served: the row
+    // would leave the input's cotangent untouched (a silent zero where the analytic answer is not
+    // zero). Refusing names it instead, as every other unservable operand on this path does.
+    if (w && (int64_t)w->value.size() < n)
+        throw std::runtime_error("r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +
+                                 std::to_string(call.rec.position) + ": the gain names " +
+                                 std::to_string(n) + " columns and the tape gave " +
+                                 std::to_string(w->value.size()));
     const double eps = param_num(call.rec, "eps", 1e-6);
     const double wadd = param_num(call.rec, "wadd", 0.0);
     const double mult = param_num(call.rec, "mult", 1.0);
-    if (!w && wadd != 0.0) return;
+    if (!w && wadd != 0.0)
+        throw std::runtime_error("r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +
+                                 std::to_string(call.rec.position) +
+                                 ": the record adds a gain offset and the tape names no gain");
 
     AdValue& dx = call.dc->at(0);
+    std::vector<char> readable((size_t)rows, 0);
+    int64_t zeroed = 0, admitted = 0, refused = 0;
     for (int64_t r = 0; r < rows; ++r) {
+        if (!row_readable(call, r)) {
+            ++zeroed;
+            continue;
+        }
+        readable[(size_t)r] = 1;
+        ++admitted;
+        const int64_t b = r * n;
+        double ss = 0.0;
+        for (int64_t i = 0; i < n && std::isfinite(ss); ++i)
+            ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
+        if (!std::isfinite(ss)) ++refused;
+    }
+    count_read_rows(call.row_count, call.read_rows, zeroed, admitted, refused);
+    if (refused > 0)
+        throw std::runtime_error(
+            "r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +
+            std::to_string(call.rec.position) + ": " + std::to_string(refused) + " of " +
+            std::to_string(admitted) +
+            " rows a consumer reads have a non-finite activation; refusing rather than zeroing a "
+            "live row's gradient");
+    parallel_for(rows, kRowChunk, [&](int64_t r) {
+        if (!readable[(size_t)r]) return;
         const int64_t b = r * n;
         double ss = 0.0;
         for (int64_t i = 0; i < n; ++i) ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
@@ -392,7 +490,7 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
             const double shared = s * s * s * x.value[(size_t)(b + i)] * t / (double)n;
             dx.value[(size_t)(b + i)] += mult * (s * c * dy.value[(size_t)(b + i)] - shared);
         }
-    }
+    });
 }
 
 }  // namespace

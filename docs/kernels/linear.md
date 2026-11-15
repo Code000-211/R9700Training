@@ -1,7 +1,8 @@
 # Device adjoints: `linear`
 
-The frozen linears on the card. The rows are registered by `src/adjoint/device/linear.hip`, which
-is one of the kernels the device plugin builds into `libr97.so`
+The frozen linears on the card, and `gather_rows`, the head's gather, the family's other row.
+The rows are registered by `src/adjoint/device/linear.hip`, which is one of the kernels the
+device plugin builds into `libr97.so`
 (`src/adjoint/device/README.md`); the checks are `tests/gpu/adjoint_linear.cpp`, built on the
 harness every device adjoint uses (`tests/support/device_check.h`) for its case, card guard and
 lookup, with this family's own comparison in the test file beside them, and the arithmetic they
@@ -10,12 +11,14 @@ stand beside.
 
 | op | reads | writes | frozen | served |
 | --- | --- | --- | --- | --- |
-| `gemm_nt_q` | `a`, `b`, `b_scale` | the cotangent of `a` | `a_scale`, `b`, `b_scale` | `dtype` `i8a8h` at `group` 128 |
+| `gemm_nt_q` | `a`, `a_scale`, `b`, `b_scale` | the cotangent of `a` | `a_scale`, `b`, `b_scale` | `dtype` `i8a8h` at `group` 128 |
 | `gemm_nt` | `a`, `b` | the cotangent of `a` | `b` | `dtype` `bf16` |
+| `gather_rows` | `x`, `idx` | the cotangent of `x` | `idx` | `dtype` `bf16` |
 
-Each row writes only the cotangent of the activation operand, and adds it into the slot the loader
-hands over (`call.dc[ia]`), so a tape walk sees the same `+=` the host row does. A record the
-predicate declines -- another `dtype`, another `group` -- gets no device row at all and keeps
+Each row writes only the cotangent of its input operand -- the activation of a linear, `x` of the
+gather -- and adds it into that operand's slot, so a tape walk sees the same `+=` the host row
+does. A record the predicate declines -- another `dtype`, another `group` -- gets no device row
+at all and keeps
 whatever row the host or another plugin provides; nothing falls back silently inside the kernel.
 
 `logits_gemm` is not covered here. Its arithmetic is `gemm_nt`'s, but the vocabulary edge is not one
@@ -24,12 +27,12 @@ schema positions; a later change can register the name against the same kernel.
 
 ## The arithmetic
 
-`gemm_nt_q` at `i8a8h`: the forward is `y[m,n] = sum_g s_b[n,g] * sum_{k in g} a_code[m,k] *
-b_code[n,k]` with `g = k / 128`. The weight is frozen, so the adjoint in the dequantised activation
-basis is
+`gemm_nt_q` at `i8a8h`: the forward is `y[m,n] = sum_g s_a[m,g] * s_b[n,g] * sum_{k in g}
+a_code[m,k] * b_code[n,k]` with `g = k / 128`. The weight is frozen, so the adjoint -- in the
+codes' activation basis, the basis the quantiser above consumes -- is
 
 ```text
-dx[m,k] += sum_n dy[m,n] * b_code[n,k] * s_b[n, k/128]        dy: [M,N]  b: [N,K]  dx: [M,K]
+dx[m,k] += s_a[m, k/128] * sum_n dy[m,n] * b_code[n,k] * s_b[n, k/128]   dy: [M,N]  dx: [M,K]
 ```
 
 The scale varies along the reduction as well as along `k`, so the sum is not one product: a 128-wide
@@ -37,7 +40,41 @@ block of `dx` is the product of the gradient with that block's codes, each colum
 own `s_b[:, block]`. One CTA owns one block, so `k`'s block index is the CTA's `blockIdx.y` and every
 lane holds the eight scales its own fragment columns need.
 
+`s_a` is the activation's grid, not the kernel's: the row multiplies the kernel's result by it after
+the download (`linear_dx_adjoint`, which is where the host row's rule is mirrored), so the kernel's
+own arithmetic is still the weight's scale over the codes. That factor cancels with the activation
+quantiser's adjoint above, which divides the code cotangent by the same `s_a`.
+
 `gemm_nt` is the same kernel with the weight already bf16 and no scale to apply.
+
+### The stored planes
+
+A `w8a8_fwht128` container's weight and scale reach the tape as plugin-private operands: no f64
+values, one device pointer each. This row therefore reads them where the engine stores them instead
+of from a staged row-major copy -- the codes in frag64 order and the scale in the tile-major
+`[N/16][K/128][16]` plane (`frag_go`/`t16_go`, whose layout and source lines are in
+[`docs/adjoints/linear.md`](../adjoints/linear.md)). `STORED` is the kernel's template parameter for
+it, so the f64 path's staging and its row-major indexing are untouched for a record that carries
+values; only where `b` and `b_scale` are read changes. That path requires `N % 16 == 0` and
+`K % 128 == 0`, which every weight the `i8a8h` GEMM runs already satisfies, and it needs no staged
+copy of either plane, so its scratch is `dy` and `dx` alone.
+
+An IQR trunk weight (the IQ5R container's, `docs/adjoints/linear.md`) reaches the same kernel
+through the same `STORED` path, after two scratch planes are built for the call: `iqr_plane_decode`
+writes the codes in frag64 order and `iqr_plane_scale` writes the form's scale in the tile-major
+bf16 plane, both with libr4d's own decoders and offsets. So the kernel is handed one plane pair
+either way -- an IQR form is a different plane, not a different product -- and its scratch for such
+a call is `dy`, `dx`, and the two decoded planes (`N*K` bytes and `N*K/128*2` bytes).
+
+`gather_rows` is not a product: the forward picks rows of `x`, `y[i,:] = x[idx[i],:]` with a
+negative index a zero row, and the adjoint scatters the picked rows back,
+
+```text
+dx[idx[i],:] += dy[i,:]        dy: [M,n]   x, dx: [rows,n]
+```
+
+A source row that several gathers pick is the sum of their rows, and an index out of range
+contributes nothing, as in the host row.
 
 ## Precision
 
@@ -48,6 +85,10 @@ scale in f32, then rounded once to bf16 before the product -- the one rounding t
 the host adjoint's f64 sum, and the reason the two are compared by tolerance rather than for
 equality: each term carries a relative error up to 2^-9, so a heavily cancelling sum can show a
 larger relative error than any single term.
+
+The gather's is the same staging plus one rounding: `dy` is converted f64 -> bf16, the f32 atomics
+accumulate it, and the f32 result is rounded to bf16 once on the way out. The host row's f64 sum
+of the same bf16 values is the reference, held to the family's tolerance as the GEMM's rows are.
 
 The test holds the kernel to a tolerance with one term added to the harness's: every element it
 compares is within 2% of the host row's value plus `1e-3` plus a tenth of the RMS of the elements
@@ -103,6 +144,12 @@ The store goes out as scalars: lane `l` holds column `l & 15` of a tile and rows
 sixteen lanes write 32 contiguous bytes of one row of `dx` per step, and the rows and columns past
 `M` and `K` are dropped rather than written.
 
+The gather's kernel is one CTA per row of `dy`, 256 threads, each thread walking the width in
+stride and adding its row to the row of `x` the index names with an f32 atomic into a zeroed
+`dx`. The atomic is the only thing in the kernel that can run out of order -- a source row
+gathered by several rows is their sum in whatever order, the sum staying in f32 -- and the rest of
+the call is one read of `dy`, one write of `dx` and a zeroing of it.
+
 ## Shapes
 
 The fixture's shapes of both ops, and the model's hidden width with sixteen rows, are compared over
@@ -136,6 +183,24 @@ count looks like; the widths are the ones [`docs/ADAPTER.md`](../ADAPTER.md) wri
 `qwen3.8-27b-iqr-v4`. No `model`-labelled test is needed for them: a device row takes its shape from
 the record, not from the container, so the numbers below are the only thing a card run needs.
 
+The gather's cases are the fixture's three widths, one case that gathers sixteen rows onto each
+source row, one that pins the edges -- a negative index, an index past the source rows, a duplicate
+index that sums, a width that is not a multiple of sixteen and more gather rows than source rows --
+and the model's hidden width at one and four thousand tokens: the single 4096-token sequence and
+the packed batch of 317, 1009 and 2697, each carrying one row per sequence before its own, as the
+container's `out_ids` does. Every one is compared whole, not on sampled rows: the host row is one
+scatter pass, twenty-one million f64 additions at the model's shape.
+
+| shape | `M` | rows of `x` | width |
+| --- | --- | --- | --- |
+| fixture, 1 | 4 | 17 | 128 |
+| fixture, 2 | 17 | 256 | 37 |
+| fixture, 3 | 37 | 320 | 384 |
+| sixteen onto one | 512 | 32 | 128 |
+| one sequence | 4097 | 4096 | 5120 |
+| packed batch | 4099 | 4096 | 5120 |
+| the edges, pinned | 7 | 4 | 37 |
+
 Limits, each checked rather than assumed. A record outside them -- one the predicate above did not
 already decline -- is declined without writing to `dc`, the way a host row declines a shape it does
 not serve; an adjoint must not throw (`src/adjoint/device/README.md`).
@@ -149,6 +214,8 @@ not serve; an adjoint must not throw (`src/adjoint/device/README.md`).
 - `N` is padded up to a multiple of 16 with zero weight rows and zero `dy` columns, because the
   reduction tile is 16 channels wide. The fixture's eight-channel projections take that path,
   and the padded rows cannot add to the sum.
+- the gather serves the bf16 records only, takes an integer `idx`, and `M * n` and `rows * n`
+  must fit a 32-bit element offset;
 
 ## Scratch memory
 
@@ -161,6 +228,10 @@ MiB, so the formula is what the call asks for. The buffers come from the plugin'
 ledger (`src/adjoint/device/scratch.h`), so they are charged to radiance's VRAM pool, and the
 test resets the ledger around the call, measures the peak the call asked for, and fails a kernel
 that leaves any of it behind (`live_bytes` back to zero).
+
+The gather's call asks for `2*M*n` bytes of bf16 `dy`, `4*M` of i32 index and `4*rows*n` of f32
+`dx`, from the same ledger: 120.1 MiB at the model's hidden width (40.0 of `dy`, 80.0 of `dx`,
+16 KiB of index).
 
 ## Measurement
 
@@ -243,3 +314,6 @@ The card tier runs its tests from `main` (`tests/gpu/main.cpp`): the same launch
 faults inside `hipLaunchKernel` once radiance's device layer has initialised, so a device test
 cannot wait until the binary exits. (The host tier also runs from `tests/host/main.cpp`, for its own
 static-lifetime reason.) `--bench` is the gpu main's flag.
+
+The gather's cases print their lines in the same `--bench` run, one per shape; the card's numbers
+for them land with the card run this revision takes.

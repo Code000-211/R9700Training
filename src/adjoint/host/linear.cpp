@@ -1,16 +1,18 @@
 // r97/adjoint/host/linear.cpp -- host twins and adjoints for the frozen linears.
 //
 // Every op here has a frozen weight: only the input cotangent is produced. The int8 linear's
-// cotangent is in the dequantised (rotated) activation basis, so the weight is dequantised in the
-// adjoint but the activation scale is not applied again.
+// cotangent is in the CODES' (rotated) activation basis -- the basis the trunk's quantisers
+// consume, each dividing the code cotangent by its own group scale -- so the adjoint dequantises
+// the weight AND applies the activation's own group scale to the dequantised row.
 
 #include "r97/adjoint.h"
 
-#include "host_step_record.h"
+#include "parallel.h"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -22,6 +24,11 @@ int64_t numel(const std::vector<int64_t>& shape) {
     for (int64_t d : shape) n *= d;
     return n;
 }
+// The pair of rows the parallel for cuts the M-row loops into: a one-row call (the fixture's
+// narrow cases) stays on the calling thread, and an odd M leaves one row to a worker rather
+// than a whole chunk. The row is the loops' output -- their inner sums stay the row's serial
+// order -- so the partition writes nothing a neighbour reads.
+constexpr int64_t kRowChunk = 2;
 
 const OpParam* find_param(const OpRecord& rec, const char* name) {
     for (const OpParam& p : rec.params) {
@@ -101,12 +108,27 @@ double scale_at(const AdValue* scale, int64_t row, int64_t group, int64_t rows, 
     return scale->value[static_cast<std::size_t>(at)];
 }
 
+// A stored operand: the tape gives its bytes behind `raw` in the engine's private layout and
+// nothing in `value`. A device row decodes that layout from the pointer; a host row that indexed
+// its empty value would read out of bounds, and a scale that answered 1.0 for it would be a
+// silent wrong number. The row refuses it by name, as the device row declines a stored plane it
+// cannot decode, so a stored weight never reaches this file's loops.
+[[noreturn]] void refuse_stored(const OpRecord& rec, int pos) {
+    throw std::runtime_error("r97: host adjoint: op '" + rec.op + "': operand '" +
+                             rec.operands[static_cast<std::size_t>(pos)].buffer +
+                             "' is stored in a plugin-private encoding the host row cannot read");
+}
+
 // y[M,N] = a[M,K] * b[N,K]^T, with the f32 accumulation of the host kernel done in f64.
 void gemm_nt_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
                   std::vector<AdValue>* out) {
     const AdValue* a = read_at(rec, operands, operand_pos(rec, "a"));
     const AdValue* b = read_at(rec, operands, operand_pos(rec, "b"));
     if (a == nullptr || b == nullptr) return;
+    const int ia = operand_pos(rec, "a");
+    const int ib = operand_pos(rec, "b");
+    if (a->raw != nullptr) refuse_stored(rec, ia);
+    if (b->raw != nullptr) refuse_stored(rec, ib);
     const int64_t K = param_int(rec, "K", a->shape.size() >= 2 ? a->shape[1] : 0);
     const int64_t N = param_int(rec, "N", b->shape.size() >= 2 ? b->shape[0] : 0);
     // `M` is the weight's capacity; the operand's own first dimension is how many rows this call
@@ -115,7 +137,7 @@ void gemm_nt_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     const Operand* w = first_write(rec);
     out->push_back(make_value(w != nullptr ? w->dtype : a->dtype, {M, N}));
     AdValue& y = out->back();
-    for (int64_t m = 0; m < M; ++m) {
+    parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t n = 0; n < N; ++n) {
             double acc = 0.0;
             for (int64_t k = 0; k < K; ++k) {
@@ -124,7 +146,7 @@ void gemm_nt_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
             }
             y.value[static_cast<std::size_t>(m * N + n)] = acc;
         }
-    }
+    });
 }
 
 void gemm_nt_adjoint(const AdjointCall& call) {
@@ -134,11 +156,12 @@ void gemm_nt_adjoint(const AdjointCall& call) {
     const AdValue& a = call.fwd[static_cast<std::size_t>(ia)];
     const AdValue& b = call.fwd[static_cast<std::size_t>(ib)];
     const AdValue& dy = call.cot[0];
+    if (b.raw != nullptr) refuse_stored(call.rec, ib);
     const int64_t K = param_int(call.rec, "K", a.shape.size() >= 2 ? a.shape[1] : 0);
     const int64_t N = param_int(call.rec, "N", b.shape.size() >= 2 ? b.shape[0] : 0);
     const int64_t M = param_int(call.rec, "M", a.shape.empty() ? 0 : a.shape[0]);
     AdValue& dx = (*call.dc)[static_cast<std::size_t>(ia)];
-    for (int64_t m = 0; m < M; ++m) {
+    parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t k = 0; k < K; ++k) {
             double acc = 0.0;
             for (int64_t n = 0; n < N; ++n) {
@@ -147,7 +170,7 @@ void gemm_nt_adjoint(const AdjointCall& call) {
             }
             dx.value[static_cast<std::size_t>(m * K + k)] += acc;
         }
-    }
+    });
 }
 
 // y[M,N] = (a codes * a_scale) * (b codes * b_scale)^T, grouped as the host kernel groups.
@@ -158,6 +181,10 @@ void gemm_nt_q_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     const AdValue* as = read_at(rec, operands, operand_pos(rec, "a_scale"));
     const AdValue* bs = read_at(rec, operands, operand_pos(rec, "b_scale"));
     if (a == nullptr || b == nullptr) return;
+    if (a->raw != nullptr) refuse_stored(rec, operand_pos(rec, "a"));
+    if (b->raw != nullptr) refuse_stored(rec, operand_pos(rec, "b"));
+    if (as != nullptr && as->raw != nullptr) refuse_stored(rec, operand_pos(rec, "a_scale"));
+    if (bs != nullptr && bs->raw != nullptr) refuse_stored(rec, operand_pos(rec, "b_scale"));
     const int64_t K = param_int(rec, "K", a->shape.size() >= 2 ? a->shape[1] : 0);
     const int64_t N = param_int(rec, "N", b->shape.size() >= 2 ? b->shape[0] : 0);
     const int64_t M = a->shape.empty() ? param_int(rec, "M", 0) : a->shape[0];
@@ -166,7 +193,7 @@ void gemm_nt_q_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     const Operand* w = first_write(rec);
     out->push_back(make_value(w != nullptr ? w->dtype : a->dtype, {M, N}));
     AdValue& y = out->back();
-    for (int64_t m = 0; m < M; ++m) {
+    parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t n = 0; n < N; ++n) {
             double acc = 0.0;
             for (int64_t g = 0; g < groups; ++g) {
@@ -181,18 +208,23 @@ void gemm_nt_q_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
             }
             y.value[static_cast<std::size_t>(m * N + n)] = acc;
         }
-    }
+    });
 }
 
-// dx in the dequantised activation basis: dy * W, where W dequantises the int8 weight codes.
+// dx in the codes' activation basis: the dequantised product dy * W, times the activation's group
+// scale s_a -- the cotangent a downstream quantiser consumes (gemm_nt_q_twin:208 applies s_a to `a`).
 void gemm_nt_q_adjoint(const AdjointCall& call) {
     const int ia = operand_pos(call.rec, "a");
     const int ib = operand_pos(call.rec, "b");
+    const int ias = operand_pos(call.rec, "a_scale");
     const int ibs = operand_pos(call.rec, "b_scale");
     if (ia < 0 || ib < 0 || call.cot.empty()) return;
     const AdValue& a = call.fwd[static_cast<std::size_t>(ia)];
     const AdValue& b = call.fwd[static_cast<std::size_t>(ib)];
+    const AdValue* as = ias >= 0 ? &call.fwd[static_cast<std::size_t>(ias)] : nullptr;
     const AdValue* bs = ibs >= 0 ? &call.fwd[static_cast<std::size_t>(ibs)] : nullptr;
+    if (b.raw != nullptr) refuse_stored(call.rec, ib);
+    if (bs != nullptr && bs->raw != nullptr) refuse_stored(call.rec, ibs);
     const AdValue& dy = call.cot[0];
     const int64_t K = param_int(call.rec, "K", a.shape.size() >= 2 ? a.shape[1] : 0);
     const int64_t N = param_int(call.rec, "N", b.shape.size() >= 2 ? b.shape[0] : 0);
@@ -200,7 +232,7 @@ void gemm_nt_q_adjoint(const AdjointCall& call) {
     const int64_t group = param_int(call.rec, "group", K > 0 ? K : 1);
     const int64_t groups = group > 0 ? (K + group - 1) / group : 1;
     AdValue& dx = (*call.dc)[static_cast<std::size_t>(ia)];
-    for (int64_t m = 0; m < M; ++m) {
+    parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t k = 0; k < K; ++k) {
             const int64_t g = group > 0 ? k / group : 0;
             double acc = 0.0;
@@ -209,9 +241,9 @@ void gemm_nt_q_adjoint(const AdjointCall& call) {
                        b.value[static_cast<std::size_t>(n * K + k)] *
                        scale_at(bs, n, g, N, groups);
             }
-            dx.value[static_cast<std::size_t>(m * K + k)] += acc;
+            dx.value[static_cast<std::size_t>(m * K + k)] += acc * scale_at(as, m, g, M, groups);
         }
-    }
+    });
 }
 
 // logits_gemm: the same transposed product, with the head's own parameter names.
@@ -220,13 +252,15 @@ void logits_gemm_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     const AdValue* x = read_at(rec, operands, operand_pos(rec, "x"));
     const AdValue* w = read_at(rec, operands, operand_pos(rec, "lm_head"));
     if (x == nullptr || w == nullptr) return;
+    if (x->raw != nullptr) refuse_stored(rec, operand_pos(rec, "x"));
+    if (w->raw != nullptr) refuse_stored(rec, operand_pos(rec, "lm_head"));
     const int64_t K = param_int(rec, "n_embd", x->shape.size() >= 2 ? x->shape[1] : 0);
     const int64_t N = param_int(rec, "n_vocab", w->shape.size() >= 2 ? w->shape[0] : 0);
     const int64_t M = x->shape.empty() ? 0 : x->shape[0];
     const Operand* y = first_write(rec);
     out->push_back(make_value(y != nullptr ? y->dtype : x->dtype, {M, N}));
     AdValue& logits = out->back();
-    for (int64_t m = 0; m < M; ++m) {
+    parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t n = 0; n < N; ++n) {
             double acc = 0.0;
             for (int64_t k = 0; k < K; ++k) {
@@ -235,7 +269,7 @@ void logits_gemm_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
             }
             logits.value[static_cast<std::size_t>(m * N + n)] = acc;
         }
-    }
+    });
 }
 
 void logits_gemm_adjoint(const AdjointCall& call) {
@@ -244,12 +278,13 @@ void logits_gemm_adjoint(const AdjointCall& call) {
     if (ix < 0 || iw < 0 || call.cot.empty()) return;
     const AdValue& x = call.fwd[static_cast<std::size_t>(ix)];
     const AdValue& w = call.fwd[static_cast<std::size_t>(iw)];
+    if (w.raw != nullptr) refuse_stored(call.rec, iw);
     const AdValue& dy = call.cot[0];
     const int64_t K = param_int(call.rec, "n_embd", x.shape.size() >= 2 ? x.shape[1] : 0);
     const int64_t N = param_int(call.rec, "n_vocab", w.shape.size() >= 2 ? w.shape[0] : 0);
     const int64_t M = x.shape.empty() ? 0 : x.shape[0];
     AdValue& dx = (*call.dc)[static_cast<std::size_t>(ix)];
-    for (int64_t m = 0; m < M; ++m) {
+    parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t k = 0; k < K; ++k) {
             double acc = 0.0;
             for (int64_t n = 0; n < N; ++n) {
@@ -258,7 +293,7 @@ void logits_gemm_adjoint(const AdjointCall& call) {
             }
             dx.value[static_cast<std::size_t>(m * K + k)] += acc;
         }
-    }
+    });
 }
 
 // gather_rows: y[i,:] = x[idx[i],:] and a negative index selects a zero row.
@@ -267,6 +302,7 @@ void gather_rows_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     const AdValue* x = read_at(rec, operands, operand_pos(rec, "x"));
     const AdValue* idx = read_at(rec, operands, operand_pos(rec, "idx"));
     if (x == nullptr || idx == nullptr) return;
+    if (x->raw != nullptr) refuse_stored(rec, operand_pos(rec, "x"));
     const int64_t width = param_int(rec, "n", x->shape.size() >= 2 ? x->shape[1] : 1);
     const Operand* y = first_write(rec);
     const int64_t rows = y != nullptr && !y->shape.empty() ? y->shape[0] : static_cast<int64_t>(idx->value.size());
@@ -311,6 +347,7 @@ void embed_lookup_twin(const OpRecord& rec, const std::vector<AdValue>& operands
     const AdValue* tokens = read_at(rec, operands, operand_pos(rec, "tokens"));
     const AdValue* table = read_at(rec, operands, operand_pos(rec, "wte"));
     if (tokens == nullptr || table == nullptr) return;
+    if (table->raw != nullptr) refuse_stored(rec, operand_pos(rec, "wte"));
     const int64_t width = param_int(rec, "n_embd", table->shape.size() >= 2 ? table->shape[1] : 1);
     const int64_t vocab = param_int(rec, "n_vocab", table->shape.size() >= 2 ? table->shape[0] : 0);
     const int64_t offset = param_int(rec, "vocab_offset", 0);
@@ -332,26 +369,6 @@ void embed_lookup_twin(const OpRecord& rec, const std::vector<AdValue>& operands
 
 void embed_lookup_adjoint(const AdjointCall&) {}
 
-// The host step's int8 walk consumes code operands: its quantisers divide the code cotangent by
-// the group scale. The family row's cotangent is for the dequantised activation, so this wrapper
-// multiplies it by the activation scale to hand the codes' cotangent back.
-void gemm_nt_q_code_adjoint(const AdjointCall& call) {
-    gemm_nt_q_adjoint(call);
-    const int ia = operand_pos(call.rec, "a");
-    const int ias = operand_pos(call.rec, "a_scale");
-    if (ia < 0 || ias < 0) return;
-    const AdValue& a = call.fwd[static_cast<std::size_t>(ia)];
-    const AdValue* as = &call.fwd[static_cast<std::size_t>(ias)];
-    const int64_t K = param_int(call.rec, "K", a.shape.size() >= 2 ? a.shape[1] : 0);
-    const int64_t M = a.shape.empty() ? param_int(call.rec, "M", 0) : a.shape[0];
-    const int64_t group = param_int(call.rec, "group", K > 0 ? K : 1);
-    const int64_t groups = group > 0 ? (K + group - 1) / group : 1;
-    AdValue& dx = (*call.dc)[static_cast<std::size_t>(ia)];
-    for (int64_t m = 0; m < M; ++m)
-        for (int64_t k = 0; k < K; ++k)
-            dx.value[static_cast<std::size_t>(m * K + k)] *= scale_at(as, m, k / group, M, groups);
-}
-
 }  // namespace
 
 R97_REGISTER_TWIN("gemm_nt", gemm_nt_twin)
@@ -359,7 +376,6 @@ R97_REGISTER_ADJOINT_F("gemm_nt", host, gemm_nt_adjoint, 1)
 
 R97_REGISTER_TWIN("gemm_nt_q", gemm_nt_q_twin)
 R97_REGISTER_ADJOINT_F("gemm_nt_q", host, gemm_nt_q_adjoint, 1, 2, 3)
-R97_REGISTER_ADJOINT_IF_F("gemm_nt_q", host, gemm_nt_q_code_adjoint, host_step_record, 1, 2, 3)
 
 R97_REGISTER_TWIN("logits_gemm", logits_gemm_twin)
 R97_REGISTER_ADJOINT_F("logits_gemm", host, logits_gemm_adjoint, 1)

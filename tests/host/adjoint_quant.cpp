@@ -712,4 +712,104 @@ R97_TEST(adjoint_fused_quant_agrees_with_finite_differences) {
     }
 }
 
+/* -- (8) the int8 producers' fused rows ------------------------------------- */
+
+/* The int8 trunk's three producers compose an elementwise part with the
+ * `had_quant_act_i8g` quantiser, so unlike the fp8 family above they write no
+ * bf16 activation of their own: the part's output is internal and only the
+ * codes and the scale reach the tape. Their linearised rows therefore have to
+ * reach the quantiser's own `had_quant_act_i8g_ste` row, and the base point --
+ * the part's output the quantiser was linearised at -- is appended after the
+ * writes, which is the schema position the frozen list names. */
+
+const char* i8g_part(const char* op) {
+    if (std::strcmp(op, "gated_had_quant_i8g") == 0) return "silu_mul";
+    if (std::strcmp(op, "gate_had_quant_i8g") == 0) return "act_mul";
+    return "rmsnorm";
+}
+
+bool i8g_norm(const char* op) { return std::strcmp(op, "rmsnorm_had_quant_i8g") == 0; }
+bool i8g_gated(const char* op) { return std::strcmp(op, "gated_had_quant_i8g") == 0; }
+
+OpRecord i8g_rec(const char* op, const FusedShape& s, bool linearised) {
+    const int64_t ngrp = fused_groups(s);
+    OpRecord rec;
+    rec.op = op;
+    if (linearised) rec.op += "_ste";
+    rec.n = s.rows;
+    if (i8g_norm(op)) {
+        rec.params = {{"M", s.rows},  {"n", s.n},     {"group", s.group},
+                      {"dtype", "bf16"}, {"eps", "1e-6"}};
+        rec.operands = {{"x", "bf16", {s.rows, s.n}, 0, s.rows, false},
+                        {"w", "f32", {s.n}, 0, 1, false}};
+    } else if (i8g_gated(op)) {
+        rec.params = {{"M", s.rows},  {"n", s.n},     {"group", s.group},
+                      {"dtype", "bf16"}, {"act", "silu"}};
+        rec.operands = {{"gate_up", "bf16", {s.rows, 2 * s.n}, 0, s.rows, false}};
+    } else {
+        rec.params = {{"M", s.rows},  {"n", s.n},     {"group", s.group},
+                      {"dtype", "bf16"}, {"act", "sigmoid"}};
+        rec.operands = {{"a", "bf16", {s.rows, s.n}, 0, s.rows, false},
+                        {"b", "bf16", {s.rows, s.n}, 0, s.rows, false}};
+    }
+    rec.operands.push_back({"codes", "i8", {s.rows, s.n}, 0, s.rows, true});
+    rec.operands.push_back({"scale", "f32", {s.rows, ngrp}, 0, s.rows, true});
+    if (linearised)
+        rec.operands.push_back({"base", "bf16", {s.rows, s.n}, 0, s.rows, false});
+    return rec;
+}
+
+/* The intermediate the part wrote, which is what the quantiser saw and what
+ * the linearised row is taken at. The fused row does not write it, so it is
+ * computed the way the row computes it: the part's own twin over the read
+ * operands of the fused record. */
+std::vector<AdValue> i8g_intermediate(const char* op, const FusedShape& s,
+                                      const std::vector<AdValue>& in) {
+    const OpRecord rec = i8g_rec(op, s, false);
+    std::string err;
+    TwinFn part = twin_find(i8g_part(op), rec.params, &err);
+    if (part == nullptr) fail(std::string("no twin for ") + i8g_part(op) + ": " + err);
+    std::vector<AdValue> y;
+    part(rec, in, &y);
+    if (y.empty()) fail(std::string("no intermediate from ") + i8g_part(op));
+    return y;
+}
+
+std::vector<AdValue> i8g_in(const char* op, const FusedShape& s, uint64_t seed) {
+    if (i8g_norm(op))
+        return {values("bf16", {s.rows, s.n}, activation(Shape{s.name, s.rows, s.n, s.group}, seed)),
+                values("f32", {s.n}, gain(s.n, seed + 2))};
+    if (i8g_gated(op))
+        return {values("bf16", {s.rows, 2 * s.n},
+                       activation(Shape{s.name, s.rows, 2 * s.n, s.group}, seed))};
+    return {values("bf16", {s.rows, s.n}, activation(Shape{s.name, s.rows, s.n, s.group}, seed)),
+            values("bf16", {s.rows, s.n}, activation(Shape{s.name, s.rows, s.n, s.group}, seed + 1))};
+}
+
+std::vector<AdValue> i8g_out(const FusedShape& s) {
+    const size_t cells = (size_t)(s.rows * s.n);
+    const size_t grp = (size_t)(s.rows * fused_groups(s));
+    return {values("i8", {s.rows, s.n}, std::vector<double>(cells, 0.0)),
+            values("f32", {s.rows, fused_groups(s)}, std::vector<double>(grp, 0.0))};
+}
+
+void i8g_fd_check(const char* op, const FusedShape& s) {
+    std::vector<AdValue> in = i8g_in(op, s, 0x5deece66dull);
+    in.push_back(i8g_intermediate(op, s, in)[0]); /* the quantiser's base point */
+    const FdReport fd = check_adjoint(i8g_rec(op, s, true), in, i8g_out(s), fd_tol);
+    std::printf("%-24s %-28s adjoint rel err %.3g\n", (std::string(op) + "_ste").c_str(), s.name,
+                fd.rel);
+    require(fd);
+}
+
+/* The three producers are held to their own finite differences, which is the
+ * only check that can see a factor both the host and the device row share. */
+R97_TEST(adjoint_i8g_producers_agree_with_finite_differences) {
+    for (const FusedShape& s : fused_shapes()) {
+        i8g_fd_check("rmsnorm_had_quant_i8g", s);
+        i8g_fd_check("gated_had_quant_i8g", s);
+        i8g_fd_check("gate_had_quant_i8g", s);
+    }
+}
+
 }  // namespace

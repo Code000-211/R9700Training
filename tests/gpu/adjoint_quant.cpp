@@ -14,10 +14,9 @@
 // parts. A fused producer's record is the quantiser's (a had_quant_act_i8g record over the
 // elementwise part's output) and the elementwise op's, so `reference()` runs those two host
 // adjoints in the order the kernel undoes them, and the twin the harness builds the forward with
-// is the same composition of the parts' twins. The fused producers have no host twin yet
-// (docs/adjoints/quant.md: an op that turns up later belongs there, not here); this test registers
-// the composition so the forward values, the device adjoint's recomputed intermediate and the
-// reference all read one definition of it.
+// is the same composition of the parts' twins. The host family registers that composition under
+// each producer's name (src/adjoint/host/quant.cpp), so the forward values, the device adjoint's
+// recomputed intermediate and the reference all read one definition of it.
 //
 // Needs one R9700 (gfx1201, 32 GB) or similar; runs under the GPU test guard. No container is
 // read: the real shapes are numbers from the design, so this test does not carry the `model` label.
@@ -84,38 +83,6 @@ OpRecord quant_record(int64_t rows, int64_t n, int64_t group) {
         Operand{"scale", "f32", {rows, n / group}, 0, rows, true},
     };
     return q;
-}
-
-// The forward of each fused producer, as the composition of the parts' twins: the elementwise part
-// over the record's read operands, then the quantiser over its output.
-void fused_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
-                std::vector<AdValue>* out, Part part) {
-    const int64_t n = int_param(rec.params, "n");
-    const int64_t group = int_param(rec.params, "group");
-
-    std::vector<AdValue> y;
-    if (part == Part::none) {
-        y = {operands.at(0)};
-    } else {
-        TwinFn elem = twin_find(part_op(part), rec.params, nullptr);
-        if (!elem) throw std::runtime_error(std::string("no twin for ") + part_op(part));
-        elem(rec, operands, &y);
-    }
-    const int64_t rows = y.at(0).shape.at(0);
-    const OpRecord q = quant_record(rows, n, group);
-    TwinFn quant = twin_find(q.op, q.params, nullptr);
-    if (!quant) throw std::runtime_error("no twin for had_quant_act_i8g");
-    quant(q, y, out);
-}
-
-void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector<AdValue>* out) {
-    fused_twin(rec, op, out, Part::rmsnorm);
-}
-void gated_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector<AdValue>* out) {
-    fused_twin(rec, op, out, Part::silu_mul);
-}
-void gate_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector<AdValue>* out) {
-    fused_twin(rec, op, out, Part::sigmoid_mul);
 }
 
 // -- the reference: the parts' host adjoints, in the order the kernel undoes them -------------
@@ -246,6 +213,254 @@ void wrong_quant_adjoint(const AdjointCall& call) {
     for (size_t i = 0; i < dx.value.size(); ++i) dx.value[i] += call.cot.at(0).value[i];
 }
 
+// The live tape's fused producers: the elementwise output is a third write beside the codes and the
+// scale, and `rmsnorm_had_quant_i8g`'s record carries a phantom write ahead of them. The row must
+// find the roles by dtype and shape -- the codes' cotangent is cot[1] there, not cot[0] -- sum the
+// output's own cotangent in, and refuse a count it does not serve by name. Each of those was a
+// silent zero on the real container (399 of 400 leaves), so they are pinned here on the tape's
+// shapes, not the schema's.
+void fused_tape_shapes() {
+    const int64_t rows = 4, n = 128, group = 128, ngrp = n / group, total = rows * n;
+    uint64_t seed = 0x5eed1234ull;
+    struct Spec {
+        Part part;
+        const char* op;
+        bool phantom;
+    };
+    const Spec specs[] = {{Part::rmsnorm, "rmsnorm_had_quant_i8g", true},
+                          {Part::silu_mul, "gated_had_quant_i8g", false},
+                          {Part::sigmoid_mul, "gate_had_quant_i8g", false}};
+    for (const Spec& sp : specs) {
+        OpRecord rec;
+        rec.op = sp.op;
+        rec.params = {{"M", rows}, {"n", n}, {"group", group}, {"dtype", std::string("bf16")}};
+        if (sp.part == Part::rmsnorm) {
+            rec.params.push_back({"eps", std::string("1e-6")});
+            rec.params.push_back({"wadd", std::string("0.0")});
+        }
+        if (sp.part == Part::sigmoid_mul) rec.params.push_back({"act", std::string("sigmoid")});
+        std::vector<AdValue> fwd;
+        if (sp.part == Part::rmsnorm) {
+            rec.operands.push_back(read_operand("x", rows, n));
+            rec.operands.push_back(Operand{"none:1", "invalid", {}, 0, 0, true});
+            rec.operands.push_back(Operand{"w", "bf16", {n}, 0, 1, false});
+            fwd.push_back(device_check::random_value("bf16", {rows, n}, &seed));
+            fwd.emplace_back();
+            fwd.push_back(device_check::random_value("bf16", {n}, &seed));
+        } else if (sp.part == Part::silu_mul) {
+            rec.operands.push_back(read_operand("gate_up", rows, 2 * n));
+            fwd.push_back(device_check::random_value("bf16", {rows, 2 * n}, &seed));
+        } else {
+            rec.operands.push_back(read_operand("gate", rows, n));
+            rec.operands.push_back(read_operand("x", rows, n));
+            fwd.push_back(device_check::random_value("bf16", {rows, n}, &seed));
+            fwd.push_back(device_check::random_value("bf16", {rows, n}, &seed));
+        }
+        rec.operands.push_back(Operand{"q", "i8", {rows, n}, 0, rows, true});
+        AdValue codes;
+        codes.dtype = "i8";
+        codes.shape = {rows, n};
+        codes.value.resize((size_t)total);
+        for (int64_t i = 0; i < total; ++i)
+            codes.value[(size_t)i] = double((i * 37) % 255) - 127.0;
+        fwd.push_back(std::move(codes));
+        rec.operands.push_back(Operand{"scale", "f32", {rows, ngrp}, 0, rows, true});
+        AdValue scale;
+        scale.dtype = "f32";
+        scale.shape = {rows, ngrp};
+        scale.value.resize((size_t)(rows * ngrp));
+        for (int64_t i = 0; i < rows * ngrp; ++i) scale.value[(size_t)i] = 1.0 + 0.01 * (i % 7);
+        fwd.push_back(std::move(scale));
+        // The elementwise output the fused producer also writes, and its consumers' cotangent.
+        rec.operands.push_back(Operand{"out_bf16", "bf16", {rows, n}, 0, rows, true});
+        fwd.push_back(device_check::random_value("bf16", {rows, n}, &seed));
+        std::vector<AdValue> cot;
+        // One cotangent per write, in the record's write order: the walk hands the row exactly
+        // that, so the phantom write's slot is a hole the codes' cotangent must not land in.
+        for (const Operand& o : rec.operands) {
+            if (!o.written) continue;
+            if (o.buffer == "q")
+                cot.push_back(device_check::random_value("f32", {rows, n}, &seed));
+            else if (o.buffer == "scale")
+                cot.push_back(device_check::random_value("f32", {rows, ngrp}, &seed));
+            else if (o.buffer == "out_bf16")
+                cot.push_back(device_check::random_value("f32", {rows, n}, &seed));
+            else
+                cot.emplace_back();
+        }
+        std::vector<AdValue> dc;
+        for (const Operand& o : rec.operands) {
+            AdValue v;
+            v.dtype = o.dtype;
+            v.shape = o.shape;
+            v.value.assign((size_t)numel(o.shape), 0.0);
+            dc.push_back(std::move(v));
+        }
+        AdjointCall call{rec, fwd, cot, &dc, nullptr, ""};
+        AdjointFn fn = adjoint_find(rec.op, Side::device, rec.params, nullptr);
+        R97_CHECK(fn != nullptr);
+        fn(call);
+        double sum = 0.0;
+        for (double v : dc.at(0).value) sum += std::fabs(v);
+        R97_CHECK(sum > 0.0);
+        std::printf("%s fused shape (%lld operands, phantom %d): dc[0] non-zero, |sum| %.6g\n",
+                    rec.op.c_str(), (long long)rec.operands.size(), (int)sp.phantom, sum);
+
+        // A count the row does not serve refuses by name instead of returning a zero gradient.
+        // Two extras, not one: one more write than the schema's shape is the fused producer's own
+        // layout (codes, scale, output), so only a count past every served layout is a wrong one.
+        OpRecord wrong = rec;
+        wrong.operands.push_back(Operand{"extra", "bf16", {rows, n}, 0, rows, true});
+        wrong.operands.push_back(Operand{"extra2", "bf16", {rows, n}, 0, rows, true});
+        std::vector<AdValue> wfwd = fwd, wcot = cot, wdc = dc;
+        wfwd.emplace_back();
+        wfwd.emplace_back();
+        wcot.emplace_back();
+        wcot.emplace_back();
+        wdc.emplace_back();
+        wdc.emplace_back();
+        AdjointCall wcall{wrong, wfwd, wcot, &wdc, nullptr, ""};
+        std::string what;
+        try {
+            fn(wcall);
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        R97_CHECK(!what.empty());
+        R97_CHECK(what.find(rec.op) != std::string::npos);
+        std::printf("%s wrong count: %s\n", rec.op.c_str(), what.c_str());
+    }
+}
+
+
+// The live `gate_had_quant_i8g` record, as the tape carries it: the params declare n=256
+// group=128 while the codes are 6144 wide with a 48-group scale (group 128), and the elementwise
+// output is a third write beside them. Every role is the shapes', not the params' -- pinning this
+// is what the schema's four-operand shape could not do, and the short-operand refusals below are
+// the ones that used to be silent zeros.
+void live_gate_shape() {
+    const int64_t rows = 4, codes_n = 6144, ngrp = 48;  // group 128, the live record's
+    const int64_t total = rows * codes_n;
+    uint64_t seed = 0x9a7f0badull;
+
+    OpRecord rec;
+    rec.position = 1453;
+    rec.op = "gate_had_quant_i8g";
+    // `n` names something else entirely (256): the row must read the widths off the operands, and
+    // only the activation and the group's power-of-two come from the params.
+    rec.params = {{"M", rows},
+                  {"n", int64_t(256)},
+                  {"group", int64_t(128)},
+                  {"dtype", std::string("bf16")},
+                  {"act", std::string("sigmoid")}};
+    rec.operands = {read_operand("gate", rows, codes_n), read_operand("x", rows, codes_n),
+                    Operand{"q8", "i8", {rows, codes_n}, 0, rows, true},
+                    Operand{"s8", "f32", {rows, ngrp}, 0, rows, true},
+                    Operand{"out", "bf16", {rows, codes_n}, 0, rows, true}};
+    std::vector<AdValue> fwd;
+    fwd.push_back(device_check::random_value("bf16", {rows, codes_n}, &seed));
+    fwd.push_back(device_check::random_value("bf16", {rows, codes_n}, &seed));
+    AdValue codes;
+    codes.dtype = "i8";
+    codes.shape = {rows, codes_n};
+    codes.value.resize((size_t)total);
+    for (int64_t i = 0; i < total; ++i) codes.value[(size_t)i] = double((i * 37) % 255) - 127.0;
+    fwd.push_back(std::move(codes));
+    AdValue scale;
+    scale.dtype = "f32";
+    scale.shape = {rows, ngrp};
+    scale.value.resize((size_t)(rows * ngrp));
+    for (int64_t i = 0; i < rows * ngrp; ++i) scale.value[(size_t)i] = 1.0 + 0.01 * (i % 7);
+    fwd.push_back(std::move(scale));
+    fwd.push_back(device_check::random_value("bf16", {rows, codes_n}, &seed));
+
+    // One cotangent per write, in the record's write order: the codes' is cot[0] here.
+    const std::vector<AdValue> cot = {device_check::random_value("f32", {rows, codes_n}, &seed),
+                                      device_check::random_value("f32", {rows, ngrp}, &seed),
+                                      device_check::random_value("f32", {rows, codes_n}, &seed)};
+    std::vector<AdValue> dc;
+    for (const Operand& o : rec.operands) {
+        AdValue v;
+        v.dtype = o.dtype;
+        v.shape = o.shape;
+        v.value.assign((size_t)numel(o.shape), 0.0);
+        dc.push_back(std::move(v));
+    }
+    AdjointCall call{rec, fwd, cot, &dc, nullptr, ""};
+    AdjointFn fn = adjoint_find(rec.op, Side::device, rec.params, nullptr);
+    R97_CHECK(fn != nullptr);
+    fn(call);
+    double sg = 0.0, sx = 0.0;
+    for (double v : dc.at(0).value) sg += std::fabs(v);
+    for (double v : dc.at(1).value) sx += std::fabs(v);
+    R97_CHECK(sg > 0.0);
+    R97_CHECK(sx > 0.0);
+    std::printf("gate_had_quant_i8g live shape (codes %lld wide, %lld-group scale): roles found, "
+                "|dc| %.6g + %.6g\n",
+                (long long)codes_n, (long long)ngrp, sg, sx);
+
+    // A slot the walk hands back short refuses by name: `dc[1]` is x's cotangent, `fwd[0]` the
+    // gate's activation. A return here would be the zero this row was fixed never to produce.
+    {
+        std::vector<AdValue> short_dc = dc;
+        short_dc.at(1).value.resize((size_t)(total - 1));
+        AdjointCall sc{rec, fwd, cot, &short_dc, nullptr, ""};
+        std::string what;
+        try {
+            fn(sc);
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        R97_CHECK(what.find("dc[1]") != std::string::npos);
+        R97_CHECK(what.find(rec.op) != std::string::npos);
+        std::printf("gate_had_quant_i8g short dc[1]: %s\n", what.c_str());
+    }
+    {
+        std::vector<AdValue> short_fwd = fwd;
+        short_fwd.at(0).value.resize((size_t)(total - 1));
+        AdjointCall sf{rec, short_fwd, cot, &dc, nullptr, ""};
+        std::string what;
+        try {
+            fn(sf);
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        R97_CHECK(what.find("fwd[0]") != std::string::npos);
+        std::printf("gate_had_quant_i8g short fwd[0]: %s\n", what.c_str());
+    }
+    // The tape's own values short, not the walk's slots: a scale snapshot one value short is what
+    // produced 399 zeros on the real container, and the codes' cotangent short is the other half of
+    // the same silence. Both refuse by name, before any scratch is taken.
+    {
+        std::vector<AdValue> short_fwd = fwd;
+        short_fwd.at(3).value.resize((size_t)(rows * ngrp - 1));
+        AdjointCall ss{rec, short_fwd, cot, &dc, nullptr, ""};
+        std::string what;
+        try {
+            fn(ss);
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        R97_CHECK(what.find("operand 'scale'") != std::string::npos);
+        R97_CHECK(what.find(rec.op) != std::string::npos);
+        std::printf("gate_had_quant_i8g short scale: %s\n", what.c_str());
+    }
+    {
+        std::vector<AdValue> short_cot = cot;
+        short_cot.at(0).value.resize((size_t)(total - 1));
+        AdjointCall sc2{rec, fwd, short_cot, &dc, nullptr, ""};
+        std::string what;
+        try {
+            fn(sc2);
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        R97_CHECK(what.find("codes cotangent") != std::string::npos);
+        R97_CHECK(what.find(rec.op) != std::string::npos);
+        std::printf("gate_had_quant_i8g short codes cotangent: %s\n", what.c_str());
+    }
+}
+
 void run() {
     const auto options = device_check::guard_options(int64_t(1) << 30);
     const r97test::DeviceGuard guard(options);
@@ -303,15 +518,13 @@ void run() {
         R97_CHECK(wrong.first_slot == 0);
         std::printf("rejected the wrong kernel: %s\n", wrong.note.c_str());
     }
+
+    // The live tape's shapes, which the schema's count check used to refuse in silence, and the
+    // gate record's own widths, which its params do not name.
+    fused_tape_shapes();
+    live_gate_shape();
 }
 
 }  // namespace
 
 R97_TEST(adjoint_quant_device) { run(); }
-
-// The fused producers' twins: the parts' twins composed, registered here because the host family
-// has no twin for them yet. They carry no predicate (a device test's records are the ones it
-// builds), and they are what the harness and the reference build a case's forward with.
-R97_REGISTER_TWIN("rmsnorm_had_quant_i8g", rmsnorm_twin)
-R97_REGISTER_TWIN("gated_had_quant_i8g", gated_twin)
-R97_REGISTER_TWIN("gate_had_quant_i8g", gate_twin)

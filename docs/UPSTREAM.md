@@ -51,6 +51,8 @@ calls the join. See
 | `patches/training/0120-view-operands.patch` | training | 21 | 0 | 25 | not-submitted | the issue record names a narrowing view but not where its values are |
 | `patches/training/0121-issue-inout-mark.patch` | training | 2 | 0 | 8 | not-submitted | an operand whose kernel also reads the value it replaces is marked as such |
 | `patches/training/0122-issue-stream.patch` | training | 14 | 0 | 16 | not-submitted | the stream the step's ops issue on, so an observer can order a copy behind the op it sees |
+| `patches/training/0123-view-unspannable.patch` | training | 13 | 8 | 25 | not-submitted | the issue observer describes the tensor a kernel receives whenever it cannot state a byte span |
+| `patches/training/0124-encoding-on-record.patch` | training | 10 | 0 | 11 | not-submitted | the issue observer carries the weight's stored encoding when its dtype has no element size |
 
 Every patch is `not-submitted` at this pin. None is `merged`: none is in radiance's `origin/main`.
 Moving one to `open` or `merged` changes only its own row and `Upstream:` line, in the pull request

@@ -1,0 +1,52 @@
+Concern: the issue observer describes the tensor a kernel receives whenever it cannot state a byte span
+Upstream: not-submitted
+
+0101 states an operand's `bytes` only when the tensor is one contiguous span: a strided view and a
+plugin-private quantised tensor (a cube weight the kernel decodes in its own layout) both report 0
+there, because neither has a byte count a consumer may read as one packed span. 0120 gives the
+strided view its shape and strides, but only for a buffer, and not at all for a dtype with no byte
+size -- so a consumer that must read a weight's or a pool operand's values has the declared shape
+and nothing else. This extends the view to every operand the ABI cannot span: weights as well as
+buffers, and a packed tensor of a dtype with no element size too. `bytes` stays 0 for those; the
+view is the description and is never a synthesised packed copy. An element offset into a dtype with
+no element size is not a byte address, so the view carries the offset as issued.
+
+--- a/abi/rad_runtime.h
++++ b/abi/rad_runtime.h
+@@ -936,7 +936,9 @@
+-    /* The tensor the kernel receives, when it is not the declared one: a view narrows dim 0, or
+-     * strides the last axis (the q norm reads the query half of the interleaved q|gate buffer).
+-     * `view_off` is its first element's offset from the declared buffer's, and `view_stride` the
+-     * strides into the declared layout. `bytes` is 0 for such a view: it is not one span. */
++    /* The tensor the kernel receives, when it is not the declared one: a view narrows dim 0, or
++     * strides the last axis (the q norm reads the query half of the interleaved q|gate buffer), or
++     * the declared dtype has no element size (a plugin-private quantised tensor, which the kernel
++     * decodes in its own layout). `view_off` is its first element's offset from the declared
++     * tensor's -- in elements, as issued -- and `view_stride` the strides into the declared
++     * layout. `bytes` is 0 for such a tensor: it is not one span a consumer may read packed. */
+     uint8_t  view_rank;
+     int64_t  view_shape[RAD_MAX_RANK];
+     int64_t  view_stride[RAD_MAX_RANK];
+--- a/core/runtime/issue.cpp
++++ b/core/runtime/issue.cpp
+@@ -1368,13 +1368,16 @@
+-        /* The view the kernel actually receives, when it is not the declared tensor; a consumer
+-         * that has to copy the operand's values cannot read them as one span. */
+-        if (full && o.kind == RAD_OPK_BUF && full->rank > 0 &&
+-            !rad_tensor_is_contiguous(&t[i])) {
++        /* The tensor the kernel actually receives, when it is not one span of the declared dtype;
++         * a consumer that has to copy or read the operand's values cannot take them packed. A
++         * plugin-private dtype has no element size, so no span of it can be stated in bytes. */
++        if (full && (o.kind == RAD_OPK_BUF || o.kind == RAD_OPK_WEIGHT) && full->rank > 0 &&
++            (!rad_tensor_is_contiguous(&t[i]) || rad_dtype_bytes(t[i].dtype, 1) == 0)) {
+             e.view_rank = (uint8_t)t[i].rank;
+             for (uint32_t d = 0; d < t[i].rank && d < RAD_MAX_RANK; ++d) {
+                 e.view_shape[d]  = t[i].shape[d];
+                 e.view_stride[d] = t[i].stride[d];
+             }
+             const int64_t es = rad_dtype_bytes(t[i].dtype, 1);
+             if (es > 0 && rad_dtype_bits(t[i].dtype) % 8 == 0 && t[i].data && full->data)
+                 e.view_off = ((const uint8_t*)t[i].data - (const uint8_t*)full->data) / es;
++            else
++                e.view_off = o.offset;  /* no byte address: the element offset as issued */
+         }
