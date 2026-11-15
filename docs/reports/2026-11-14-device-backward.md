@@ -1109,6 +1109,32 @@ reductions are in f64 (`:259-260`) and its `mult`/`wadd`/`eps` all come from the
 So the row is *shaped* right, and whether it *computes* right is now a device-versus-host question,
 which is the experiment below rather than more reading.
 
+### A repeated ~1e4 amplification on the GDN path
+
+Ranking every same-buffer cotangent step in `/tmp/r97-fwd.log` restricted to **within one block**
+(positions no more than 25 apart, so no block boundary is crossed) gives 238 steps above 2x. The
+largest of them repeat at the same pair of ops on different layers:
+
+| buffer | transition | gain | occurrences |
+|---|---|---|---|
+| `gdn_o` | `had_quant_act_i8g` → `gdn_gated_rmsnorm` | **1.07e4 - 1.23e4** | 4 |
+| `gdn_k` | `gdn_kkt_solve` → `gdn_chunk_scan` | 1.5e4 - 4.8e4 | 6 |
+| `h.q8` | `gemm_nt_q` → `lora_shrink` | 2.66e4 | -- |
+| `ffn.q8` | `gemm_nt_q` → `lora_shrink` | 9.1e3 - 9.2e3 | 2 |
+
+**The `gdn_o` one is the ~1.07e4 the report has seen before, and this reading is not the one that was
+retracted.** The earlier finding came from `R97_DUMP_SNAP`, whose in-place slot for `gdn_o` is the
+buffer the op itself wrote -- which is why it was withdrawn. These are `R97_DUMP_DC` rows, the walk's
+own cotangent after each row ran, so they are not the snapshot ambiguity.
+
+**The step direction is `had_quant_act_i8g` at the higher position leaving `gdn_o`, and
+`gdn_gated_rmsnorm` at the lower position leaving ~1.07e4 times as much.** The walk runs from the
+higher position to the lower, so the amplification is applied by **`gdn_gated_rmsnorm`**, whose
+adjoint is in `src/adjoint/device/gdn_prep.hip` (`:690-755`). That is the next row to read, and the
+host walk now running will show whether the host row does the same -- if it does, the convention is
+shared and the FD is what says it is wrong; if it does not, it is a device-row defect and the host
+walk's per-block cotangents will show it directly.
+
 ### The gain is per block, multiplicative, and uniform: ~1600x every block
 
 **Which slot, exactly, because a block has two.** Every block carries **two** `lora_expand` rows that
