@@ -1111,16 +1111,25 @@ which is the experiment below rather than more reading.
 
 ### A repeated ~1e4 amplification on the GDN path
 
-Ranking every same-buffer cotangent step in `/tmp/r97-fwd.log` restricted to **within one block**
-(positions no more than 25 apart, so no block boundary is crossed) gives 238 steps above 2x. The
-largest of them repeat at the same pair of ops on different layers:
+Ranking every same-buffer cotangent step in `/tmp/r97-fwd.log` **by the block each position belongs
+to** -- not by a position gap -- gives 100 steps above 2x. **An earlier reading of this used a
+position gap of 25 and was wrong:** blocks are 17 to 22 positions wide (block 63 is 1429..1456, 62 is
+1408..1428, 61 is 1387..1407, 60 is 1366..1386, read off the `blk.N.` buffer names in the same log),
+so a 25-position gap crosses a boundary and most of what it measured was the block-to-block growth
+re-measured on another buffer. The table below keys on the block, and the difference is large:
 
-| buffer | transition | gain | occurrences |
-|---|---|---|---|
-| `gdn_o` | `had_quant_act_i8g` → `gdn_gated_rmsnorm` | **1.07e4 - 1.23e4** | 4 |
-| `gdn_k` | `gdn_kkt_solve` → `gdn_chunk_scan` | 1.5e4 - 4.8e4 | 6 |
-| `h.q8` | `gemm_nt_q` → `lora_shrink` | 2.66e4 | -- |
-| `ffn.q8` | `gemm_nt_q` → `lora_shrink` | 9.1e3 - 9.2e3 | 2 |
+| buffer | transition | gain | occurrences | within block? |
+|---|---|---|---|---|
+| `gdn_o` | `had_quant_act_i8g` -> `gdn_gated_rmsnorm` | **9.2e3 - 1.23e4** | 5 | **yes** |
+| `h.q8` | `gemm_nt_q` -> `lora_shrink` | 2.66e4 | -- | **no, 61 -> 60** |
+| `gdn_k` | `gdn_kkt_solve` -> `gdn_chunk_scan` | 1.5e4 - 4.8e4 | 6 | **no, 61 -> 60** |
+| `ffn.q8` | `gemm_nt_q` -> `lora_shrink` | 9.1e3 - 9.2e3 | 2 | **no, 58 -> 57** |
+
+**Only the `gdn_o` rows are genuine within-block steps, and they are the top five of all 100:** 1.233e4
+(block 58), 1.087e4 (61), 1.07e4 (62), 9221 (60), 8044 (57). **The next-largest genuine within-block
+step in the whole walk is 127.5** (`h` through `lora_expand` -> `rmsnorm_had_quant_i8g`, block 63) --
+two orders of magnitude below them. So the ~1e4 is not one of several comparable amplifiers: **it is
+the only O(1e4) within-block step in the walk.**
 
 **The `gdn_o` one is the ~1.07e4 the report has seen before, and this reading is not the one that was
 retracted.** The earlier finding came from `R97_DUMP_SNAP`, whose in-place slot for `gdn_o` is the
@@ -1130,10 +1139,11 @@ own cotangent after each row ran, so they are not the snapshot ambiguity.
 **The step direction is `had_quant_act_i8g` at the higher position leaving `gdn_o`, and
 `gdn_gated_rmsnorm` at the lower position leaving ~1.07e4 times as much.** The walk runs from the
 higher position to the lower, so the amplification is applied by **`gdn_gated_rmsnorm`**, whose
-adjoint is in `src/adjoint/device/gdn_prep.hip` (`:690-755`). That is the next row to read, and the
-host walk now running will show whether the host row does the same -- if it does, the convention is
-shared and the FD is what says it is wrong; if it does not, it is a device-row defect and the host
-walk's per-block cotangents will show it directly.
+adjoint is `gdn_gated_rmsnorm_device_adjoint` (`src/adjoint/device/gdn_prep.hip:690-749`). Its host
+twin is the same formula (`src/adjoint/host/gdn_prep.cpp:519-520, 563-564`), and the whole-walk host
+A/B that would have compared them cannot run on this container (see the section on the arbiter
+below) -- but the host-tier FD test can, and it clears the row: see the two sections after this one.
+
 
 **And the amplification is the norm's own scale, not a defect in the row's shape.** The `gdn_o`
 cotangent series over the walk, from the same log, is:
@@ -1226,7 +1236,7 @@ a wrong adjoint that this test could not see. On this container it is 1e-6 and t
 bite -- but it is a place where the test's two sides share an assumption with each other and not with
 the model.
 
-### The in-place read is handled correctly, and the arithmetic does not close
+### The in-place read is handled correctly, and the arithmetic closes
 
 The op is in place -- `gdn_gated_rmsnorm` takes `{w.o, w.z}` and writes `{w.o}` -- so the obvious next
 suspect is that the walk hands it its own output (max 278) rather than the scan's (max 0.42). **It
@@ -1234,27 +1244,31 @@ does not.** `src/step_device.cpp` keeps a `before` map per block (`:1075`), each
 `before[operand.buffer]` to what it produced (`:1276`), and a reader that is not the writer of the
 same buffer resolves through `before.find(read.buffer)` (`:1171`) -- so `gdn_gated_rmsnorm`'s read of
 `w.o` gets `gdn_chunk_scan`'s output, which is the value the op saw. **The aliasing hypothesis is
-eliminated.**
+eliminated.** The cotangent side is the same shape and is also right: `cot` holds one entry per
+*written* operand (`src/backward.cpp:511-515`), copied out of the version store before the row runs,
+so the row is handed its incoming cotangent and not one it has already produced.
 
-**And the size does not close.** The GDN path supplies **~1.1e3 per GDN layer**, and this block
-layout is three GDN layers to one attention layer (the `gdn_o` positions run 21, 21, 48 apart), so
-that is `1.1e3^3` per four blocks -- about **190x per block**. The walk-versus-FD table needs **~1.8e3
-per block** (block 63 is 249x too small, block 60 is 6.9e7 too big, and that is 9.76 decades over
-three blocks). **The gap is a factor of ~10, so the GDN norm is not the whole of the spurious
-growth.** The other within-block transitions in the ranking table are the place to look for the rest:
-`gdn_k` `gdn_kkt_solve` -> `gdn_chunk_scan` at 1.5e4 - 4.8e4, `h.q8` `gemm_nt_q` -> `lora_shrink` at
-2.66e4, and `ffn.q8` `gemm_nt_q` -> `lora_shrink` at 9.1e3 - 9.2e3 are all per-layer, and each is
-large enough to matter at that budget.
+**And the size closes, once the per-layer figure is right.** The GDN path supplies **~1e4 per GDN
+layer** (the top five within-block steps above), and this layout is three GDN layers to one attention
+layer. Between block 63 and block 57 there are five GDN layers (the `gdn_o` rows at blocks 62, 61,
+60, 58 and 57), so the path supplies **5 x 4.0 = 20 decades** across those seven blocks. The
+walk-versus-FD table needs **9.76 decades over three blocks (63 -> 60)**, i.e. **3.25 decades per
+block, or 22.8 over seven** -- and the two agree to **12%**. **An earlier reading of this compared
+1.1e3 per GDN layer against 1.8e3 per block, called the gap a factor of 10, and concluded the growth
+was spread across several rows. That was wrong on both the per-layer figure and the comparison, and
+it is withdrawn: the GDN norm accounts for the walk's entire spurious growth, and it is the only row
+in the walk whose within-block step is anywhere near this size.**
 
-**So the honest state is: one row of this family is provably correct and documented, the aliasing
-route is closed, and the spurious growth is spread across more than one row.** The FD test that
-cleared `gdn_gated_rmsnorm` is the pattern to repeat for the other three -- each is a host-tier twin
-comparison that needs no container.
+**So the honest state is: the row that carries the whole growth is FD-verified correct, is documented
+by the container's own architecture, and is handed the right values on both sides.** Those three
+facts cannot all hold together with a wrong gradient unless the defect is compositional -- which is
+the next section.
 
-### Every row in the ranking is individually FD-verified, so the defect is compositional
+### Every row that could carry the growth is individually FD-verified, so the defect is compositional
 
-The four rows the ranking table named are each covered by a host-tier twin-versus-adjoint finite
-difference, and **every one of them passes**:
+Every row the ranking table named -- the one genuine within-block amplifier and the three whose steps
+crossed a block boundary -- is covered by a host-tier twin-versus-adjoint finite difference, and
+**every one of them passes**:
 
 | row | test | result |
 |---|---|---|
