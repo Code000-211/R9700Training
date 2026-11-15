@@ -602,7 +602,16 @@ instrument.
 these fixes explain `all_finite false` and restore the first-non-finite position as a diagnostic.
 They do **not** explain a *finite* multiplier on the finite stretch.
 
-### Two defects found in passing
+### Defects and divergences found in passing
+
+- **A device/host divergence in the fused producers, filed as #142.** The device row folds the fused
+  bf16 output's own cotangent into its result (`src/adjoint/device/quant.hip:743-795`); `fused_adjoint`
+  hands on only the codes' and the scale's (`src/adjoint/host/quant.cpp:982,1003`) and never reads it.
+  The two rows are therefore **different functions**, so the device-vs-host plus host-vs-FD argument
+  that clears these three ops does not hold for them. Measured negligible on this run (the term is
+  live in 1 of 78 `rmsnorm_had_quant_i8g` records, and there it is one part in 8.0e5), and not fixed
+  here -- closing it needs the `_ste` fixture to consume the bf16 output, or the new term ships
+  untested.
 
 - `src/adjoint/host/gdn_scan.cpp:446-455`: the twin's `unit()` computes `n = u/H`, `h = u%H`, then
   **shadows `h`** with the loop `for (int64_t h = 0; h < g.H; ++h)`, so each of the `N*H` units
