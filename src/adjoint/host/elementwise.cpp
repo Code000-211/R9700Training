@@ -448,7 +448,12 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
     if (rows <= 0) return;
     if (w && (int64_t)w->value.size() < n) return;
     const double eps = param_num(rec, "eps", 1e-6);
-    const double wadd = param_num(rec, "wadd", 0.0);
+    // R97_NORM_WADD0=1: force the plain gain. The record carries `wadd=1` (a Gemma-style `w + 1`),
+    // but the container's norm is Qwen3-style `x * rsqrt(...) * w`, and the twin's re-quantisation
+    // disagrees with the kernel's codes on 99.4% of them -- the signature of a systematic gain
+    // offset. Forcing the offset off says whether the record or the kernel is the one that is wrong.
+    const double wadd = std::getenv("R97_NORM_WADD0") != nullptr ? 0.0
+                                                                : param_num(rec, "wadd", 0.0);
     const double mult = param_num(rec, "mult", 1.0);
     if (!w && wadd != 0.0) return;
 
@@ -473,6 +478,24 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
         }
     }
     AdValue y = write_value(rec, 2, x.shape);
+    // R97_DUMP_QUANT=1: the twin's own normalisation constants for row 0. `DUMPTWIN` reports that
+    // this twin's output matches its *input* at ratio 1.0 while the kernel's written `h` differs by
+    // 36%, so either `s` is ~1 (the input is already normalised) or the gain is missing.
+    if (std::getenv("R97_DUMP_QUANT") != nullptr) {
+        double ss = 0.0, xmax = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            const double v = x.value[(size_t)i];
+            ss += v * v;
+            xmax = std::max(xmax, std::fabs(v));
+        }
+        const double s0 = 1.0 / std::sqrt(ss / (double)n + eps);
+        std::fprintf(stderr,
+                     "NORMTWIN pos=%lld n=%lld rows=%lld w=%s eps=%.6g wadd=%.6g mult=%.6g "
+                     "xmax=%.6g ss_mean=%.6g s=%.6g\n",
+                     (long long)rec.position, (long long)n, (long long)rows,
+                     w != nullptr ? "yes" : "NULL", eps, wadd, mult, xmax, ss / (double)n, s0);
+        std::fflush(stderr);
+    }
     parallel_for(rows, kRowChunk, [&](int64_t r) {
         const int64_t b = r * n;
         double ss = 0.0;

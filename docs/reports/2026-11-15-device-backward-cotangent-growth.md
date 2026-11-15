@@ -623,6 +623,34 @@ the twin then normalises without a weight, a different wrong answer rather than 
 schema-matching snapshot and fall back only when there is none; `GAINPOS` already shows both snapshots
 at the same position, so the tape carries what decides it.
 
+### `wadd` and the gain are not it either
+
+`NORMTWIN` prints the twin's own normalisation constants for row 0:
+
+| pos | `w` | `eps` | `wadd` | `xmax` | `ss_mean` | `s` |
+|---|---|---|---|---|---|---|
+| 1449 | yes | 1e-06 | **1** | 115.5 | 1069.6 | 0.0306 |
+| 1429 | yes | 1e-06 | **1** | 5.0 | 1.281 | 0.884 |
+
+The record carries `wadd=1` -- a Gemma-style `w + 1` -- while the container's norm is Qwen3-style
+`x * rsqrt(mean(x^2)+eps) * w`. Forcing it off (`R97_NORM_WADD0=1`) moves the comparison but does not
+fix it:
+
+| pos | `code_bad` (wadd=1) | `code_bad` (wadd=0) | `scale_rel` | `act_rel` |
+|---|---|---|---|---|
+| 1449 | 99.4% | **99.4%** | 1.014 -> 0.919 | 1.363 -> 1.044 |
+| 1429 | 93.9% | 93.9% | 0.320 -> 0.936 | 0.628 -> 0.589 |
+
+So the gain offset is a real difference between the record and the kernel, and removing it brings the
+*scale* and the *magnitude* closer, but the codes still disagree on almost every element. A gain
+offset cannot do that on its own, and neither rotation arm explains it, so the twin's activation
+differs in a way that is neither the rotation nor the gain.
+
+**The schema-rank preference is inert.** Preferring the snapshot whose rank matches the record's
+schema changes nothing (`code_err` 254 at 1449, 45 at 1429, byte-identical), so `norm_gain` was
+already returning the rank-matched operand and the change is reverted rather than kept as an unproven
+branch.
+
 ## The quotient's guard
 
 The mask pass divides each code's cotangent by its group scale, and the quotient is exact only
