@@ -448,10 +448,11 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
     if (rows <= 0) return;
     if (w && (int64_t)w->value.size() < n) return;
     const double eps = param_num(rec, "eps", 1e-6);
-    // R97_NORM_WADD0=1: force the plain gain. The record carries `wadd=1` (a Gemma-style `w + 1`),
-    // but the container's norm is Qwen3-style `x * rsqrt(...) * w`, and the twin's re-quantisation
-    // disagrees with the kernel's codes on 99.4% of them -- the signature of a systematic gain
-    // offset. Forcing the offset off says whether the record or the kernel is the one that is wrong.
+    // R97_NORM_WADD0=1: force the offset off, as a control only. The record's `wadd=1` is *right*
+    // for this container: `docs/OPS-qwen35-device.md` declares `eps=1e-06 wadd=1` on every
+    // `rmsnorm_had_quant_i8g` row, and `docs/adjoints/elementwise.md` records that Qwen3.5 uses
+    // GemmaRMSNorm's `w + 1` with a zero-centred gain. Forcing 0 therefore makes `w + 0` near zero
+    // and collapses the twin's activation, which is a negative control, not a candidate fix.
     const double wadd = std::getenv("R97_NORM_WADD0") != nullptr ? 0.0
                                                                 : param_num(rec, "wadd", 0.0);
     const double mult = param_num(rec, "mult", 1.0);

@@ -623,35 +623,39 @@ the twin then normalises without a weight, a different wrong answer rather than 
 schema-matching snapshot and fall back only when there is none; `GAINPOS` already shows both snapshots
 at the same position, so the tape carries what decides it.
 
-### `wadd` and the gain are not it either
+### The gain offset is right; the earlier test was backwards
 
-`NORMTWIN` prints the twin's own normalisation constants for row 0:
+`NORMTWIN` prints the twin's constants: `w=yes eps=1e-06 wadd=1`. **That is correct.**
+`docs/OPS-qwen35-device.md` declares `eps=1e-06 wadd=1` on every `rmsnorm_had_quant_i8g` row, and
+`docs/adjoints/elementwise.md:181` records that Qwen3.5 uses GemmaRMSNorm's `w + 1` with a
+**zero-centred gain**. The record and the twin both match the op.
 
-| pos | `w` | `eps` | `wadd` | `xmax` | `ss_mean` | `s` |
-|---|---|---|---|---|---|---|
-| 1449 | yes | 1e-06 | **1** | 115.5 | 1069.6 | 0.0306 |
-| 1429 | yes | 1e-06 | **1** | 5.0 | 1.281 | 0.884 |
+Forcing `wadd=0` therefore tested the wrong direction: with a zero-centred gain it makes `w + 0` near
+zero, so the twin's activation collapses. The run cannot discriminate the 99.4% disagreement, and the
+numbers say so once read correctly:
 
-The record carries `wadd=1` -- a Gemma-style `w + 1` -- while the container's norm is Qwen3-style
-`x * rsqrt(mean(x^2)+eps) * w`. Forcing it off (`R97_NORM_WADD0=1`) moves the comparison but does not
-fix it:
+| pos | `code_bad` | `scale_rel` | `act_rel` |
+|---|---|---|---|
+| 1449, `wadd=1` | 99.4% | 1.014 | 1.363 |
+| 1449, `wadd=0` | 99.4% | 0.919 | 1.044 |
 
-| pos | `code_bad` (wadd=1) | `code_bad` (wadd=0) | `scale_rel` | `act_rel` |
-|---|---|---|---|---|
-| 1449 | 99.4% | **99.4%** | 1.014 -> 0.919 | 1.363 -> 1.044 |
-| 1429 | 93.9% | 93.9% | 0.320 -> 0.936 | 0.628 -> 0.589 |
+**`act_rel` is `max|f - y| / max|f|` -- a relative error, not a match.** 1.363 -> 1.044 is a move
+from 136% to 104% error: total disagreement either way. The same reading applies to `best_of`'s third
+field, where `1:x:1` is a **100% relative error**, not "matches `x` at ratio 1". An identity would
+print `1:x:0`. The earlier reading of that field as a match was wrong.
 
-So the gain offset is a real difference between the record and the kernel, and removing it brings the
-*scale* and the *magnitude* closer, but the codes still disagree on almost every element. A gain
-offset cannot do that on its own, and neither rotation arm explains it, so the twin's activation
-differs in a way that is neither the rotation nor the gain.
+**`code_bad` counts any nonzero code difference**, so 99.4% is not by itself evidence of a
+permutation: a uniform sub-LSB mismatch flips nearly every code, and `code_err=254` is a single
+element. The instrument that separates the two is a histogram of `|twin_code - kernel_code|` -- a
+tight 1-2 with a few outliers is a small systematic difference (gain values, precision), a broad
+spread is what a layout difference would need.
 
 **The schema-rank preference is inert.** Preferring the snapshot whose rank matches the record's
 schema changes nothing (`code_err` 254 at 1449, 45 at 1429, byte-identical), so `norm_gain` was
 already returning the rank-matched operand and the change is reverted rather than kept as an unproven
 branch.
 
-## The quotient's guard
+## The quotient's guard## The quotient's guard
 
 The mask pass divides each code's cotangent by its group scale, and the quotient is exact only
 while it stays inside f32. On this container it does not: 2.66e36 over a 5.96e-5 scale is 4.5e40.
