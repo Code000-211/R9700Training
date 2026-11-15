@@ -371,12 +371,34 @@ inline FdReport check_adjoint(const OpRecord& rec, const std::vector<AdValue>& i
         return std::find(frozen.begin(), frozen.end(), i) != frozen.end();
     };
 
-    // The forward over the full schema: reads keep `in`'s values; every written operand gets what
-    // the twin produced, which an adjoint may read back. An in-place operand is both -- the twin
-    // writes its new value and an adjoint reads that, not the old one -- so the write's place in
-    // the twin's output list counts whether or not it is also a read.
+    // Magnitude knob. `urand` is uniform in [-1,1), so this check has only ever run at O(1)
+    // values -- but the container's forward values are not O(1): the gated-delta layer's `gdn_o`
+    // reaches ~278 and the residual stream grows with depth. R97_FD_AMP scales the read operands
+    // (and therefore the forward the twin produces) so the adjoint can be checked where it
+    // actually runs. The cotangent stays O(1): the adjoint is linear in it, so scaling it would
+    // only rescale both sides of the comparison.
+    std::vector<AdValue> in_scaled = in;
+    if (const char* amp_env = std::getenv("R97_FD_AMP")) {
+        const double amp = std::atof(amp_env);
+        if (amp != 0.0)
+            for (AdValue& v : in_scaled)
+                for (double& x : v.value) x *= amp;
+    }
+    const std::vector<AdValue>& in_use = in_scaled;
+
+    // The forward over the full schema. Every operand gets the value the op saw there:
+    // a read operand its input, a written one the twin's output.
+    //
+    // An in-place operand is ONE schema slot holding TWO values -- the op reads the pre-op one
+    // and writes the post-op one -- so only one can go in `fwd[i]`. This check used to put the
+    // twin's output there. The walk puts the pre-op value there: `step_device.cpp:1251` serves
+    // `before`, the previous writer's copy, into the slot the adjoint reads. So the default put
+    // the adjoint at a point production never uses, and R97_FD_PREOP=1 moves it to the point
+    // production does. Both are kept because the two are genuinely different questions: "is the
+    // adjoint right given the output" and "is it right given what the walk hands it".
+    const bool preop = std::getenv("R97_FD_PREOP") != nullptr;
     std::vector<AdValue> out_vals;
-    twin(rec, in, &out_vals);
+    twin(rec, in_use, &out_vals);
     if (out_vals.size() != out_spec.size()) {
         rep.note = "twin produced " + std::to_string(out_vals.size()) + " outputs, expected " +
                    std::to_string(out_spec.size());
@@ -387,7 +409,8 @@ inline FdReport check_adjoint(const OpRecord& rec, const std::vector<AdValue>& i
         size_t r = 0, w = 0;
         for (size_t i = 0; i < rec.operands.size(); ++i) {
             const bool reads = !rec.operands[i].written || inout_at(i);
-            fwd[i] = rec.operands[i].written ? out_vals[w++] : in[r];
+            const bool from_read = reads && (preop || !rec.operands[i].written);
+            fwd[i] = from_read ? in_use[r] : out_vals[w++];
             if (reads) ++r;
         }
     }
@@ -432,7 +455,7 @@ inline FdReport check_adjoint(const OpRecord& rec, const std::vector<AdValue>& i
     // The check: perturb the inputs, run the twin, take the central difference
     // of loss = <twin, cot>.
     auto loss_at = [&](double eps) {
-        std::vector<AdValue> x = in;
+        std::vector<AdValue> x = in_use;
         size_t at = 0;
         for (size_t i = 0; i < rec.operands.size(); ++i) {
             if (rec.operands[i].written && !inout_at(i)) continue;

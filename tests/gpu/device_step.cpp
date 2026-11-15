@@ -624,7 +624,7 @@ void card_case(const char* test, int64_t n, bool probe) {
     // R97_CENTRAL_BLK names the block ("blk.51."); default is the block whose gradient the walk
     // reported as 1.2e37.
     if (std::getenv("R97_CENTRAL") != nullptr) {
-        const auto find_w = [&](const char* blk) -> int64_t {
+        const auto find_w = [&](const std::string& blk) -> int64_t {
             for (size_t i = 0; i < params.size(); ++i)
                 if (params[i].name.find("lora") != std::string::npos &&
                     params[i].name.find(blk) != std::string::npos &&
@@ -633,14 +633,32 @@ void card_case(const char* test, int64_t n, bool probe) {
             return -1;
         };
         // The params are named `model.layers.<N>.<module>.lora_A` (not `blk.<N>.`), so the block
-        // spec is `model.layers.51.`. Falls back to layer 0 and then to any LoRA leaf, so the
-        // measurement always runs.
-        const char* env_blk = std::getenv("R97_CENTRAL_BLK");
-        int64_t wi = env_blk ? find_w(env_blk) : -1;
-        if (wi < 0) wi = find_w("model.layers.51.");
-        if (wi < 0) wi = find_w("model.layers.0.");
-        if (wi < 0) wi = find_w("");
-        if (wi >= 0) {
+        // spec is `model.layers.51.`. R97_CENTRAL_BLKS takes a comma-separated list and measures
+        // each in one run: the walk's error is per-layer and compounding, so the block at which the
+        // FD oracle and the walk first disagree localises it, and forwards are cheap next to the
+        // backward. R97_CENTRAL_BLK stays the single-block form.
+        std::vector<std::string> specs;
+        if (const char* env_blks = std::getenv("R97_CENTRAL_BLKS")) {
+            std::string s(env_blks);
+            size_t at = 0;
+            while (at <= s.size()) {
+                const size_t comma = s.find(',', at);
+                const std::string piece = s.substr(at, comma == std::string::npos ? std::string::npos
+                                                                                 : comma - at);
+                if (!piece.empty()) specs.push_back(piece);
+                if (comma == std::string::npos) break;
+                at = comma + 1;
+            }
+        }
+        if (specs.empty()) specs.push_back(std::getenv("R97_CENTRAL_BLK")
+                                               ? std::getenv("R97_CENTRAL_BLK")
+                                               : "model.layers.51.");
+        for (const std::string& spec : specs) {
+            int64_t wi = find_w(spec);
+            if (wi < 0) wi = find_w("model.layers.51.");
+            if (wi < 0) wi = find_w("model.layers.0.");
+            if (wi < 0) wi = find_w("");
+            if (wi < 0) continue;
             const std::string name = params[wi].name;
             const float w0 = params[wi].value[0];
             double g0 = 0.0;
@@ -668,10 +686,6 @@ void card_case(const char* test, int64_t n, bool probe) {
                         test, name.c_str(), w0, eps, g0, cd, lp, lm);
             std::printf("%s: CENTRAL-BF16 %s eps=%.6g grad=%.6g central=%.6g bp=%.9g bm=%.9g\n",
                         test, name.c_str(), eps_big, g0, cd_big, bp, bm);
-            j["central"] = {{"name", name}, {"w", w0}, {"eps", eps}, {"grad", g0},
-                            {"central", cd}, {"loss_plus", lp}, {"loss_minus", lm},
-                            {"eps_bf16", eps_big}, {"central_bf16", cd_big},
-                            {"loss_plus_bf16", bp}, {"loss_minus_bf16", bm}};
             // The control: a perturbation large enough that the loss MUST move if the forward
             // reads the params it is handed. Without it a `central` of exactly zero cannot be
             // told apart from a forward that cached the weights, and the FD would prove nothing.
@@ -682,8 +696,19 @@ void card_case(const char* test, int64_t n, bool probe) {
             std::printf("%s: CENTRAL-CONTROL %s w+10%% loss=%.9g base=%.9g %s\n", test,
                         name.c_str(), lc, result.loss,
                         live ? "(params are live)" : "(PARAMS CACHED -- FD invalid)");
-            j["central"]["control_loss"] = lc;
-            j["central"]["params_live"] = live;
+            j["central_blocks"].push_back({{"name", name}, {"w", w0}, {"eps", eps}, {"grad", g0},
+                                           {"central", cd}, {"loss_plus", lp}, {"loss_minus", lm},
+                                           {"eps_bf16", eps_big}, {"central_bf16", cd_big},
+                                           {"loss_plus_bf16", bp}, {"loss_minus_bf16", bm},
+                                           {"control_loss", lc}, {"params_live", live}});
+            // The single-block object stays the first measured block, so existing readers of
+            // j["central"] keep working.
+            if (!j.contains("central"))
+                j["central"] = {{"name", name}, {"w", w0}, {"eps", eps}, {"grad", g0},
+                                {"central", cd}, {"loss_plus", lp}, {"loss_minus", lm},
+                                {"eps_bf16", eps_big}, {"central_bf16", cd_big},
+                                {"loss_plus_bf16", bp}, {"loss_minus_bf16", bm},
+                                {"control_loss", lc}, {"params_live", live}};
         }
     }
 
