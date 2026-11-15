@@ -461,14 +461,29 @@ which is `B^T` over 5120 terms with `B` of order 1e-3 (measured: 1.0e-03, 1.1e-0
 record shrinks. `lora_shrink`'s larger `DUMPREC` ratios are its *scale* slot, which the quantiser's
 straight-through adjoint drops -- dead cotangent, not the row's Jacobian.
 
-**Resolved for the rows that amplify; open for two.** The loss-level central difference in
+**Resolved for the rows that amplify; open for three.** The loss-level central difference in
 `device_step_tape` cannot adjudicate this gradient -- at block 63 the same weight moves the loss +0.080
 at 1% and -0.213 at 10%, a sign flip where a linear response gives +0.797 -- but the *row-level*
 `R97_FD_REC` can, and it says every well-posed slot is exact at the walk's own magnitudes (table
-above). So the 4.7-11.1x the branch applies is its true Jacobian, and the growth is the product of true
-factors. What stays open is `gemm_nt_q` (its weight is an unresolved `none:5@1454`/`none:6@1454` operand in the
-host snapshot, so its twin sees zeros) and the quantised producers (a step function, which no central
-difference describes). Those two are the remaining live-scale unknowns.
+above). So the 4.7-11.1x the branch applies is the twin's true Jacobian. **That is weaker than "the
+growth is the product of true factors", and the third open item is why:** the FD is circular on the
+forward, and `DUMPTWIN` shows the fused norm's twin re-quantising an activation the kernel did not
+produce (99.4% of codes, scale off by 101%) at exactly the record whose `dc[h]` the growth is measured
+on. A twin that is wrong there makes the norm's row wrong and the FD blind to it in the same step.
+
+The three open items at live scale:
+
+1. **the fused norm's twin** -- codes disagree with the kernel's on 99.4% of elements at pos 1449 and
+   93.9% at 1429, against 5.9% (one integer step) for both gated producers. This is the one that
+   matters: it is the row the growth is read from.
+2. **`gemm_nt_q`** -- its weight is an unresolved `none:5@1454`/`none:6@1454` operand in the host
+   snapshot, so its twin sees zeros.
+3. **the quantised producers' activations** -- a step function, which no central difference describes.
+
+So the claim this report can stand behind is: the amplifying rows' *adjoints* match their *twins*, the
+gated twins match the kernel, and the norm's twin does not. Whether the growth is the true Jacobian is
+still open, and now has a named suspect.
+
 
 **A consequence, not a second defect.** The device path stores cotangents as bf16 (all nine device row
 files call `f32_to_bf16`); the host keeps f64. At block 54 the branch cotangent is 3.79e+09 and the
@@ -557,6 +572,31 @@ w0=5120` says the tape's gain there is a single `[5120]` row, so row 0 is the wh
 the twin's norm parameters (`eps`, `wadd`, `mult`) and the quantiser's rotation, and the tape's own
 codes are the oracle for both -- re-quantise the kernel's activation with the twin's quantiser, or the
 twin's activation with the kernel's, and the one that matches names the side.
+
+## The gain's two snapshots
+
+`GAINPOS` (under `R97_GAIN_POS=1`) prints the operand `norm_gain` takes, with the schema's shape and
+the snapshot's. On the live fused records the same operand arrives twice, in two different `fwd`
+vectors, with different shapes:
+
+```
+GAINPOS pos=1449 j=2 blk.63.ffn_norm.weight schema=[5120] value_rank=1 values=5120
+GAINPOS pos=1449 j=2 blk.63.ffn_norm.weight schema=[5120] value_rank=2 values=2621440
+GAINPOS pos=1429 j=2 blk.63.attn_norm.weight schema=[5120] value_rank=1 values=5120
+GAINPOS pos=1429 j=2 blk.63.attn_norm.weight schema=[5120] value_rank=2 values=2621440
+```
+
+The schema is the container's own description of the weight -- a single `[5120]` row -- and one
+snapshot agrees with it while the other is a `[512, 5120]` tensor materialised once per row. Which one
+a row gets depends on the `fwd` vector it is handed, and `note_gain_rows` warns about the second while
+`FDRMS` (inside `rmsnorm_twin`) sees the first. That is the contradiction the two instruments
+reported, and it is a property of the tape, not of either instrument.
+
+**Preferring the snapshot whose rank matches the schema does not fix the twin's disagreement**, and it
+was tried and reverted: with `norm_gain` skipping the rank-mismatched snapshot, `DUMPTWIN`'s
+`code_err` at 1449 stayed at 254 and the walk's own test went from passing to failing. So the rank
+mismatch is real and is not the cause of the norm's twin disagreeing with the kernel; the cause is
+still the twin's norm parameters or the quantiser's rotation.
 
 ## The quotient's guard
 

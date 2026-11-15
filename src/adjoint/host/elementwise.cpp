@@ -414,6 +414,21 @@ const AdValue* norm_gain(const OpRecord& rec, const std::vector<AdValue>& op, in
         if (rec.operands[j].written) continue;
         if (!gain_row(op[j], n)) continue;
         note_gain_rows(op[j], n, rec.operands[j].buffer, rec.position);
+        // R97_GAIN_POS=1: which operand was taken as the gain, and with what shape and size. The
+        // schema's shape and the snapshot's can differ, and a gain that is `[rows, n]` in the record
+        // but `[n]` in the snapshot (or the reverse) decides whether row 0 is the whole gain.
+        if (std::getenv("R97_GAIN_POS") != nullptr) {
+            std::string schema;
+            for (int64_t d : rec.operands[j].shape)
+                schema += (schema.empty() ? "" : ",") + std::to_string(d);
+            std::fprintf(stderr, "GAINPOS pos=%lld j=%zu buffer=%s schema=[%s] value_rank=%zu "
+                                 "value0=%lld values=%zu n=%lld\n",
+                         (long long)rec.position, j, rec.operands[j].buffer.c_str(),
+                         schema.c_str(), op[j].shape.size(),
+                         op[j].shape.empty() ? -1LL : (long long)op[j].shape[0],
+                         op[j].value.size(), (long long)n);
+            std::fflush(stderr);
+        }
         return &op[j];
     }
     return nullptr;
