@@ -285,9 +285,11 @@ was an average of them, neither the net nor a constant:
 
 The amplification **accelerates**: ~52x per block early, ~3e3 in the middle, then 3.8e12 in the single
 step before the non-finite. Averaged over the **13 steps** from the head to the block-51 leaf the net
-is **~984x per block** (1377x to block 51's last finite value), against a **true ~2.70x per block**
-(76 / 1.9e-4 = 4e5 over the same 13 steps). That is a **~365x per-block excess**, and
-365^13 = 2e33 -- the over-statement, reached without assuming any uniform factor.
+is **~984x per block** (1377x to block 51's last finite value), against a **true ~3.9x per block**
+(9.07e3 / 1.9e-4 = 4.8e7 over the same 13 steps). That is a **~250x per-block excess**, and
+250^13 = 1.9e31 -- the over-statement, reached without assuming any uniform factor. (This paragraph
+quoted "~2.70x per block / 365x / 2e33" until the `R97_CENTRAL` run; that pair came from the ~75.9
+secant, which is not a derivative -- see "The verdict" below.)
 
 Inside a block the *largest single record-level jump* is `gdn_gated_rmsnorm`, whose Jacobian grows
 ~1e4 when a row's `mean(x^2)` approaches `eps`; it both reads and writes `gdn_o` (opnd 0 and opnd 3),
@@ -330,42 +332,57 @@ is amplified again before the bf16 store. Whether *any* widening of the device's
 longer show -- everything below is non-finite. That is what the loss's central difference settles,
 and it is the only open question now.
 
-### The verdict: the true gradient is ~76, and the walk reports -1.55e35
+### The verdict: the true gradient is O(1e4), and the walk reports 6.28e35
 
-The central difference was run on the 512-token case with a control that proves the forward reads
-the params it is handed (`tests/gpu/device_step.cpp`, `R97_CENTRAL=1`):
-
-```
-CENTRAL         model.layers.51.self_attn.q_proj.lora_A w=0.0135678 eps=1.35678e-06
-                grad=-1.5512e+35  central=0  lp=7371.59135  lm=7371.59135
-CENTRAL-CONTROL model.layers.51.self_attn.q_proj.lora_A w+10% loss=7371.69427
-                base=7371.59135 (params are live)
-```
-
-The control moves the loss, so the FD is real. The small-eps `central == 0` is a **bf16 resolution
-artifact**, not a zero gradient: a 1.36e-6 move on 0.0135678 is 1e-4 relative, below the forward's
-own ~0.4% bf16 mantissa, so the two losses are bit-identical by construction. The usable FD is the
-10% step:
+`R97_CENTRAL=1` was run on the 512-token case with a control proving the forward reads the params it
+is handed. The run of 2026-11-15 (`/tmp/r97-dstep-device_step_tape-i9Nlis`) is the first with
+`eps_bf16` and `central_bf16` in the record:
 
 ```
-dL/dw ~ 0.102922558275 / 1.3567836955189706e-03 = 75.9
+name            model.layers.51.self_attn.q_proj.lora_A
+w               0.013567836955189705
+eps             1.3567836955189706e-06   -> central 0.0          (bit-identical losses)
+eps_bf16        1.3567836955189706e-04   -> central_bf16 -9073.830365103388
+loss            7371.591348378961
+loss_plus_bf16  7370.903491856901        loss_minus_bf16 7373.365736875957
+grad            6.2826791988271414e+35   (the walk's leaf gradient)
+params_live     true, control_loss 7371.694270937236
 ```
 
-| | value |
+**The small-eps `central == 0` is a bf16 resolution artifact**, not a zero gradient: a 1.36e-6 move
+on 0.0135678 is 1e-4 relative, below the forward's own ~0.4% bf16 mantissa, so the two losses are
+bit-identical by construction. At `eps_bf16` the loss does move, in both directions:
+
+| estimate | value |
 |---|---|
-| **true** `dL/dw` (10% forward difference) | **~75.9** |
-| the walk's leaf gradient, same weight | **-1.5512e35** |
-| **over-statement** | **~2.0e33** |
+| forward secant, `+1%` | **-5070.1** |
+| backward secant, `-1%` | **-13078.0** |
+| **central difference, `±1%`** | **-9073.8** |
+| the walk's leaf gradient, same weight | **+6.2827e35** |
+| **over-statement** | **~6.9e31** |
 
-**So the backward's leaf gradient is wrong by ~2e33** -- not a range limit, not an accumulator width,
-not a bf16 store, and not something any widening fixes. The true gradient is O(1e2), exactly what a
-27B model on 512 tokens should give; the walk's cotangents reach 1e37 because it amplifies **~984x per
-block** over the 13 steps from the head to the block-51 leaf, where the true amplification is **~2.70x
-per block** (76 / 1.9e-4 = 4e5 over those same 13 steps) -- a ~365x per-block excess. (Stated over
-64 blocks the same pair is 4.06x against 1.22x; that framing is wrong here, because the leaf is in
-block 51 and the walk only passes 13 blocks to reach it. Both framings compound to the same 2e33.)
-The head cotangent is right -- 1.9e-4 is the CE gradient of a 511-token mean. **`descent` held only
-because AdamW is scale-free.**
+**The `~75.9` an earlier draft of this section quoted is wrong, and this run is what shows it.** That
+figure was a **10% one-sided secant** (`0.102922558275 / 1.3567836955189706e-03`); over 10% the loss
+is nowhere near linear, so it is not a derivative. At 1% the two secants already differ by a factor
+of **2.6** (-5070 against -13078), which is why the central difference is the one to trust -- and why
+even ±1% is not a linear interval, so -9074 is an estimate of the derivative at `w` with the second
+derivative's contribution in it, not a converged value. Every estimator tried lands in **O(1e4)**;
+none lands near 1e2.
+
+**So the backward's leaf gradient is wrong by ~7e31** -- not a range limit, not an accumulator width,
+not a bf16 store, and not something any widening fixes. With the true `dL/dw` at ~9e3 and the head
+cotangent at 1.9e-4 (the CE gradient of a 511-token mean, which is right), the true amplification over
+the 13 steps from the head to the block-51 leaf is **~3.9x per block**; the walk measures **~984x**, a
+**~250x per-block excess**, and 250^13 = 1.9e31. That compounds to the 6.9e31 the two leaf values
+give. **`descent` held only because AdamW is scale-free** (`lr*mhat/(sqrt(vhat)+eps)` is
+`lr*sign(g)` in the first step).
+
+**The tip's structural reading, which the run also now records** (`n_a_finite_nonzero`, added the
+same day): of the 400 `A` leaves, **82 have a finite non-zero gradient, 318 have a non-finite one, and
+0 have an exactly-zero one** -- the same 82/82 split on `B`, `a_changed == b_changed == 375`. The
+first non-finite value is `lora_shrink` at position 1150, operand `h.s8`, index 6, i.e. the first
+non-finite has moved down from `rmsnorm_had_quant_i8g`@1176 since the f64 row reduction landed.
+`forward_all_finite` is true and the head `rmsnorm` reads `512 readable / 0 zeroed / 0 refused`.
 
 ### The growth is one global per-layer factor, not one op
 
@@ -397,7 +414,7 @@ the factor is not"), and `gemm_nt_q` (`src/adjoint/device/linear.hip:121,129`) a
 (`src/adjoint/host/lora.cpp:255-258`) both handle `1/s` correctly. What survives is that the three
 i8g fused producers cannot be reached by any finite difference at all.
 
-### One real scale bug, found and fixed -- and measured NOT to be the 2e33
+### One real scale bug, found and fixed -- and measured NOT to be the 1.9e31
 
 **`gemm_nt_q`'s adjoint returned the cotangent of the dequantised activation while the walk's code
 operands carry the codes' cotangent.** Every quantiser's adjoint divides by the group scale `s`
@@ -418,7 +435,7 @@ The host already had the right rule, but only behind a tag: `gemm_nt_q_code_adjo
 The contradiction was visible in the file: `gemm_nt_q_twin:208` multiplies `a` by `a_scale`,
 `gemm_nt_q_adjoint:242` did not. All three rows now apply it, and the tag plumbing is deleted.
 
-**The fix is live, and it does not explain the 2e33.** Re-measured on the card after the change
+**The fix is live, and it does not explain the 1.9e31.** Re-measured on the card after the change
 (`/tmp/r97-dstep-postfix.log`):
 
 | | before | after |
@@ -428,7 +445,7 @@ The contradiction was visible in the file: `gemm_nt_q_twin:208` multiplies `a` b
 | `gdn_o` at `gdn_chunk_scan`, block 62 -> 61 | 4.160e3 -> 7.602e6 | 1.128e3 -> 1.655e6 |
 
 The gradient moved by ~4x and the growth curve's rate is unchanged (~984x per block). **A missing
-`a_scale` worth ~5x per hop cannot account for a 2e33 over-statement**; this is a genuine defect on
+`a_scale` worth ~5x per hop cannot account for a ~1.9e31 over-statement**; this is a genuine defect on
 its own and it stays fixed, but the amplification that makes `all_finite` false is still
 unexplained. The strongest remaining lead was the *within-layer* jump the post-fix curve still
 shows: `gdn_o`'s cotangent grows ~1e4 as the walk passes the `gdn_chunk_scan` record, at every block
@@ -469,7 +486,7 @@ An op-level probe (`tests/host/gdn_gradient_probe.cpp`, CPU only) central-differ
 host twin against its own host adjoint -- the method that found the `gemm_nt_q` scale, and one that a
 device-vs-host *relative* comparison cannot replace. Every op it reached is the exact derivative of
 its own forward (`adj/fd = 1.000000` at every probed element, worst relative error 1e-9..1e-7), and
-it was shown to see a factor of 2 when one is injected, so it would see 2e33.
+it was shown to see a factor of 2 when one is injected, so it would see 1.9e31.
 
 | op | fixtures | result |
 |---|---|---|
@@ -500,7 +517,7 @@ the `+ cot_h` fused-output term and the norm backward, so no factor is visible b
 carries code cotangents of 2.44e30..2.62e33 while `gdn_o`'s reach 1e35..1e38 -- with live scales as
 small as 5.96e-05, the quotient crosses f32's 3.4e38. That is consistent with the report's
 first-non-finite being this row's in-place output, and it is a real defect on its own, though an
-overflow gives Inf rather than a 2e33 multiplier.
+overflow gives Inf rather than a large finite multiplier.
 
 **That gap is now closed.** The three producers have host twins and host adjoints
 (`src/adjoint/host/quant.cpp`), built as the composition the GPU tier already had in its test TU, and
@@ -573,15 +590,21 @@ only that the walk reached the leaf".
 schema's 800 leaves with matching names and shapes; the forward is all finite, so the container, the
 loader and the forward are ruled out as the source of any non-finite value; the first non-finite value
 is at `model.layers.0.linear_attn.in_proj_qkv.lora_A`; and **96 % of the 2946 s step is the backward**
-(2832.8 s), which is what a per-op adjoint amplifying by ~365x per block costs in time as well as
+(2832.8 s), which is what a per-op adjoint amplifying by ~250x per block costs in time as well as
 correctness.
 
 **What it does not establish, and an earlier draft of this section claimed.** That "127 of the 400 `A`
 leaves moved when the contract says none may", and that the split is "structurally wrong at both
 ends". Both are unsupported: 127 is exactly what poisoning produces, because a non-finite gradient
-both moves the parameter and defeats `part != 0.0`. Settling it needs a field this run does not carry
--- a count of the `A` leaves whose gradient is **finite and non-zero** -- and until that is measured,
-`a_changed` on this case says nothing about whether a cotangent reached `A`.
+both moves the parameter and defeats `part != 0.0`.
+
+**The field that settles it now exists.** `tests/gpu/device_step.cpp` records
+`n_a_finite_nonzero`/`n_b_finite_nonzero` -- the count of leaves whose sum of squares is finite *and*
+non-zero, so `n_*_finite_nonzero + n_zero_* == n_*` holds iff no leaf gradient went non-finite. On the
+512-token case it reads **82 of 400** (`A` and `B` alike, with `n_zero_a == n_zero_b == 0`, so 318 of
+each factor are non-finite). **The 4096 record predates the field**, so its own value is still
+unmeasured; the qualitative answer there is already known to be "substantially fewer than 400", since
+`first_nonzero_a_finite` is false.
 
 **One oddity worth naming on its own.** 70 of the 400 `B` leaves have a non-zero gradient
 (`n_zero_b == 0`) yet their value did not move under the step. No AdamW update should leave a
@@ -590,11 +613,11 @@ result and should not be read as one.
 
 **The acceptance criterion is still not met**, and `all_finite` is the check that decides it: the
 adapter gradient exists and is the right shape, but it is non-finite at block 0. That is the same
-defect the 512-token case localised to a ~2e33 excess growth over the backward walk, now shown to hold
-at the issue's own size.
+defect the 512-token case localised to a ~1.9e31 excess growth over the backward walk, now shown to
+hold at the issue's own size.
 
 **What the 4096 case adds beyond the 512:** the failure is not an artefact of a short sequence. With
 4096 positions the backward takes 47 minutes and produces the same non-finite leaf at the same
 place, so the defect is in the walk's arithmetic and not in a corner the short case happened to take.
 It also puts a number on what the defect costs: **96 % of the step is the backward**, which is what
-a per-op adjoint that amplifies by ~365x per block costs in time as well as in correctness.
+a per-op adjoint that amplifies by ~250x per block costs in time as well as in correctness.
