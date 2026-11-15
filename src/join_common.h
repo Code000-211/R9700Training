@@ -210,11 +210,11 @@ inline AdValue snapshot(const Operand& op, const OperandContent& content,
             std::fprintf(stderr,
                          "DUMPSNAP op=%s pos=%lld buffer=%s dtype=%s shape=[%s] bytes=%zu named=%d "
                          "data=%p view_shape=[%s] view_stride=[%s] view_off=%lld nonzero=%ld of %lld "
-                         "maxabs=%.6g\n",
+                         "maxabs=%.6g written=%d in_place=%d\n",
                          op_name, static_cast<long long>(pos), op.buffer.c_str(), op.dtype.c_str(),
                          sh.c_str(), content.bytes, static_cast<int>(content.named), content.data,
                          vs.c_str(), vst.c_str(), static_cast<long long>(op.view_off), nz, span,
-                         maxabs);
+                         maxabs, static_cast<int>(op.written), static_cast<int>(op.in_place));
             // The stored form's inputs (patch 0124): the engine's own planes, so a form the row
             // derives is checkable against what the layout hook saw.
             if (op.enc != nullptr) {
