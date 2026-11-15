@@ -804,9 +804,12 @@ their host twins' widths. And the fused producers' device row and host row are *
 not exclude them -- filed as #142, measured negligible here (live in 1 of 78 records, one part in
 8.0e5), and it is the last place a factor could hide.
 
-**These fixes explain the non-finiteness, and the measurement above says that is most of what there is
-to explain.** What they do not explain is the one finite leaf: 6.9e31 over its own truth, with no
-per-block curve behind it.
+**These fixes explain the non-finite marker; they do not explain the amplification.** Each one removes a
+real f32 overflow from a row reduction, and together they moved the first non-finite from `lora_shrink`@1150
+to `gdn_gated_rmsnorm`@1143 -- which is what a range fix buys: the instrument keeps working further down
+the walk. **The ~1.6e3 per layer is untouched by them** (section "The per-layer factor, measured"), and
+that is #55's actual defect. What is also not explained is the one finite leaf: 6.9e31 over its own
+truth.
 
 ### The first per-hop measurement at the container's own magnitudes
 
