@@ -185,6 +185,95 @@ int64_t pulled_bytes(const Operand& op, const OperandContent& content) {
     return span * es;
 }
 
+// One head operand as the forward left it: copied on the issuing lane at the issue, before the
+// engine reuses the buffer. `content` is what the walk reads -- the copy's host address and the
+// tape's own byte count, exactly as pull_operands hands them over.
+struct CapturedOperand {
+    std::vector<uint8_t> bytes;  // the host copy of the operand's span; empty when it has none
+    OperandContent content;
+    std::string error;           // why the copy was not taken; empty when it was, or had no span
+};
+
+// One head record's operands, in the tape's schema order.
+struct CapturedRecord {
+    std::vector<CapturedOperand> operand;
+    std::string error;  // why the record was not captured; empty when it was
+};
+
+// The head's records, keyed by the position the tape gave them.
+using HeadCapture = std::map<int64_t, CapturedRecord>;
+
+// Copy a head record's operands on the issuing lane, at the issue.
+//
+// The engine overwrites the head's buffers after their ops issue and before the backward pulls
+// them: at its issue the final norm's input held a maximum magnitude of 14720 and the norm's
+// output 11.06, and after serve() the same two addresses read -7.87e33 and 42.25. No forward op
+// computed a non-finite value, so the pull -- not the forward -- is what is wrong, and the head's
+// read set rightly refuses rows it cannot prove. The observer runs after the op and while the
+// buffers still hold what the op left, so a copy taken here is the value the op saw, and the walk
+// reads the copy instead of the buffer.
+//
+// Which records are the head's: the ones issued outside any block after the tape has recorded
+// `layers` blocks. That is exact, not a positional guess. An op inside a layer carries that
+// layer's block index, which is never negative; the tape's block list reaches `layers` entries at
+// the last layer's begin (the step's own check requires the store's `layers + 1` boundaries to
+// match `blocks().size() + 1`); and from that moment the only ops recorded with no block open are
+// the ones issued after the last layer's end -- the trailing records the join walks,
+// `ops[blocks.back().end..)`. An op of the embedding before the first block, or one inside the
+// last layer, fails one half each.
+//
+// The logits record is left out. It is the join's own seed: the CE loop reads its output through
+// the tape's recorded pointer, which is the step's last write of it, and the head walk never
+// snapshots the record. Copying it would hold a row per token of the whole vocabulary -- 4 GB at
+// 4096 tokens -- for bytes nothing reads.
+//
+// A copy the card refuses is recorded as that operand's error, not thrown: the hook runs inside
+// the engine's issue path, and a capture that could not be taken must leave the walk's refusal to
+// name the operand and position (snap_record) rather than stop the step in the middle of serve.
+void capture_head_record(const Tape& tape, const OpRecord& op,
+                         const std::vector<OperandContent>& content, int64_t layers,
+                         RadStream stream, HeadCapture* out) {
+    if (op.block >= 0) return;
+    if (static_cast<int64_t>(tape.blocks().size()) < layers) return;
+    for (const Operand& o : op.operands)
+        if (o.written && o.buffer == "logits") return;
+    CapturedRecord& held = (*out)[op.position];
+    held.operand.resize(op.operands.size());
+    for (size_t j = 0; j < op.operands.size(); ++j) {
+        CapturedOperand& c = held.operand[j];
+        if (j >= content.size()) {
+            c.error = "the tape recorded no content for it";
+            continue;
+        }
+        try {
+            const int64_t bytes = pulled_bytes(op.operands[j], content[j]);
+            if (bytes > 0) {
+                c.bytes.resize(static_cast<size_t>(bytes));
+                if (rad_memcpy_async(c.bytes.data(), content[j].data, bytes, stream) != 0 ||
+                    rad_stream_sync(stream) != 0) {
+                    c.error = "copying " + std::to_string(bytes) +
+                              " bytes back on the step's stream: " + rad_dev_last_error();
+                    c.bytes.clear();
+                    c.content.data = content[j].data;
+                } else {
+                    c.content.data = c.bytes.data();
+                }
+            } else {
+                // Nothing to copy: an absent operand, or one whose values the tape does not span.
+                // The recorded pointer is kept so snapshot() sees the operand was there; neither
+                // case reads a value from it.
+                c.content.data = content[j].data;
+            }
+            c.content.bytes = content[j].bytes;
+            c.content.named = content[j].named;
+        } catch (const std::exception& e) {
+            c.error = e.what();
+            c.bytes.clear();
+            c.content = OperandContent{content[j].data, content[j].bytes, content[j].named};
+        }
+    }
+}
+
 // Every operand of `op` as the walk will ask for it, copied back on `stream` and waited for, so
 // the caller can snapshot them on the host. The copies are one queue's work: the ops that wrote
 // them were issued on the same lane. `skip` (empty, or one entry per operand) marks an operand the
@@ -277,8 +366,13 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         ResidualPlan plan;
         int64_t budget = options.residual_budget_bytes;
         std::shared_ptr<BoundaryRecorder> recorder;
-        driver.set_engine_hook([&driver, &recorder, &wire, &plan, &budget, live, targets, max_rank,
-                                tokens, meta](rad::Engine& engine) {
+        // The head's operands, copied at their issue (capture_head_record): the engine overwrites
+        // the head's buffers before the backward pulls them, so the walk reads these bytes rather
+        // than the buffer. Only the head's records are held, and only a call that walks (one with
+        // `grads`) installs the hook at all.
+        HeadCapture head_capture;
+        driver.set_engine_hook([&driver, &recorder, &wire, &plan, &budget, &head_capture, grads,
+                                live, targets, max_rank, tokens, meta](rad::Engine& engine) {
             if (live) {
                 LiveAdapterConfig cfg{"train", targets, std::max<int64_t>(max_rank, 1), 1.0};
                 std::string err;
@@ -315,6 +409,19 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                     "device step: the engine gave no stream for the step's lane");
             recorder = std::make_shared<BoundaryRecorder>(
                 driver.tape(), ResidualStore(stream, plan, budget));
+            if (!grads) return;
+            // The recorder owns the tape's one issue hook, so wrap it rather than replace it: the
+            // boundary store still sees every issue, and the capture copies the head's operands
+            // while their buffers still hold what the op left. `stream` is the lane the step's ops
+            // issue on, which is where the copy has to order.
+            Tape& capture_tape = driver.tape();
+            Tape::IssueHook inner = capture_tape.issue_hook();
+            capture_tape.set_issue_hook(
+                [inner, &head_capture, stream, layers = meta.layers](
+                    const Tape& t, const OpRecord& op, const std::vector<OperandContent>& content) {
+                    if (inner) inner(t, op, content);
+                    capture_head_record(t, op, content, layers, stream, &head_capture);
+                });
         });
 
         const Clock::time_point forward_begin = Clock::now();
@@ -358,16 +465,25 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         measured.residual_extras = plan.extras();
         measured.residual_store_bytes = store.bytes();
         measured.residual_budget_bytes = budget;
+        // What the issue hook held for the head: the records it copied and the bytes they take. A
+        // step that walks nothing installs no hook, so these stay 0.
+        measured.head_capture_records = static_cast<int64_t>(head_capture.size());
+        for (const auto& entry : head_capture)
+            for (const CapturedOperand& c : entry.second.operand)
+                measured.head_capture_bytes += static_cast<int64_t>(c.bytes.size());
         if (options.keep_boundaries) {
             measured.boundary_name.assign(static_cast<size_t>(measured.layers + 1), {});
             measured.boundary_value.assign(static_cast<size_t>(measured.layers + 1), {});
             measured.boundary_cotangent.assign(static_cast<size_t>(measured.layers + 1), {});
         }
 
-        // The head's records are the ops after the last block. The logits op among them is the
+        // The head's records are the ops after the last block: the same range the capture hook
+        // filled (capture_head_record), so `head_start` is the position from which a record's
+        // operands come from the capture rather than a pull. The logits op among them is the
         // join's own: it has no adjoint row (the transposed product replaces it), so the walk gets
         // the records before it and a seed on the buffer it reads.
-        std::vector<OpRecord> head_records(ops.begin() + static_cast<std::ptrdiff_t>(blocks.back().end),
+        const int64_t head_start = static_cast<int64_t>(blocks.back().end);
+        std::vector<OpRecord> head_records(ops.begin() + static_cast<std::ptrdiff_t>(head_start),
                                            ops.end());
         size_t logits_at = head_records.size();
         for (size_t i = 0; i < head_records.size() && logits_at == head_records.size(); ++i)
@@ -640,10 +756,15 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             if (o.written || step_writes.count(o.buffer)) return std::string();
             return snapshot_key(o);
         };
-        // One record's operands as the walk will ask for them. A frozen read the shared store
-        // already holds is bound without a pull; the step's first read of one is pulled and
-        // widened here and held for every later block; everything else is pulled back and widened
-        // into the caller's per-block store.
+        // One record's operands as the walk will ask for them. A head record's operands are the
+        // bytes copied at their issue (head_capture): the engine has overwritten their buffers
+        // since, so a pull here would read another writer's values -- -7.87e33 where the op saw
+        // 14720. A head record without a capture is refused by name, never pulled: the pull is
+        // exactly what the refusal exists for. Every other record -- the blocks, all before
+        // `head_start` -- is pulled back as before: a frozen read the shared store already holds is
+        // bound without a pull, the step's first read of one is pulled and widened here and held
+        // for every later block, and everything else is pulled back and widened into the caller's
+        // per-block store.
         struct SnappedRecord {
             std::vector<AdValue> now;                            // frozen entries stay empty
             std::vector<std::shared_ptr<const AdValue>> frozen;  // non-null: answered by `shared`
@@ -661,12 +782,48 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 out.frozen[j] = shared.find(key[j]);
                 skip[j] = out.frozen[j] ? 1 : 0;
             }
+            const CapturedRecord* captured = nullptr;
+            if (rec.position >= head_start) {
+                const auto it = head_capture.find(rec.position);
+                if (it == head_capture.end())
+                    throw std::runtime_error(
+                        "device step: the head record '" + rec.op + "' at position " +
+                        std::to_string(rec.position) +
+                        " has no captured operands: the step's issue hook did not copy it, so the "
+                        "walk would read a buffer the engine has overwritten since");
+                if (!it->second.error.empty())
+                    throw std::runtime_error("device step: the head record '" + rec.op +
+                                             "' at position " + std::to_string(rec.position) +
+                                             " was not captured: " + it->second.error);
+                captured = &it->second;
+                if (captured->operand.size() != rec.operands.size())
+                    throw std::runtime_error(
+                        "device step: the head record '" + rec.op + "' at position " +
+                        std::to_string(rec.position) + " captured " +
+                        std::to_string(captured->operand.size()) + " operands, not " +
+                        std::to_string(rec.operands.size()));
+            }
             std::vector<PulledContent> held;
-            const Clock::time_point pull_begin = Clock::now();
-            pull_operands(rec, content, stream, &held, skip);
-            OpTiming& pull_acc = pull_time[rec.op];
-            pull_acc.calls += 1;
-            pull_acc.seconds += seconds_since(pull_begin);
+            if (captured) {
+                held.resize(rec.operands.size());
+                for (size_t j = 0; j < rec.operands.size(); ++j) {
+                    if (out.frozen[j]) continue;  // answered by the shared store, not the capture
+                    const CapturedOperand& c = captured->operand[j];
+                    if (!c.error.empty())
+                        throw std::runtime_error(
+                            "device step: the head record '" + rec.op + "' at position " +
+                            std::to_string(rec.position) + ": operand '" +
+                            rec.operands[j].buffer + "' (" + std::to_string(j) +
+                            ") was not captured: " + c.error);
+                    held[j].content = c.content;
+                }
+            } else {
+                const Clock::time_point pull_begin = Clock::now();
+                pull_operands(rec, content, stream, &held, skip);
+                OpTiming& pull_acc = pull_time[rec.op];
+                pull_acc.calls += 1;
+                pull_acc.seconds += seconds_since(pull_begin);
+            }
             for (size_t j = 0; j < rec.operands.size(); ++j) {
                 if (out.frozen[j]) {
                     shared.bind(rec.position, j, out.frozen[j]);
@@ -678,6 +835,41 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 // block binds instead of pulling and widening again.
                 out.frozen[j] = shared.insert(key[j], std::move(out.now[j]));
                 shared.bind(rec.position, j, out.frozen[j]);
+            }
+            // R97_DUMP_PULL=1: for the head's records, what the walk will read beside what the
+            // card's buffer holds now. The walk's values are the bytes copied at the issue
+            // (head_capture), so a card line that differs from the host line is the engine's reuse
+            // of the buffer after the op -- the very reason the capture exists -- and a card that
+            // agrees says nothing overwrote it.
+            if (const char* dp = std::getenv("R97_DUMP_PULL"); dp != nullptr && dp[0] == '1' &&
+                                                                    rec.position >= 1458) {
+                for (size_t j = 0; j < rec.operands.size(); ++j) {
+                    const Operand& o = rec.operands[j];
+                    const OperandContent& c = content[j];
+                    const AdValue& v = out.now[j];
+                    const int64_t es = elem_size(o.dtype);
+                    double card[4] = {0, 0, 0, 0};
+                    if (c.data != nullptr && es > 0 && c.bytes >= static_cast<size_t>(es)) {
+                        const int64_t n = std::min<int64_t>(4, c.bytes / es);
+                        std::vector<uint8_t> tmp(static_cast<size_t>(n * es));
+                        if (rad_memcpy_async(tmp.data(), c.data, n * es, stream) == 0 &&
+                            rad_stream_sync(stream) == 0)
+                            for (int64_t k = 0; k < n; ++k)
+                                card[k] = read_elem(o.dtype, tmp.data() + k * es, 0);
+                    }
+                    std::fprintf(stderr,
+                                 "DUMPPULL pos=%lld op=%s buffer=%s operand=%zu written=%d dtype=%s "
+                                 "bytes=%zu values=%zu raw=%p card=[%.6g %.6g %.6g %.6g] "
+                                 "host=[%.6g %.6g %.6g %.6g]\n",
+                                 static_cast<long long>(rec.position), rec.op.c_str(),
+                                 o.buffer.c_str(), j, static_cast<int>(o.written), o.dtype.c_str(),
+                                 c.bytes, v.value.size(), v.raw, card[0], card[1], card[2], card[3],
+                                 v.value.size() > 0 ? v.value[0] : 0.0,
+                                 v.value.size() > 1 ? v.value[1] : 0.0,
+                                 v.value.size() > 2 ? v.value[2] : 0.0,
+                                 v.value.size() > 3 ? v.value[3] : 0.0);
+                    std::fflush(stderr);
+                }
             }
             return out;
         };
@@ -722,6 +914,12 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             for (size_t j = 0; j < rec.operands.size(); ++j)
                 if (!snapped.frozen[j]) head_snaps.set(rec.position, j, std::move(snapped.now[j]));
         }
+
+        // The head's captured operands have been read into the walk's store; the copies are not
+        // needed past this point (the block walk's records are all before `head_start`, so
+        // snap_record pulls them as before). Drop them before the residual store and the block
+        // snapshots grow beside them.
+        head_capture.clear();
 
         // The rows a consumer reads, from the whole tape (src/read_set.h's derive_read_sets):
         // a record whose every written output is read by a gather_rows and nothing else takes the

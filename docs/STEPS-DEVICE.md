@@ -4,8 +4,9 @@
 through the real container on the device kernel tier, walks the step back with the device adjoints
 and returns the adapter's gradient. It is the device twin of `r97::host_step`
 ([`STEPS-HOST.md`](STEPS-HOST.md)), with the same block-walk structure and the same pure helpers
-(`src/join_common.h`), and it differs in three things: the forward values the walk reads are pulled
-back from the card, the head is never held whole, and the gradient is staged on the card.
+(`src/join_common.h`), and it differs in three things: the forward values the walk reads come back
+from the card (pulled at the replay for a block, copied at the issue for the head's records), the
+head is never held whole, and the gradient is staged on the card.
 
 ## The tier it needs
 
@@ -46,6 +47,8 @@ are in the build.
    `scale.col`, the sum over the four classes, and the inverse fwht per row — accumulated into
    `d_hout` `[tokens, hidden]` f32. `d_hout` seeds the head's remaining records (the final
    `rmsnorm` and the `gather_rows` before the logits op), which are walked with the device rows.
+   Their operands are not pulled: the issue hook copied them at their issue, while the buffers
+   still held what the op left (see below).
 5. **The flush.** The card's staging holds one f32 buffer per leaf the step's rows named. It is
    copied out once, rounded to bf16, and split into the delta's leaves by the naming the walk
    used (`fused_slots` / `slot_prefix` / the record's prefix), then ordered like `params`. Any
@@ -65,6 +68,26 @@ the evaluation pass of a training loop, and the pre-step reference of a check.
 | the CE chunk (card) | 64 x 248320 x 2 B for the logits and the same for the gradient |
 | one block's f64 snapshots (host) | ~2.5 GB |
 | the card's gradient staging | one f32 buffer per leaf, 320 KiB + 768 KiB per `q_proj` at rank 16 |
+| the head's captured operands (host) | one copy per head operand, the logits record excluded: 42 MB per 4096 x 5120 bf16 |
+
+### The head's operands, copied at the issue
+
+The engine reuses the head's buffers after their ops issue and before the walk runs: at its issue
+the final norm's input held a maximum magnitude of 14720 and its output 11.06, and after `serve()`
+the same two addresses read -7.87e33 and 42.25. No forward op computed a non-finite value, so a
+pull taken then copies another writer's bytes -- and the head's read set rightly refused 512 of
+512 rows it could not prove. `device_step` therefore wraps the tape's issue hook (the boundary
+recorder's, which it keeps) and copies the operands of every record issued outside a block after
+the tape has recorded `L` blocks: the head's trailing records, `ops[blocks.back().end..)`. That
+criterion is exact -- an op inside a layer carries that layer's block index, the block list
+reaches `L` entries at the last layer's begin, and after the last layer's end every op is recorded
+with no block open. The logits record is left out: the CE loop reads its output through the tape's
+pointer, the step's last write of it, and the walk never snapshots the record -- its output is
+4 GB at 4096 tokens. `snap_record` reads the capture for a record at or after `head_start` and
+refuses by name -- record, operand and position -- when a head record has no capture, rather than
+pulling a stale buffer. The copies are dropped after the head walk; the block walk pulls as
+before. The report carries `head_capture_records` and `head_capture_bytes`, and a forward-only
+call installs no hook.
 
 ### The frozen operands, widened once
 

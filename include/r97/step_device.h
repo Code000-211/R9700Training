@@ -3,10 +3,12 @@
 // The forward driver runs the batch on the device kernel tier, the residual at every layer
 // boundary is kept in one VRAM allocation, and each block is replayed from it on the card and
 // walked in reverse with the device adjoints (Side::device). The forward values the walk reads
-// are the operands' bytes pulled back at the replay and widened to the walk's f64 contract; the
-// adapter's gradients are staged on the card by the device rows and flushed once, at the step's
-// end. The head is walked through the chunked CE loop and never holds a logit row's cotangent:
-// docs/STEPS-DEVICE.md owns the path and the memory it holds.
+// are the operands' bytes: pulled back at the replay for a block, and copied at the issue for the
+// head's records, whose buffers the engine reuses before the walk runs (capture_head_record in
+// src/step_device.cpp); either is widened to the walk's f64 contract. The adapter's gradients are
+// staged on the card by the device rows and flushed once, at the step's end. The head is walked
+// through the chunked CE loop and never holds a logit row's cotangent: docs/STEPS-DEVICE.md owns
+// the path and the memory it holds.
 //
 // The join names neither a loss nor an adapter kind, as the host join does: Model::objective
 // supplies the seeds, Model::delta the wire and the gradient names.
@@ -88,6 +90,12 @@ struct DeviceStepReport {
     int64_t d_hout_bytes = 0;
     int64_t head_rows = 0;
     int64_t head_chunks = 0;
+
+    // The head's operands copied at their issue, before the engine reused the buffers: the records
+    // captured and the bytes held (the head's, never the whole tape's). A forward-only call walks
+    // nothing, so it installs no hook and both stay 0.
+    int64_t head_capture_records = 0;
+    int64_t head_capture_bytes = 0;
 
     // The report's own f64 copies of the boundaries, when keep_boundaries is set.
     int64_t kept_boundary_bytes = 0;

@@ -19,6 +19,9 @@
 #if R97_FORWARD
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -27,6 +30,9 @@
 #include <vector>
 
 #include "engine.h"           // radiance's core/; Engine, Config, rad_strerror
+#include "rad_device.h"       // rad_dev_props / rad_memcpy_async / rad_stream_sync: the dump's copy
+#include "rad_plugin.h"       // the fp8 decoders join_common's read_elem calls
+#include "join_common.h"      // elem_size / numel / read_elem: the R97_DUMP_FWD scan reads values
 #include "r97/loss.h"         // bf16_to_f32: the step's buffers widened to f32
 #include "util/stallwatch.h"  // radiance's core/; the watch serve() takes
 
@@ -61,6 +67,162 @@ float widen(const void* at, const std::string& dtype) {
         return bf16_to_f32(v);
     }
     fail("a buffer of dtype '" + dtype + "', which this forward cannot widen to f32");
+}
+
+// R97_DUMP_FWD=1: is the forward's finiteness being watched? Read once per step, at the issue.
+bool dump_fwd_enabled() {
+    const char* d = std::getenv("R97_DUMP_FWD");
+    return d != nullptr && d[0] == '1';
+}
+
+// One writer is enough: once an op has produced a non-finite value, its descendants' lines only
+// bury the name. Reset per step by the driver.
+bool g_dump_fwd_done = false;
+// How many probe lines have printed this step (see dump_fwd_scan). Reset per step by the driver.
+long g_dump_fwd_probes = 0;
+// The written operands read and the ones skipped, so a silent run is told from one that looked.
+long g_dump_fwd_scanned = 0;
+long g_dump_fwd_skipped = 0;
+
+// The dtypes read_elem widens to f64. A written operand of any other -- "f8", a plugin-private
+// quantised tensor -- has no f64 form to scan, and is left alone rather than read as a wrong one.
+bool readable_dtype(const std::string& d) {
+    return d == "bf16" || d == "f16" || d == "f32" || d == "f64" || d == "i8" || d == "u8" ||
+           d == "i32" || d == "u32" || d == "i64" || d == "u64" || d == "fp8_e4m3" ||
+           d == "fp8_e5m2";
+}
+
+// The first non-finite value in one operand's span, or -1, and the largest finite magnitude seen:
+// a probe line with maxabs 0 says the span read as zeros (a copy that raced, or a wrong address)
+// rather than as the values the op wrote. `base` is host memory: on the device tier the caller has
+// already copied the span back, because the tape's pointers are the card's and reading one here
+// faults (the device join's pull_operands copies for the same reason).
+int64_t first_non_finite_at(const std::string& dtype, const uint8_t* base, int64_t count,
+                            int64_t es, double* maxabs) {
+    int64_t at = -1;
+    double m = 0.0;
+    for (int64_t i = 0; i < count; ++i) {
+        const double v = read_elem(dtype, base + i * es, 0);
+        if (!std::isfinite(v)) {
+            if (at < 0) at = i;
+            continue;
+        }
+        const double a = std::fabs(v);
+        if (a > m) m = a;
+    }
+    if (maxabs != nullptr) *maxabs = m;
+    return at;
+}
+
+// R97_DUMP_FWD=1: for every forward op in order, the first non-finite value of each operand the op
+// declared it wrote. The tape's issue hook is called after the op is recorded and while the buffers
+// still hold what it wrote, so this names the writer of a value the backward only ever meets later,
+// once the buffer has been reused -- which is why the join's own scan (backward.cpp) reports the
+// reader's record (the head's rmsnorm) rather than the op the inf was born at. One line per
+// finding names the op, its position, the operand and its schema index, the value's flat index,
+// its row and column, and the value. The first non-finite per operand is enough, and printing
+// stops at the first op that produced one: the writer, not its descendants.
+//
+// `host_memory` says the tape's pointers are host addresses (the host backend) and can be read in
+// place; otherwise the operand's span is copied back on `stream`, which is the lane the op issued
+// on, so the copy orders behind it. A copy the card refuses names its operand and is skipped: the
+// dump must never be the thing that stops a step.
+void dump_fwd_scan(const OpRecord& op, const std::vector<OperandContent>& content, bool host_memory,
+                   RadStream stream) {
+    if (g_dump_fwd_done) return;
+    bool found = false;
+    for (size_t j = 0; j < op.operands.size() && j < content.size(); ++j) {
+        const Operand& o = op.operands[j];
+        if (!o.written) continue;
+        const OperandContent& c = content[j];
+        const int64_t es = elem_size(o.dtype);
+        const int64_t inner =
+            o.shape.empty() || o.shape[0] <= 0 ? 0 : numel(o.shape) / o.shape[0];
+        const int64_t row_lo = o.rows > 0 ? o.row_lo : 0;
+        const int64_t rows = o.rows > 0 ? o.rows : (o.shape.empty() ? 0 : o.shape[0]);
+        const int64_t count = rows * inner;
+        const int64_t bytes = count * es;
+        // A written operand the scan will not read says why: silence must mean "read and finite",
+        // never "never looked". One line per skipped operand, and the run's totals at the end of
+        // the forward.
+        const char* why = nullptr;
+        if (c.data == nullptr) {
+            why = "no-pointer";
+        } else if (es <= 0 || !readable_dtype(o.dtype)) {
+            why = "dtype";
+        } else if (o.shape.empty() || o.shape[0] <= 0) {
+            why = "no-shape";
+        } else if (inner <= 0 || count <= 0) {
+            why = "empty";
+        } else if (c.bytes < static_cast<size_t>(bytes)) {
+            why = "short-span";
+        }
+        if (why != nullptr) {
+            ++g_dump_fwd_skipped;
+            std::fprintf(stderr,
+                         "DUMPFWD skip op=%s pos=%lld buffer=%s operand=%zu dtype=%s bytes=%zu "
+                         "need=%lld why=%s\n",
+                         op.op.c_str(), static_cast<long long>(op.position), o.buffer.c_str(), j,
+                         o.dtype.c_str(), c.bytes, static_cast<long long>(bytes), why);
+            std::fflush(stderr);
+            continue;
+        }
+        ++g_dump_fwd_scanned;
+        std::vector<uint8_t> copy;
+        const uint8_t* base;
+        if (host_memory) {
+            base = static_cast<const uint8_t*>(c.data);
+        } else {
+            if (stream == nullptr) {
+                std::fprintf(stderr,
+                             "DUMPFWD op=%s pos=%lld buffer=%s operand=%zu: the card's lane gave "
+                             "no stream to copy %lld bytes back\n",
+                             op.op.c_str(), static_cast<long long>(op.position), o.buffer.c_str(),
+                             j, static_cast<long long>(bytes));
+                std::fflush(stderr);
+                continue;
+            }
+            copy.resize(static_cast<size_t>(bytes));
+            if (rad_memcpy_async(copy.data(), c.data, bytes, stream) != 0 ||
+                rad_stream_sync(stream) != 0) {
+                std::fprintf(stderr,
+                             "DUMPFWD op=%s pos=%lld buffer=%s operand=%zu: the card would not "
+                             "copy %lld bytes back: %s\n",
+                             op.op.c_str(), static_cast<long long>(op.position), o.buffer.c_str(),
+                             j, static_cast<long long>(bytes), rad_dev_last_error());
+                std::fflush(stderr);
+                continue;
+            }
+            base = copy.data();
+        }
+        double maxabs = 0.0;
+        const int64_t at = first_non_finite_at(o.dtype, base, count, es, &maxabs);
+        // The first few written operands, and every op of the head, print what was read even when
+        // it is finite: a probe with maxabs 0 says the copy raced or the address was wrong, so a
+        // run with no finding is told from a scan that read nothing.
+        if (g_dump_fwd_probes < 6 || op.position >= 1450) {
+            ++g_dump_fwd_probes;
+            std::fprintf(stderr,
+                         "DUMPFWD probe op=%s pos=%lld buffer=%s operand=%zu bytes=%zu count=%lld "
+                         "data=%p maxabs=%.6g nonfinite_at=%lld\n",
+                         op.op.c_str(), static_cast<long long>(op.position), o.buffer.c_str(), j,
+                         c.bytes, static_cast<long long>(count), c.data, maxabs,
+                         static_cast<long long>(at));
+        }
+        if (at < 0) continue;
+        std::fprintf(stderr,
+                     "DUMPFWD op=%s pos=%lld buffer=%s operand=%zu index=%lld row=%lld col=%lld "
+                     "value=%.9g data=%p\n",
+                     op.op.c_str(), static_cast<long long>(op.position), o.buffer.c_str(), j,
+                     static_cast<long long>(at), static_cast<long long>(row_lo + at / inner),
+                     static_cast<long long>(at % inner),
+                     read_elem(o.dtype, base + at * es, 0), c.data);
+        found = true;
+    }
+    if (found) {
+        std::fflush(stderr);
+        g_dump_fwd_done = true;
+    }
 }
 
 }  // namespace
@@ -236,6 +398,14 @@ void ForwardDriver::run_engine(const Batch& batch) {
     // first, and the new engine is started before the tape attaches to it.
     tape_.detach();
     tape_.clear();
+    // R97_DUMP_FWD's wrapper is not the recorder's to clear: a step with no recorder (a plain
+    // forward) would leave it on the tape, and the next step would nest it. Drop it here, and let
+    // the step find its writer afresh.
+    if (dump_fwd_enabled()) {
+        tape_.set_issue_hook(nullptr);
+        g_dump_fwd_done = false;
+        g_dump_fwd_probes = 0;
+    }
     last_.reset();
     engine_.reset();
 
@@ -278,6 +448,33 @@ void ForwardDriver::run_engine(const Batch& batch) {
     tape_.attach(engine_->issue_ctx());
     if (!tape_.attached()) fail("the engine gave no rank context to record the step on");
     if (engine_hook_) engine_hook_(*engine_);
+
+    // R97_DUMP_FWD=1: watch the forward's own values for the first non-finite one, at the issue
+    // where the buffers still hold what the op left (dump_fwd_scan). The boundary recorder the
+    // engine hook just installed owns the tape's one issue hook, so wrap it rather than replace it:
+    // the recorder still sees every issue, and the scan reads the record it is handed. The tape's
+    // pointers are host addresses only on the host backend; otherwise the scan copies each written
+    // span back on the lane the op issued on. The armed line is the evidence the hook ran at all,
+    // so "no DUMPFWD line" can mean "every value was finite" rather than "the scan never started".
+    if (dump_fwd_enabled()) {
+        RadDeviceProps props{};
+        const bool host_memory = rad_dev_props(0, &props) == 0 && props.is_host_backend != 0;
+        // The lane's stream is looked up per op, not cached: the op just issued on it, and the
+        // copy must order behind the op, not behind whatever the stream held before serve began.
+        std::fprintf(stderr, "DUMPFWD armed: host_memory=%d\n", static_cast<int>(host_memory));
+        std::fflush(stderr);
+        Tape::IssueHook inner = tape_.issue_hook();
+        tape_.set_issue_hook([this, inner, host_memory](
+                                 const Tape& t, const OpRecord& op,
+                                 const std::vector<OperandContent>& content) {
+            if (inner) inner(t, op, content);
+            RadStream stream = nullptr;
+#if defined(RAD_CTX_STREAM)
+            if (engine_) stream = rad_ctx_cur_stream(engine_->issue_ctx());
+#endif
+            dump_fwd_scan(op, content, host_memory, stream);
+        });
+    }
 
     auto watch = std::make_unique<rad::StallWatch>("r97 forward", 60000);
     s = engine_->serve(std::move(watch));
