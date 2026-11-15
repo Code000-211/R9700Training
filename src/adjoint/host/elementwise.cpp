@@ -421,12 +421,28 @@ const AdValue* norm_gain(const OpRecord& rec, const std::vector<AdValue>& op, in
             std::string schema;
             for (int64_t d : rec.operands[j].shape)
                 schema += (schema.empty() ? "" : ",") + std::to_string(d);
+            // The values themselves, not just the shape: the gain was exonerated on buffer, shape
+            // and rank, but never on the numbers. A rank-2 snapshot whose rows differ from each
+            // other is not a broadcast of the rank-1 vector, and a rank-1 vector that is not the
+            // container's weight makes every elementwise comparison against the kernel wrong.
+            std::string vals;
+            for (size_t i = 0; i < std::min<size_t>(op[j].value.size(), 4); ++i)
+                vals += (vals.empty() ? "" : ",") + std::to_string(op[j].value[i]);
+            double row0_vs_row1 = -1.0;
+            if (op[j].shape.size() == 2 && op[j].shape[0] > 1 && op[j].shape[1] > 0) {
+                const int64_t wcol = op[j].shape[1];
+                row0_vs_row1 = 0.0;
+                for (int64_t i = 0; i < wcol; ++i)
+                    row0_vs_row1 = std::max(row0_vs_row1,
+                                            std::fabs(op[j].value[(size_t)i] -
+                                                      op[j].value[(size_t)(wcol + i)]));
+            }
             std::fprintf(stderr, "GAINPOS pos=%lld j=%zu buffer=%s schema=[%s] value_rank=%zu "
-                                 "value0=%lld values=%zu n=%lld\n",
+                                 "value0=%lld values=%zu n=%lld vals=[%s] row0_vs_row1=%.6g\n",
                          (long long)rec.position, j, rec.operands[j].buffer.c_str(),
                          schema.c_str(), op[j].shape.size(),
                          op[j].shape.empty() ? -1LL : (long long)op[j].shape[0],
-                         op[j].value.size(), (long long)n);
+                         op[j].value.size(), (long long)n, vals.c_str(), row0_vs_row1);
             std::fflush(stderr);
         }
         return &op[j];

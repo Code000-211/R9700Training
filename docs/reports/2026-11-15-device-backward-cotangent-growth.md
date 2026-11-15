@@ -870,6 +870,34 @@ those rows is the reconstruction this section already uses:
 Those three together are the decision: the FD is not usable on these rows, and nothing in this report
 quotes an FD number for a quantised producer.
 
+### The gain's values: two snapshots, different data, and one is not a broadcast
+
+`GAINPOS` now prints the values, not just the shape:
+
+| pos | snapshot | first four values | `row0_vs_row1` |
+|---|---|---|---|
+| 1449 | rank 1 `[5120]` | `0.245117, 0.146484, 0.209961, 0.213867` | -- |
+| 1449 | rank 2 `[512,5120]` | `0.347402, 0.648529, 1.341123, 0.037116` | **4.99** |
+| 1429 | rank 1 `[5120]` | `0.075684, 0.171875, 0.113281, 0.080078` | -- |
+| 1429 | rank 2 `[512,5120]` | `-0.308146, 0.157739, -0.318916, -1.028865` | **12.52** |
+
+Two things follow.
+
+**The rank-2 snapshot is not a broadcast of a `[1,5120]` weight.** Its rows differ from each other
+by 5.0 at 1449 and 12.5 at 1429, which a broadcast of one vector cannot produce. Whatever that operand
+is, it is per-row data carrying the weight's buffer name.
+
+**The two snapshots carry different data.** The rank-1 entries are small and positive (0.076-0.245),
+which is what a zero-centred RMSNorm gain looks like once `w + 1` is applied; the rank-2 entries
+include -1.03, which is not. The twin takes the rank-1 one (`FDRMS w_rank=1`), and it is the
+weight-shaped, gain-plausible of the two.
+
+**Whether the rank-1 entries are the container's weight is still unproven.** The direct test is to feed
+`rmsnorm_twin` the reference step's `weights_.get("blk.63.ffn_norm.weight")` and compare the codes;
+that needs `weights_` plumbed into `elementwise.cpp`, which the twin does not currently have. What the
+data rules out is the rank-2 operand: it cannot be the weight, and any caller taking it is taking
+per-row data as a gain.
+
 ## The quotient's guard## The quotient's guard## The quotient's guard
 
 The mask pass divides each code's cotangent by its group scale, and the quotient is exact only
