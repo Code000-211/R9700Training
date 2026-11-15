@@ -772,12 +772,29 @@ It also fits the shape of the evidence: a per-record factor of ~1.38 applied uni
 census finding no op, is what a small systematic difference in the saved operands would look like
 compounded 90 times per layer. The report already carries the two instruments for this -- `R97_DUMP_FWD`
 (the forward's own operands as they were computed) and `R97_DUMP_SNAP` (what the walk was handed).
-**Both flags must run in one process**, because `DUMPSNAP` prints the pointer, the view and a `nonzero`
-count but **not** `maxabs`, while `DUMPFWD` prints `maxabs` and `nonfinite_at`; comparing across two
-retained logs is not possible, and the retained ones confirm it (`/tmp/r97-dump-window.log` has 46
-`DUMPSNAP` lines and no `DUMPFWD`; `/tmp/r97-fwd-hunt.log` has 168 `DUMPFWD` and no `DUMPSNAP`). Run
-both, key on `(op, pos, buffer)` and compare operand by operand on one layer. **That is a cheaper and
-more decisive test than any further census, and it is the named next step.**
+**Both flags must run in one process**, because `DUMPSNAP` printed the pointer, the view and a `nonzero`
+count but **not** `maxabs` or a position, while `DUMPFWD` printed `maxabs`, `nonfinite_at` and `pos`;
+comparing across two retained logs is not possible, and the retained ones confirm it
+(`/tmp/r97-dump-window.log` has 46 `DUMPSNAP` lines and no `DUMPFWD`; `/tmp/r97-fwd-hunt.log` has 168
+`DUMPFWD` and no `DUMPSNAP`).
+
+**That gap is now closed** (commit `a3fb369`'s successor). `snapshot()` takes the record's position and
+prints it, and computes `maxabs` over the same span `DUMPFWD` reports it over -- skipping non-finite
+values so the two are comparable rather than both being `inf`. Both dumps gained a `=2` form
+(`R97_DUMP_FWD=2`, `R97_DUMP_SNAP=2`) that prints a line for **every** operand of every record instead
+of the first few, so the join is not limited to `gemm_nt_q` and the lora rows. The join itself is
+`/tmp/r97-snapjoin.py`, which keys on `(op, pos, buffer)` and reports two things per key: whether the
+tape's recorded `data=` pointer equals the pointer the forward actually wrote, and whether the two
+`maxabs` agree. **A stale or mismatched snapshot shows as a different pointer or a disagreeing
+`maxabs`; a correct one shows as neither.** Run both at `=2` on one layer and read the join.
+
+The analyzer's negative controls were run against the retained pair and behave as the split predicts:
+`/tmp/r97-dump-window.log` gives `0` forward lines and `44` snapshot lines with `28` keys present in
+neither dump, and `/tmp/r97-fwd-hunt.log` gives `36` forward and `0` snapshot -- `NO JOIN` both times,
+which is exactly why the pair proves nothing. It also confirms the old build printed no `pos` (every
+`snap-only` key has `pos=None`).
+
+**That is a cheaper and more decisive test than any further census, and it is the named next step.**
 
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from

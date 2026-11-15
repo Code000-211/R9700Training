@@ -830,7 +830,7 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                     shared.bind(rec.position, j, out.frozen[j]);
                     continue;
                 }
-                out.now[j] = snapshot(rec.operands[j], held[j].content, rec.op.c_str());
+                out.now[j] = snapshot(rec.operands[j], held[j].content, rec.op.c_str(), rec.position);
                 if (key[j].empty()) continue;
                 // The step's first read of a frozen operand: its one widen, which every later
                 // block binds instead of pulling and widening again.

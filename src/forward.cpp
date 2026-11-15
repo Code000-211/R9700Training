@@ -70,9 +70,15 @@ float widen(const void* at, const std::string& dtype) {
 }
 
 // R97_DUMP_FWD=1: is the forward's finiteness being watched? Read once per step, at the issue.
+// =2 is the same watch with every scanned operand's probe line printed rather than the first few,
+// which is what lets a probe be joined against a snapshot of the same (op, pos, buffer, data).
 bool dump_fwd_enabled() {
     const char* d = std::getenv("R97_DUMP_FWD");
-    return d != nullptr && d[0] == '1';
+    return d != nullptr && (d[0] == '1' || d[0] == '2');
+}
+bool dump_fwd_all() {
+    const char* d = std::getenv("R97_DUMP_FWD");
+    return d != nullptr && d[0] == '2';
 }
 
 // One writer is enough: once an op has produced a non-finite value, its descendants' lines only
@@ -200,7 +206,7 @@ void dump_fwd_scan(const OpRecord& op, const std::vector<OperandContent>& conten
         // The first few written operands, and every op of the head, print what was read even when
         // it is finite: a probe with maxabs 0 says the copy raced or the address was wrong, so a
         // run with no finding is told from a scan that read nothing.
-        if (g_dump_fwd_probes < 6 || op.position >= 1450) {
+        if (dump_fwd_all() || g_dump_fwd_probes < 6 || op.position >= 1450) {
             ++g_dump_fwd_probes;
             std::fprintf(stderr,
                          "DUMPFWD probe op=%s pos=%lld buffer=%s operand=%zu bytes=%zu count=%lld "

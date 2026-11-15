@@ -158,7 +158,7 @@ inline bool joined_dense(const Operand& op, const OperandContent& content, std::
 // slice the kernel saw, which for a ranged operand starts at row_lo; the walk's adjoints expect
 // the full buffer with the untouched rows zero.
 inline AdValue snapshot(const Operand& op, const OperandContent& content,
-                        const char* op_name = nullptr) {
+                        const char* op_name = nullptr, int64_t pos = -1) {
     AdValue v;
     // The family adjoints read the record's dtype off the value too (an absent scale is spelled
     // "invalid"), so keep it with the numbers.
@@ -170,12 +170,17 @@ inline AdValue snapshot(const Operand& op, const OperandContent& content,
     // trunk weight's stored layout was identified and how a zero operand is told from a wrong span;
     // see docs/adjoints/linear.md. The non-zero count is over the span the tape gave, so a named
     // operand that is all zeros shows as nz=0 of n rather than as an absent line.
-    if (const char* d = std::getenv("R97_DUMP_SNAP"); d != nullptr && d[0] == '1') {
+    if (const char* d = std::getenv("R97_DUMP_SNAP"); d != nullptr && (d[0] == '1' || d[0] == '2')) {
         static long n_gemm = 0, n_lora = 0;
         const std::string name = op_name != nullptr ? op_name : "";
         const bool lora = name == "lora_expand" || name == "lora_shrink";
         long& n = lora ? n_lora : n_gemm;
-        if ((name == "gemm_nt_q" || lora) && n < (lora ? 40 : 4)) {
+        // =1 is the historical few-records form. =2 prints every record's every operand, which is
+        // what lets a snapshot be joined against DUMPFWD's own read of the same
+        // (op, pos, buffer, data) in one process -- the only way a stale or mismatched snapshot is
+        // told from a correct one, since two separate logs cannot be joined.
+        const bool all = d[0] == '2';
+        if (all || ((name == "gemm_nt_q" || lora) && n < (lora ? 40 : 4))) {
             ++n;
             std::string sh, vs, vst;
             for (int64_t x : op.shape) sh += std::to_string(x) + " ";
@@ -183,21 +188,33 @@ inline AdValue snapshot(const Operand& op, const OperandContent& content,
             for (int64_t x : op.view_stride) vst += std::to_string(x) + " ";
             long nz = -1;
             long long span = 0;
+            double maxabs = 0.0;
             const int64_t es = elem_size(op.dtype);
             if (content.data != nullptr && es > 0 && content.bytes > 0) {
                 nz = 0;
                 span = static_cast<long long>(content.bytes) / es;
-                for (long long i = 0; i < span; ++i)
-                    if (read_elem(op.dtype,
-                                  static_cast<const uint8_t*>(content.data) + i * es, 0) != 0.0)
-                        ++nz;
+                for (long long i = 0; i < span; ++i) {
+                    const double x = read_elem(op.dtype,
+                                               static_cast<const uint8_t*>(content.data) + i * es, 0);
+                    if (x != 0.0) ++nz;
+                    // maxabs over the same span DUMPFWD reports it over, so a snapshot and the
+                    // forward's own read of the same buffer are comparable in one process rather
+                    // than in two logs that cannot be joined. A stale snapshot shows as a maxabs
+                    // that disagrees with the forward's for the same (op, pos, buffer, data).
+                    if (x == x) {
+                        const double a = x < 0 ? -x : x;
+                        if (a > maxabs) maxabs = a;
+                    }
+                }
             }
             std::fprintf(stderr,
-                         "DUMPSNAP op=%s buffer=%s dtype=%s shape=[%s] bytes=%zu named=%d data=%p "
-                         "view_shape=[%s] view_stride=[%s] view_off=%lld nonzero=%ld of %lld\n",
-                         op_name, op.buffer.c_str(), op.dtype.c_str(), sh.c_str(), content.bytes,
-                         static_cast<int>(content.named), content.data, vs.c_str(), vst.c_str(),
-                         static_cast<long long>(op.view_off), nz, span);
+                         "DUMPSNAP op=%s pos=%lld buffer=%s dtype=%s shape=[%s] bytes=%zu named=%d "
+                         "data=%p view_shape=[%s] view_stride=[%s] view_off=%lld nonzero=%ld of %lld "
+                         "maxabs=%.6g\n",
+                         op_name, static_cast<long long>(pos), op.buffer.c_str(), op.dtype.c_str(),
+                         sh.c_str(), content.bytes, static_cast<int>(content.named), content.data,
+                         vs.c_str(), vst.c_str(), static_cast<long long>(op.view_off), nz, span,
+                         maxabs);
             // The stored form's inputs (patch 0124): the engine's own planes, so a form the row
             // derives is checkable against what the layout hook saw.
             if (op.enc != nullptr) {
