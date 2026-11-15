@@ -939,6 +939,70 @@ The two callers get their operands from different places:
 - the adjoint from `call.fwd`, built in `backward.cpp` from `snapshots.at(rec.position, k)`, whose shape
   must equal the record's declared one -- `[512,5120]`.
 
+## Root cause: `fused_adjoint` hands the elementwise row the wrong operand list
+
+`fused_adjoint` (`src/adjoint/host/quant.cpp:953`) counts the record's read operands:
+
+```cpp
+size_t reads = 0;
+for (const Operand& o : call.rec.operands) if (!o.written) ++reads;
+```
+
+and then builds the elementwise call's operand vector as a **prefix** of the record's:
+
+```cpp
+std::vector<AdValue> efwd(call.fwd.begin(), call.fwd.begin() + reads);
+efwd.push_back(y[0]);
+AdjointCall ecall{call.rec, efwd, ecot, call.dc, nullptr, ""};   // the FULL fused record
+```
+
+The read operands are **not** a prefix. The live fused norm's record is
+
+| index | buffer | role |
+|---|---|---|
+| 0 | `h` | read |
+| 1 | `x` | written, in place |
+| 2 | `blk.63.ffn_norm.weight` | read |
+| 3 | `h.q8` | written |
+| 4 | `h.s8` | written |
+| 5 | `h` | written, in place |
+
+so `reads = 2` (indices 0 and 2), and `efwd = {fwd[0], fwd[1], y[0]} = {h, x, y}`. Paired with the
+six-operand record, `norm_gain` skips `j = 1` (`operands[1].written`) and takes `j = 2` --
+`efwd[2] = y[0]`, the norm's **own output**, under `operands[2] = blk.63.ffn_norm.weight`.
+
+That is exactly the measured line: `value_rank=2 value0=512 values=2621440 row0_vs_row1=4.99031`,
+`vals=[0.347402,0.648529,1.341123,0.037116]` -- the norm's output, whose rows genuinely differ. The
+twin, called with the full operand vector, takes `fwd[2]` = the real `[5120]` weight. **The adjoint
+differentiates `dc[h]` with the intermediate as its gain.**
+
+**Fix.** Call the elementwise row with its own operand list -- the record's non-written operands in
+order, then the intermediate as a written operand -- and fold the slots it fills back onto the fused
+record's:
+
+```cpp
+for (size_t j = 0; j < call.rec.operands.size(); ++j) {
+    if (call.rec.operands[j].written) continue;
+    slot.push_back(j);  efwd.push_back(call.fwd[j]);  erec.operands.push_back(call.rec.operands[j]);
+}
+// the intermediate the part wrote, as a written operand of its own shape
+slot.push_back(call.rec.operands.size());  efwd.push_back(y[0]);  erec.operands.push_back(yop);
+...
+elem_adj(ecall);
+for (size_t i = 0; i < slot.size(); ++i)   // back onto the fused slots
+    if (slot[i] < call.dc->size() && call.dc->at(slot[i]).value.size() == edc[i].value.size())
+        for (size_t k = 0; k < edc[i].value.size(); ++k) call.dc->at(slot[i]).value[k] += edc[i].value[k];
+```
+
+With the compacted record, `norm_gain` sees `{h (read), weight (read), y (written)}`: it skips the
+intermediate and takes the weight. The intermediate's own slot has no fused counterpart, so its
+cotangent is dropped rather than misrouted into the weight's slot.
+
+**Two earlier diagnoses were wrong and are withdrawn.** The schema-rank preference in `norm_gain`
+could not have helped: `call.fwd` held no rank-1 candidate at all. And the `[512, 5120]` snapshot was
+never a tape view -- `VIEW` prints nothing at 1449, so `view_shape` is empty and the tape's record
+declares the operand as `[512, 5120]` only because the value handed to the row was the intermediate.
+
 **Measured, with the caller tagged (`GAINPOS ... who=`):**
 
 ```

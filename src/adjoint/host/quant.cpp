@@ -1308,17 +1308,53 @@ void fused_adjoint(const AdjointCall& call, Part part) {
     // The elementwise adjoint takes the parts' operands and the intermediate they wrote; it adds
     // its cotangents into the slots the parts' read operands hold. The two-way rule lives in that
     // row, so the read set the caller proved travels with it, as the device row hands its own.
-    std::vector<AdValue> efwd(call.fwd.begin(),
-                              call.fwd.begin() + static_cast<std::ptrdiff_t>(reads));
+    // The read operands are NOT a prefix of the record's: the live fused norm reads 0 and 2 and
+    // writes 1, 3, 4 and 5, so taking the first `reads` handed the elementwise row operand 1 -- a
+    // written activation -- in place of the weight, and put the intermediate in the weight's slot.
+    // `norm_gain` then took the intermediate as the gain: `[512, 5120]` where the operand is
+    // `[5120]`, row 0 of the norm's own output, and the row differentiated `dc[h]` with it.
+    //
+    // The part is called with its own operand list -- the record's read operands in order, then the
+    // intermediate it wrote -- and the slots it fills are mapped back onto the fused record's.
+    std::vector<size_t> slot;
+    std::vector<AdValue> efwd;
+    OpRecord erec = call.rec;
+    erec.operands.clear();
+    for (size_t j = 0; j < call.rec.operands.size(); ++j) {
+        if (call.rec.operands[j].written) continue;
+        slot.push_back(j);
+        efwd.push_back(call.fwd[j]);
+        erec.operands.push_back(call.rec.operands[j]);
+    }
+    Operand yop;
+    yop.buffer = part_op(part);
+    yop.shape = y[0].shape;
+    yop.written = true;
+    slot.push_back(call.rec.operands.size());
     efwd.push_back(y[0]);
+    erec.operands.push_back(yop);
+    std::vector<AdValue> edc(slot.size());
+    for (size_t i = 0; i < edc.size(); ++i) {
+        edc[i].dtype = efwd[i].dtype;
+        edc[i].shape = efwd[i].shape;
+        edc[i].value.assign(static_cast<size_t>(numel(efwd[i].shape)), 0.0);
+    }
     std::vector<AdValue> ecot = {qdc[0]};
-    AdjointCall ecall{call.rec, efwd, ecot, call.dc, nullptr, ""};
+    AdjointCall ecall{erec, efwd, ecot, &edc, nullptr, ""};
     ecall.read_rows = call.read_rows;
     ecall.row_count = call.row_count;
-    AdjointFn elem_adj = adjoint_find(part_op(part), Side::host, call.rec.params, nullptr);
+    AdjointFn elem_adj = adjoint_find(part_op(part), Side::host, erec.params, nullptr);
     if (elem_adj == nullptr)
         throw std::invalid_argument(std::string("quant: no host adjoint for ") + part_op(part));
     elem_adj(ecall);
+    // Fold the part's slots back onto the fused record's. The intermediate's own slot has no fused
+    // counterpart: it is not on the tape, and its cotangent belongs to the quantiser's output.
+    for (size_t i = 0; i < slot.size(); ++i) {
+        if (slot[i] >= call.dc->size()) continue;
+        AdValue& dst = call.dc->at(slot[i]);
+        if (dst.value.size() != edc[i].value.size()) continue;
+        for (size_t k = 0; k < dst.value.size(); ++k) dst.value[k] += edc[i].value[k];
+    }
 
     // R97_DUMP_QUANT=1: the same stage sums the device row prints, so a host gradient that came
     // back zero names its stage instead of the whole row. `quant_dx` is the cotangent the quantiser
