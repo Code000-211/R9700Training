@@ -1074,6 +1074,35 @@ to three digits.
 perturbing anything. The claim to hold onto is that one -- the walk climbs and the truth does not --
 and the absolute over-statement is an order-of-magnitude, not a measurement.
 
+### Where inside a block the gain sits
+
+Walking block 63's records in walk order and reading the residual `h` cotangent at each one that
+touches it (`/tmp/r97-fwd.log`):
+
+| pos | op | buffer | cotangent |
+|---|---|---|---|
+| 1458 | `rmsnorm` | `x` | 1.3132e-07 |
+| 1457 | `add` | `h` | 1.3132e-07 |
+| 1456 | `lora_expand` | `h` | 1.3132e-07 |
+| 1449 | `rmsnorm_had_quant_i8g` | `h` | **7.242e-06** |
+| 1448 | `lora_expand` | `h` | 7.242e-06 |
+
+**The FFN sublayer's adjoint adds a contribution ~54x larger than the cotangent it was handed.** The
+residual cotangent enters the FFN path at 1.3132e-07 and the path returns 7.242e-06, so the sublayer's
+own `d_h` is ~7.11e-06 -- 54x the incoming residual, where a well-behaved sublayer returns something
+of the same order.
+
+**The gain concentrates at the `*_had_quant_i8g` rows**, which is the same family the `gemm_nt_q` fix
+(`linear.hip:648-657`) addressed, so the first question is whether this row applies the same
+activation-scale convention. It does: `rmsnorm_back_kernel` (`src/adjoint/device/quant.hip:248-290`)
+applies the RMS-norm Jacobian and deliberately returns the **codes'** cotangent, leaving the
+quantiser's scale to the consumer -- the consumer (`lora_shrink`/`gemm_nt_q`) multiplies by
+`a_scale`, which is exactly the division of labour `linear.hip:648-652` describes. The kernel's row
+reductions are in f64 (`:259-260`) and its `mult`/`wadd`/`eps` all come from the record.
+
+So the row is *shaped* right, and whether it *computes* right is now a device-versus-host question,
+which is the experiment below rather than more reading.
+
 ### The gain is per block, multiplicative, and uniform: ~1600x every block
 
 **Which slot, exactly, because a block has two.** Every block carries **two** `lora_expand` rows that
