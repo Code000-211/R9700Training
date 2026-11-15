@@ -437,6 +437,26 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
     const double mult = param_num(rec, "mult", 1.0);
     if (!w && wadd != 0.0) return;
 
+    // R97_GAIN_ROW=1: index a `[rows, n]` gain by the row instead of reading row 0 for all of
+    // them. The tape materialises a fused producer's gain once per row and the rows differ, so
+    // whether the kernel reads row `r` or row 0 is a question only the tape can answer: with the
+    // flag on, `DUMPTWIN`'s activation comparison either collapses to bf16 rounding (per-row is
+    // right) or stays where it is (row 0 is).
+    const bool gain_row_flag = std::getenv("R97_GAIN_ROW") != nullptr;
+    const bool per_row = w != nullptr && w->shape.size() == 2 && w->shape[0] == rows && gain_row_flag;
+    if (gain_row_flag) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr,
+                         "FDRMS pos=%lld rows=%lld w_rank=%zu w0=%lld per_row=%d\n",
+                         (long long)rec.position, (long long)rows,
+                         w != nullptr ? w->shape.size() : 0,
+                         w != nullptr && !w->shape.empty() ? (long long)w->shape[0] : -1,
+                         per_row ? 1 : 0);
+            std::fflush(stderr);
+        }
+    }
     AdValue y = write_value(rec, 2, x.shape);
     parallel_for(rows, kRowChunk, [&](int64_t r) {
         const int64_t b = r * n;
@@ -444,8 +464,10 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
         for (int64_t i = 0; i < n; ++i) ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
         const double s = 1.0 / std::sqrt(ss / (double)n + eps);
         for (int64_t i = 0; i < n; ++i)
-            y.value[(size_t)(b + i)] =
-                x.value[(size_t)(b + i)] * s * (w ? w->value[(size_t)i] + wadd : 1.0) * mult;
+            y.value[(size_t)(b + i)] = x.value[(size_t)(b + i)] * s *
+                                       (w ? w->value[per_row ? (size_t)(b + i) : (size_t)i] + wadd
+                                          : 1.0) *
+                                       mult;
     });
     out->push_back(std::move(y));
 }

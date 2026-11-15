@@ -523,6 +523,41 @@ act_rel=` -- the twin's re-quantisation against the tape's codes and scales, and
 intermediate against the activation at the record's in-place write. It is the check the kernel table
 cannot give, and it costs one pass.
 
+## The twins' forward against the tape: the gate matches, the norm does not
+
+The live-scale FD above compares a row against its own twin, so it is circular on the *forward*: if a
+twin's activation differs from the kernel's, the walk evaluates every row at the wrong point and the
+FD still reads 1. `DUMPTWIN` (under `R97_DUMP_QUANT=1`) is the tape-side oracle -- it re-quantises the
+twin's intermediate and compares the codes and the scale against the ones the kernel actually wrote:
+
+| pos | op | `code_err` | `code_bad` | `scale_rel` |
+|---|---|---|---|---|
+| 1453 | gated_had_quant_i8g | 1 | 529616/8912896 (5.9%) | 0.00289 |
+| 1445 | gate_had_quant_i8g | 1 | 184822/3145728 (5.9%) | 0.00262 |
+| **1449** | **rmsnorm_had_quant_i8g** | **254** | **2604887/2621440 (99.4%)** | **1.01364** |
+| **1429** | **rmsnorm_had_quant_i8g** | **45** | **2462396/2621440 (93.9%)** | **0.31958** |
+
+The two gated producers agree to one integer step on 94% of codes and 0.3% on the scale -- bf16
+rounding at the quantiser's boundaries, which is what a correct twin looks like. **The fused norm does
+not agree at all**: 99.4% of its codes differ, by up to 254 (twice the i8 grid), and its scale by
+101%. A scale is `amax/127`, so a scale that is off by 2x means the twin's activation has twice the
+amplitude of the kernel's -- or is a different tensor.
+
+**The activation column of `DUMPTWIN` cannot decide that**, and the reason is worth recording: the
+walk's snapshot of an *in-place* write is the value the buffer held *before* the record, so for
+`rmsnorm_had_quant_i8g` there is no operand in `fwd` holding the kernel's normed `h` at all --
+`best_of=[1:x:1 3:h.q8:1.03 5:h:1.36]` is the twin's `y` against the residual, the codes and the
+*un-normed* `h`. Only an *ordinary* write (the codes, the scale) carries the kernel's output, which is
+why the code comparison above is the one that counts.
+
+So this is an open discrepancy at exactly the record whose `dc[h]` the growth is measured on, and the
+FD is blind to it by construction. It is not the per-row gain: `FDRMS pos=1449 rows=512 w_rank=1
+w0=5120` says the tape's gain there is a single `[5120]` row, so row 0 is the whole gain and
+`R97_GAIN_ROW` changes nothing (measured: identical output to the digit). The remaining candidates are
+the twin's norm parameters (`eps`, `wadd`, `mult`) and the quantiser's rotation, and the tape's own
+codes are the oracle for both -- re-quantise the kernel's activation with the twin's quantiser, or the
+twin's activation with the kernel's, and the one that matches names the side.
+
 ## The quotient's guard
 
 The mask pass divides each code's cotangent by its group scale, and the quotient is exact only

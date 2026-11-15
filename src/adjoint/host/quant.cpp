@@ -1084,8 +1084,13 @@ void fused_adjoint(const AdjointCall& call, Part part) {
         // The sharper comparison: the activation the kernel wrote. A fused producer writes the
         // part's output in place (the norm's `h`, the gate's product), and that IS the intermediate
         // the twin recomputes, so the two must agree up to bf16 rounding.
+        // The activation the kernel wrote, at *every* written operand of the same size: a record
+        // carries the residual and the branch at the same shape, so reporting the largest error
+        // would name the wrong tensor. The best match is the part's own output, and each candidate
+        // is printed so the pairing is visible rather than assumed.
         double act_err = 0.0, act_scale = 0.0;
         int64_t act_at = -1;
+        std::string act_all;
         for (size_t i = 0; i < call.fwd.size(); ++i) {
             const AdValue& f = call.fwd[i];
             if (i >= call.rec.operands.size() || !call.rec.operands[i].written) continue;
@@ -1096,14 +1101,19 @@ void fused_adjoint(const AdjointCall& call, Part part) {
                 if (d > e) e = d;
                 if (std::fabs((double)f.value[j]) > sc) sc = std::fabs((double)f.value[j]);
             }
-            if (e > act_err || act_at < 0) { act_err = e; act_scale = sc; act_at = (int64_t)i; }
+            char one[96];
+            std::snprintf(one, sizeof(one), "%zu:%s:%.3g ", i,
+                          call.rec.operands[i].buffer.c_str(), sc > 0.0 ? e / sc : e);
+            act_all += one;
+            if (act_at < 0 || e < act_err) { act_err = e; act_scale = sc; act_at = (int64_t)i; }
         }
         std::fprintf(stderr,
-                     "DUMPTWIN pos=%lld op=%s codes=%zu code_err=%.6g code_bad=%lld/%zu "
-                     "scale_rel=%.6g act_at=%lld act_err=%.6g act_rel=%.6g\n",
-                     (long long)call.rec.position, call.rec.op.c_str(), codes.value.size(),
-                     code_err, (long long)code_bad, codes.value.size(), scale_rel,
-                     (long long)act_at, act_err, act_scale > 0.0 ? act_err / act_scale : act_err);
+                     "DUMPTWIN pos=%lld op=%s twin=%d codes=%zu code_err=%.6g code_bad=%lld/%zu "
+                     "scale_rel=%.6g act_at=%lld act_err=%.6g act_rel=%.6g best_of=[%s]\n",
+                     (long long)call.rec.position, call.rec.op.c_str(), qt != nullptr ? 1 : 0,
+                     codes.value.size(), code_err, (long long)code_bad, codes.value.size(),
+                     scale_rel, (long long)act_at, act_err,
+                     act_scale > 0.0 ? act_err / act_scale : act_err, act_all.c_str());
         std::fflush(stderr);
     }
 
