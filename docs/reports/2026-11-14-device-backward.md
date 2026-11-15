@@ -1398,7 +1398,6 @@ every second report (the per-block sequence) the cotangent ratios are **6707, 12
 `R97_DUMP_FWD` pair gave. **A forward that is flat and a backward that grows 3.2 decades per block,
 measured by two instruments that share no code path, is the defect stated as plainly as this
 container can state it.**
-***
 
 ### Every row that could carry the growth is individually FD-verified, so the defect is compositional
 
