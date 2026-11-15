@@ -543,32 +543,55 @@ exactly the schema's leaves.
 non-finite value in the result is produced on the way back. That is the same shape the 512-token case
 reported, and it rules the container, the loader and the forward out as the source.
 
-### The start-split contract fails
+### The start-split contract fails, and only `all_finite` can be read on its own
 
-The case's structural check is independent of magnitude: a perturbation confined to the start must
-leave the `A` leaves untouched and move every `B` leaf.
+The case's structural check is meant to be independent of magnitude: a perturbation confined to the
+start must leave the `A` leaves untouched and move every `B` leaf. **On this run it cannot be read
+that way**, and the reason is in the test's own definitions:
 
-| check | required | measured |
-|---|---|---|
-| `a_all_zero` | true | **false** |
-| `a_changed` | 0 | **127** of 400 |
-| `n_zero_a` | 400 | **273** |
-| `b_all_nonzero` | true | true |
-| `b_changed` | 400 | **330** |
-| `n_zero_b` | 0 | 0 |
-| `all_finite` | true | **false** |
+- `a_all_zero` is `part != 0.0` over the leaf's gradient (`tests/gpu/device_step.cpp:529`), and
+  **`NaN != 0.0` is true**, so one non-finite element sets it false with no real cotangent involved;
+- `a_changed`/`b_changed` count leaves whose parameter **moved after the AdamW step** (`:692-697`),
+  which a NaN gradient also causes;
+- `n_zero_a`/`n_zero_b` count gradients that are **exactly zero** (`:524`, `:536`) -- a NaN gradient
+  is not counted.
 
-So 127 of the 400 `A` leaves moved when the contract says none may, and 70 of the 400 `B` leaves
-stayed at zero when the contract says all must move. The first non-finite leaf is
-`model.layers.0.linear_attn.in_proj_qkv.lora_A`, and the first `A` leaf that stayed zero is
-`model.layers.20.linear_attn.out_proj.lora_A` -- a different layer, and a high one, which is where
-the per-block growth of "The measurement" would put it.
+The artifact settles which case this is: **`first_nonzero_a_finite` is `false`**, so the first non-zero
+`A` gradient is itself non-finite, and the test's own comment at `:496` says a non-finite leaf "says
+only that the walk reached the leaf".
 
-**This is the issue's acceptance criterion, and it is not met.** The join runs, the schema is right,
-the forward is clean and the step completes -- but the adapter gradient is not the adapter gradient:
-it is non-finite at block 0, and its structural split is wrong at both ends. That is the same defect
-the 512-token case localised to a ~2e33 excess growth over the backward walk, now shown to hold at
-the issue's own size.
+| check | required | measured | read |
+|---|---|---|---|
+| `n_grads == n_params`, `names_match`, `shapes_match`, `n_other` | 800, true, true, 0 | 800, true, true, 0 | **pass** |
+| `b_all_nonzero` | true | true | pass |
+| `n_zero_a` | 400 | **273** | **FAIL** -- 127 `A` leaves hold a gradient, and it is not finite |
+| `n_zero_b` | 0 | 0 | pass |
+| `all_finite` | true | **false** | **FAIL** |
+| `a_all_zero`, `a_changed`, `b_changed` | — | false, 127, 330 | **confounded by the rows above** |
+
+**What this run does establish.** The step completes at the issue's own size and hands back the
+schema's 800 leaves with matching names and shapes; the forward is all finite, so the container, the
+loader and the forward are ruled out as the source of any non-finite value; the first non-finite value
+is at `model.layers.0.linear_attn.in_proj_qkv.lora_A`; and **96 % of the 2946 s step is the backward**
+(2832.8 s), which is what a per-op adjoint amplifying by ~365x per block costs in time as well as
+correctness.
+
+**What it does not establish, and an earlier draft of this section claimed.** That "127 of the 400 `A`
+leaves moved when the contract says none may", and that the split is "structurally wrong at both
+ends". Both are unsupported: 127 is exactly what poisoning produces, because a non-finite gradient
+both moves the parameter and defeats `part != 0.0`. Settling it needs a field this run does not carry
+-- a count of the `A` leaves whose gradient is **finite and non-zero** -- and until that is measured,
+`a_changed` on this case says nothing about whether a cotangent reached `A`.
+
+**One oddity worth naming on its own.** 70 of the 400 `B` leaves have a non-zero gradient
+(`n_zero_b == 0`) yet their value did not move under the step. No AdamW update should leave a
+parameter with a non-zero gradient bit-identical, so this is unexplained; it is not a zero-gradient
+result and should not be read as one.
+
+**The acceptance criterion is still not met**, and `all_finite` is the check that decides it: the
+adapter gradient exists and is the right shape, but it is non-finite at block 0. That is the same
+defect the 512-token case localised to a ~2e33 excess growth over the backward walk, now shown to hold
+at the issue's own size.
 
 **What the 4096 case adds beyond the 512:** the failure is not an artefact of a short sequence. With
 4096 positions the backward takes 47 minutes and produces the same non-finite leaf at the same
