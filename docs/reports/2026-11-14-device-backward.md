@@ -843,6 +843,27 @@ comparable across the two instruments: `DUMPFWD` prints the device address (`0x7
 three times per step** (the step's own forward, the pre-step reference, the post-step forward), so one
 key has several `DUMPFWD` lines and a snapshot is only comparable against the pass that produced it.
 
+**The mechanism is in the tape, and it is exact.** `gdn_gated_rmsnorm`'s record has four operands --
+`nX = 0` (reads `w.o`), `nZ = 1`, `nW = 2` (the frozen norm weight), `nO = 3` (writes `w.o`)
+(`src/adjoint/host/gdn_prep.cpp:88-95`) -- and `DUMPSNAP` printed `gdn_o` **twice** for that op, slots
+0 and 3, **both at 278**. Slot 0 is the input the op read, and it should hold 0.423828.
+`Tape::record` copies each operand's span at the issue (`src/tape.cpp:216-221`,
+`copies_.emplace_back(from, from + bytes)`), and the issue hook fires **after** the op has written --
+`src/forward.cpp:124` says so directly: "called after the op is recorded and while the buffers still
+hold what it wrote". **For an in-place operand the read value is therefore gone by the time it is
+copied, and the walk is handed the write.**
+
+**No per-op FD could have caught this**, because `check_adjoint` builds `fwd` from the twin
+(`tests/support/adjoint_check.h:385-393`) rather than from a tape, so its in-place read slot holds the
+pre-op value by construction. The defect lives between the engine and the walk, not inside any
+adjoint -- which is why every per-op adjoint measures correct and the composed walk does not.
+
+**What that leaves, precisely.** The finding is measured, and its size matches the per-layer factor.
+What is not yet shown is that it is the *whole* of the factor rather than one term of it: the honest
+next step is to make the tape keep the pre-op value for an in-place read (a copy before the op, or a
+device-side snapshot of the slot), then re-measure the walk's growth. If the ~1.6e3 per layer falls
+out, this was the cause; if it drops by 656x only, this was one term and the census resumes.
+
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
