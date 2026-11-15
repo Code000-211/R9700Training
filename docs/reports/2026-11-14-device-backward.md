@@ -794,98 +794,62 @@ neither dump, and `/tmp/r97-fwd-hunt.log` gives `36` forward and `0` snapshot --
 which is exactly why the pair proves nothing. It also confirms the old build printed no `pos` (every
 `snap-only` key has `pos=None`).
 
-**The probe was run, and it finds the defect -- after a first reading of it that was wrong and is
-retracted here.**
+**The probe was run. Both readings I published from it are wrong and are retracted here; what it
+establishes is narrower and negative.**
 
-`/tmp/r97-snap-probe.log`, window 09:08:42-09:16:52 (490 s), the 512-token case with
-`R97_DUMP_FWD=2 R97_DUMP_SNAP=2` in one process: **4558** `DUMPFWD` probe lines, **6775** `DUMPSNAP`
-lines, **2274** `(op, pos, buffer)` keys present in both. A join over those keys reports **2530**
-snapshot lines whose `maxabs` equals a forward `maxabs` for the same key and **0** that equal none.
+`/tmp/r97-snap-probe.log` and `/tmp/r97-snap-probe2.log`, two 490 s windows, the 512-token case with
+`R97_DUMP_FWD=2 R97_DUMP_SNAP=2` in one process: 4558 forward probe lines, 6775 snapshot lines, 2274
+`(op, pos, buffer)` keys present in both.
 
-**That join is circular and the "0 mismatches" means nothing.** `dump_fwd_scan` skips every operand
-the op did not write (`src/forward.cpp:142`, `if (!o.written) continue;`) and reads the buffer on the
-op's own stream at the issue, so for a *written* key both instruments are reading the same buffer's
-post-op contents at nearly the same moment. Agreement there is what the construction guarantees, not
-a measurement. **The read operands -- the values the walk actually consumes as inputs -- have no
-`DUMPFWD` line at all**, so the join says nothing about them, and those are the only ones whose
-fidelity matters.
+**Retracted reading 1 -- "the snapshot agrees with the forward, 2530 to 0, so it is faithful".** The
+join is circular: `dump_fwd_scan` skips every operand the op did not write (`src/forward.cpp:142`) and
+reads the buffer at the issue, so for a *written* key both instruments read the same post-op
+contents. **Read operands -- the values the walk consumes -- have no `DUMPFWD` line at all.** Two
+things in that reading do stand: the pointer is not comparable (device `0x7448...` against host
+`0x64d4...`), and the forward runs two or three times per step.
 
-**The read operands can be checked against the writer's line instead, and the same log shows the
-defect immediately.** In forward order (ascending position) the gated-delta layer runs
-`gdn_chunk_scan` then `gdn_gated_rmsnorm`:
+**Retracted reading 2 -- "an in-place read is recorded post-op, so the walk is handed the write".**
+This one had a hand-verified case and a code path and was still wrong:
 
 | | op | pos | `gdn_o` (`w.o`) | pointer |
 |---|---|---|---|---|
-| writer | `gdn_chunk_scan` | 1415 | **0.423828** | `0x64d46a82fb30` |
-| reader | `gdn_gated_rmsnorm` | 1416 | **278** | `0x64d46a82fb30` |
+| writer | `gdn_chunk_scan` | 1415 | 0.423828 | `0x64d46a82fb30` |
+| reader | `gdn_gated_rmsnorm` | 1416 | 278 | `0x64d46a82fb30` |
 
-**The reader's operand is `w.o` at the same pointer, and its snapshot holds 278 -- which is
-`gdn_gated_rmsnorm`'s own output** (`DUMPFWD` at pos 1416, operand 3, `gdn_o`, `maxabs=278`). The op
-is **in-place**: `rad_block_gdn.h:216` declares it as `{w.o, w.z} -> {w.o}`, reading the `w.o` that
-`gdn_chunk_scan` produced and overwriting it. **So the walk is handed the value the op wrote, not the
-value the op read: 278 against 0.423828, a factor of 656 on one operand of every gated-delta layer.**
+278 is the reader's own output, the op is in-place (`rad_block_gdn.h:216`, `{w.o, w.z} -> {w.o}`), and
+across all 192 `gdn_o` snapshot lines `0.423828` appears exactly once -- as the writer's own output.
+Generalising that to every operand: of **512** in-place operands, **511** have a recorded read slot
+equal to the op's own output and **0** equal the value it read (`lora_expand` 288,
+`rmsnorm_had_quant_i8g` 127, `gdn_conv_prep` 48, `rope` 32, `kv_store` 16).
 
-**That value is confirmed never to reach the walk as an input.** Across all 192 `gdn_o` snapshot lines
-in the log, `0.423828` appears exactly once -- as `gdn_chunk_scan`'s own output at pos 1415 -- and at
-no other position or pointer. The `gdn_gated_rmsnorm` snapshot for that buffer is 278 at every layer
-(pos 9, 30, 51, ... 1416), so the input the op consumed is absent from the tape.
+**All of that is true, and none of it is a defect, because the walk does not use the tape's copies
+for this.** `Tape::record` does record post-op for an in-place operand -- `include/r97/tape.h:65-69`
+says so outright ("The observer runs after the op does, so a written operand's copy is what the op
+left"). But the device walk keeps its **own** capture: `std::map<std::string, AdValue> before` at
+`src/step_device.cpp:1075`, filled at each write's issue (`:1274-1276`) and served back to a read at
+`:1251`, `snapped.now[j] = writer_rows(prev->second, snapped.now[j])`. **`snapshot()` -- where
+`DUMPSNAP` prints -- runs before that overwrite**, so the probe was measuring the value the walk
+discards. The comment at `:1067-1071` names the very case: "An in-place read is the same defect with
+the writer being this op's own earlier state ... the adjoint then sees the value the op read, not what
+the arena holds a moment later (**the gated norm's gdn_o, above all**)".
 
-**And the size is right.** 656x is **2.82 decades**, against the measured per-layer factor of ~1.6e3
-(3.19 decades, one buffer through one op across adjacent layers). One in-place operand per layer,
-snapshotted post-op, is the right order of magnitude and the right shape -- a small systematic
-difference in the saved operands, applied uniformly, compounded per layer. **This is the composition
-the earlier sections argued for; the probe found it, and only the first join's reading of it was
-wrong.**
+**And the compensation covered this run completely.** The walk's capture is conditional -- only a write
+with `view_shape.empty() && rows > 0 && rows == shape[0]` can be held (`src/step_device.cpp:1274`),
+and a read the writer's shape does not cover falls back to the live pull with a printed line
+(`:1243-1250`) -- so its gap is measurable rather than argued. In `/tmp/r97-snap-probe2.log` that gap
+is **0**: no `live pull kept` line and no `refuses by name`, for any operand of the step. The two
+instruments do disagree, and the disagreement is the tape's documented behaviour, which the walk does
+not depend on.
 
-**Two things also had to be got right to read the log at all**, and both stand. The pointer is **not**
-comparable across the two instruments: `DUMPFWD` prints the device address (`0x7448...`) and
-`DUMPSNAP` the host address of the copied-back bytes (`0x64d4...`). And the forward runs **two or
-three times per step** (the step's own forward, the pre-step reference, the post-step forward), so one
-key has several `DUMPFWD` lines and a snapshot is only comparable against the pass that produced it.
-
-**The mechanism is in the tape, and it is exact.** `gdn_gated_rmsnorm`'s record has four operands --
-`nX = 0` (reads `w.o`), `nZ = 1`, `nW = 2` (the frozen norm weight), `nO = 3` (writes `w.o`)
-(`src/adjoint/host/gdn_prep.cpp:88-95`) -- and `DUMPSNAP` printed `gdn_o` **twice** for that op, slots
-0 and 3, **both at 278**. Slot 0 is the input the op read, and it should hold 0.423828.
-`Tape::record` copies each operand's span at the issue (`src/tape.cpp:216-221`,
-`copies_.emplace_back(from, from + bytes)`), and the issue hook fires **after** the op has written --
-`src/forward.cpp:124` says so directly: "called after the op is recorded and while the buffers still
-hold what it wrote". **For an in-place operand the read value is therefore gone by the time it is
-copied, and the walk is handed the write.**
-
-**No per-op FD could have caught this**, because `check_adjoint` builds `fwd` from the twin
-(`tests/support/adjoint_check.h:385-393`) rather than from a tape, so its in-place read slot holds the
-pre-op value by construction. The defect lives between the engine and the walk, not inside any
-adjoint -- which is why every per-op adjoint measures correct and the composed walk does not.
-
-**What that leaves, precisely.** The finding is measured, and its size matches the per-layer factor.
-What is not yet shown is that it is the *whole* of the factor rather than one term of it: the honest
-next step is to make the tape keep the pre-op value for an in-place read (a copy before the op, or a
-device-side snapshot of the slot), then re-measure the walk's growth. If the ~1.6e3 per layer falls
-out, this was the cause; if it drops by 656x only, this was one term and the census resumes.
-
-**And it is systemic, measured without any heuristic.** The sound test needs no "last writer" guess: for
-an in-place operand the record's read slot is the same buffer the op writes, so if the tape captured
-the read value the snapshot must **differ** from the op's own recorded output, and if it captured the
-write the two must **agree**. Comparing each in-place snapshot against that op's own `DUMPFWD`
-`maxabs` at the same `(op, pos, buffer)`, on the re-run that prints each operand's role
-(`/tmp/r97-snap-probe2.log`, 490 s, `fa88d75`):
-
-| | |
-|---|---|
-| in-place operands (`written=1 in_place=1`) | **512** |
-| snapshot equals the op's **own output** -- read value lost | **511** |
-| snapshot differs from it -- read value preserved | **0** |
-| no forward line to compare against | 1 |
-
-By op, the 511 are `lora_expand` **288**, `rmsnorm_had_quant_i8g` **127**, `gdn_conv_prep` **48**,
-`rope` **32**, `kv_store` **16** -- every one of them on the adapter's gradient path.
-
-**A naive "last writer" count is not usable and is recorded only to be withdrawn**: comparing every
-read against the highest position below it that wrote the same buffer name gives 471 of 2579
-read-only operands and 441 of 509 in-place ones "differing", but a buffer written in place records its
-post-op value as that writer's copy, so the model is wrong for exactly the buffers in question. The
-own-output test above needs no model and gives 511 of 512.
+**So the composition hypothesis is still unexplained and the search resumes**, now with two candidate
+explanations eliminated rather than added. Two counts from intermediate models are withdrawn as
+unusable rather than merely wrong, and are named here so they cannot be reintroduced: **"2335
+differences"** (every snapshot against the highest position-below writer) and **"471 of 2579
+read-only, 441 of 509 in-place"** (the same model). A buffer written in place records its post-op value
+as that writer's copy, so the "last writer" model is wrong for exactly the buffers in question; and
+buffer names repeat across the 64 layers, so a lower position of the same name may be another layer's.
+The own-output test needs neither assumption and gave 511 of 512 -- and that property turned out to be
+one the walk does not depend on.
 
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
