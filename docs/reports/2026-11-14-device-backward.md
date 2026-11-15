@@ -771,9 +771,13 @@ correctly at the values it was handed.
 It also fits the shape of the evidence: a per-record factor of ~1.38 applied uniformly, with the jump
 census finding no op, is what a small systematic difference in the saved operands would look like
 compounded 90 times per layer. The report already carries the two instruments for this -- `R97_DUMP_FWD`
-(the forward's own operands as they were computed) and `R97_DUMP_SNAP` (what the walk was handed) -- and
-the probe is to run both on one layer and compare operand by operand. **That is a cheaper and more
-decisive test than any further census, and it is the named next step.**
+(the forward's own operands as they were computed) and `R97_DUMP_SNAP` (what the walk was handed).
+**Both flags must run in one process**, because `DUMPSNAP` prints the pointer, the view and a `nonzero`
+count but **not** `maxabs`, while `DUMPFWD` prints `maxabs` and `nonfinite_at`; comparing across two
+retained logs is not possible, and the retained ones confirm it (`/tmp/r97-dump-window.log` has 46
+`DUMPSNAP` lines and no `DUMPFWD`; `/tmp/r97-fwd-hunt.log` has 168 `DUMPFWD` and no `DUMPSNAP`). Run
+both, key on `(op, pos, buffer)` and compare operand by operand on one layer. **That is a cheaper and
+more decisive test than any further census, and it is the named next step.**
 
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
