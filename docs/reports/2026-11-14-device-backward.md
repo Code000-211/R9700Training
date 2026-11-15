@@ -1017,6 +1017,49 @@ independent measurement of a 256 anywhere. It is recorded as a direction, not as
 of 400 (the 4096 case gives 0), `a_changed` 374, `b_changed` 375, step 312.17 s of which 264.06 s is
 backward.
 
+**And the lead is eliminated as *the* cause by the ladder itself.** If some constant factor -- 256,
+or anything else -- scaled the whole walk, adding its decades to every point would leave the ladder's
+*shape* untouched:
+
+| block | walk/(FD/511), decades | after a constant 256 (+2.41) |
+|---|---|---|
+| 63 | -2.40 | **+0.01** |
+| 60 | +7.84 | +10.25 |
+| 55 | +22.60 | +25.01 |
+| 51 | +34.57 | +36.98 |
+
+**Block 63 would land on the truth and blocks 60, 55 and 51 would still be wrong by 10, 25 and 37
+decades.** A constant cannot do that: the walk's error is a **rate**, 3.125 decades per layer, and no
+top-of-walk scale factor produces a rate. So 249.4's nearness to 256 is a coincidence of where the
+rate happens to cross the truth on the way up -- block 63 sits just below it -- and the direction to
+chase remains the per-layer amplification, not a single misplaced power of two.
+
+### The defect, in one line: the truth is flat and the walk climbs
+
+Put the two instruments side by side on the same four leaves, the walk's `grad` against the
+mean-corrected FD:
+
+| block | walk | true (FD / 511) | true / walk |
+|---|---|---|---|
+| 63 | 0.007446 | 1.857 | 249 |
+| 60 | 9.437e+07 | 1.372 | 1.45e-08 |
+| 55 | -1.045e+23 | 2.644 | -2.53e-23 |
+| 51 | 6.594e+35 | -17.76 | -2.69e-35 |
+
+**The true values span 1.4 to 17.8 -- 1.1 decades across twelve layers, flat within the noise of a
+quantised model. The walk spans 37.9 decades over the same twelve layers.**
+
+That is the whole defect stated without any reference to layers, families, or op types: **the walk
+injects roughly 3.1 decades of gain per layer where the truth has none.** The cotangent is not merely
+mis-scaled at one point -- it is *amplified* once per layer, which is why the error grows with depth
+and why no single factor at the top, the head, or the objective can account for it. Whatever is
+wrong, it is inside the per-layer walk, and it is multiplicative per layer.
+
+It also explains why the last block is the *least* wrong: block 63 is the first layer the walk
+touches, so it has had the fewest layers' worth of spurious gain applied to it, and its -2.40 decades
+is the error accumulated in the ~1.6 layers above it -- the head, the objective, and block 63's own
+records. Everything below compounds from there.
+
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
