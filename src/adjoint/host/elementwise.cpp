@@ -408,7 +408,8 @@ void note_gain_rows(const AdValue& v, int64_t n, const std::string& buffer, int6
     }
 }
 
-const AdValue* norm_gain(const OpRecord& rec, const std::vector<AdValue>& op, int64_t n) {
+const AdValue* norm_gain(const OpRecord& rec, const std::vector<AdValue>& op, int64_t n,
+                        const char* who) {
     const size_t count = std::min(op.size(), rec.operands.size());
     for (size_t j = 1; j < count; ++j) {
         if (rec.operands[j].written) continue;
@@ -437,9 +438,9 @@ const AdValue* norm_gain(const OpRecord& rec, const std::vector<AdValue>& op, in
                                             std::fabs(op[j].value[(size_t)i] -
                                                       op[j].value[(size_t)(wcol + i)]));
             }
-            std::fprintf(stderr, "GAINPOS pos=%lld j=%zu buffer=%s schema=[%s] value_rank=%zu "
+            std::fprintf(stderr, "GAINPOS pos=%lld who=%s j=%zu buffer=%s schema=[%s] value_rank=%zu "
                                  "value0=%lld values=%zu n=%lld vals=[%s] row0_vs_row1=%.6g\n",
-                         (long long)rec.position, j, rec.operands[j].buffer.c_str(),
+                         (long long)rec.position, who, j, rec.operands[j].buffer.c_str(),
                          schema.c_str(), op[j].shape.size(),
                          op[j].shape.empty() ? -1LL : (long long)op[j].shape[0],
                          op[j].value.size(), (long long)n, vals.c_str(), row0_vs_row1);
@@ -459,7 +460,7 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
     if (op.empty()) return;
     const AdValue& x = op[0];
     const int64_t n = width_of(rec, x.shape);
-    const AdValue* w = norm_gain(rec, op, n);
+    const AdValue* w = norm_gain(rec, op, n, "twin");
     const int64_t rows = rows_of(x, n);
     if (rows <= 0) return;
     if (w && (int64_t)w->value.size() < n) return;
@@ -544,7 +545,7 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
     const AdValue& x = call.fwd[0];
     const AdValue& dy = call.cot[0];
     const int64_t n = width_of(call.rec, x.shape);
-    const AdValue* w = norm_gain(call.rec, call.fwd, n);
+    const AdValue* w = norm_gain(call.rec, call.fwd, n, "adjoint");
     // R97_GAIN_POS=1: which snapshot the *adjoint* took. `GAINPOS` shows two at the same position --
     // rank 1 `[n]` and rank 2 `[rows,n]` -- and `FDRMS` shows the twin takes the rank-1 one, so this
     // names what the row itself differentiates with. A rank-2 gain read as row 0 is a per-row tensor

@@ -468,6 +468,23 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                 refuse("op '" + rec.op + "' at position " + std::to_string(rec.position) +
                        ": operand '" + rec.operands[k].buffer + "' is snapped with shape " +
                        shape_text(v->shape) + ", not " + shape_text(want));
+            // R97_DUMP_VIEW=1: what a view operand's strides say about its span. A view whose
+            // numel exceeds its operand's reads past the declared buffer unless every excess
+            // stride is zero, and a nonzero row stride over a one-row buffer is that read.
+            if (std::getenv("R97_DUMP_VIEW") != nullptr && !rec.operands[k].view_shape.empty()) {
+                std::string stride;
+                for (int64_t d : rec.operands[k].view_stride)
+                    stride += (stride.empty() ? "" : ",") + std::to_string(d);
+                std::fprintf(stderr,
+                             "VIEW pos=%lld j=%zu buffer=%s shape=%s view=%s stride=[%s] off=%lld "
+                             "values=%zu numel=%lld\n",
+                             (long long)rec.position, k, rec.operands[k].buffer.c_str(),
+                             shape_text(rec.operands[k].shape).c_str(),
+                             shape_text(rec.operands[k].view_shape).c_str(), stride.c_str(),
+                             (long long)rec.operands[k].view_off, v->value.size(),
+                             (long long)numel(rec.operands[k].shape));
+                std::fflush(stderr);
+            }
             // A plugin-private operand (the w8a8_fwht128 trunk's weight and its scale) has no
             // f64 form: the snapshot carries its shape and the tape's pointer but no values, and
             // a device row decodes the engine's stored layout from that pointer. An operand with

@@ -939,6 +939,31 @@ The two callers get their operands from different places:
 - the adjoint from `call.fwd`, built in `backward.cpp` from `snapshots.at(rec.position, k)`, whose shape
   must equal the record's declared one -- `[512,5120]`.
 
+**Measured, with the caller tagged (`GAINPOS ... who=`):**
+
+```
+GAINPOS pos=1449 who=twin    j=2 buffer=blk.63.ffn_norm.weight schema=[5120] value_rank=1 value0=5120  values=5120    vals=[0.245117,0.146484,0.209961,0.213867]
+GAINPOS pos=1449 who=adjoint j=2 buffer=blk.63.ffn_norm.weight schema=[5120] value_rank=2 value0=512  values=2621440 vals=[0.347402,0.648529,1.341123,0.037116] row0_vs_row1=4.99031
+ADJGAIN  pos=1449 buffer=h w_rank=2 w0=512 values=2621440 n=5120
+```
+
+The twin has a `[5120]` gain; the adjoint has `[512, 5120]` -- and `VIEW` prints **nothing** at 1449, so the
+record's `view_shape` is empty. The two callers are therefore reading **different records**:
+
+- the snapshot acceptance compares against `rec`, the tape's record (`backward.cpp:452-483`);
+- `AdjointCall` is built with `*adjoint_rec`, the record `options.prepare_record` built
+  (`backward.cpp:556-560`, `:696`).
+
+| record | declared | snapshot | values |
+|---|---|---|---|
+| tape's `rec` (acceptance) | `[512, 5120]` | `[512, 5120]` | 2621440 |
+| prepared `adjoint_rec` (adjoint) | `[5120]` | `[512, 5120]` | 2621440 |
+
+So **the walk accepts a `[512, 5120]` snapshot against the tape's declaration and then hands it to a row
+whose prepared record declares `[5120]`.** `norm_gain` returns it because `[rows, n]` passes `gain_row`,
+and the adjoint reads row 0. The tape and the join disagree about the gain's shape for the same buffer at
+the same position, and nothing reconciles them.
+
 **The defect is the operand's view declaration.** `backward.cpp:464-470` compares a snapshot against
 `view_shape` whenever it is non-empty:
 
