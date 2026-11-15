@@ -1414,6 +1414,51 @@ what a row wrote and what the next row reads looks like. **That is the next thin
 it is measurable on the host tier: the walk's own cotangent for one named buffer, against the same
 buffer's cotangent from a twin built at the same rows.
 
+### No existing test can see this, and the reason is the dtype of the transfer, not the magnitude
+
+**The defect survived 281 host tests because on the host the cotangent is never f32.** `AdValue.value`
+is `std::vector<double>`; the `static_cast<float>` in `adjoint_check.h`'s twin of the quant rows
+(`src/adjoint/host/quant.cpp:386`, a bf16 straight-through round-trip) is applied to the *forward
+activation*, and `float amax` / `float top` (`:461-465`) are forward values too. `cot` stays f64 end to
+end. On the device, `quant.hip:345-349` casts the **whole cotangent buffer** to f32 before any kernel
+runs, and `mask_rotate_kernel` (`:171`) takes `const float* cot`. **So the f32 bottleneck exists only
+across the host-to-device boundary, and it is a property of the transfer, not of any row's
+arithmetic.**
+
+**Measured, not argued.** The FD harness's random cotangent is normally O(1), so a knob was added to
+scale it (`R97_FD_COT`, `tests/support/adjoint_check.h:430-445`). Three arms, full suite, with
+`R97_LIBQUANT` set so `iqr_decode` runs rather than skips:
+
+| cotangent scale | result |
+|---|---|
+| `1` (the knob's default) | **281 tests, 0 failed** |
+| `1e39` | **281 tests, 0 failed** |
+| `1e45` | **281 tests, 0 failed** |
+
+`1e45` is seven decades past f32's ceiling and it changes **no host result at all**. That matters
+because it rules out the obvious explanation: if the harness's O(1) cotangent were what hid the
+defect, `1e45` would break every quantised row. It breaks none. **The magnitude is not the reason --
+the transfer's dtype is.** The default arm is clean, so the other two are not a knob that silently
+disables the checks.
+
+**A magnitude knob on the inputs does find something, but a different thing.** `R97_FD_AMP`, which
+scales the operands instead, takes the suite from 0 to 9 failures at 10x (0 -> 8 excluding the
+`libquant` skip; 11 at 100x, 18 at 1000x, 21 at 10000x). Naming them splits the set: **six of the nine
+are the knob's own damage** -- it multiplies *every* read operand, so in four tests it scales a rope
+position, a kv-store slot or a select row and the test throws out of range before any adjoint runs
+(`rope_registry_row_...`, `kv_store_registry_row_...`, `reference_op_select_rows`), and three more are
+the *twin* refusing the fixture (`twin produced 0 outputs`). **Two are real, and both are in the
+quantised-GEMM family, the same family as the cast:** `reference_linear_gemm_nt_q_reads_in_schema_order`
+(`adjoint says 9.171167, finite differences say 91.711676`, **ratio exactly 10.0, the amp factor**) and
+`adjoint_i8g_producers_agree_with_finite_differences` (`-60.393119` vs `-67.708964`, ratio 1.12).
+
+**So the honest tally of what the existing harness can reach is: input magnitude, two rows, both in
+the quantised-GEMM family; cotangent magnitude, nothing at all on the host.** The mechanism itself --
+the unguarded f64-to-f32 cotangent transfer at `quant.hip:345-349` -- is beyond the reach of every
+test in the repository, which is the specific reason it was not caught. Reproducing it needs a
+device-tier arm, and **no `tests/gpu/*.cpp` uses `adjoint_check.h`** (checked), so the FD harness is
+host-only and there is no place to point it at the device rows today.
+
 ### The host walk is not an available arbiter on this container
 
 `R97_HOST_WALK_AB=1 R97_DUMP_DC=1` was run on the 512-token case to settle device-rows-versus-plumbing
