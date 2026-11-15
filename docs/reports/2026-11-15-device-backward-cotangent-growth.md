@@ -716,6 +716,46 @@ zero-centred gain sits near 1; but forcing `wadd=0` moved `act_rel` only to 1.04
 factor does not explain it either. What is established is the direction: the norm's twin computes a
 different activation, and at 1429 the tape hands it the wrong snapshot outright.
 
+### Why 1429 loses the pre-write value
+
+`src/step_host.cpp:257-284` corrects an in-place read from a `before` map:
+
+```cpp
+if (!in_place) continue;
+const auto prev = before.find(read.buffer);
+if (prev != before.end() && prev->second.shape == now[j].shape)
+    now[j] = prev->second;
+```
+
+and `before` is filled **only by a written operand of an op that has already replayed**
+(`src/step_host.cpp:295-298`):
+
+```cpp
+snaps.set(op.position, j, now[j]);
+if (operand.written && ...) before[operand.buffer] = std::move(now[j]);
+```
+
+So the correction fires only when an **earlier** op in the block wrote the same buffer. When it does
+not fire, `now[j]` stays as `snapshot(rec.operands[j], content[j])`, and the tape's `content` for that
+operand is the value at the tape's recording point -- which for a buffer this same op writes is the
+value **after** the write.
+
+That matches the measurement exactly:
+
+- **1429**: no earlier op wrote `h`, `before` has no entry, the read keeps the post-write value, and
+  `in_vs_write = 0` -- the read and the write are bit-identical.
+- **1449**: an earlier op did write `h`, `before` has an entry, the read is corrected, and
+  `in_vs_write = 0.996`.
+
+`deq_vs_write` is 0.0003 (1449) and 0.0055 (1429), so the write snapshot is the kernel's output at
+both positions -- which is what makes the 1429 read a copy of the op's own output rather than of its
+input.
+
+**This is a hypothesis about the tape's recording point, not an established fact**: the fix belongs in
+the tape or in the replay's contract for a buffer that the same op writes, and it is not a local edit
+to `step_host.cpp`, since the information the correction needs (the pre-write value) is not present in
+`content` when no earlier op wrote the buffer.
+
 ## The quotient's guard## The quotient's guard
 
 The mask pass divides each code's cotangent by its group scale, and the quotient is exact only
