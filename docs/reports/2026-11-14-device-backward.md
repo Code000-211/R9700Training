@@ -502,10 +502,13 @@ small as 5.96e-05, the quotient crosses f32's 3.4e38. That is consistent with th
 first-non-finite being this row's in-place output, and it is a real defect on its own, though an
 overflow gives Inf rather than a 2e33 multiplier.
 
-Closing this needs a host twin and host adjoint for those three fused producers (the linearised
-composition already written in `tests/gpu/adjoint_quant.cpp:568`, pinned first against `libref`),
-after which the probe above can run on them. That is a card-free but non-trivial piece of work, and
-it is the named next step.
+**That gap is now closed.** The three producers have host twins and host adjoints
+(`src/adjoint/host/quant.cpp`), built as the composition the GPU tier already had in its test TU, and
+each has a linearised `<op>_ste` row so that a finite difference can differentiate it -- these are
+quantisers, so their forward is a step unless the row is linearised at a base point. Held to their
+own differences at two shapes they read 1e-9 to 1e-11, against 1e-12 to 1e-9 for the fp8 control in
+the same run. So the three producers' **host** side is now excluded, and the remaining side no
+finite difference has reached is the **device** row's `cot / s`, which is #140.
 
 ### Two defects found in passing
 
