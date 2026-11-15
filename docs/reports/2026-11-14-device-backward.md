@@ -1627,14 +1627,31 @@ block below -- read across every block in one run:
 | 13 | 0 | **2621440** | 0 |
 
 **Every value is finite and every element is non-zero down to position 1147. At 1134 the whole buffer
-is non-finite -- 2621440 of 2621440.** The transition straddles position 1143, which is the f32
-ceiling the report already named. So the chain is:
+is non-finite -- 2621440 of 2621440.** The transition straddles position 1143. So the chain is:
 
 1. the head hands the output norm **1.31316e-07** (`d_hout`, measured);
 2. **each block multiplies the residual cotangent by ~1000-2500x**, uniformly, 13 blocks over;
-3. after those 13 blocks it is **2.66e36**;
-4. two blocks later it passes f32's **3.4e38** and the whole buffer goes non-finite;
-5. every gradient below that point is non-finite, so `all_finite` is false.
+3. after those 13 blocks it is **2.66e36** at position 1147;
+4. **by position 1134 the whole buffer is non-finite.**
+
+**Which ceiling it crosses there is not settled by this measurement, and the report should say so.**
+The growth is about 1.4x per position, so from 2.65846e+36 at position 1147: the raw f32 ceiling
+(3.4e38) is reached in ~14 positions, and the divide's ceiling (3.4e38 x s) in fewer, by however much
+`s` is under 1 -- but both land in the same neighbourhood of 1134, and the buffer is observed only at
+1147 (all finite) and 1134 (all non-finite), thirteen positions later. **The transition's position
+therefore fits both mechanisms.** What the table *does* settle is that neither can be blamed on a
+small-scale group here: 9.47594e+34 is finite at position 1155, which requires that group's scale to
+exceed 2.8e-04, and 2.65846e+36 is finite at 1147, requiring its scale to exceed 7.8e-03. **So the
+five smallest measured scales (5.95831e-05 and up) do not sit at these positions**, and the divide's
+early fire for them is a prediction about other positions, not about this transition.
+
+**The mechanism is still the divide, on the ordering argument rather than on this table** (`s < 1`
+puts the divide's ceiling below the raw one for every such group, so it fires first wherever a
+small-scale group carries a large cotangent). **But the position of this particular transition does
+not prove it, and the earlier draft's claim that it "straddles position 1143, which is the f32
+ceiling" was reading a threshold into data that fits two of them.**
+
+And every gradient below that point is non-finite, so `all_finite` is false.
 
 **The forward is flat and the FD's leaf gradients are flat, so steps 1 and 2 cannot both be right.**
 The cotangent growth is the walk's, and it produces the f32 overflow -- **and the overflow is the
