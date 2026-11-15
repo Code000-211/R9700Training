@@ -939,10 +939,25 @@ The two callers get their operands from different places:
 - the adjoint from `call.fwd`, built in `backward.cpp` from `snapshots.at(rec.position, k)`, whose shape
   must equal the record's declared one -- `[512,5120]`.
 
-So **the tape declares the gain as a per-row tensor and the twin's caller supplies it as a vector**,
-for the same buffer at the same position. The reconciliation is between the record's declared gain
-shape and the shape the twin's caller uses, or between the two snapshots the store holds -- not a
-lookup preference in `norm_gain`.
+**The defect is the operand's view declaration.** `backward.cpp:464-470` compares a snapshot against
+`view_shape` whenever it is non-empty:
+
+```cpp
+const std::vector<int64_t>& want = rec.operands[k].view_shape.empty()
+                                       ? rec.operands[k].shape
+                                       : rec.operands[k].view_shape;
+if (v->shape != want) refuse(...);
+```
+
+`GAINPOS` reports `schema=[5120]` -- the operand's `shape` -- while the accepted snapshot is
+`[512, 5120]` (2621440 values, first dim 512). A snapshot is only accepted when it equals `want`, so
+**`view_shape` must be `[512, 5120]`: a 512x view of a 5120-element operand.** That is a view which
+multiplies the element count, and it is what lets a per-row tensor through the shape check.
+
+So the tape declares `blk.63.ffn_norm.weight` as a `[5120]` operand carrying a `[512, 5120]` view, the
+adjoint takes the whole view and `norm_gain` reads row 0 of it. **The fix is to slice the row the
+declared `shape` names rather than hand `norm_gain` the whole tensor** -- or to reject a view whose
+numel differs from its operand's, since no legitimate view of a weight does that.
 
 ## The quotient's guard## The quotient's guard## The quotient's guard
 
