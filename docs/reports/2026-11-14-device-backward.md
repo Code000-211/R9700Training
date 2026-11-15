@@ -634,6 +634,20 @@ pairs balanced at product exactly 1.0, so it is not the quantiser scales. **It i
 of ~1.6e3 made somewhere the scale audit does not cover**, and the instrument that now narrows it is
 `R97_DUMP_DC` at real magnitudes -- which is what the pass above demonstrates works.
 
+**And the same pass already says where it is not: it is not inside a row.** Within block 62 the
+cotangents are ordinary -- `gdn_in` reads 0.527 at `gdn_conv_prep`@1413, 0.652 at
+`gdn_gated_rmsnorm`@1416 and 0.652 at `lora_expand`@1411; `gdn_o` spans 0.105 at
+`had_quant_act_i8g`@1417 to 1128 at `gdn_gated_rmsnorm`@1416, which is the `1/rms` conditioning the
+host reproduces. Within block 61 they are equally ordinary at 664..812. **The ~1.2e3 jump in
+`gdn_in` happens between those two windows**, i.e. at the block boundary rather than inside any one
+record.
+
+**So the next probe is cheap and specific:** `R97_DUMP_DC`'s op list (`src/backward.cpp:751-761`)
+covers `rope`, `lora_expand`, `lora_shrink`, `rmsnorm`, `rmsnorm_had_quant_i8g` and every record of
+positions 1390..1458. Widening that window to cover blocks 60..63 -- and adding `add`,
+`gdn_chunk_scan`, `gdn_kkt_solve` and `gdn_conv_prep` by name -- puts the boundary's contribution in
+the same table, and the factor is then localised to a record rather than to a block.
+
 **Two mechanical findings came out of the audit and are acted on.** The f32 row reductions: the
 report's own f64 fix landed at one of three sites on this path, and the other two
 (`gated_rmsnorm_adjoint_kernel`'s `float dot` over 5120, `rmsnorm_adjoint_kernel`'s `float tt`) plus
