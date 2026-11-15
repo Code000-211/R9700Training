@@ -1175,6 +1175,19 @@ ceiling the report already named. So the chain is:
 The cotangent growth is the walk's, and it is the whole of `all_finite false` -- there is no second,
 independent defect downstream. Fix the per-block gain and the overflow goes with it.
 
+**And the factor is per record, not per block.** Block 63's last `lora_expand h` entry to block 62's
+last is x1913, 3.282 decades, and a block holds ~22.78 records (1458 positions over 64 blocks). That
+is **0.140-0.149 decades per record, x1.38-1.41**, which agrees with the 0.140 decades/record this
+report measured independently from the growth curve. So the walk multiplies its cotangent by about
+**1.4 at every single row it walks**, sixty-four times over.
+
+That is the target, and it is a much narrower one than "the walk is wrong": a row that should pass a
+cotangent through, or add a small contribution to it, is instead growing it by ~40% every time. Rows
+that add a second contribution of comparable magnitude to a passthrough produce exactly this on a
+max-abs metric, so the first thing to look at is a row whose adjoint writes into a slot the incoming
+cotangent already occupies -- the in-place passthrough at `src/backward.cpp:716-731` is the one place
+the walk deliberately does that.
+
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
