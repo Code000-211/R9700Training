@@ -1180,16 +1180,76 @@ void fused_adjoint(const AdjointCall& call, Part part) {
                         rmax = std::max(rmax, q);
                     }
                 }
+                // Two tests that `row_ratio` cannot make, because it is an L1 ratio: an exact
+                // permutation preserves it, a Hadamard preserves it approximately, and a different
+                // gain with similar L1 also fits. (1) Sorting each row of `y` and of `deq` separates
+                // a permutation (sorted rows equal) from everything else. (2) `deq` under a
+                // gain-after-rotation kernel is `R^-1(g * R(n))` where `n = x*s` is the *ungained*
+                // normalised activation, so building `y2 = R^-1(g * R(n))` from the twin's own `y`
+                // and `x` and comparing it to `deq` tests that kernel shape directly.
+                double sort_rel = 0.0, y2_rel = 0.0, y2_scale = 0.0;
+                {
+                    std::vector<double> a(n), b(n);
+                    for (int64_t r = 0; r < rows; ++r) {
+                        for (int64_t i = 0; i < n; ++i) {
+                            a[(size_t)i] = y[0].value[(size_t)(r * n + i)];
+                            b[(size_t)i] = dq[(size_t)(r * n + i)];
+                        }
+                        std::sort(a.begin(), a.end());
+                        std::sort(b.begin(), b.end());
+                        for (int64_t i = 0; i < n; ++i) {
+                            const double d = std::fabs(a[(size_t)i] - b[(size_t)i]);
+                            if (d > sort_rel) sort_rel = d;
+                        }
+                    }
+                    // n = x * s, g = y / n, y2 = R^-1(g * R(n)).
+                    std::vector<double> nn(n), gg(n), tmp(n);
+                    for (int64_t r = 0; r < rows; ++r) {
+                        double ss = 0.0;
+                        for (int64_t i = 0; i < n; ++i) {
+                            const double v = call.fwd[0].value[(size_t)(r * n + i)];
+                            ss += v * v;
+                        }
+                        const double sr = 1.0 / std::sqrt(ss / (double)n + 1e-6);
+                        for (int64_t i = 0; i < n; ++i) {
+                            const double xv = call.fwd[0].value[(size_t)(r * n + i)];
+                            nn[(size_t)i] = xv * sr;
+                            tmp[(size_t)i] = nn[(size_t)i];
+                        }
+                        for (int64_t gi = 0; gi < n / group; ++gi)
+                            fwht(tmp.data() + gi * group, group);
+                        for (int64_t i = 0; i < n; ++i) {
+                            const double nv = nn[(size_t)i];
+                            gg[(size_t)i] = nv != 0.0 ? y[0].value[(size_t)(r * n + i)] / nv : 0.0;
+                        }
+                        for (int64_t gi = 0; gi < n / group; ++gi) {
+                            const int64_t k0 = gi * group;
+                            for (int64_t i = 0; i < group; ++i)
+                                tmp[(size_t)(k0 + i)] *= gg[(size_t)(k0 + i)];
+                            fwht(tmp.data() + k0, group);
+                            for (int64_t i = 0; i < group; ++i)
+                                tmp[(size_t)(k0 + i)] /= (double)group;
+                        }
+                        for (int64_t i = 0; i < n; ++i) {
+                            const double d = std::fabs(tmp[(size_t)i] - dq[(size_t)(r * n + i)]);
+                            if (d > y2_rel) y2_rel = d;
+                            if (std::fabs(dq[(size_t)(r * n + i)]) > y2_scale)
+                                y2_scale = std::fabs(dq[(size_t)(r * n + i)]);
+                        }
+                    }
+                }
                 std::fprintf(stderr,
                              "DEQORACLE pos=%lld deq_vs_in=%.6g deq_vs_write=%.6g in_vs_write=%.6g "
                              "in_max=%.6g ymax=%.6g deqmax=%.6g y_over_deq=%.6g row_ratio=[%.6g,%.6g] "
-                             "sum_ratio=%.6g\n",
+                             "sum_ratio=%.6g sort_rel=%.6g y2_rel=%.6g\n",
                              (long long)call.rec.position,
                              in_scale > 0.0 ? vs_in / in_scale : vs_in,
                              in_scale > 0.0 ? vs_wr / in_scale : vs_wr,
                              in_scale > 0.0 ? in_vs_wr / in_scale : in_vs_wr, in_scale, ymax, dqmax,
                              dqmax > 0.0 ? ymax / dqmax : 0.0, rmin, rmax,
-                             sum_d > 0.0 ? sum_y / sum_d : 0.0);
+                             sum_d > 0.0 ? sum_y / sum_d : 0.0,
+                             y2_scale > 0.0 ? sort_rel / y2_scale : sort_rel,
+                             y2_scale > 0.0 ? y2_rel / y2_scale : y2_rel);
             }
             std::fprintf(stderr, "DUMPROT pos=%lld op=%s rot_err=%.6g rot_bad=%lld/%zu deq_rel=%.6g\n",
                          (long long)call.rec.position, call.rec.op.c_str(), rot_err,

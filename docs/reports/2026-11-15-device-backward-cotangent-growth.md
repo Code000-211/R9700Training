@@ -788,46 +788,51 @@ names it instead of returning a gradient taken at the output. It is not applied 
 make the host walk refuse at 1429, which is a change to what the A/B can run and is the maintainer's
 call.
 
-### The norm's twin is a rotation apart, not a scale apart
+### The L1 agreement was a coincidence of magnitude, not an arrangement
 
-`DEQORACLE` now reports the twin's activation against the kernel's by magnitude, per row and in sum:
+`DEQORACLE` reports the twin's activation against the kernel's by magnitude, per row and in sum:
 
 | pos | op | `row_ratio` | `sum_ratio` | `deq_rel` |
 |---|---|---|---|---|
 | 1453 | `gated_had_quant_i8g` | [0.9937, 0.9988] | 0.9966 | 0.005 |
-| 1449 | `rmsnorm_had_quant_i8g` | [0.9894, 1.0337] | **1.0080** | **1.364** |
-| 1429 | `rmsnorm_had_quant_i8g` | [1.0063, 1.0140] | **1.0102** | **0.628** |
+| 1449 | `rmsnorm_had_quant_i8g` | [0.9894, 1.0337] | 1.0080 | 1.364 |
+| 1429 | `rmsnorm_had_quant_i8g` | [1.0063, 1.0140] | 1.0102 | 0.628 |
 
-Every row's magnitude agrees to 1-3% and the row sums to 1%, while the elementwise maximum differs by
-63-136%. **The two tensors carry the same values in a different arrangement.** That eliminates every
-scalar explanation at once -- a scale, a gain, `wadd`, `eps` -- and it is what a rotation applied
-differently on the two sides looks like.
+**`row_ratio` is an L1 ratio, and L1 agreement does not mean "same values, different arrangement".**
+A permutation preserves it exactly, a Hadamard preserves it approximately, and a different gain vector
+with similar L1 also fits. Two tests separate those, and both are now in the instrument.
 
-The gated producers agree elementwise to 0.5%, so their rotation matches; the norm's does not.
+**Sorted rows** (an exact permutation would give ~0):
 
-**It is not the quantiser's rotation.** `deq_vs_write = 0.0003` at 1449 proves the unrotation is
-correct -- `fwht(codes * scale) / group` reproduces the kernel's stored output -- so `deq` and `y` are
-both in the original domain and the difference is between them, not a domain mismatch. The single
-extra rotation `DUMPROT` applies does not help either (99.4% of codes still differ), which is
-consistent with the same conclusion.
+| pos | `sort_rel` |
+|---|---|
+| 1453 gated | **0.0048** |
+| 1449 norm | **0.420** |
+| 1429 norm | **0.628** |
 
-**What is left is a rotation inside the norm itself.** A fused kernel that normalises, rotates,
-applies the gain in the rotated domain and then quantises computes
+**The norm's twin is not a permutation of the kernel's activation.** Its rows' multisets differ by
+42-63%, so the L1 agreement is a coincidence of magnitude, not evidence of rearrangement. The earlier
+reading of that table as "same values in a different arrangement" was wrong.
 
-```
-deq = R^-1( (w + 1) * R(x * s) )
-```
+**Gain-after-rotation** (`y2 = R^-1(g * R(n))` built from the twin's own `y` and `x`, compared to the
+kernel's activation):
 
-while the twin computes `y = (w + 1) * x * s`. A Hadamard preserves the L2 norm and, for
-near-random signs, the L1 magnitude to a few percent -- which is exactly what `row_ratio` shows -- while
-moving every element, which is exactly what `deq_rel` shows. It also explains why the gain, `wadd` and
-`eps` all check out and change nothing: they are the same on both sides; only the order is different.
+| pos | `y2_rel` | `deq_rel` |
+|---|---|---|
+| 1449 norm | 1.362 | 1.364 |
+| 1429 norm | **0.110** | 0.628 |
 
-That is the next test and it is cheap: compare `fwht(y)` against `fwht(deq)` elementwise and see
-whether their ratio is the gain vector `w + 1`. If it is, the twin must apply the gain *after* the
-rotation rather than before it.
+At 1449 the construction changes nothing -- `g` is nearly constant within each group, so `y2` collapses
+to `y` and the test cannot discriminate. At 1429 it comes six times closer, which is suggestive but not
+a fit. **Neither a permutation nor a gain-after-rotation explains the norm's twin.**
 
-## The quotient's guard## The quotient's guard
+What is established is the shape of the disagreement: the twin's activation carries the right
+magnitude per row and the wrong values elementwise, and it is neither a permutation nor a rotation
+order change. The remaining candidates are the norm's `s` (a per-row scalar, which would leave the
+multiset shape intact and is not excluded by `sort_rel` if the rows are compared as sorted *within* a
+row) and the input's row indexing.
+
+## The quotient's guard## The quotient's guard## The quotient's guard
 
 The mask pass divides each code's cotangent by its group scale, and the quotient is exact only
 while it stays inside f32. On this container it does not: 2.66e36 over a 5.96e-5 scale is 4.5e40.

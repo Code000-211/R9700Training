@@ -479,9 +479,10 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
         }
     }
     AdValue y = write_value(rec, 2, x.shape);
-    // R97_DUMP_QUANT=1: the twin's own normalisation constants for row 0. `DUMPTWIN` reports that
-    // this twin's output matches its *input* at ratio 1.0 while the kernel's written `h` differs by
-    // 36%, so either `s` is ~1 (the input is already normalised) or the gain is missing.
+    // R97_DUMP_QUANT=1: the twin's own normalisation constants for row 0. `DUMPTWIN`'s `best_of`
+    // field is a *relative error* (`max|f - y| / max|f|`), not a match ratio: `1:x:1` is a 100%
+    // error, and an identity would print `1:x:0`. These constants are what tell the norm's
+    // disagreement from the quantiser's.
     if (std::getenv("R97_DUMP_QUANT") != nullptr) {
         double ss = 0.0, xmax = 0.0;
         for (int64_t i = 0; i < n; ++i) {
