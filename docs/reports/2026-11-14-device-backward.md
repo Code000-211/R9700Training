@@ -672,13 +672,30 @@ Same order, within a factor of 1.8 per layer and 1.4 per record, from a complete
 instrument. **So the defensible statement is: the walk multiplies by ~1.3x per record and ~1e3 per
 decoder layer**, and the two instruments bracket it.
 
-**Two sites carry the biggest single jumps in that sequence**, and they are the prime suspects:
-`gdn_chunk_scan` writing `gdn_o` (9 occurrences, x6.7e3 to x1.5e4) and `rmsnorm_had_quant_i8g` writing
-`h.s8` (25 occurrences, x9.6e2 to x1.6e3). **Neither is yet a verdict.** A ratio between two
-consecutive records' operands is not a hop product -- the two may be different buffers, or different
-versions of one buffer, which is precisely the error this section has already had to retract twice.
-Turning these into a named record needs the per-record handed-vs-left probe below, on one buffer with
-its read and write identified.
+**The hops are balanced, and that rules the scale bookkeeping out.** Pairing every record that touches a
+buffer with the next one that does (within two positions), on the same dump:
+
+| buffer | adjacent pairs | equal to all printed digits | differ |
+|---|---|---|---|
+| `h` | 28 | **28** | **0** |
+| `gdn_in` | 10 | 8 | 2 |
+| `gdn_o` | 5 | 0 | 5 |
+
+`h`'s producer -> consumer pairs are **exactly** equal: `rmsnorm_had_quant_i8g`@1449 reads
+`7.24196e-06` and `lora_expand`@1448 reads `7.24196e-06`; @1429/@1428 both read `9.23157e-04`. The
+quantiser's `1/s` and its consumer's `s` cancel exactly, as the audit above predicted. **The two
+`gdn_o` columns differ by a steady ~1.07e4** (`had_quant_act_i8g`@1417 `0.105` against
+`gdn_gated_rmsnorm`@1416 `1128`), but **that ratio is constant across layers** -- 1457x, 1446x, 1267x
+between consecutive `had_quant_act_i8g` values, i.e. both operands grow at the same per-layer rate. A
+constant offset between two operands is a scale difference, not an amplification.
+
+**So the amplification is applied by the ops, not by a hop.** `h`'s own cotangent, taken at one op
+(`rmsnorm_had_quant_i8g`) across 27 occurrences spanning positions 1449 to 1148 -- 301 records,
+**13.2 layers** -- runs `7.24196e-06` to `2.72076e36`: **42.575 decades**, i.e. **0.1414 decades per
+record (1.384x)** and **3.22 decades per layer (1.67e3)**. Its hops are exactly balanced and it still
+grows at that rate, so **the factor is inside the per-op adjoints on the `h` path, not in the scale
+bookkeeping.** That is a third independent measurement and it agrees with the `gdn_o` trace to within
+1% per record and 1% per layer.
 
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
