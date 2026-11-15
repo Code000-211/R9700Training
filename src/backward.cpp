@@ -697,6 +697,10 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             d != nullptr && d[0] == '1' &&
             (rec.op == "rope" || rec.op == "lora_expand" || rec.op == "lora_shrink" ||
              rec.op == "rmsnorm" ||
+             // The op the 512 case's remaining non-finite is born in, at position 1176 in block
+             // 63: not an exact match for "rmsnorm", and outside the last-block window below, so
+             // without this line the dump is silent about the one row it is being run for.
+             rec.op == "rmsnorm_had_quant_i8g" ||
              // The inf hunt: every record of the last block, so the earliest forward value that is
              // not finite is named by its op and position rather than guessed.
              (rec.position >= 1390 && rec.position <= 1458))) {
