@@ -1060,7 +1060,28 @@ touches, so it has had the fewest layers' worth of spurious gain applied to it, 
 is the error accumulated in the ~1.6 layers above it -- the head, the objective, and block 63's own
 records. Everything below compounds from there.
 
+**A caveat on the absolute ratios, which the shape does not depend on.** The FD's own plus/minus
+deltas are not a converged difference. In `device_step_tape-4GGbWg` they are strongly asymmetric:
+block 63 `+0.0797 / -0.1364` (42%), block 60 `-0.1918 / -0.3791` (both the same sign), block 55
+`+0.1788 / -0.1499`, block 51 `-0.6879 / +1.7744` (61%); and block 63's `+10%` control (`-0.213`) has
+the opposite sign to its `+1%` (`+0.0797`), so no quadratic through the three points fits the `-1%`
+side. **A central difference cancels the even terms, so the derivative may well be sound -- but its
+error is unquantified**, and the figures `249x`, `1.41e7` and `3.71e34` are the FD's, not the truth's
+to three digits.
+
+**What does not depend on the FD at all is the ladder's shape**: the walk's own cotangent growth
+(3.198 decades per block, the forward's flatness, the f32 clip at position 1143) is measured without
+perturbing anything. The claim to hold onto is that one -- the walk climbs and the truth does not --
+and the absolute over-statement is an order-of-magnitude, not a measurement.
+
 ### The gain is per block, multiplicative, and uniform: ~1600x every block
+
+**Which slot, exactly, because a block has two.** Every block carries **two** `lora_expand` rows that
+read and write the residual `h` -- the FFN-down expand and the mixer (`attn_out`/`ssm_out`) expand --
+so the log has two `lora_expand h` entries per block. The table below reads the **second**, the lower
+position (1448, 1420, 1399, 1386, ...), i.e. the mixer expand, and takes that row's left cotangent.
+Nothing else in the dump is used. The first entry of each pair is not tabulated; block 63's is
+discussed below because it is the exception.
 
 The cotangent to compare across layers is the **residual** one -- the `lora_expand h` read slot, the
 value the block hands down -- and it must be read on that slot alone. (Taking the max over all of a
@@ -1068,11 +1089,11 @@ block's rows instead measures the *scale* gradients, `h.s8` at ~1e-2, which are 
 quantisation group and naturally far larger; that mistake produces a spurious period-4 pattern by
 layer type, which is withdrawn here.)
 
-On the residual slot, from the same `/tmp/r97-head.log`:
+On that slot, from `/tmp/r97-head.log` (and identically in `/tmp/r97-fwd.log`):
 
 | block | residual cotangent | gain over the block below |
 |---|---|---|
-| 63 | 7.242e-06 | -- |
+| 63 | 7.242e-06 | **x55** (from `d_hout`, not from a block) |
 | 62 | 0.01385 | **x1913** |
 | 61 | 34 | x2454 |
 | 60 | 3.507e+04 | x1032 |
@@ -1087,14 +1108,23 @@ On the residual slot, from the same `/tmp/r97-head.log`:
 | 51 | 1.633e+33 | x1717 |
 | 50 | 2.679e+36 | x1641 |
 
-**3.198 decades per block, and the gain never leaves 3.01-3.39.** That is a factor of ~1600 every
-block, thirteen times over -- 10^41 in total -- where the FD says the true leaf gradients are flat.
+**3.198 decades per block across the thirteen block-to-block gains, and none leaves 3.01-3.39.** That
+is a factor of ~1600 every block, thirteen times over -- 10^41 in total -- where the FD says the true
+leaf gradients are flat.
 
-**The uniformity is the informative part.** The gain does not depend on the block's type (the 3:1
-hybrid would show a period-4 signature if it did), nor on its position, nor on whether the block
-contains the attention path at all. It is the same operation, done once per block, multiplying where
-it should add. That is a much tighter constraint than "the walk is wrong somewhere below the head",
-and it is where the next look goes: the per-block walk's own accumulation, not the layers' contents.
+**Block 63 is the exception, and it is informative.** Its 7.242e-06 is not a block's output: block 63
+is the first layer the walk touches and it is **seeded from `d_hout`** (1.31316e-07 at position 1456),
+not from a previous block's `InputCotangent`. From that seed to its own mixer expand is **x55**,
+1.5 decades below the thirteen gains above. So "the same operation, done once per block" is true of
+the thirteen block-to-block gains and **not** of block 63, and the difference is exactly the handoff
+-- the seed path and `pick_boundary`/`first_rows` (`src/join_common.h:350-364`) rather than the
+block-internal walk. That is a second, separate place to look, and the one the first layer's
+anomalous gain points at.
+
+**The uniformity of the other thirteen is still the informative part.** The gain does not depend on
+the block's type (the 3:1 hybrid would show a period-4 signature if it did), nor on its position, nor
+on whether the block contains the attention path. It is the same operation, done once per block,
+multiplying where it should add.
 
 ### And the forward is flat too: the cotangent growth is spurious, measured from both sides
 
@@ -1172,8 +1202,16 @@ ceiling the report already named. So the chain is:
 5. every gradient below that point is non-finite, so `all_finite` is false.
 
 **The forward is flat and the FD's leaf gradients are flat, so steps 1 and 2 cannot both be right.**
-The cotangent growth is the walk's, and it is the whole of `all_finite false` -- there is no second,
-independent defect downstream. Fix the per-block gain and the overflow goes with it.
+The cotangent growth is the walk's, and it produces the f32 overflow -- **and the overflow is the
+whole of `all_finite false`**, in the sense that nothing downstream of position 1143 can be observed
+to be anything else.
+
+**What that does *not* say.** Every `lora_expand h` below position 1134 is 2621440-of-2621440
+non-finite, so blocks 0-49 are **unobserved, not clean**. A second defect could sit anywhere in them
+and this run would not see it. The claim the data supports is narrower: the per-block gain is
+sufficient to produce the overflow, the overflow explains `all_finite false` on its own, and nothing
+below block 50 can be measured until the gain is fixed. Fix the gain first, then re-read the blocks
+below it -- that is the only way to find out whether anything else is there.
 
 **And the factor is per record, not per block.** Block 63's last `lora_expand h` entry to block 62's
 last is x1913, 3.282 decades, and a block holds ~22.78 records (1458 positions over 64 blocks). That
@@ -1181,12 +1219,28 @@ is **0.140-0.149 decades per record, x1.38-1.41**, which agrees with the 0.140 d
 report measured independently from the growth curve. So the walk multiplies its cotangent by about
 **1.4 at every single row it walks**, sixty-four times over.
 
-That is the target, and it is a much narrower one than "the walk is wrong": a row that should pass a
-cotangent through, or add a small contribution to it, is instead growing it by ~40% every time. Rows
-that add a second contribution of comparable magnitude to a passthrough produce exactly this on a
-max-abs metric, so the first thing to look at is a row whose adjoint writes into a slot the incoming
-cotangent already occupies -- the in-place passthrough at `src/backward.cpp:716-731` is the one place
-the walk deliberately does that.
+**What the ~1.4x is not.** Two candidates were checked and are out.
+
+- **The in-place passthrough is not it.** `src/backward.cpp:716-731` fills `dc[j]` from
+  `cot[cot_index[j]]` only when the row left the slot exactly zero, and that is a **single-path
+  assignment**, not an accumulation -- it cannot multiply anything. Withdrawn as the lead.
+- **The activation scale in `gemm_nt_q`'s `dx` is not it.** `src/adjoint/device/linear.hip:648-657`
+  carries the correction (`dx += bf16(host_dx) * scale_at(as, m, k/gsize, M, groups)`), and the
+  dedicated host test `tests/host/scale_factor_probe.cpp` (`scale_factor_probe_keeps_the_activation_
+  scale`, landed in `4f9a6d5`) measures it directly at a **real, non-unit** `a_scale`
+  (`max |a_scale - 1| = 0.875`): **mean adj/fd 1.0000, worst |adj-fd|/max 4.19e-09**, over fifteen
+  probed elements spanning three groups. Run this session on the tip, 1 test, 0 failed. The factor is
+  applied.
+
+  The *hazard* the same code carries is real but not this bug: `scale_at`
+  (`src/adjoint/device/linear.hip:409-417`) falls through to
+  `scale->value[min(row*groups+group, n-1)]` for any activation-scale size that is not `1`,
+  `rows*groups`, `groups` or `rows`, silently indexing the wrong scale instead of declining. For this
+  container it resolves -- the activation scale is `[512, 40]` and `rows*groups = 512 * 40` exactly --
+  but a container whose activation group size differs from its weight's would hit the clamp.
+
+**So the target is the per-block walk's own row arithmetic**, with the two above excluded and the
+block-boundary handoff (block 63's x55) as the separate second place to look.
 
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
