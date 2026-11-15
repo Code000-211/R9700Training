@@ -1264,6 +1264,14 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                     if (operand.written && operand.view_shape.empty() && operand.rows > 0 &&
                         operand.rows == operand.shape[0]) {
                         before[operand.buffer] = std::move(snapped.now[j]);
+                    } else if (operand.written) {
+                        // This write is not one the capture can hold -- a strided write, or a
+                        // partial row window -- so it must not be replaced by, or leave standing,
+                        // the value an *earlier* write put in the map. A reader after this point
+                        // saw this write, not that one, and serving the older value would be
+                        // silent and plausible: the class this effort exists to remove. Drop the
+                        // entry, so the walk refuses by name at `prev == before.end()` instead.
+                        before.erase(operand.buffer);
                     }
                 }
             });
