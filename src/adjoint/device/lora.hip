@@ -167,6 +167,7 @@ RadStream adjoint_stream() {
 int64_t blocks(int64_t n) { return (n + kBlock - 1) / kBlock; }
 
 int64_t f32_bytes(int64_t n) { return n * (int64_t)sizeof(float); }
+int64_t f64_bytes(int64_t n) { return n * (int64_t)sizeof(double); }
 
 // The record's operands, in the schema's order: a, a_scale, slot, lora_a, t. Only the coded form is
 // this row's: a float activation leaves `a_scale` absent, in place, and has no device row.
@@ -266,8 +267,8 @@ void fill_slots(const AdValue& slot, int64_t S, std::vector<int>* out) {
 // the shared row reads it from global, which costs the reads and keeps the row served.
 __global__ void shrink_dx_kernel(const float* __restrict__ a, const float* __restrict__ as,
                                  const float* __restrict__ ct, const float* __restrict__ la,
-                                 const int* __restrict__ slot, float* __restrict__ dx,
-                                 float* __restrict__ sct, int64_t M, int64_t K, int64_t R,
+                                 const int* __restrict__ slot, double* __restrict__ dx,
+                                 double* __restrict__ sct, int64_t M, int64_t K, int64_t R,
                                  int64_t groups, int64_t group, int64_t row_in_shared) {
     const int64_t m = blockIdx.x;
     if (m >= M) return;
@@ -275,7 +276,7 @@ __global__ void shrink_dx_kernel(const float* __restrict__ a, const float* __res
     if (s < 0) return;  // a base row: no cotangent
     const int t = threadIdx.x;
     extern __shared__ float sh[];   // R, the token's cotangent, when it fits
-    __shared__ float sh_p[kBlock];  // one column's product with its code
+    __shared__ double sh_p[kBlock]; // one column's product with its code
     const float* ct_row = ct + m * R;
     if (row_in_shared) {
         for (int64_t j = t; j < R; j += blockDim.x) sh[j] = ct_row[j];
@@ -285,16 +286,21 @@ __global__ void shrink_dx_kernel(const float* __restrict__ a, const float* __res
     const float* scale_row = as + m * groups;
     const float* A = la + s * R * K;
     const float* a_row = a + m * K;
-    float* dx_row = dx + m * K;
-    float* sct_row = sct + m * groups;
+    double* dx_row = dx + m * K;
+    double* sct_row = sct + m * groups;
+    // f64 throughout, as the host row is (`host/reference_lora.cpp:292`): the cotangents this row
+    // is handed reach 1e36 at block 50, where a group's sum of `g * code` over 128 columns lands
+    // on f32's 3.4e38 ceiling and saturates -- measured as the first non-finite in the whole walk
+    // (`lora_shrink`, operand `h.s8`, position 1150, maxabs 3.40178e+38). `g` is a reduction over
+    // R and is the same argument one level down; the codes' own output `dx` sat at 1.6e36.
     for (int64_t base = 0; base < K; base += blockDim.x) {
         const int64_t k = base + t;
-        float p = 0.0f;
+        double p = 0.0;
         if (k < K) {
-            float g = 0.0f;
-            for (int64_t j = 0; j < R; ++j) g += ct_row[j] * A[j * K + k];
-            dx_row[k] = g * scale_row[k / group];
-            p = g * a_row[k];
+            double g = 0.0;
+            for (int64_t j = 0; j < R; ++j) g += (double)ct_row[j] * (double)A[j * K + k];
+            dx_row[k] = g * (double)scale_row[k / group];
+            p = g * (double)a_row[k];
         }
         sh_p[t] = p;
         __syncthreads();
@@ -307,7 +313,7 @@ __global__ void shrink_dx_kernel(const float* __restrict__ a, const float* __res
         for (int64_t g = g_first + t; g <= g_last; g += blockDim.x) {
             const int64_t lo = (g * group > k0 ? g * group : k0) - k0;
             const int64_t hi = min(k1, min((g + 1) * group, K)) - k0;
-            float sum = 0.0f;
+            double sum = 0.0;
             for (int64_t i = lo; i < hi; ++i) sum += sh_p[i];
             atomicAdd(&sct_row[g], sum);
         }
@@ -410,6 +416,18 @@ bool download_add_f32(AdValue* slot, void* src, std::vector<float>* stage, RadSt
     return true;
 }
 
+// The same for an f64 buffer: the rows that can carry a cotangent past f32's ceiling stage in
+// double, so a sum that would overflow f32 is taken before anything is narrowed.
+bool download_add_f64(AdValue* slot, void* src, std::vector<double>* stage, RadStream stream) {
+    if (!slot) return true;
+    const int64_t n = (int64_t)slot->value.size();
+    stage->resize((size_t)n);
+    if (rad_memcpy_async(stage->data(), src, f64_bytes(n), stream) != 0) return false;
+    if (rad_stream_sync(stream) != 0) return false;
+    for (int64_t i = 0; i < n; ++i) slot->value[(size_t)i] += (*stage)[(size_t)i];
+    return true;
+}
+
 // The shrink's adjoint: the coded form only. The row of cot t in shared memory when the pool's
 // width fits it, and one block per token for the value-space cotangent.
 void lora_shrink_device_adjoint(const AdjointCall& call) {
@@ -448,8 +466,8 @@ void lora_shrink_device_adjoint(const AdjointCall& call) {
     device::ScratchBlock d_ct(f32_bytes(sh.M * sh.R));
     device::ScratchBlock d_la(f32_bytes(sh.S * sh.R * sh.K));
     device::ScratchBlock d_slot((int64_t)(sh.M * (int64_t)sizeof(int)));
-    device::ScratchBlock d_dx(f32_bytes(sh.M * sh.K));
-    device::ScratchBlock d_sct(f32_bytes(sh.M * sh.groups));
+    device::ScratchBlock d_dx(f64_bytes(sh.M * sh.K));
+    device::ScratchBlock d_sct(f64_bytes(sh.M * sh.groups));
     if (!d_a || !d_as || !d_ct || !d_la || !d_slot || !d_dx || !d_sct) return;
 
     std::vector<float> h_a, h_as, h_ct, h_la;
@@ -458,15 +476,15 @@ void lora_shrink_device_adjoint(const AdjointCall& call) {
     if (!upload_f32(t_cot, d_ct.p, sh.M * sh.R, &h_ct, stream)) return;
     if (!upload_f32(*sh.la, d_la.p, sh.S * sh.R * sh.K, &h_la, stream)) return;
     if (!upload_slots(slots, d_slot.p, stream)) return;
-    if (rad_memset_async(d_dx.p, 0, f32_bytes(sh.M * sh.K), stream) != 0) return;
-    if (rad_memset_async(d_sct.p, 0, f32_bytes(sh.M * sh.groups), stream) != 0) return;
+    if (rad_memset_async(d_dx.p, 0, f64_bytes(sh.M * sh.K), stream) != 0) return;
+    if (rad_memset_async(d_sct.p, 0, f64_bytes(sh.M * sh.groups), stream) != 0) return;
 
     const int64_t row_in_shared = sh.R <= kMaxRShared ? 1 : 0;
     const int64_t shared = row_in_shared ? sh.R * (int64_t)sizeof(float) : 0;
     hipLaunchKernelGGL(shrink_dx_kernel, dim3((unsigned int)sh.M), dim3(kBlock),
                        (size_t)shared, (hipStream_t)stream, (const float*)d_a.p,
                        (const float*)d_as.p, (const float*)d_ct.p, (const float*)d_la.p,
-                       (const int*)d_slot.p, (float*)d_dx.p, (float*)d_sct.p, sh.M, sh.K, sh.R,
+                       (const int*)d_slot.p, (double*)d_dx.p, (double*)d_sct.p, sh.M, sh.K, sh.R,
                        sh.groups, sh.group, row_in_shared);
     const int64_t chunks = (sh.M + kRowsChunk - 1) / kRowsChunk;
     for (int64_t s = 0; s < sh.S; ++s) {
@@ -479,9 +497,9 @@ void lora_shrink_device_adjoint(const AdjointCall& call) {
     }
     if (rad_stream_sync(stream) != 0) return;
 
-    std::vector<float> h_dx, h_sct;
-    if (!download_add_f32(&a_cot, d_dx.p, &h_dx, stream)) return;
-    if (!download_add_f32(&s_cot, d_sct.p, &h_sct, stream)) return;
+    std::vector<double> h_dx, h_sct;
+    if (!download_add_f64(&a_cot, d_dx.p, &h_dx, stream)) return;
+    if (!download_add_f64(&s_cot, d_sct.p, &h_sct, stream)) return;
 }
 
 // The expand's adjoint: the cotangent of t over the projection's columns, and dB over the tokens.

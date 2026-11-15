@@ -638,6 +638,49 @@ not exclude them -- filed as #142, measured negligible here (live in 1 of 78 rec
 to explain.** What they do not explain is the one finite leaf: 6.9e31 over its own truth, with no
 per-block curve behind it.
 
+### The first per-hop measurement at the container's own magnitudes
+
+No retained log had a single `R97_DUMP_DC` line, so every device row's verdict until now rested on
+synthetic fixtures with small values. One `R97_DUMP_DC=1` pass on the 512-token case produced **4018
+lines**, and the answer is unambiguous. `maxabs` is the largest magnitude the row left in that
+operand, and `3.40178e+38` is f32's own ceiling (`FLT_MAX` = 3.4028235e38):
+
+| position | op | operand | maxabs | non-finite | forward |
+|---|---|---|---|---|---|
+| **1150** | `lora_shrink` (blk.50 `ffn_gate_up`) | `h.s8` -- the **scale** cotangent | **3.40178e+38** | 10228 of 20480 | finite |
+| 1150 | `lora_shrink` | `h.q8` -- the codes' cotangent | 1.60425e+36 | 0 | finite |
+| 1146 | `lora_shrink` (blk.50 `ssm_out`) | `gdn_o.s8` | 3.35119e+38 | 163 | finite |
+| 1138 | `lora_expand` (blk.50 `ssm_inz`) | `gdn_in` | 7.24429e+37 | 5230196 of 8388608 | finite |
+
+**Every `fwd_at` is `-1`: the forward is finite at all of them.** So the non-finite is made in the
+backward, by the row, not inherited from a poisoned forward.
+
+**The first one is saturation, not a multiplier.** `lora_shrink`'s scale cotangent is a sum of
+`g * code` over a group's 128 columns, where `g` is the value-space cotangent (`~1e36` at block 50,
+seen here as `h.q8`) and `code` is the int8 code (up to 127). One product is already `1e38`; summing
+128 of them in f32 lands on the ceiling and stays there. The host row does this sum in `double`
+(`host/reference_lora.cpp:292`, `s_cot->value[ge] += g * a->value[e]`). **This is the fourth instance
+of the same class on this path, and it is the site of the first non-finite in the whole walk.**
+
+### The fix, and what it is and is not
+
+`src/adjoint/device/lora.hip`'s `shrink_dx_kernel` is now f64 end to end -- `g`'s reduction over `R`,
+the per-column product, the shared staging and the per-group sum, with only the store narrowing, and
+the two scratch buffers and the download widened to match. It builds clean on gfx1201
+(`atomicAdd(double*)` is available) and the GPU tier stays green.
+
+**What it fixes is the non-finiteness, and it is worth being exact about that.** The magnitude at
+block 50 is genuinely `1e36` where the leaf's true gradient is `9073.83` -- the walk is carrying a
+cotangent about `1e33` too large well before any reduction overflows. Removing the f32 ceiling removes
+a *symptom* that was masking the search: with the first non-finite pinned at a known range defect, the
+position of the next one stops being a diagnostic. With it widened, the first non-finite becomes a
+measurement again.
+
+**The table also says the amplification is real, large, and upstream of this row.** `lora_shrink`
+*received* `1e36` at position 1150 and *wrote* `1.6e36`; the row is not where the factor is made.
+What the pass does establish is that the device rows do see the container's real magnitudes, and that
+at those magnitudes f32 staging is not enough anywhere on this path.
+
 ### Defects and divergences found in passing
 
 - **A device/host divergence in the fused producers, filed as #142.** The device row folds the fused
