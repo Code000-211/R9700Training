@@ -1096,6 +1096,85 @@ contains the attention path at all. It is the same operation, done once per bloc
 it should add. That is a much tighter constraint than "the walk is wrong somewhere below the head",
 and it is where the next look goes: the per-block walk's own accumulation, not the layers' contents.
 
+### And the forward is flat too: the cotangent growth is spurious, measured from both sides
+
+`R97_DUMP_FWD=2` prints every scanned operand's forward probe (`src/forward.cpp:79-82`, `:209`).
+Run beside `R97_DUMP_DC=1` on the same case (`/tmp/r97-fwd.log`, 457 s, 4564 probes, 5851 cotangent
+rows), it gives the forward residual `h` at every `lora_expand` -- one pair per block, 128 probes:
+
+| | value |
+|---|---|
+| probes | 128 (two per block, all 64 blocks) |
+| smallest | 106 |
+| largest | 4704 |
+| span | **1.65 decades** |
+
+**The forward residual stream is essentially constant across the whole model**, drifting slowly and
+monotonically from ~130-1800 in block 0 to ~170-4700 in block 63. There is no layer in which it
+grows or shrinks by a factor of a thousand.
+
+That closes the argument. A leaf's gradient is its cotangent times its forward value, and both of the
+things that can be measured independently are flat:
+
+- **the FD's leaf gradients**: 1.4 to 17.8, 1.1 decades over twelve layers;
+- **the forward activations**: 106 to 4704, 1.65 decades over sixty-four blocks.
+
+**So the leaf gradient can only be flat if the cotangent is flat -- and the walk's cotangent climbs
+41 decades over thirteen blocks.** The 3.198 decades per block is not the forward's doing, not the
+objective's, and not a constant anywhere. It is the walk's own cotangent, multiplied where it should
+be added, once per block.
+
+### The whole chain, end to end
+
+The `lora_expand h` cotangent -- what the row left, which is the residual cotangent handed to the
+block below -- read across every block in one run:
+
+| position | maxabs | nonfinite | nonzero |
+|---|---|---|---|
+| 1456 | 1.31316e-07 | 0 | 2616320 |
+| 1448 | 7.24196e-06 | 0 | 2616320 |
+| 1428 | 9.23157e-04 | 0 | 2621440 |
+| 1420 | 1.3855e-02 | 0 | 2621440 |
+| 1407 | 0.980469 | 0 | 2621440 |
+| 1399 | 34 | 0 | 2621440 |
+| 1386 | 1360 | 0 | 2621440 |
+| 1378 | 35072 | 0 | 2621440 |
+| 1365 | 1.37626e+06 | 0 | 2621440 |
+| 1357 | 8.33618e+07 | 0 | 2621440 |
+| 1337 | 3.77487e+09 | 0 | 2621440 |
+| 1316 | 6.76887e+12 | 0 | 2621440 |
+| 1308 | 1.56131e+14 | 0 | 2621440 |
+| 1295 | 1.23145e+16 | 0 | 2621440 |
+| 1287 | 2.28558e+17 | 0 | 2621440 |
+| 1274 | 8.32265e+18 | 0 | 2621440 |
+| 1266 | 4.05828e+20 | 0 | 2621440 |
+| 1246 | 1.71924e+22 | 0 | 2621440 |
+| 1238 | 4.34458e+23 | 0 | 2621440 |
+| 1225 | 2.32718e+25 | 0 | 2621440 |
+| 1217 | 6.33477e+26 | 0 | 2621440 |
+| 1204 | 3.79119e+28 | 0 | 2621440 |
+| 1196 | 9.45786e+29 | 0 | 2621440 |
+| 1183 | 8.04958e+31 | 0 | 2621440 |
+| 1175 | 1.61245e+33 | 0 | 2621440 |
+| 1155 | 9.47594e+34 | 0 | 2621440 |
+| 1147 | **2.65846e+36** | 0 | 2621440 |
+| 1134 | 0 | **2621440** | 0 |
+| 13 | 0 | **2621440** | 0 |
+
+**Every value is finite and every element is non-zero down to position 1147. At 1134 the whole buffer
+is non-finite -- 2621440 of 2621440.** The transition straddles position 1143, which is the f32
+ceiling the report already named. So the chain is:
+
+1. the head hands the output norm **1.31316e-07** (`d_hout`, measured);
+2. **each block multiplies the residual cotangent by ~1000-2500x**, uniformly, 13 blocks over;
+3. after those 13 blocks it is **2.66e36**;
+4. two blocks later it passes f32's **3.4e38** and the whole buffer goes non-finite;
+5. every gradient below that point is non-finite, so `all_finite` is false.
+
+**The forward is flat and the FD's leaf gradients are flat, so steps 1 and 2 cannot both be right.**
+The cotangent growth is the walk's, and it is the whole of `all_finite false` -- there is no second,
+independent defect downstream. Fix the per-block gain and the overflow goes with it.
+
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
