@@ -1200,6 +1200,32 @@ taken at a point whose rows are not small, or the loss does not read the rows th
 (`scored` is 511 of 512). That is the next thing to measure, and it is measurable on the host tier
 without the container.
 
+**And the container's own architecture documents this scale, which is what makes it expected rather
+than suspicious.** `third_party/radiance/arch/common/rad_block_gdn.h:128-135` says, of the op right
+before this one:
+
+> The following gated RMS norm does not cancel it: the scan output is around 1e-6, so
+> mean(o^2) ~ 1e-12 is dominated by eps = 1e-6 and the norm reduces to a fixed division by
+> sqrt(eps).
+
+`gdn_chunk_scan`'s output really is at that magnitude -- its max is 0.42 but most of its 5120
+channels per row are far smaller, so the row's mean square sits near 1e-12 and `sc` is
+`1/sqrt(1e-12 + 1e-6) = 1000`. **So `sc ~ 1e3` is the designed behaviour of this block, and the
+~1.1e3 per-GDN-layer cotangent growth is that scale applied to a cotangent.** The forward agrees:
+`0.42 * 1000 = 420` against the 278 the norm's output shows.
+
+**The eps is the same on both sides, so it is not a source of the divergence.**
+`r4d_rad_gdn_gated_rmsnorm` reads `eps` from the record (`r4d_gdn_gated_rmsnorm_h128_bf16.hip:131`,
+`r4d_getf(a, "eps", 1e-6)`), the record gets it from the model's config
+(`rad_block_gdn.h:214`, `RAD_F64("eps", g.eps)`), and the trainer's adjoint and its twin both use the
+constant `kRmsEps = 1e-6` (`src/adjoint/device/gdn_prep.hip:74`,
+`src/adjoint/host/gdn_prep.cpp:102`) -- and the arch's own comment puts `g.eps` at 1e-6. **The one
+hazard this leaves is structural rather than active:** the FD test compares the twin against the
+adjoint, and both hardcode 1e-6, so a container whose config set `eps` to anything else would produce
+a wrong adjoint that this test could not see. On this container it is 1e-6 and the hazard does not
+bite -- but it is a place where the test's two sides share an assumption with each other and not with
+the model.
+
 ### The host walk is not an available arbiter on this container
 
 `R97_HOST_WALK_AB=1 R97_DUMP_DC=1` was run on the 512-token case to settle device-rows-versus-plumbing
