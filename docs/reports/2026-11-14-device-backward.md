@@ -746,6 +746,19 @@ walk, jumps above 1.2x per occurrence: `kv_store` 4/10 (40 %), `gated_had_quant_
 the ops rather than concentrated in one.** Naming it needs a per-op finite difference -- each op's own
 adjoint against its own central difference at the real magnitudes -- not a jump census.
 
+**And the existing per-op FD tests cannot see it, for a checkable reason.** `tests/gpu/` already has
+per-op finite-difference checks for every op on the `h` path -- `adjoint_lora`, `adjoint_quant`,
+`adjoint_linear`, `adjoint_elementwise`, `adjoint_gdn_prep`, `adjoint_gdn_scan`, `adjoint_gdn_kkt` --
+and they all pass. But they run at **`rows = 4, n = 128`** (`adjoint_quant.cpp:223`, and
+`codes_n = 6144` at `:342`) and at **`K = 300`** in three groups of 128, 128 and 44
+(`adjoint_lora.cpp:89`). The container's live rows are **5120 and 17408 wide over 512 or 4096 rows**.
+
+Three of the four defects this report has already landed are **width-dependent f32 row reductions**
+(`shrink_dx_kernel`'s 128-column group, `expand_dt_kernel`'s 17408-column sum, `rmsnorm_back_kernel`'s
+5120-term dot) -- every one of them found by a real-magnitude run and none of them reachable from a
+128-wide test. **The next probe is therefore the existing FD tests at the container's own widths**, not
+a new instrument.
+
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
