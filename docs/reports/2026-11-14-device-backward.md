@@ -886,6 +886,50 @@ refusal on a path the 4096 case does not take, absent from the earlier `all` run
 evaluations are cheap because `step_device.cpp:413` returns early on a null `grads`, so the oracle's
 five calls per block are forward-only.
 
+### The oracle as a ladder: the walk is already wrong at the LAST layer
+
+`R97_CENTRAL_BLKS` measures several blocks in one run (`/tmp/r97-bisect.log`, window 10:09-10:47, 2256 s,
+42 oracle evaluations). The control is live at every block (`params are live`), and the truth is
+well-behaved at every block -- so this is not an FD artefact:
+
+| block | leaf | walk's `grad` | FD `central_bf16` | \|walk/FD\| | decades |
+|---|---|---|---|---|---|
+| **63** (last) | `self_attn.q_proj.lora_A` | **0.00744629** | **948.917** | 7.85e-6 | **-5.11** |
+| 60 | `linear_attn.in_proj_qkv.lora_A` | **9.43718e+07** | **701.006** | 1.35e+05 | **+5.13** |
+| 55 | `self_attn.q_proj.lora_A` | -1.04482e+23 | 1351.07 | 7.73e+19 | +19.89 |
+| 51 | `self_attn.q_proj.lora_A` | 6.59422e+35 | -9073.83 | 7.27e+31 | +31.86 |
+| 45 | `linear_attn.in_proj_qkv.lora_A` | **-nan** | 2394.96 | -- | -- |
+| 40 | `linear_attn.in_proj_qkv.lora_A` | **-nan** | 876.065 | -- | -- |
+| 20 | `linear_attn.in_proj_qkv.lora_A` | **-nan** | 1262.9 | -- | -- |
+| 0 | `linear_attn.in_proj_qkv.lora_A` | **-nan** | -74358.9 | -- | -- |
+
+**The truth is O(1e2..1e4) at every one of the eight blocks** -- 949, 701, 1351, -9074, 2395, 876, 1263,
+-74359. That is the strongest confirmation yet that the gradient is a well-behaved number at every
+depth, and that the walk's 6.28e35 is not a range artefact of a genuinely huge gradient.
+
+**And the walk is wrong at block 63, the first layer it touches.** There is no compounding above it:
+`self_attn.q_proj.lora_A` of the last decoder layer reads **0.00744629** where the loss's own central
+difference is **948.917** -- five decades too *small*. Whatever the per-layer amplification is, it is
+not the whole story, and the earlier framing ("the walk grows ~1.6e3 per layer where the truth grows
+1.24x") cannot account for a five-decade error with zero layers in between.
+
+**The two families are off in opposite directions, by almost exactly the same factor.** Block 63 is a
+full-attention layer and reads **1.27e5 too small**; block 60 is a gated-delta layer and reads
+**1.35e5 too big**. The container is a 3:1 hybrid -- 48 linear-attention plus 16 full-attention layers
+-- so the two readings are one leaf of each family, and their errors are equal and opposite to within
+6%: **-5.11 and +5.13 decades**. That is not a scale factor, and it is not a per-layer accumulation:
+it is a property that differs between the two attention families.
+
+**Below block 60 the error compounds at ~934x per layer** (60 -> 51 is 9 layers, 5.40e26, i.e. 10^26.73
+over 9), which is the same order as the ~1.55e3 per layer the growth curve gave over 22.78 records.
+So both statements hold: **a family-dependent error of ~±5 decades at the top, compounding at ~1e3 per
+layer as it descends.** The compounding was measured before; the ±5 decades at the top is new, and it
+is the one that has to be explained first, because it needs no accumulation to appear.
+
+**The next probe is therefore narrow**: two leaves of the *same* block, one from `self_attn` and one
+from `linear_attn`. If they are off by equal and opposite factors there too, the defect is a
+per-family mis-assignment of the adapter gradient rather than anything in the backward's arithmetic.
+
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
