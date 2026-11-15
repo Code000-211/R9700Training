@@ -1088,9 +1088,15 @@ touches it (`/tmp/r97-fwd.log`):
 | 1448 | `lora_expand` | `h` | 7.242e-06 |
 
 **The FFN sublayer's adjoint adds a contribution ~54x larger than the cotangent it was handed.** The
-residual cotangent enters the FFN path at 1.3132e-07 and the path returns 7.242e-06, so the sublayer's
-own `d_h` is ~7.11e-06 -- 54x the incoming residual, where a well-behaved sublayer returns something
-of the same order.
+residual cotangent enters the FFN path at 1.3132e-07 and the path returns 7.242e-06, so the
+sublayer's own `d_h` is ~7.11e-06.
+
+**That ratio is not by itself evidence of a defect, and should not be read as one.** In a residual
+network `d_h_in = d_h_out + d_sublayer`, and a sublayer's contribution may legitimately be much larger
+than the residual cotangent it joins -- ordinary for a block whose Jacobian is not small. What makes
+it suspect here is only the external comparison: the FD says the *leaf gradients* are flat across
+twelve layers, so the walk's sublayer contributions cannot be growing 3.2 decades per block. The 54x
+is where to look, not a proof of anything.
 
 **The gain concentrates at the `*_had_quant_i8g` rows**, which is the same family the `gemm_nt_q` fix
 (`linear.hip:648-657`) addressed, so the first question is whether this row applies the same
