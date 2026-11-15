@@ -1050,6 +1050,16 @@ not close the same way -- 274 finite-non-zero, 0 zero, 126 non-finite, but 331 m
 non-finite `B` leaves moved and 69 did not. That asymmetry is unexamined and should not be read as
 either result until it is.
 
+**A separate defect worth its own line: the case is not run-to-run deterministic.** Four runs of the
+512-token case with the same seed and the same build give `a_changed` 374, 374, 375, 375 and
+`b_changed` 375, 375, 374, 377, while `loss -> loss_after` is bit-identical across all four
+(7371.59 -> 6347.88, -1023.71). The earlier `512d`/`512e`/`512f` runs likewise named different first
+non-finite ops, and the 4096 re-run gives `b_changed` 331 against the earlier run's 330 at the same
+`loss`. **A bit-identical loss with a differing changed-leaf count says the non-finite values differ
+run to run** -- which is what a NaN/Inf entering a sum whose order is not fixed would look like, and
+it is not the same question as the amplification. It is recorded as a separate defect, not folded
+into the factor.
+
 **The acceptance criterion is still not met**, and `all_finite` is the check that decides it: the
 adapter gradient exists and is the right shape, but it is non-finite at block 0. That is the same
 defect the 512-token case localised to a ~1.9e31 excess growth over the backward walk, now shown to
