@@ -1316,6 +1316,43 @@ below: a rate that is the same in every block, of either type, is a property of 
 plumbing, not of any sublayer. **An earlier reading called this "the GDN norm accounts for most of the
 growth", and before that "a factor of 10 gap, spread across several rows"; both are withdrawn.**
 
+### The quantiser's scale is not the cause, and the flat-forward fact is confirmed independently
+
+The remaining untested suspect was `src/adjoint/device/quant.hip:199` -- `d[tid] = live ?
+cot[base+tid] / (float)s : 0.0f;` divides the codes' cotangent by the group scale **in f32**. The
+serving quantiser stores `m / 127` for any `m > 0` and never floors it, so a group whose rotated amax
+is tiny stores a tiny scale and the quotient can overflow to Inf in one step, which then enters the
+inverse rotation and the elementwise backprop as a whole-row event. `R97_DUMP_QUANT=1`
+(`quant.hip:359-377`) reports the smallest scale, where it sits, and how many are below 1e-32.
+
+**It ran on a 512-token step and the answer is no.** Across 34 reports the smallest scale anywhere in
+the walk is **0.00396077**, the five smallest are 0.00396077 / 0.00683458 / 0.0074691 / 0.0109611 /
+0.0125276, and **`below1e-32=0` at every single report.** A quotient of the largest cotangent seen
+(1.6e25) by the smallest scale (0.0040) is 4.0e27, still eight orders inside f32's 3.4e38 ceiling.
+**The `cot / s` divide does not overflow and is not the defect.**
+
+**But the probe recorded the forward and the cotangent of every op it touched, and it confirms the
+decisive fact a second way.** For the residual norm `rmsnorm_had_quant_i8g`, in walk order, the
+forward `y` and the incoming cotangent `cot` are:
+
+| report | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+|---|---|---|---|---|---|---|---|---|---|
+| `cot` | 0.435344 | 4.4951 | 2919.78 | 4634.72 | 3.508e+06 | 5.502e+06 | 3.771e+09 | 5.833e+09 | 3.572e+12 |
+| `y` | 2.573e+06 | 2.375e+06 | 2.766e+06 | 2.391e+06 | 2.867e+06 | 2.387e+06 | 2.808e+06 | 2.549e+06 | 2.787e+06 |
+
+| report | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 |
+|---|---|---|---|---|---|---|---|---|
+| `cot` | 1.951e+13 | 1.362e+16 | 2.800e+16 | 1.794e+19 | 3.101e+19 | 1.771e+22 | 2.991e+22 | **1.590e+25** |
+| `y` | 2.387e+06 | 2.800e+06 | 2.430e+06 | 2.681e+06 | 2.429e+06 | 2.549e+06 | 2.404e+06 | **2.453e+06** |
+
+**The forward is flat across all seventeen reports -- 2.375e+06 to 2.867e+06, a factor of 1.21, or
++-0.04 decades per report -- while the cotangent runs 0.435344 to 1.590e+25, 25.6 decades.** Taking
+every second report (the per-block sequence) the cotangent ratios are **6707, 1202, 1075, 947, 3812,
+1317, 987, 897 -- 2.95 to 3.58 decades per block, mean 3.20**, the same rate the `R97_DUMP_DC` and
+`R97_DUMP_FWD` pair gave. **A forward that is flat and a backward that grows 3.2 decades per block,
+measured by two independent instruments, is the defect stated as plainly as this container can state
+it.**
+
 ### Every row that could carry the growth is individually FD-verified, so the defect is compositional
 
 Every row the ranking table named -- the one genuine within-block amplifier and the three whose steps
