@@ -794,33 +794,54 @@ neither dump, and `/tmp/r97-fwd-hunt.log` gives `36` forward and `0` snapshot --
 which is exactly why the pair proves nothing. It also confirms the old build printed no `pos` (every
 `snap-only` key has `pos=None`).
 
-**The probe was run, and it refutes the snapshot hypothesis.** `/tmp/r97-snap-probe.log`, window
-09:08:42-09:16:52 (490 s), the 512-token case with `R97_DUMP_FWD=2 R97_DUMP_SNAP=2` in one process:
-**4558** `DUMPFWD` probe lines and **6775** `DUMPSNAP` lines, with **2274** `(op, pos, buffer)` keys
-present in both. Of the snapshot lines that have a forward counterpart, **2530 agree with a forward
-`maxabs` for the same key and 0 agree with none.** The saved forward is not stale and not
-mismatched: the walk is handed exactly the values the forward computed.
+**The probe was run, and it finds the defect -- after a first reading of it that was wrong and is
+retracted here.**
 
-**Two things had to be got right to read that, and the first attempt got both wrong.** The pointer is
-**not** comparable -- `DUMPFWD` prints the device address (`0x7448...`, the card's space) and
-`DUMPSNAP` the host address of the copied-back bytes (`0x64d4...`), so every pair "differs" and means
-nothing. And the forward runs **two or three times per step** (the step's own forward, the pre-step
-reference, the post-step forward), so one key has several `DUMPFWD` lines and a snapshot is only
-comparable against the pass that produced it. A naive pairwise join reported **one** disagreement --
-`lora_shrink`@3, `lora.t.r32.lane0`, snapshot `maxabs` 28.6302 against a forward `maxabs` 0 -- and that
-pairing was an artefact: the key has three forward lines, two reading 28.6302 and the third, the
-post-step pass over a rank-32 lane this rank-16 model never uses, reading 0. The test is set
-membership, not pairwise equality. With that, **0 mismatches**.
+`/tmp/r97-snap-probe.log`, window 09:08:42-09:16:52 (490 s), the 512-token case with
+`R97_DUMP_FWD=2 R97_DUMP_SNAP=2` in one process: **4558** `DUMPFWD` probe lines, **6775** `DUMPSNAP`
+lines, **2274** `(op, pos, buffer)` keys present in both. A join over those keys reports **2530**
+snapshot lines whose `maxabs` equals a forward `maxabs` for the same key and **0** that equal none.
 
-**So the composition hypothesis as stated is dead, and that is the useful part.** The argument was: if
-every per-op adjoint is FD-correct at the container's real shapes, and every accumulation is correct,
-and the snapshot is the forward's own value, then the walk is the exact gradient of the true function
--- and it is not. Two of those three premises have now been checked directly. **The one that has not
-is the first: the FD tests run at the right *shapes* (`K=5120`, `N=12288`, `K=17408`, `M=4096`, hidden
-17408) but on small synthetic *values*.** A shape-correct, magnitude-dependent defect -- an f32
-intermediate that overflows inside a kernel, or a `1/s` that underflows -- is exactly what an FD test
-at O(1) values cannot see, and it is the only premise left standing. **That is the next probe: the
-same per-op FD at the container's real magnitudes, not just its real shapes.**
+**That join is circular and the "0 mismatches" means nothing.** `dump_fwd_scan` skips every operand
+the op did not write (`src/forward.cpp:142`, `if (!o.written) continue;`) and reads the buffer on the
+op's own stream at the issue, so for a *written* key both instruments are reading the same buffer's
+post-op contents at nearly the same moment. Agreement there is what the construction guarantees, not
+a measurement. **The read operands -- the values the walk actually consumes as inputs -- have no
+`DUMPFWD` line at all**, so the join says nothing about them, and those are the only ones whose
+fidelity matters.
+
+**The read operands can be checked against the writer's line instead, and the same log shows the
+defect immediately.** In forward order (ascending position) the gated-delta layer runs
+`gdn_chunk_scan` then `gdn_gated_rmsnorm`:
+
+| | op | pos | `gdn_o` (`w.o`) | pointer |
+|---|---|---|---|---|
+| writer | `gdn_chunk_scan` | 1415 | **0.423828** | `0x64d46a82fb30` |
+| reader | `gdn_gated_rmsnorm` | 1416 | **278** | `0x64d46a82fb30` |
+
+**The reader's operand is `w.o` at the same pointer, and its snapshot holds 278 -- which is
+`gdn_gated_rmsnorm`'s own output** (`DUMPFWD` at pos 1416, operand 3, `gdn_o`, `maxabs=278`). The op
+is **in-place**: `rad_block_gdn.h:216` declares it as `{w.o, w.z} -> {w.o}`, reading the `w.o` that
+`gdn_chunk_scan` produced and overwriting it. **So the walk is handed the value the op wrote, not the
+value the op read: 278 against 0.423828, a factor of 656 on one operand of every gated-delta layer.**
+
+**That value is confirmed never to reach the walk as an input.** Across all 192 `gdn_o` snapshot lines
+in the log, `0.423828` appears exactly once -- as `gdn_chunk_scan`'s own output at pos 1415 -- and at
+no other position or pointer. The `gdn_gated_rmsnorm` snapshot for that buffer is 278 at every layer
+(pos 9, 30, 51, ... 1416), so the input the op consumed is absent from the tape.
+
+**And the size is right.** 656x is **2.82 decades**, against the measured per-layer factor of ~1.6e3
+(3.19 decades, one buffer through one op across adjacent layers). One in-place operand per layer,
+snapshotted post-op, is the right order of magnitude and the right shape -- a small systematic
+difference in the saved operands, applied uniformly, compounded per layer. **This is the composition
+the earlier sections argued for; the probe found it, and only the first join's reading of it was
+wrong.**
+
+**Two things also had to be got right to read the log at all**, and both stand. The pointer is **not**
+comparable across the two instruments: `DUMPFWD` prints the device address (`0x7448...`) and
+`DUMPSNAP` the host address of the copied-back bytes (`0x64d4...`). And the forward runs **two or
+three times per step** (the step's own forward, the pre-step reference, the post-step forward), so one
+key has several `DUMPFWD` lines and a snapshot is only comparable against the pass that produced it.
 
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
