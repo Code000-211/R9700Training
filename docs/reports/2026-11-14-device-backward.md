@@ -989,14 +989,49 @@ both moves the parameter and defeats `part != 0.0`.
 `n_a_finite_nonzero`/`n_b_finite_nonzero` -- the count of leaves whose sum of squares is finite *and*
 non-zero, so `n_*_finite_nonzero + n_zero_* == n_*` holds iff no leaf gradient went non-finite. On the
 512-token case it reads **82 of 400** (`A` and `B` alike, with `n_zero_a == n_zero_b == 0`, so 318 of
-each factor are non-finite). **The 4096 record predates the field**, so its own value is still
-unmeasured; the qualitative answer there is already known to be "substantially fewer than 400", since
-`first_nonzero_a_finite` is false.
+each factor are non-finite).
 
-**One oddity worth naming on its own.** 70 of the 400 `B` leaves have a non-zero gradient
-(`n_zero_b == 0`) yet their value did not move under the step. No AdamW update should leave a
-parameter with a non-zero gradient bit-identical, so this is unexplained; it is not a zero-gradient
-result and should not be read as one.
+**The 4096 case has now been re-run with the field** (`/tmp/r97-dstep-device_step_seq4096-sR5Lxx`,
+2026-11-15 09:00, `R97_TEST_ONLY=device_step_seq4096`, 2996.85 s: forward 103.93, backward 2883.52,
+head 6.32; `vram_peak` 28.01 GiB):
+
+| field | value |
+|---|---|
+| `n_a_finite_nonzero` | **0 of 400** |
+| `n_b_finite_nonzero` | **274 of 400** |
+| `n_zero_a` / `n_zero_b` | 273 / 0 |
+| `a_changed` / `b_changed` | 127 / 331 |
+| `all_finite` | false |
+| `descended` | **false** (loss 34682.089 -> 50870.029, **+16187.9**) |
+
+**`273 + 0 + 127 = 400` exactly**: every `A` leaf is either exactly zero (273) or non-finite (127), and
+**not one has a finite non-zero gradient at the issue's own size**. That is the cleanest statement of the
+`A` side yet, and it also explains `a_changed == 127` -- the 127 that moved are precisely the 127 that
+went non-finite, since a non-finite gradient both moves the parameter and defeats `part != 0.0`.
+
+**The `B` side is the opposite shape and is the better diagnostic**: 274 of 400 finite and non-zero,
+none exactly zero. So the 4096 case is not "everything is poisoned" -- it is a walk that stays usable
+for most of `B` and has saturated completely on `A`.
+
+**And the case now fails its own descent check.** `device_step_seq4096: threw: check failed: descended`,
+`1 tests, 1 failed` -- the loss rises by 16187.9 after one AdamW step, where the 512-token case's
+descent held. The first non-finite is `gdn_chunk_scan`'s operand `gdn_k`[1] at position 463, from the
+row. So on this case the acceptance failures are three, not one: `all_finite`, `a_changed == 0`, and
+`descended`.
+
+**One oddity worth naming on its own, and it holds at both sizes.** On the 512-token case 70 of the 400
+`B` leaves have a non-zero gradient (`n_zero_b == 0`) yet their value did not move under the step; on
+the 4096 case the same reading is 69 (`b_changed` 331 of 400 with `n_zero_b == 0`). An AdamW update
+should leave no parameter with a non-zero gradient bit-identical, so this is unexplained; it is not a
+zero-gradient result and should not be read as one. **It is not an underflow threshold either**: at
+step 1 with bias correction AdamW's update is `lr * m_hat / (sqrt(v_hat) + eps) = lr * 1 = 1e-3`,
+against a parameter near 0.0136 whose ulp is 9.3e-10 -- eight orders of magnitude apart.
+
+**The `A` side of the 4096 case is the one that closes exactly**, and it is worth stating on its own:
+273 exactly-zero + 127 non-finite + 0 finite-non-zero = 400, and `a_changed == 127`. The `B` side does
+not close the same way -- 274 finite-non-zero, 0 zero, 126 non-finite, but 331 moved -- so 57 of the
+non-finite `B` leaves moved and 69 did not. That asymmetry is unexamined and should not be read as
+either result until it is.
 
 **The acceptance criterion is still not met**, and `all_finite` is the check that decides it: the
 adapter gradient exists and is the right shape, but it is non-finite at block 0. That is the same
