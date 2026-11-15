@@ -1,3 +1,38 @@
+## The gate: the growth reproduces on the host walk (Gate A)
+
+`R97_HOST_WALK_AB=2 R97_WALK_BLOCKS=4 R97_DUMP_DC=1`, layers 60..63, 535.5 s:
+
+| blocks walked | host walk gradient norm |
+|---|---|
+| 1 (layer 63) | 51.349 |
+| 4 (layers 60..63) | **4.37994e+10** |
+
+The `h` cotangent at the fused norms, in walk order:
+
+| pos | op | maxabs |
+|---|---|---|
+| 1457 | add | 1.3159e-07 |
+| 1449 | rmsnorm_had_quant_i8g | 7.25586e-06 |
+| 1429 | rmsnorm_had_quant_i8g | 9.61356e-04 |
+| 1421 | rmsnorm_had_quant_i8g | 1.35151e-02 |
+| 1408 | rmsnorm_had_quant_i8g | 0.897298 |
+| 1400 | rmsnorm_had_quant_i8g | 30.0715 |
+| 1387 | rmsnorm_had_quant_i8g | 1356.55 |
+| 1379 | rmsnorm_had_quant_i8g | 31279.9 |
+| 1366 | rmsnorm_had_quant_i8g | 1.34996e+06 |
+
+Consecutive ratios: 132.5, 14.1, 66.4, 33.5, 45.1, 23.1, 43.2 -- geometric mean **40.8x, 1.61
+decades per boundary**, against the device walk's 40.1x and 1.60.
+
+**The host walk grows at the same rate as the device walk.** The rows are f64 host code
+(`elementwise.cpp`, `quant.cpp`, `linear.cpp`), so the device rows are exonerated: the defect is in
+what both walks share -- the composition (`src/backward.cpp`), the snapshot store, or the tape. This
+is the plan's Gate A, and Phase 2A is the next step: `R97_DUMP_VER=1`, the per-version dump, to name
+the first record whose effective Jacobian is not its row's own.
+
+**Note the residual `x` path stays flat** (1.3159e-07 at the block 63 `add`) while the `h` path grows,
+so whatever the composition does, it does to one branch and not the other.
+
 # The device backward's `h` cotangent grows 3.2 decades per block
 
 Issue #145. The device step's backward grows the residual stream's cotangent by a factor of
