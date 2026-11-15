@@ -1296,8 +1296,10 @@ withdrawn below.
 **A second measurement agrees.** Taking the maximum `h` cotangent over *all* ops in a block rather than
 the one fixed op gives 9.23e-4, 0.9805, 1360, 1.376e+06, 3.775e+09, 6.769e+12, ... -- the same series
 two to three orders of magnitude higher, because a different op in the block carries the larger value,
-and the same 3.0 to 3.4 decades per block (3.026, 3.142, 3.005, **3.438**, 3.254, 3.260, ...). **Both
-measurements put block 59 among the fastest and the gated-delta blocks in the middle of the range.**
+and the same rate (3.026, 3.142, 3.005, **3.438**, 3.254, 3.260, 2.830, ...). **Both measurements put
+block 59 among the fastest and the gated-delta blocks in the middle of the range.** The span is 1.448
+to 3.438; the 2.830 at block 56 and the 1.448 at block 50, the walk's last block, are the two values
+outside 3.0-3.4.
 
 **That withdraws "the GDN path accounts for 87%", which was circular.** It multiplied the `gdn_o`
 per-block rate (3.217) by the number of GDN blocks and divided by the walk's own per-block rate
@@ -1325,15 +1327,25 @@ is tiny stores a tiny scale and the quotient can overflow to Inf in one step, wh
 inverse rotation and the elementwise backprop as a whole-row event. `R97_DUMP_QUANT=1`
 (`quant.hip:359-377`) reports the smallest scale, where it sits, and how many are below 1e-32.
 
-**It ran on a 512-token step and the answer is no.** Across 34 reports the smallest scale anywhere in
-the walk is **0.00396077**, the five smallest are 0.00396077 / 0.00683458 / 0.0074691 / 0.0109611 /
-0.0125276, and **`below1e-32=0` at every single report.** A quotient of the largest cotangent seen
-(1.6e25) by the smallest scale (0.0040) is 4.0e27, still eight orders inside f32's 3.4e38 ceiling.
-**The `cot / s` divide does not overflow and is not the defect.**
+**It ran on a 512-token step and the scale is never extreme.** The complete log holds **256 reports**;
+the smallest scale anywhere in the walk is **5.95831e-05** (the five smallest are 5.95831e-05 /
+6.37644e-05 / 8.98981e-05 / 0.000143236 / 0.000148421), and **`below1e-32=0` at every single
+report.** So no group stores a scale near the f32 floor and the divide has no reason to overflow *on
+its own*.
 
-**But the probe recorded the forward and the cotangent of every op it touched, and it confirms the
-decisive fact a second way.** For the residual norm `rmsnorm_had_quant_i8g`, in walk order, the
-forward `y` and the incoming cotangent `cot` are:
+**But it does overflow at the far end of the walk, and that is the NaN mechanism.** The largest
+cotangent the probe sees is **4.27042e+41**, and 4.27e41 / 5.96e-05 = **7.2e45** -- past f32's 3.4e38
+ceiling by seven orders. The walk goes non-finite at **report 55 of 256**; the last finite cotangent
+is 4.27042e+41 at report 54 and **201 of the 256 reports are NaN**, while the forward `y` stays finite
+throughout (2.0e6 to 2.9e6). **So the divide is a consequence of the growth, not the cause of it: once
+the cotangent has grown past ~2e43 the quotient cannot be represented, and everything downstream is
+NaN.** The cause is still the per-block growth below.
+
+**The probe also records the forward and the cotangent of every op it touches, and it confirms the
+rate a second way.** Two cautions on reading it: the printed `cot` and `y` are **sums of absolute
+values** over the op's output buffer (`quant.hip:718-720`), not `maxabs` like `R97_DUMP_DC` and
+`R97_DUMP_FWD`, so the magnitudes are not directly comparable to those tables -- only the *rate* is.
+For the residual norm `rmsnorm_had_quant_i8g`, in walk order:
 
 | report | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
 |---|---|---|---|---|---|---|---|---|---|
@@ -1350,8 +1362,9 @@ forward `y` and the incoming cotangent `cot` are:
 every second report (the per-block sequence) the cotangent ratios are **6707, 1202, 1075, 947, 3812,
 1317, 987, 897 -- 2.95 to 3.58 decades per block, mean 3.20**, the same rate the `R97_DUMP_DC` and
 `R97_DUMP_FWD` pair gave. **A forward that is flat and a backward that grows 3.2 decades per block,
-measured by two independent instruments, is the defect stated as plainly as this container can state
-it.**
+measured by two instruments that share no code path, is the defect stated as plainly as this
+container can state it.**
+***
 
 ### Every row that could carry the growth is individually FD-verified, so the defect is compositional
 
