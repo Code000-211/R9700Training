@@ -497,6 +497,11 @@ void card_case(const char* test, int64_t n, bool probe) {
     // The per-operand non-zero counts on the 288 lora rows are what settles the mechanism.
     std::string first_nonzero_a_leaf, first_nonzero_b_leaf;
     bool first_nonzero_a_finite = true, first_nonzero_b_finite = true;
+    // The count the structural question actually needs. `part != 0.0` is true for NaN, so a poisoned
+    // leaf reads as "moved" in `a_all_zero`/`a_changed`; a *finite* non-zero `part` is the only
+    // reading that says a live cotangent reached the module. `n_zero_a` is its complement on the
+    // zero side only -- `n_a_finite_nonzero + n_zero_a == n_a` holds exactly when the run is finite.
+    int64_t n_a_finite_nonzero = 0, n_b_finite_nonzero = 0;
     int64_t n_zero_a = 0, n_zero_b = 0;
     double grad_norm_sq   = 0.0;
     for (const r97::Param& p : params) {
@@ -527,12 +532,14 @@ void card_case(const char* test, int64_t n, bool probe) {
                 if (first_zero_a_leaf.empty()) first_zero_a_leaf = p.name;
             }
             if (part != 0.0) a_all_zero = false;
+            if (std::isfinite(part) && part != 0.0) ++n_a_finite_nonzero;
             if (part != 0.0 && first_nonzero_a_leaf.empty()) {
                 first_nonzero_a_leaf = p.name;
                 for (size_t i = 0; i < g->value.size(); ++i)
                     if (!std::isfinite(g->value[i])) first_nonzero_a_finite = false;
             }
         }
+        if (is_b && std::isfinite(part) && part != 0.0) ++n_b_finite_nonzero;
         if (is_b && part == 0.0) {
             b_all_nonzero = false;
             ++n_zero_b;
@@ -798,6 +805,12 @@ void card_case(const char* test, int64_t n, bool probe) {
     j["first_zero_b_leaf"]    = first_zero_b_leaf;
     j["n_zero_a"]             = n_zero_a;
     j["n_zero_b"]             = n_zero_b;
+    // The count that reads the structural contract independently of the range defect: `part != 0.0`
+    // is true for NaN, so `a_all_zero`/`a_changed` cannot distinguish "a cotangent reached A" from
+    // "A was poisoned". `n_*_finite_nonzero + n_zero_* == n_*` iff the run produced no non-finite
+    // leaf gradient at all.
+    j["n_a_finite_nonzero"]   = n_a_finite_nonzero;
+    j["n_b_finite_nonzero"]   = n_b_finite_nonzero;
     j["grad_norm"]            = std::sqrt(grad_norm_sq);
     j["opt_applied"]          = applied;
     j["updates_done"]         = opt.updates_done();
