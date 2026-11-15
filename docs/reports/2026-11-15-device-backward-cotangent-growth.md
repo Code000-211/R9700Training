@@ -764,12 +764,22 @@ an in-place read its post-write value, **the row computes its derivative at the 
 `ss`, `s` and both terms of the rule are taken from the op's own output instead of its input. The
 1429 finding is therefore a backward defect, not a broken instrument.
 
-Which cotangent it lands on is worth stating precisely rather than assuming. The record's operand 0 is
-the branch activation `h` (read) and operand 5 is `h` again (written in place), so `call.dc->at(0)`
--- the row's `dx` -- is the cotangent of `h`, which is the quantity whose growth this ticket tracks.
-That would put the defect directly on the measured path rather than only on the residual. It has not
-been confirmed by a control that swaps the snapshot, so it is stated here as the reading of the record
-and not as a measurement.
+Which cotangent it lands on resolves from three facts that agree:
+
+1. the record's operand 0 is the branch activation `h` (read), and operand 5 is `h` again (written in
+   place) -- `[0] h read [512,5120]`, `[5] h written in_place`;
+2. the adjoint writes its input's cotangent to `call.dc->at(0)`, so the row's `dx` is operand 0's
+   cotangent;
+3. `DUMPDC` names that slot `h` and measures it at `9.23157e-04` at 1429.
+
+So the row's `dx` is `dc[h]`, the quantity whose growth this ticket tracks, and the 1429 defect sits on
+the measured path rather than only on the residual. That is a convergence of the record's layout, the
+adjoint's code and the instrument's own label -- **not** a swap control, which would be the direct
+proof and has not been run.
+
+`eps` is settled the same way: `NORMTWIN` prints `eps=1e-06` and `docs/OPS-qwen35-device.md` declares
+`eps=1e-06` on every `rmsnorm_had_quant_i8g` row, so the twin's value matches the declaration whether
+or not the record carries the param (it is read as `param_num(rec, "eps", 1e-6)`).
 
 The natural mitigation is a refusal, in keeping with the rest of this path (`elementwise.cpp:533-540`
 already refuses a gain the tape could not give values for): when an in-place read's snapshot is
