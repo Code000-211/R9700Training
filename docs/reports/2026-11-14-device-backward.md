@@ -722,19 +722,29 @@ chain, and the short ones are almost nothing but it:
 | 13 records | the same, then `gdn_gated_rmsnorm -> gdn_chunk_scan -> gdn_kkt_solve -> gdn_conv_prep` |
 | 20 records | the same, then `rope -> rmsnorm` (the full-attention layer) |
 
-**The shortest segments are the fastest per record, and they are the ones that are nearly only the
-`lora_expand -> lora_shrink` core**: 8 records at 1.51x each is 15.0x for the segment, while 20 records
-at 1.23x is 127x -- so adding twelve records of gdn or attention work contributes only 127/15 = 8.5x.
-The core carries the bulk of the per-record factor.
+It is tempting to read the higher per-record rate of the short segments as the shared core carrying the
+factor. **It does not survive the arithmetic.** Per 91-record period there are four 8-record segments,
+three 13-record and one 20-record:
 
-**`lora_shrink` is therefore the prime suspect, and the independent per-record sequence agrees.** In the
-`R97_DUMP_POS=all` walk, the op with by far the most jumps above 1.2x is `lora_shrink` -- **57 of 391
-ratios**, against 26 for `gated_had_quant_i8g`, 26 for `rmsnorm_had_quant_i8g`, 24 for `gdn_conv_prep`
-and 13 for `lora_expand`. It is also one of the two rows this report already widened to f64 because its
-128-term sum was crossing `3.4e38`.
+| segment | decades per period | share of decades | share of records |
+|---|---|---|---|
+| 8 records | 5.718 | **44.7 %** | 35 % |
+| 13 records | 5.277 | **41.3 %** | 43 % |
+| 20 records | 1.790 | **14.0 %** | 22 % |
 
-**This is a suspect, not a verdict.** It needs the per-op finite difference -- `lora_shrink`'s own
-adjoint against its own central difference at the real magnitudes -- which is the probe below.
+**12.785 decades per period**, and the core's 44.7 % over 35 % of the records is close to proportional.
+The per-segment products are also not what a first reading suggests: `1.51^8` is **27.0** and `1.23^20`
+is **62.8**, so a single long segment still outgrows a single short one.
+
+**Normalising the jump counts by occurrences kills the op-level suspect too.** In the `R97_DUMP_POS=all`
+walk, jumps above 1.2x per occurrence: `kv_store` 4/10 (40 %), `gated_had_quant_i8g` 26/78 (33 %),
+`lora_shrink` 57/177 (32 %), `gdn_chunk_scan` 9/29 (31 %), `gate_had_quant_i8g` 4/20 (20 %),
+`had_quant_act_i8g` 10/58 (17 %), `gdn_conv_prep` 24/145 (17 %), `rmsnorm_had_quant_i8g` 26/186 (14 %),
+`lora_expand` 13/177 (7 %). **The top four are 40/33/32/31 per cent -- clustered, with no standout.**
+
+**So both attempts to name a single op fail, and that is itself the finding: the ~1.38x is smeared across
+the ops rather than concentrated in one.** Naming it needs a per-op finite difference -- each op's own
+adjoint against its own central difference at the real magnitudes -- not a jump census.
 
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
