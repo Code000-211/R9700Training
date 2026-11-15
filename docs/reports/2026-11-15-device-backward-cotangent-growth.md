@@ -788,6 +788,30 @@ names it instead of returning a gradient taken at the output. It is not applied 
 make the host walk refuse at 1429, which is a change to what the A/B can run and is the maintainer's
 call.
 
+### The norm's twin is a rotation apart, not a scale apart
+
+`DEQORACLE` now reports the twin's activation against the kernel's by magnitude, per row and in sum:
+
+| pos | op | `row_ratio` | `sum_ratio` | `deq_rel` |
+|---|---|---|---|---|
+| 1453 | `gated_had_quant_i8g` | [0.9937, 0.9988] | 0.9966 | 0.005 |
+| 1449 | `rmsnorm_had_quant_i8g` | [0.9894, 1.0337] | **1.0080** | **1.364** |
+| 1429 | `rmsnorm_had_quant_i8g` | [1.0063, 1.0140] | **1.0102** | **0.628** |
+
+Every row's magnitude agrees to 1-3% and the row sums to 1%, while the elementwise maximum differs by
+63-136%. **The two tensors carry the same values in a different arrangement.** That eliminates every
+scalar explanation at once -- a scale, a gain, `wadd`, `eps` -- and it is what a rotation applied
+differently on the two sides looks like.
+
+The gated producers agree elementwise to 0.5%, so their rotation matches. The norm's does not. The
+single extra rotation `DUMPROT` applies does **not** fix it (99.4% of codes still differ), so the
+difference is not "rotated versus not rotated" but **the rotation's width or its placement**: the twin
+rotates over `group = n / scale.shape[1] = 128`, and if the kernel rotates over a different span the
+two produce the same magnitudes and different elements -- exactly what is measured.
+
+That is the next test, and it is cheap: rotate the twin's activation over a range of candidate widths
+and see which one collapses `deq_rel` to the gated producers' 0.005.
+
 ## The quotient's guard## The quotient's guard
 
 The mask pass divides each code's cotangent by its group scale, and the quotient is exact only

@@ -1153,13 +1153,43 @@ void fused_adjoint(const AdjointCall& call, Part part) {
                         if (c > in_vs_wr) in_vs_wr = c;
                     }
                 }
+                // The twin's activation against the kernel's by magnitude: if the twin's is a scalar
+                // multiple of the kernel's, `ymax/deqmax` is that multiple and the difference is one
+                // factor (a scale or a gain), not a different tensor.
+                double ymax = 0.0, dqmax = 0.0;
+                for (size_t i = 0; i < dq.size() && i < y[0].value.size(); ++i) {
+                    if (std::fabs(y[0].value[i]) > ymax) ymax = std::fabs(y[0].value[i]);
+                    if (std::fabs(dq[i]) > dqmax) dqmax = std::fabs(dq[i]);
+                }
+                // Per-row magnitude ratio. A `s` that differs per row shows as a spread here; a
+                // single elementwise difference (a gain vector) leaves every row's ratio the same
+                // only when the max sits in the same column, so also report the ratio of the row
+                // sums, which a per-row scale moves exactly.
+                double rmin = 1e300, rmax = -1e300, sum_y = 0.0, sum_d = 0.0;
+                for (int64_t r = 0; r < rows; ++r) {
+                    double ry = 0.0, rd = 0.0;
+                    for (int64_t i = 0; i < n; ++i) {
+                        ry += std::fabs(y[0].value[(size_t)(r * n + i)]);
+                        rd += std::fabs(dq[(size_t)(r * n + i)]);
+                    }
+                    sum_y += ry;
+                    sum_d += rd;
+                    if (rd > 0.0) {
+                        const double q = ry / rd;
+                        rmin = std::min(rmin, q);
+                        rmax = std::max(rmax, q);
+                    }
+                }
                 std::fprintf(stderr,
                              "DEQORACLE pos=%lld deq_vs_in=%.6g deq_vs_write=%.6g in_vs_write=%.6g "
-                             "in_max=%.6g\n",
+                             "in_max=%.6g ymax=%.6g deqmax=%.6g y_over_deq=%.6g row_ratio=[%.6g,%.6g] "
+                             "sum_ratio=%.6g\n",
                              (long long)call.rec.position,
                              in_scale > 0.0 ? vs_in / in_scale : vs_in,
                              in_scale > 0.0 ? vs_wr / in_scale : vs_wr,
-                             in_scale > 0.0 ? in_vs_wr / in_scale : in_vs_wr, in_scale);
+                             in_scale > 0.0 ? in_vs_wr / in_scale : in_vs_wr, in_scale, ymax, dqmax,
+                             dqmax > 0.0 ? ymax / dqmax : 0.0, rmin, rmax,
+                             sum_d > 0.0 ? sum_y / sum_d : 0.0);
             }
             std::fprintf(stderr, "DUMPROT pos=%lld op=%s rot_err=%.6g rot_bad=%lld/%zu deq_rel=%.6g\n",
                          (long long)call.rec.position, call.rec.op.c_str(), rot_err,
