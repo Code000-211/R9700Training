@@ -756,9 +756,16 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
              // 63: not an exact match for "rmsnorm", and outside the last-block window below, so
              // without this line the dump is silent about the one row it is being run for.
              rec.op == "rmsnorm_had_quant_i8g" ||
-             // The inf hunt: every record of the last block, so the earliest forward value that is
-             // not finite is named by its op and position rather than guessed.
-             (rec.position >= 1390 && rec.position <= 1458))) {
+             // The block boundary, where the per-block factor of ~1.6e3 is introduced rather than
+             // inside any one row: the delta-net chain's own rows and the residual add, so a block
+             // boundary's contribution shows up in the same table as the rows either side of it.
+             rec.op == "add" || rec.op == "gdn_chunk_scan" || rec.op == "gdn_kkt_solve" ||
+             rec.op == "gdn_conv_prep" || rec.op == "gdn_gated_rmsnorm" ||
+             // The inf hunt: every record of the last blocks, so the earliest forward value that is
+             // not finite is named by its op and position rather than guessed. Widened from
+             // 1390..1458 (blocks 61..62) to 1300..1458 so the jump between adjacent blocks is
+             // inside the window instead of straddling its edge.
+             (rec.position >= 1300 && rec.position <= 1458))) {
             for (size_t j = 0; j < rec.operands.size(); ++j) {
                 int64_t nonzero = 0, nonfinite = 0;
                 double maxabs = 0.0;

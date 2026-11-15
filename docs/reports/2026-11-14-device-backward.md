@@ -589,18 +589,31 @@ multiply).
 
 **Two measurements, and they say different things -- which is the whole point.**
 
-**The walk's cotangent in one buffer, tracked across blocks** (`gdn_in`, the `lora_expand` operand,
-from the `R97_DUMP_DC=1` pass):
+**The walk's cotangent in one buffer through one op, tracked across nine block transitions**
+(`gdn_o` at the `gdn_gated_rmsnorm` record, `R97_DUMP_DC=1`):
 
-| block | position | maxabs |
-|---|---|---|
-| 62 | 1416 | 0.652 |
-| 61 | 1395 | 664 |
-| 60 | 1369 | 1.02e+06 |
-| 58 | 1320 | 4.36e+12 |
+| position | maxabs | x since previous | gap |
+|---|---|---|---|
+| 1416 | 1128 | -- | -- |
+| 1395 | 1.663e+06 | 1474 | 21 |
+| 1374 | 2.030e+09 | 1221 | 21 |
+| 1325 | 9.570e+15 | 4714 | 49 |
+| 1304 | 7.962e+18 | 832 | 21 |
+| 1283 | 1.306e+22 | 1640 | 21 |
+| 1234 | 3.466e+28 | 2654 | 49 |
+| 1213 | 4.976e+31 | 1435 | 21 |
+| 1192 | 1.324e+35 | 2661 | 21 |
+| **1143** | **3.390e+38** | 2560 | 49 |
 
-Block to block that is **1018x, 1530x, and 2073x** -- geometric mean over the four blocks, **1.6e3 per
-block**. Same buffer, same op, adjacent records: this is not a ratio of two different quantities.
+**~1e3 to 2.7e3 per step, and a 21-record gap is the one that means "one layer" here** (a block's
+delta-net chain is about that many records), so the two 49-record gaps reading 4714 and 2654 vanish
+at the same rate per layer. **Geometric mean over the nine transitions: ~1.6e3 per layer** -- one
+buffer through one op, not a ratio of two different quantities.
+
+**The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
+reaches `3.390e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
+position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). The residual stream's
+own cotangent (`h`) shows the same growth and the same clipping.
 
 **The true gradient, from the central difference at two leaves:**
 
@@ -615,10 +628,10 @@ a well-behaved O(1e3) number at every depth. **So the walk carries ~1e3 too much
 truth carries ~1.24x** -- and the per-block factor the earlier sections argued for is real, it is just
 **~1.6e3 rather than ~984**, and it is measured now rather than divided out of a logit-space ratio.
 
-**The two measurements also predict each other.** From `0.652` at block 62, crossing f32's `3.4e38` at
-`1.6e3` per block takes `log10(3.4e38/0.652) / log10(1.6e3)` = **12.1 blocks**, i.e. **block 50**. The
-first non-finite in the walk is at position 1150, in block 50. That is not a coincidence, and it is
-what makes the rate credible.
+**The rate also predicts where the walk clips.** From 1128 at position 1416, crossing f32's `3.4e38`
+at `1.6e3` per layer takes `log10(3.4e38/1128) / 3.2` = **11 layers**, and the measured clip is at
+position 1143, nine transitions down the same list. That the two agree to within the two-block gaps is
+what makes the rate credible rather than fitted.
 
 **Which also explains the NaN leaves without contradicting the rate.** The walk's cotangent grows
 geometrically until it crosses the f32 ceiling, then stays non-finite. Leaves at block 40 and block 0
@@ -634,19 +647,22 @@ pairs balanced at product exactly 1.0, so it is not the quantiser scales. **It i
 of ~1.6e3 made somewhere the scale audit does not cover**, and the instrument that now narrows it is
 `R97_DUMP_DC` at real magnitudes -- which is what the pass above demonstrates works.
 
-**And the same pass already says where it is not: it is not inside a row.** Within block 62 the
-cotangents are ordinary -- `gdn_in` reads 0.527 at `gdn_conv_prep`@1413, 0.652 at
-`gdn_gated_rmsnorm`@1416 and 0.652 at `lora_expand`@1411; `gdn_o` spans 0.105 at
-`had_quant_act_i8g`@1417 to 1128 at `gdn_gated_rmsnorm`@1416, which is the `1/rms` conditioning the
-host reproduces. Within block 61 they are equally ordinary at 664..812. **The ~1.2e3 jump in
-`gdn_in` happens between those two windows**, i.e. at the block boundary rather than inside any one
-record.
+**And it is not inside a row.** Within one block the cotangents are ordinary: `gdn_in` reads 0.527 at
+`gdn_conv_prep`@1413, 0.652 at `gdn_gated_rmsnorm`@1416 and 0.652 at `lora_expand`@1411, and `gdn_o`
+spans 0.105 at `had_quant_act_i8g`@1417 to 1128 at `gdn_gated_rmsnorm`@1416 -- which is the `1/rms`
+conditioning the host reproduces, a factor of 1.07e4 that does **not** accumulate because the next
+layer starts again at a small value. The growth is carried *between* layers, not made inside one.
 
-**So the next probe is cheap and specific:** `R97_DUMP_DC`'s op list (`src/backward.cpp:751-761`)
-covers `rope`, `lora_expand`, `lora_shrink`, `rmsnorm`, `rmsnorm_had_quant_i8g` and every record of
-positions 1390..1458. Widening that window to cover blocks 60..63 -- and adding `add`,
-`gdn_chunk_scan`, `gdn_kkt_solve` and `gdn_conv_prep` by name -- puts the boundary's contribution in
-the same table, and the factor is then localised to a record rather than to a block.
+**That probe was then run, and the instrument is now permanent.** `R97_DUMP_DC`'s op list
+(`src/backward.cpp:751-768`) covers `rope`, `lora_expand`, `lora_shrink`, `rmsnorm`,
+`rmsnorm_had_quant_i8g`, `add`, `gdn_chunk_scan`, `gdn_kkt_solve`, `gdn_conv_prep` and
+`gdn_gated_rmsnorm`, and its window is positions 1300..1458 instead of 1390..1458, so an adjacent
+pair of layers is inside the window rather than straddling its edge. The table above is that run.
+
+**What it does not yet answer is *which* record introduces the factor.** The growth is visible in
+`gdn_o`, `gdn_in` and `h` at every layer, and no single record's own `dx`/`dy` ratio stands out in
+the window -- so the next narrowing is a per-record comparison of what a row was handed against what
+it left, at one layer boundary, rather than a wider window.
 
 **Two mechanical findings came out of the audit and are acted on.** The f32 row reductions: the
 report's own f64 fix landed at one of three sites on this path, and the other two
