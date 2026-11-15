@@ -1081,14 +1081,14 @@ touches it (`/tmp/r97-fwd.log`):
 
 | pos | op | buffer | cotangent |
 |---|---|---|---|
-| 1458 | `rmsnorm` | `x` | 1.3132e-07 |
-| 1457 | `add` | `h` | 1.3132e-07 |
-| 1456 | `lora_expand` | `h` | 1.3132e-07 |
+| 1458 | `rmsnorm` | `x` | 1.31316e-07 |
+| 1457 | `add` | `h` | 1.31316e-07 |
+| 1456 | `lora_expand` | `h` | 1.31316e-07 |
 | 1449 | `rmsnorm_had_quant_i8g` | `h` | **7.242e-06** |
 | 1448 | `lora_expand` | `h` | 7.242e-06 |
 
 **The FFN sublayer's adjoint adds a contribution ~54x larger than the cotangent it was handed.** The
-residual cotangent enters the FFN path at 1.3132e-07 and the path returns 7.242e-06, so the
+residual cotangent enters the FFN path at 1.31316e-07 and the path returns 7.242e-06, so the
 sublayer's own `d_h` is ~7.11e-06.
 
 **That ratio is not by itself evidence of a defect, and should not be read as one.** In a residual
@@ -1706,7 +1706,8 @@ report measured independently from the growth curve. So the walk multiplies its 
 block-boundary handoff (block 63's x55) as the separate second place to look.
 
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
-reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
+reaches `3.38953e38`, f32's ceiling, and 1187495 of its 3145728 values are already non-finite (the
+other 1958233 are finite and non-zero, so nothing here is merely zeroed); from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
 the rate itself**: the last transition spans 3.408 decades where a 49-record gap had been running 6.4
 to 6.7, i.e. it ran out of exponent range roughly halfway through. And the position agrees: at 3.190
