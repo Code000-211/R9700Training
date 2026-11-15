@@ -1186,12 +1186,15 @@ normalisation with `sc * w ~ 656` amplifies its input's cotangent by that same f
 cotangent step (1.1e4) and the forward step (6.6e2) differ only by the `1/ch` and second-term factors
 of the same Jacobian.
 
-**So the growth at this row is the RMS-norm Jacobian doing its job on a peaked row.** `gdn_o`'s max
-is 0.42 while its row RMS must be ~1e-3 for `sc` to be ~1e3 -- a few large channels and many small
-ones, which is what a gated recurrence output looks like. **That is not a bug in
-`gdn_gated_rmsnorm`.** What it does mean is that **the walk's cotangent to this sublayer grows 1.1e3
-per layer while the FD says the loss's gradient to the parameters does not grow at all** -- so the
-contradiction is now pinned to this row and to the cotangent it is handed, not to the ladder's shape.
+**So the step at this row is the RMS-norm Jacobian doing its job on a peaked row.** `gdn_o`'s max is
+0.42 while its row RMS must be ~1e-3 for `sc` to be ~1e3 -- a few large channels and many small ones,
+which is what a gated recurrence output looks like. **That is not a bug in `gdn_gated_rmsnorm`.**
+
+**But it is not the source of the walk's growth either.** The step is the largest single within-block
+step in the walk (+4.03 decades), and the block's *net* is only +3.16, so the rest of the block gives
+back 0.87 -- and, as the next section measures, **an attention block grows at least as fast**. A row
+that is FD-verified correct, documented by the container's architecture, and larger than the net it
+produces is a step inside a per-block rate, not the explanation of it.
 
 ### And the row is FD-verified correct, at exactly those magnitudes
 
@@ -1248,7 +1251,7 @@ a wrong adjoint that this test could not see. On this container it is 1e-6 and t
 bite -- but it is a place where the test's two sides share an assumption with each other and not with
 the model.
 
-### The in-place read is handled correctly, and the arithmetic nearly closes
+### The in-place read is handled correctly, and the growth is per block rather than per sublayer
 
 The op is in place -- `gdn_gated_rmsnorm` takes `{w.o, w.z}` and writes `{w.o}` -- so the obvious next
 suspect is that the walk hands it its own output (max 278) rather than the scan's (max 0.42). **It
@@ -1260,26 +1263,41 @@ eliminated.** The cotangent side is the same shape and is also right: `cot` hold
 *written* operand (`src/backward.cpp:511-515`), copied out of the version store before the row runs,
 so the row is handed its incoming cotangent and not one it has already produced.
 
-**And the size nearly closes, once the per-layer figure is right.** The `gdn_o` series gives a clean
-per-block rate: the `had_quant_act_i8g` level is 0.105469 (block 62), 153 (61), 220160 (60) and
-7.81684e11 (58), i.e. **x1451, x1439 and x3.55e6 over two blocks -- 3.162, 3.158 and 3.275 decades
-per block**, and 3.217 decades/block over the whole 62 -> 58 span. **The walk-versus-FD table's own
-rate is 3.413 (63 -> 60), 3.124 (63 -> 55) and 3.081 (63 -> 51) decades per block** -- the same rate,
-inside the spread of the walk's own three estimates. Five of the seven blocks from 57 to 63 are GDN
-(62, 61, 60, 58, 57), so the GDN path supplies **5 x 3.217 = 16.09 decades of the 18.48** the walk's
-rate implies over those six blocks: **87%.**
+**And the growth is per block, not per sublayer -- which withdraws the "87%".** Measuring the residual
+cotangent on `h` at **the same op in every block** (`rmsnorm_had_quant_i8g`, the slot this report's own
+per-block table uses) gives a level for each of the fourteen blocks the log covers:
 
-**So the GDN norm accounts for most of the spurious growth, and the rest is not attributed.** An
-earlier reading compared 1.1e3 per GDN layer against 1.8e3 per block, called the gap a factor of 10,
-and concluded the growth was spread across several rows; that was wrong on the per-layer figure and on
-the comparison, and it is withdrawn. **But "the GDN norm is the whole of it" would be an overclaim
-too** -- 13% of the growth is still unaccounted for, and the three rows whose steps crossed a block
-boundary are not evidence either way, because their ratios were the block-to-block growth re-measured.
+| block | 63 | 62 | 61 | 60 | **59** | 58 | 57 | 56 |
+|---|---|---|---|---|---|---|---|---|
+| `h` maxabs | 9.23e-4 | 0.9805 | 1360 | 1.376e+06 | **3.775e+09** | 6.769e+12 | 1.231e+16 | 8.323e+18 |
+| dec from previous | -- | 3.026 | 3.142 | 3.005 | **3.438** | 3.254 | 3.260 | 2.830 |
 
-**So the honest state is: the row that carries most of the growth is FD-verified correct, is
-documented by the container's own architecture, and is handed the right values on both sides.** Those
-facts cannot all hold together with a wrong gradient unless the defect is compositional -- which is
-the next section.
+| block | 55 | 54 | 53 | 52 | 51 | 50 |
+|---|---|---|---|---|---|---|
+| `h` maxabs | 1.719e+22 | 2.327e+25 | 3.791e+28 | 8.05e+31 | 9.476e+34 | 2.658e+36 |
+| dec from previous | 3.315 | 3.131 | 3.212 | 3.327 | 3.071 | 1.448 |
+
+**The rate is 3.0 to 3.4 decades per block for every block, and block 59 -- the attention block, the
+one with no `gdn_o` row at all -- is the fastest of the twelve at 3.438.** The three GDN blocks in the
+same range (62, 61, 60) run 3.026, 3.142 and 3.005. **So the growth is type-independent: it does not
+matter whether a block is gated-delta or full attention.**
+
+**That withdraws "the GDN path accounts for 87%", which was circular.** It multiplied the `gdn_o`
+per-block rate (3.217) by the number of GDN blocks and divided by the walk's own per-block rate
+(3.08) -- but both rates are ~3.1 because they are the *same* per-block rate measured on two buffers,
+so the ratio reduces to 5/6, the fraction of blocks that are GDN, and says nothing about the GDN
+sublayer's contribution. **The correct decomposition is within one block, and it does not favour the
+norm:** the GDN's gross within-block step is **+4.03 decades** (1.07e4) while the block's net is
+**+3.16**, so the rest of the block contributes **-0.87 decades** (1128 -> 153, 1.66e6 -> 220160). The
+norm is the largest single within-block step in the walk, but the per-block net it produces is no
+larger than an attention block's.
+
+**So the honest state is: the residual cotangent grows ~3.1 decades per block, uniformly across block
+types, and the GDN norm is the largest single step inside a block but is not established as the
+source of the growth.** That is consistent with -- and strengthens -- the compositional conclusion
+below: a rate that is the same in every block, of either type, is a property of the per-block
+plumbing, not of any sublayer. **An earlier reading called this "the GDN norm accounts for most of the
+growth", and before that "a factor of 10 gap, spread across several rows"; both are withdrawn.**
 
 ### Every row that could carry the growth is individually FD-verified, so the defect is compositional
 
