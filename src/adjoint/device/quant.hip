@@ -243,21 +243,29 @@ __global__ void gate_back_kernel(const float* rotated_cot, const float* gate, co
 
 // The RMS norm, one block per row: ss = sum x^2 and t = sum r x c share the row's reduction, c =
 // w + wadd. dx_j = mult * (rs c_j r_j - rs^3 x_j t / n), the row's shared term carried by every
-// element. ss and t accumulate in f32, per the family's tolerance; the gain is frozen (the host
+// element. ss and t accumulate in f64 -- the note below says why; the gain is frozen (the host
 // rmsnorm adjoint leaves it), so only x's cotangent comes back.
 __global__ void rmsnorm_back_kernel(const float* rotated_cot, const float* x, const float* w,
                                     unsigned short* dx, int64_t n, float eps, float wadd,
                                     float mult) {
-    __shared__ float sh_ss[256];
-    __shared__ float sh_t[256];
+    // The row reduction is carried in f64, matching the host twin's `double drs`
+    // (src/adjoint/host/quant.cpp:628-632). A cotangent of order 1e34 -- which the real container
+    // reaches by block 51 and the fixture never does -- makes the 5120-term sum of
+    // `rotated_cot * x * (w + wadd)` cross f32's 3.4e38 and the f64 one not, so an f32 accumulator
+    // here is a device-versus-reference divergence, not a tolerance. The operands are still the
+    // f32 ones the record carries (rounded to its declared dtype, as the host rounds them), so the
+    // sum differs from the host's only in its width. `ss` rides the same reduction because the
+    // shared term uses `rs^3`, which amplifies any error in it.
+    __shared__ double sh_ss[256];
+    __shared__ double sh_t[256];
     const int tid = (int)threadIdx.x;
     const int64_t base = (int64_t)blockIdx.x * n;
 
-    float ss = 0.0f, t = 0.0f;
+    double ss = 0.0, t = 0.0;
     for (int64_t i = tid; i < n; i += blockDim.x) {
-        const float xi = x[base + i];
+        const double xi = (double)x[base + i];
         ss += xi * xi;
-        t += rotated_cot[base + i] * xi * (w[i] + wadd);
+        t += (double)rotated_cot[base + i] * xi * ((double)w[i] + (double)wadd);
     }
     sh_ss[tid] = ss;
     sh_t[tid] = t;
@@ -270,12 +278,14 @@ __global__ void rmsnorm_back_kernel(const float* rotated_cot, const float* x, co
         __syncthreads();
     }
 
-    const float inv_n = 1.0f / (float)n;
-    const float rs = rsqrtf(sh_ss[0] * inv_n + eps);
-    const float shared = mult * rs * rs * rs * sh_t[0] * inv_n;
+    const double inv_n = 1.0 / (double)n;
+    const double rs = 1.0 / sqrt(sh_ss[0] * inv_n + (double)eps);
+    const double shared = (double)mult * rs * rs * rs * sh_t[0] * inv_n;
     for (int64_t i = tid; i < n; i += blockDim.x) {
-        const float c = w[i] + wadd;
-        dx[base + i] = f32_to_bf16(mult * (rs * c * rotated_cot[base + i]) - shared * x[base + i]);
+        const double c = (double)w[i] + (double)wadd;
+        const double v = (double)mult * (rs * c * (double)rotated_cot[base + i]) -
+                         shared * (double)x[base + i];
+        dx[base + i] = f32_to_bf16((float)v);
     }
 }
 
@@ -339,6 +349,32 @@ void mask_and_rotate(const AdValue& codes, const AdValue& scale, const AdValue& 
         h_cot[(size_t)i] = (float)cot.value[(size_t)i];
     }
     for (int64_t i = 0; i < rows * ngrp; ++i) h_scale[(size_t)i] = scale.value[(size_t)i];
+    // The kernel divides the codes' cotangent by the group's scale (`d[tid] = cot / (float)s`).
+    // That is exact only while the quotient stays inside f32: the serving quantiser stores `m / 127`
+    // for ANY `m > 0` and never floors it, so a group whose rotated amax is tiny stores a tiny
+    // scale, and `cot / scale` overflows to Inf in one step -- and that Inf then enters the
+    // inverse rotation and the elementwise backprop, which is a whole-row event, not a per-group
+    // one. Report the smallest scale and where it sits, and how many are below the range where a
+    // quotient of order 1 already reaches f32's ceiling (3.4e38).
+    {
+        double min_s = 0.0;
+        int64_t min_r = -1, min_g = -1, extreme = 0;
+        for (int64_t i = 0; i < rows * ngrp; ++i) {
+            const double sv = scale.value[(size_t)i];
+            if (i == 0 || sv < min_s) {
+                min_s = sv;
+                min_r = i / ngrp;
+                min_g = i % ngrp;
+            }
+            if (sv < 1e-32) ++extreme;
+        }
+        std::fprintf(stderr,
+                     "SCALERANGE rows=%lld ngrp=%lld groups=%lld min=%.6g at=%lld,%lld "
+                     "below1e-32=%lld\n",
+                     (long long)rows, (long long)ngrp, (long long)(rows * ngrp), min_s,
+                     (long long)min_r, (long long)min_g, (long long)extreme);
+        std::fflush(stderr);
+    }
 
     device::ScratchBlock d_y(total * (int64_t)sizeof(double));
     device::ScratchBlock d_scale(rows * ngrp * (int64_t)sizeof(double));

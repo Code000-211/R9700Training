@@ -609,6 +609,77 @@ void card_case(const char* test, int64_t n, bool probe) {
                     host_report.forward_all_finite ? 1 : 0, host_seconds);
     }
 
+    // ---- the central difference, only when asked: R97_CENTRAL=1. Perturbs one LoRA weight by a
+    // small relative eps and re-forwards, so the loss's own sensitivity to that weight is
+    // measured -- the number that settles whether the walk's ~1e37-magnitude gradient is the true
+    // gradient (the loss jumps ~eps * 1e37, non-finite) or a scale bug (the loss moves ~eps *
+    // 1e0..1e3). The step's params are still the original here, before the AdamW step below.
+    // R97_CENTRAL_BLK names the block ("blk.51."); default is the block whose gradient the walk
+    // reported as 1.2e37.
+    if (std::getenv("R97_CENTRAL") != nullptr) {
+        const auto find_w = [&](const char* blk) -> int64_t {
+            for (size_t i = 0; i < params.size(); ++i)
+                if (params[i].name.find("lora") != std::string::npos &&
+                    params[i].name.find(blk) != std::string::npos &&
+                    params[i].value.size() > 0 && params[i].value[0] != 0.0f)
+                    return (int64_t)i;
+            return -1;
+        };
+        // The params are named `model.layers.<N>.<module>.lora_A` (not `blk.<N>.`), so the block
+        // spec is `model.layers.51.`. Falls back to layer 0 and then to any LoRA leaf, so the
+        // measurement always runs.
+        const char* env_blk = std::getenv("R97_CENTRAL_BLK");
+        int64_t wi = env_blk ? find_w(env_blk) : -1;
+        if (wi < 0) wi = find_w("model.layers.51.");
+        if (wi < 0) wi = find_w("model.layers.0.");
+        if (wi < 0) wi = find_w("");
+        if (wi >= 0) {
+            const std::string name = params[wi].name;
+            const float w0 = params[wi].value[0];
+            double g0 = 0.0;
+            for (const r97::Param& c : grads)
+                if (c.name == name) { g0 = c.value[0]; break; }
+            // The forward runs bf16, whose mantissa resolves ~4e-3 relative: a perturbation below
+            // that leaves the loss bit-identical by construction and the small-eps difference reads
+            // exactly 0 -- quantisation, not a zero gradient. So measure at two steps: the small
+            // one (which shows the floor) and one ~2.5 bf16 ulps up, which the forward can see.
+            const double eps = std::max(std::fabs(w0) * 1e-4, 1e-6);
+            params[wi].value[0] = (float)(w0 + eps);
+            const double lp = step(batch, params, nullptr).loss;
+            params[wi].value[0] = (float)(w0 - eps);
+            const double lm = step(batch, params, nullptr).loss;
+            params[wi].value[0] = w0;
+            const double cd = (lp - lm) / (2.0 * eps);
+            const double eps_big = std::max(std::fabs(w0) * 1e-2, 1e-4);
+            params[wi].value[0] = (float)(w0 + eps_big);
+            const double bp = step(batch, params, nullptr).loss;
+            params[wi].value[0] = (float)(w0 - eps_big);
+            const double bm = step(batch, params, nullptr).loss;
+            params[wi].value[0] = w0;
+            const double cd_big = (bp - bm) / (2.0 * eps_big);
+            std::printf("%s: CENTRAL %s w=%.6g eps=%.6g grad=%.6g central=%.6g lp=%.9g lm=%.9g\n",
+                        test, name.c_str(), w0, eps, g0, cd, lp, lm);
+            std::printf("%s: CENTRAL-BF16 %s eps=%.6g grad=%.6g central=%.6g bp=%.9g bm=%.9g\n",
+                        test, name.c_str(), eps_big, g0, cd_big, bp, bm);
+            j["central"] = {{"name", name}, {"w", w0}, {"eps", eps}, {"grad", g0},
+                            {"central", cd}, {"loss_plus", lp}, {"loss_minus", lm},
+                            {"eps_bf16", eps_big}, {"central_bf16", cd_big},
+                            {"loss_plus_bf16", bp}, {"loss_minus_bf16", bm}};
+            // The control: a perturbation large enough that the loss MUST move if the forward
+            // reads the params it is handed. Without it a `central` of exactly zero cannot be
+            // told apart from a forward that cached the weights, and the FD would prove nothing.
+            params[wi].value[0] = (float)(w0 + std::fabs(w0) * 0.1);
+            const double lc = step(batch, params, nullptr).loss;
+            params[wi].value[0] = w0;
+            const bool live = lc != result.loss;
+            std::printf("%s: CENTRAL-CONTROL %s w+10%% loss=%.9g base=%.9g %s\n", test,
+                        name.c_str(), lc, result.loss,
+                        live ? "(params are live)" : "(PARAMS CACHED -- FD invalid)");
+            j["central"]["control_loss"] = lc;
+            j["central"]["params_live"] = live;
+        }
+    }
+
     // One AdamW step off the gradient, at the config's default lr, weight decay 0: a zero
     // gradient leaves its parameter bit-identical, and a nonzero one moves it.
     const r97::ParamSet before = params;

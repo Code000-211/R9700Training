@@ -1,8 +1,9 @@
 // tests/host/adjoint_linear.cpp -- the frozen-linears family through the adjoint checker.
 //
 // The tiny fixture's dimensions (hidden 128, MLP 256, vocabulary 320) are one of the three shapes
-// every op runs. The int8 linear's adjoint is checked in the dequantised activation basis: its
-// activation scale is a constant of the quantiser, not a factor of this GEMM's input cotangent.
+// every op runs. The int8 linear's adjoint is checked with a real activation scale: the row returns
+// the codes' cotangent (its dequantised `dx` times `a_scale`), which is the derivative a finite
+// difference of the codes measures and the factor the quantiser above divides out again.
 // Label: host.
 #include "support/adjoint_check.h"
 #include "support/test.h"
@@ -154,15 +155,12 @@ OpRecord embed_lookup_rec(int64_t M, int64_t n_vocab, int64_t n_embd) {
     return rec;
 }
 
-void check(const OpRecord& rec, uint64_t seed, int unit_scale_read = -1) {
+void check(const OpRecord& rec, uint64_t seed) {
     Case c = make_case(rec, seed);
     const KernelReport k = check_kernel(rec, c.in, c.out, bf16_tol);
     std::printf("%s kernel max err %.3g\n", rec.op.c_str(), k.max_err);
     require(k);
-    // The int8 GEMM's adjoint is in the dequantised activation basis, so the finite-difference
-    // check holds the activation scale at one. The kernel check above keeps the real scale.
-    if (unit_scale_read >= 0)
-        for (double& x : c.in[static_cast<std::size_t>(unit_scale_read)].value) x = 1.0;
+
     const FdReport f = check_adjoint(rec, c.in, c.out, fd_tol, seed ^ 0x51ed);
     std::printf("%s adjoint rel err %.3g\n", rec.op.c_str(), f.rel);
     require(f);
@@ -177,10 +175,11 @@ R97_TEST(adjoint_linear_gemm_nt) {
 }
 
 R97_TEST(adjoint_linear_gemm_nt_q) {
-    /* Reads are a, a_scale, b, b_scale: the scale at read index 1. */
-    check(gemm_nt_q_rec(4, 256, 128), 0x2001, 1);  // the tiny fixture's int8 linear
-    check(gemm_nt_q_rec(1, 128, 256), 0x2002, 1);
-    check(gemm_nt_q_rec(7, 320, 384), 0x2003, 1);
+    /* The activation scale is real here: the row returns the codes' cotangent, so the finite
+     * difference of the codes and the adjoint describe the same derivative. */
+    check(gemm_nt_q_rec(4, 256, 128), 0x2001);  // the tiny fixture's int8 linear
+    check(gemm_nt_q_rec(1, 128, 256), 0x2002);
+    check(gemm_nt_q_rec(7, 320, 384), 0x2003);
 }
 
 R97_TEST(adjoint_linear_logits_gemm) {
@@ -264,10 +263,11 @@ R97_TEST(adjoint_linear_embed_lookup_is_a_stop) {
         for (double x : a.value) R97_CHECK(x == 0.0);
 }
 
-// gemm_nt_q's adjoint is a cotangent for the dequantised activation. Perturbing the stored code by
-// eps / a_scale changes the dequantised activation by exactly eps, which is the direction the
-// adjoint describes.
-R97_TEST(adjoint_linear_gemm_nt_q_dequant_basis) {
+// gemm_nt_q's adjoint is a cotangent for the int8 codes: the row dequantises the weight and then
+// multiplies by the activation's own group scale, the factor the quantiser above divides the code
+// cotangent by. The twin dequantises `a` with `a_scale`, so a perturbation of one code by `eps`
+// moves the loss by `eps` times exactly the derivative the adjoint reports -- at the real scale.
+R97_TEST(adjoint_linear_gemm_nt_q_code_basis) {
     const OpRecord rec = gemm_nt_q_rec(3, 5, 128);
     const Case c = make_case(rec, 0x6001);
     std::string err;
@@ -294,17 +294,13 @@ R97_TEST(adjoint_linear_gemm_nt_q_dequant_basis) {
     AdjointCall call{rec, fwd, cot, &dc, nullptr, "test"};
     adj(call);
 
-    const std::vector<int64_t>& shape = fwd[0].shape;
-    const int64_t K = shape[1];
     std::vector<double> dir(fwd[0].value.size());
     for (double& x : dir) x = 2.0 * unit(&seed) - 1.0;
 
     auto loss = [&](double eps, double sign) {
         std::vector<AdValue> in = c.in;
-        for (std::size_t e = 0; e < in[0].value.size(); ++e) {
-            const double scale = in[1].value[static_cast<std::size_t>((e / K) * (K / 128) + (e % K) / 128)];
-            in[0].value[e] += sign * eps * dir[e] / scale;
-        }
+        for (std::size_t e = 0; e < in[0].value.size(); ++e)
+            in[0].value[e] += sign * eps * dir[e];
         std::vector<AdValue> y;
         twin(rec, in, &y);
         double sum = 0.0;
@@ -316,6 +312,6 @@ R97_TEST(adjoint_linear_gemm_nt_q_dequant_basis) {
     double analytic = 0.0;
     for (std::size_t e = 0; e < dir.size(); ++e) analytic += dc[0].value[e] * dir[e];
     const double rel = std::fabs(numeric - analytic) / std::fmax(1.0, std::fabs(analytic));
-    std::printf("gemm_nt_q dequant basis rel err %.3g\n", rel);
+    std::printf("gemm_nt_q code basis rel err %.3g\n", rel);
     R97_CHECK(rel < fd_tol);
 }

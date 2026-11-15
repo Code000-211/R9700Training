@@ -390,8 +390,10 @@ void gemm_nt_q_gated_adjoint(const AdjointCall& call) {
         dw.value.size() < static_cast<std::size_t>(sh.N * sh.K))
         return;
 
-    // The activation's cotangent, gemm_nt_q's, on both halves: the dequantised weight, and the
-    // dequantised activation's own basis, its scale not applied again.
+    // The activation's cotangent in the CODES' basis: the dequantised weight, and then the
+    // activation's own group scale -- the cotangent the next quantiser consumes, since it divides
+    // the code cotangent by that same scale. Without it every quantiser->GEMM hop is 1/s_a too
+    // large.
     parallel_for(sh.M, kRowChunk, [&](int64_t m) {
         for (int64_t k = 0; k < sh.K; ++k) {
             const int64_t g = k / sh.group;
@@ -403,7 +405,8 @@ void gemm_nt_q_gated_adjoint(const AdjointCall& call) {
                        dzu[i] * b.value[static_cast<std::size_t>((sh.n + j) * sh.K + k)] *
                            scale_at(bs, sh.n + j, g, sh.N, sh.groups_k);
             }
-            dx.value[static_cast<std::size_t>(m * sh.K + k)] += acc;
+            dx.value[static_cast<std::size_t>(m * sh.K + k)] +=
+                acc * scale_at(as, m, g, sh.M, sh.groups_k);
         }
     });
 

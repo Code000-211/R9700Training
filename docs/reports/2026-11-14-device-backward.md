@@ -195,3 +195,237 @@ both dead and should not be re-raised.
 - **The head**: `logits_gemm_vocab`'s 248320-wide cotangent can never be a dense `AdValue`,
   so the head walks in chunks (`head_chunks 8`) through `head_ce_loop`, and the transposed
   product reuses the row's own trellis decoder.
+
+## After this report: the block walk had the same defect, and it is now closed
+
+The section above says the pull after `serve()` was reading reused buffers. That was one layer. The
+block replay had the same class, and closing it is what this branch's tail is:
+
+- **`df11fe6`** -- the head walk's operands are captured at their issue.
+- **`d1ac737`** -- a block read whose buffer a prior op wrote is served from the writer's `before`
+  capture at issue rather than the live, already-reused arena. A strided view and the `kv:` pool keep
+  the live pull.
+- **`2a66311`** -- `writer_view`: a strided read is gathered out of the writer's capture through the
+  operand's `view_off`/`view_stride`/`view_shape`. **This is what made `forward_all_finite` true**;
+  it had been non-finite at `attn_qg[0]` of position 1172.
+- **`fea6371`** -- an uncaptured write drops the capture (`before.erase`) instead of leaving a stale
+  one. Measured a no-op on this path (`512h` identical to `512g`): standing protection, not a fix.
+- **`e96d281`** -- reverts an experiment that widened the capture gate to `rows == 0` writes. That
+  regressed the case to four zero-gradient `lora_A`/`lora_B` leaves and moved the non-finite to
+  `lora_shrink` at 1150. The gate stays
+  `view_shape.empty() && rows > 0 && rows == shape[0]`.
+
+Measured on the 512 case with those in place: **`forward_all_finite true`**, head `rmsnorm`
+`512 readable / 0 zeroed / 0 refused`, `n_zero_a == n_zero_b == 0`, both `all_nonzero true`,
+`a_changed == b_changed == 378`, descent holding `7371.59135 -> 6347.88397` (-1023.71), step
+309.3 s (forward 46.7, head 0.8, backward 259.7). **`all_finite` is still false.**
+
+## The open defect: measured, not inferred
+
+The first non-finite the accounting sees is the cotangent of `rmsnorm_had_quant_i8g`'s in-place
+output `h` at position 1176, non-finite in **every** element -- 2621440 of 2621440, all 20480
+groups. What has been measured about it, each with the instrument named:
+
+| question | measurement |
+|---|---|
+| did it arrive from upstream? | **No.** `R97_DUMP_POS=1176` prints every operand's incoming cotangent. At 1176 the two live ones -- the codes' `h.q8` (2621440 values) and the scale's `h.s8` (20480) -- both report no non-finite anywhere (`inc_nonfinite_at=-1`); `x` and `h` carry no version. |
+| was the forward to blame? | **No.** `forward_all_finite true`. |
+| is some group's scale tiny? | **No.** `SCALERANGE` over every quant row: the smallest group scale is **7.5e-3**, and none is below 1e-32. |
+| is the zero-`amax` convention wrong? | **No.** `libr4d/r4d_fused_quant_fp8.hip:100` stores `s = 1.0f` for a zero-`amax` group, matching the reference twin (`src/adjoint/host/quant.cpp:163`) and `docs/adjoints/quant.md`. The `fmaxf(m, 1e-8f)` sites in `r4d_rmsnorm_quant_i8.hip` serve a **different op** that this container does not execute for this record. |
+
+So the row was handed finite data, with ordinary scales, and produced a wholly non-finite output.
+
+### Why "wholly", and why a per-group cause is not excluded
+
+`rmsnorm_back_kernel` (`src/adjoint/device/quant.hip:274-278`) forms a **row-wide** share:
+
+```cpp
+const float rs = rsqrtf(sh_ss[0] * inv_n + eps);
+const float shared = mult * rs * rs * rs * sh_t[0] * inv_n;    // whole row, 5120 columns
+dx[base + i] = f32_to_bf16(mult * (rs * c * rotated_cot[base + i]) - shared * x[base + i]);
+```
+
+`sh_t[0]` sums `rotated_cot * x * (w + wadd)` over the entire row, and `rotated_cot` is the inverse
+rotation of `d`, where `d[tid] = cot[base + tid] / (float)s`. So **one group** whose quotient
+crosses f32's 3.4e38 ceiling puts an `Inf` into `sh_t[0]`, `shared` becomes `Inf` (or `NaN`, if
+`sh_ss[0]` also went `Inf` so that `rs == 0` and `shared = 0 * Inf`), and `dx = finite - Inf * x[i]`
+makes **every element of that row** `-Inf` (or `NaN`). 512 such rows is the whole buffer.
+
+An earlier draft of this section claimed the opposite -- that a per-group mechanism "cannot produce
+that buffer" because all 20480 groups would have to be degenerate. **That was wrong and is
+retracted**: the row-wide reduction carries a single group's overflow across the whole row.
+
+### The measurement: the cotangent grows ~1e3.4 per layer
+
+`R97_DUMP_POS=all` prints the largest finite magnitude of every record's incoming cotangent in walk
+order (63 -> 0). The curve is neither a spike nor a range limit -- it is **geometric and monotone**:
+
+| position | approx block | largest finite max abs cot |
+|---|---|---|
+| 1459 (head) | -- | 1.9e-4 |
+| 1449 | 63 | 2.7e-3 |
+| 1400 | 59 | 2.0e4 |
+| 1358 | 56 | 4.3e10 |
+| 1309 | 54 | 3.4e17 |
+| 1267 | 52 | 3.2e24 |
+| **1176** | **51** | **1.214e37** -- and the next row produces non-finite |
+
+Every layer multiplies the cotangent by **~2500**. Within a layer the largest single contributor is
+`gdn_chunk_scan` (x1e4); each quantised row adds ~1e2; `gemm_nt_q` adds none. From position **1175**
+onward, **817 records** report a non-finite *incoming* cotangent -- the non-finite values propagated
+from 1176 and never became finite again.
+
+`maxabs` counts finite values only (`src/backward.cpp:610`), so a fully non-finite vector reports the
+largest surviving finite magnitude rather than `inf`. That is why the curve appears to plateaus after
+1176: it does not, the vector simply stops being finite.
+
+### What that means, and what it rules out
+
+The growth is **not** an unbalanced quant `1/s`. The quant row divides the code's cotangent by the
+group scale (`d[tid] = cot / s`, both twins -- in f64 on the host, `src/adjoint/host/quant.cpp:299`),
+and the *consumer* of the code multiplies it back by `s`: `gemm_nt_q`'s adjoint works "in the
+dequantised activation basis" and applies `dy * s` column by column
+(`src/adjoint/device/linear.hip:121,129`). So the `1/s` round-trip is balanced, and the ~2500x per
+layer is the product of the **weight matrices' spectral norms** -- the backward's genuine
+straight-through Jacobian, or a scale bug that one layer's norm would expose. The growth curve cannot
+tell those apart.
+
+One thing the curve does settle, and where the device is wrong on its own: `rmsnorm_back_kernel`
+accumulates its row reduction `t` in **f32** (`src/adjoint/device/quant.hip:256-260`, 5120 terms)
+while the host twin accumulates `drs` in **f64** (`src/adjoint/host/quant.cpp:628-632`). The quotient
+`cot / s` is *safe* -- `1.25e34 / 0.19 ~ 6.6e34`, under f32's 3.4e38 -- so it is the **5120-term f32
+sum**, not the division, that crosses: 5120 terms of order 1e34 reach ~1e38. The f32 accumulator
+overflows there; the f64 one does not. **That is a measured device/reference divergence, and fixing
+the device accumulator to f64 makes the device match the reference** -- it is not a range hack to
+forbid. **The fix is in the tree and measured** (`src/adjoint/device/quant.hip:248-290`): with
+`ss`/`t`/`rs`/`shared` in f64 and only the store `f32_to_bf16`, the 512-token run's first
+non-finite **moved from `rmsnorm_had_quant_i8g`@1176 to `lora_expand`@1151** (`a_changed` 375 ->
+373; loss and the descent unchanged). So the accumulator was a real defect and it is fixed -- and it
+is **not sufficient**: `all_finite` is still false, because the cotangent is still ~1e37 at 1151 and
+is amplified again before the bf16 store. Whether *any* widening of the device's arithmetic can make
+`all_finite` true depends on whether that growth continues below block 51, which the walk can no
+longer show -- everything below is non-finite. That is what the loss's central difference settles,
+and it is the only open question now.
+
+### The verdict: the true gradient is ~76, and the walk reports -1.55e35
+
+The central difference was run on the 512-token case with a control that proves the forward reads
+the params it is handed (`tests/gpu/device_step.cpp`, `R97_CENTRAL=1`):
+
+```
+CENTRAL         model.layers.51.self_attn.q_proj.lora_A w=0.0135678 eps=1.35678e-06
+                grad=-1.5512e+35  central=0  lp=7371.59135  lm=7371.59135
+CENTRAL-CONTROL model.layers.51.self_attn.q_proj.lora_A w+10% loss=7371.69427
+                base=7371.59135 (params are live)
+```
+
+The control moves the loss, so the FD is real. The small-eps `central == 0` is a **bf16 resolution
+artifact**, not a zero gradient: a 1.36e-6 move on 0.0135678 is 1e-4 relative, below the forward's
+own ~0.4% bf16 mantissa, so the two losses are bit-identical by construction. The usable FD is the
+10% step:
+
+```
+dL/dw ~ 0.102922558275 / 1.3567836955189706e-03 = 75.9
+```
+
+| | value |
+|---|---|
+| **true** `dL/dw` (10% forward difference) | **~75.9** |
+| the walk's leaf gradient, same weight | **-1.5512e35** |
+| **over-statement** | **~2.0e33** |
+
+**So the backward's leaf gradient is wrong by ~2e33** -- not a range limit, not an accumulator width,
+not a bf16 store, and not something any widening fixes. The true gradient is O(1e2), exactly what a
+27B model on 512 tokens should give; the walk's cotangents reach 1e37 because it amplifies ~1e3 per
+layer where the true amplification is ~1.2x per layer (76 / 1.9e-4 = 4e5 over 64 layers). The head
+cotangent is right -- 1.9e-4 is the CE gradient of a 511-token mean. **`descent` held only because
+AdamW is scale-free.**
+
+### The growth is one global per-layer factor, not one op
+
+An earlier reading of the curve named `gdn_chunk_scan` (x1e4 per layer) the largest single
+contributor. **That is wrong, and the measurement that refutes it is the same buffer tracked across
+blocks.** Following `gdn_o`'s cotangent at the `gdn_chunk_scan` record from block to block:
+
+| block boundary | `gdn_o` cotangent maxabs | ratio |
+|---|---|---|
+| pos 1415 | 4.160e3 | -- |
+| pos 1394 | 7.602e6 | 1.8e3 |
+| pos 1373 | 7.751e9 | 1.0e3 |
+| pos 1324 | 5.432e16 | 3.2e3 |
+| pos 1303 | 1.718e20 | 5.1e3 |
+
+Every buffer grows at the same ~1e3 rate between consecutive blocks (`h` 2.3e3, `lane0` 2.7e3, `q8`
+1.7e3, `s8` 1.3e3, `gdn_o` 1.8e3) -- the factor is **global to the layer**, not an op's. The x1e4 at
+`gdn_chunk_scan` is real but it is a *within-layer* sub-op jump (the same `gdn_o` buffer grows 1.5e4
+across that record), and it is offset by shrinks across the rest of the layer, so it is neither the
+per-layer factor nor the primary suspect. A per-op verdict needs the op's Jacobian applied to the
+real cotangent (`R97_DUMP_DC`), not the ratio of two adjacent records' peaks.
+
+**A uniform ~1e3 per layer is the right size for ~5 quantised ops per layer each contributing
+`1/s ~ 5`** (`s ~ 0.2`, so 5^5 ~ 3125). That is the working hypothesis: one or more quant-consuming
+adjoints convert the code's cotangent with the wrong derivative factor, so `1/s` compounds on every
+pass through the layer's quantisers. `gemm_nt_q` (`src/adjoint/device/linear.hip:121,129`) and
+`lora_shrink` (`src/adjoint/host/lora.cpp:255-258`) both handle it correctly, so the hunt is the
+remaining producers and consumers of a `.q8`/`.s8` buffer.
+
+### One real scale bug, found and fixed -- and measured NOT to be the 2e33
+
+**`gemm_nt_q`'s adjoint returned the cotangent of the dequantised activation while the walk's code
+operands carry the codes' cotangent.** Every quantiser's adjoint divides by the group scale `s`
+(`src/adjoint/host/quant.cpp:299`, `src/adjoint/device/quant.hip:199`), so the code cotangent has to
+come back multiplied by it. A standalone probe (`tests/host/scale_factor_probe.cpp`) measured the
+omission as **`1/a_scale`, exactly**: `gemm_nt_q` at M=3, N=64, K=384, group=128, int8 codes,
+`a_scale` in {0.125, 0.25, 0.375, 0.5}, central-differencing the op's own forward against its adjoint
+for 15 single elements of `a`.
+
+| row | adj/fd | adj/fd x a_scale |
+|---|---|---|
+| tagged (`gemm_nt_q_code_adjoint`) | **1.0000** (all 15) | 0.2667 |
+| untagged (the family row, i.e. the device row's rule) | 8.0 / 4.0 / 2.667 / 2.0 | **1.000000** (all 15) |
+
+The host already had the right rule, but only behind a tag: `gemm_nt_q_code_adjoint`
+(`src/adjoint/host/linear.cpp:373-389`, registered at `:398` under `host_step_record`) multiplied
+`dx` by `scale_at(as, m, k/group, M, groups)`. The device row and the host gated row never got it.
+The contradiction was visible in the file: `gemm_nt_q_twin:208` multiplies `a` by `a_scale`,
+`gemm_nt_q_adjoint:242` did not. All three rows now apply it, and the tag plumbing is deleted.
+
+**The fix is live, and it does not explain the 2e33.** Re-measured on the card after the change
+(`/tmp/r97-dstep-postfix.log`):
+
+| | before | after |
+|---|---|---|
+| the leaf gradient | -1.5512e35 | **+6.41249e35** |
+| `all_finite` | false | **false** |
+| `gdn_o` at `gdn_chunk_scan`, block 62 -> 61 | 4.160e3 -> 7.602e6 | 1.128e3 -> 1.655e6 |
+
+The gradient moved by ~4x and the growth curve's rate is unchanged (~1e3 per layer). **A missing
+`a_scale` worth ~5x per hop cannot account for a 2e33 over-statement**; this is a genuine defect on
+its own and it stays fixed, but the amplification that makes `all_finite` false is still
+unexplained. The strongest remaining lead is the *within-layer* jump the post-fix curve still shows:
+`gdn_o`'s cotangent grows ~1e4 as the walk passes the `gdn_chunk_scan` record, at every block
+(`pos 1416 -> 1415` 1.07e4, `1395 -> 1394` 1.08e4, `1234 -> 1233` 1.13e4, ...). That is a
+same-buffer measurement, not a cross-operand ratio, so it is the op's own Jacobian -- and a chunked
+linear attention should not amplify by 1e4.
+
+**Every producer is clean.** All four quantisers divide by `s` correctly on both sides, and
+`lora_shrink` multiplies by `a_scale` unconditionally on both (`host/lora.cpp:312`,
+`device/lora.hip:296`).
+
+Separately, the `all`-mode walk **aborted at position 565** (~block 24) with the card free:
+
+```
+r97: iqr dx declined: op gemm_nt_q: the decode's scratch could not be allocated
+     (N 5120 K 17408 G 136 form trellis.mad b5 L16 lrb0 lrun8 scale=row-f32)
+```
+
+It did not occur in the earlier runs (`512n`/`512o`/`512p` all completed the backward in 257-259 s),
+so it is its own defect, not part of the magnitude question.
+
+### The accounting, for the record
+
+`cot_non_finite` covering *written* operands only (`src/backward.cpp:512`) is **correct**, not a
+blind spot: `cot[]` is what a row consumes and `dc[]` what it produces, and a read-only operand has
+no incoming cotangent to scan. The one real over-claim is the comment at `:724-725`, which is false
+on the `options.in_place_passthrough` path (`:709-718`): a slot the row left empty is filled with the
+cotangent the row was *handed*, after the pre-call scan.

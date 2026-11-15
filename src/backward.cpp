@@ -533,9 +533,9 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         // The adjoint sees the record the caller prepared when it wants one: the join may hand it
         // names and rows that differ from the tape's, while the walk keeps the tape's record for
         // its versions, boundaries and snapshots. The row is resolved from the prepared record's
-        // parameters because that record is the one the adjoint is called with: a predicate the
-        // caller sets there (the join's `r97host`) is what picks a shape-aware row, and asking the
-        // tape's parameters for it would always find the catch-all.
+        // parameters because that record is the one the adjoint is called with: a predicate set
+        // there is what picks a shape-aware row, and asking the tape's parameters for it would
+        // always find the catch-all.
         OpRecord named;
         const OpRecord* adjoint_rec = &rec;
         if (options.prepare_record) {
@@ -567,6 +567,61 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         for (size_t j = 0; j < rec.operands.size(); ++j)
             if (cot_non_finite[j] >= 0)
                 note_non_finite(rec, adjoint_rec->op, j, cot_non_finite[j], false);
+
+        // The input side of one record, in full, so "was this row handed finite data?" is answerable.
+        //
+        // Two facts settle what can be asked. The walk holds a version only for an operand that
+        // WROTE one (`plan.write_version[i][j] >= 0`), so every lookup here is guarded -- an
+        // unguarded `version_at` indexes `versions[-1]` and segfaults, which is how the first cut of
+        // this instrument died. And a read-only operand has no incoming cotangent at all: the row
+        // PRODUCES the gradient for its inputs (`dc`) and CONSUMES the cotangent of its outputs
+        // (`cot`, built for written operands alone at `:512`). So the written operands are the whole
+        // input side, and the accounting is not in fact blind here -- `h` is written *and* read (an
+        // in-place write), so `cot_non_finite[h]` is exactly its incoming cotangent.
+        // `R97_DUMP_POS=1176` names one record; `R97_DUMP_POS=all` prints every record in walk
+        // order, which is the growth curve: the walk runs 63 -> 0, so the log reads from the head
+        // downwards and the op where a magnitude jumps is the one that amplified it.
+        if (const char* dp = std::getenv("R97_DUMP_POS");
+            dp != nullptr && (std::string(dp) == "all" || rec.position == std::atoll(dp))) {
+            for (size_t j = 0; j < rec.operands.size(); ++j) {
+                const int64_t wv = plan.write_version[i][j];
+                if (wv < 0) {
+                    std::fprintf(stderr,
+                                 "DUMPPOS pos=%s op=%s opnd=%zu buffer=%s written=%d "
+                                 "no_version=1\n",
+                                 std::to_string(rec.position).c_str(), adjoint_rec->op.c_str(), j,
+                                 rec.operands[j].buffer.c_str(),
+                                 static_cast<int>(rec.operands[j].written));
+                    continue;
+                }
+                const Version& v = version_at(i, j);
+                int64_t inc = -1;
+                int64_t nvals = 0;
+                double maxabs = 0.0;
+                if (v.live && !v.cot.empty()) {
+                    inc = first_non_finite(v.cot);
+                    nvals = static_cast<int64_t>(v.cot.size());
+                    // Finite is not small. The codes' cotangent is divided by the group's scale in
+                    // f32 and the quotient must stay under 3.4e38, so the magnitude of what the row
+                    // was HANDED is the other half of that product -- without it, "finite" says
+                    // nothing about whether the division can overflow.
+                    for (double q : v.cot) {
+                        const double a = std::fabs(q);
+                        if (std::isfinite(a) && a > maxabs) maxabs = a;
+                    }
+                }
+                std::fprintf(stderr,
+                             "DUMPPOS pos=%s op=%s opnd=%zu buffer=%s written=%d live=%d "
+                             "inc_cot=%lld inc_nonfinite_at=%lld maxabs=%.6g cot_nonfinite=%lld\n",
+                             std::to_string(rec.position).c_str(), adjoint_rec->op.c_str(), j,
+                             rec.operands[j].buffer.c_str(),
+                             static_cast<int>(rec.operands[j].written), static_cast<int>(v.live),
+                             static_cast<long long>(nvals), static_cast<long long>(inc), maxabs,
+                             static_cast<long long>(j < cot_non_finite.size() ? cot_non_finite[j]
+                                                                             : -1));
+            }
+            std::fflush(stderr);
+        }
         // The frozen operands of the row that serves -- the fallback's, when the fallback took
         // the call -- resolved before the slots are sized: the walk does not ask a row for its
         // frozen operands, and a row that served must not write them anyway.

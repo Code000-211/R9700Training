@@ -341,10 +341,10 @@ The same join walks the w8a8 container. Its op graph differs in three places: th
 and norm are fused into `rmsnorm_quant_fp8`, the MLP's product and its rounding into
 `gated_quant_fp8`, and every trunk linear reads `had_quant_act_i8g`'s int8 codes through
 `gemm_nt_q`. The quantisers' adjoints hand back the **codes'** cotangent (section 3 of
-`docs/adjoints/quant.md`), while `gemm_nt_q`'s family adjoint is documented in the dequantised
-activation basis. The host step therefore tags its records and selects a code-basis wrapper for
-`gemm_nt_q` (`src/adjoint/host/host_step_record.h`); the family row and its finite-difference
-check are unchanged.
+`docs/adjoints/quant.md`), and `gemm_nt_q`'s adjoint returns the same basis: it dequantises the
+weight and then multiplies by the activation's own group scale, so the row a code operand feeds is
+handed the cotangent a downstream quantiser divides by its scale. No record tag and no step-specific
+wrapper is involved; the device row is the same rule.
 
 The adapter is initialised in the basis the container names. `Engine::lora_set_weights` builds its
 factors from the caller's map, so the basis the container was configured for has to reach them, as

@@ -1,10 +1,11 @@
 // src/adjoint/device/linear.hip -- the frozen-linears family's device adjoints, gfx1201.
 //
 // gemm_nt_q writes y[M,N] = a[M,K] * b[N,K]^T with a int8, b int8 codes carrying one bf16 scale per
-// output row and 128-wide block of K, y f32. Its adjoint, in the dequantised activation basis, is
-// the transposed product
+// output row and 128-wide block of K, y f32. Its adjoint is the transposed product in the CODES'
+// activation basis -- the basis the trunk's quantisers consume, each dividing the code cotangent by
+// its own group scale:
 //
-//     dx[m,k] = sum_n dy[m,n] * b[n,k] * s_b[n, k/128]
+//     dx[m,k] = s_a[m, k/128] * sum_n dy[m,n] * b[n,k] * s_b[n, k/128]
 //
 // and this is the kernel that carries the backward's arithmetic: bf16 dy against int8 codes, f32
 // accumulation. The scale varies with n -- the reduction index here -- and with the block of K, so
@@ -455,6 +456,7 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
     if (!call.dc) return;
     const int ia = operand_pos(call.rec, "a");
     const int ib = operand_pos(call.rec, "b");
+    const int ias = operand_pos(call.rec, "a_scale");
     const int ibs = operand_pos(call.rec, "b_scale");
     if (ia < 0 || ib < 0 || call.cot.empty()) return;
 
@@ -462,6 +464,7 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
     const AdValue& b = call.fwd[static_cast<std::size_t>(ib)];
     if (static_cast<std::size_t>(ia) >= call.dc->size()) return;
     AdValue& dx = (*call.dc)[static_cast<std::size_t>(ia)];
+    const AdValue* as = ias >= 0 ? &call.fwd[static_cast<std::size_t>(ias)] : nullptr;
     const AdValue* bs = ibs >= 0 ? &call.fwd[static_cast<std::size_t>(ibs)] : nullptr;
     const AdValue& dy = call.cot[0];
 
@@ -642,7 +645,17 @@ void linear_dx_adjoint(const AdjointCall& call, bool quant) {
         return;
     if (rad_stream_sync(stream) != 0) return;
 
-    for (std::size_t i = 0; i < dx_n; ++i) dx.value[i] += of_bf16(host_dx[i]);
+    /* The kernel's dx is the transposed product of dy with the DEQUANTISED weight, but the slot's
+     * consumer is a quantiser: it hands its code cotangent to the next GEMM, whose own adjoint
+     * multiplies by that GEMM's activation scale. So this row must return the CODES' cotangent,
+     * the dequantised one times the activation scale, exactly as the host family row does. Without
+     * it every quantiser->GEMM hop amplifies dx by 1/s and the gradient compounds over the trunk. */
+    const int64_t gsize = group > 0 ? group : 1;
+    for (std::size_t i = 0; i < dx_n; ++i) {
+        const int64_t m = static_cast<int64_t>(i) / K;
+        const int64_t k = static_cast<int64_t>(i) % K;
+        dx.value[i] += of_bf16(host_dx[i]) * scale_at(as, m, k / gsize, M, groups);
+    }
 }
 
 // The gather's row: dy staged bf16, the index staged i32, dx zeroed f32 and accumulated on the

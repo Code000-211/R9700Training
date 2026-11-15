@@ -45,19 +45,20 @@ s[m,n] = sum_{k in group g} a_code[m,k] * b_code[n,k]
 y[m,n] = sum_g s[m,n] * sa[m,g] * sb[n,g]
 ```
 
-The activation `a` is the dequantised, rotated activation of the forward: its code times
-`sa[m,g]`. Its scale belongs to the quantiser that produced it, not to this GEMM, so the row marks
-`a_scale` frozen beside `b` and `b_scale`: the walk asks for the cotangent of `a` alone. The weight
-in the adjoint is the dequantised weight:
+The activation `a` is the codes the quantiser produced, and its scale `sa[m,g]` belongs to that
+quantiser: the row marks `a_scale` frozen beside `b` and `b_scale`, so the walk asks for the
+cotangent of `a` alone -- in the codes' basis, which is the basis the quantiser consumes. The
+weight in the adjoint is the dequantised weight, and the codes' cotangent carries the activation's
+own scale:
 
 ```text
 W[n,k] = b_code[n,k] * sb[n,g]
-dx_hat[m,k] += sum_n dy[m,n] * W[n,k]
+dx_code[m,k] += sa[m,g] * sum_n dy[m,n] * W[n,k]
 ```
 
-`dx_hat` is therefore a cotangent in the rotated, dequantised basis. The scale `sa` does not appear
-in it: the quantiser's straight-through adjoint passes `dx_hat` to its own bf16 input unchanged.
-There is no cotangent for the codes, and no weight gradient.
+The factor cancels with the quantiser's: its straight-through adjoint divides the code cotangent by
+`sa[m,g]` (section 3 of the quantiser's page, `quant.md`), so a row that omitted it would amplify
+every quantiser -> GEMM hop by `1/sa`. There is no cotangent for the scales, and no weight gradient.
 
 The host issues `gemm_nt_q` (not the fp8 `gemm_nt_q_gated` form) for `qwen35_w8a8`'s gated MLP:
 `gate_up.i8` disables that arch's gated fold and the two halves are two ordinary int8 linears. No
@@ -195,8 +196,9 @@ Each op's twin, `embed_lookup`'s included, is compared with radiance's host kern
 tolerance on three shapes, one of them the tiny fixture's (hidden 128, MLP 256, vocabulary 320).
 Each adjoint that answers is compared with central finite differences of the twin to `1e-6`
 relative; `embed_lookup`'s stop is checked to add nothing to either of its operands. For
-`gemm_nt_q` the finite-difference case holds the activation scale at one, because the adjoint
-describes the dequantised basis; a separate check perturbs the codes by `eps / sa` and confirms
-`dx_hat` against the dequantised directional derivative with a real scale. One more check pins the
-frozen positions of every row against the table above, so this page and the registration cannot
-drift apart.
+`gemm_nt_q` the finite difference runs at a real per-group activation scale, because the row
+returns the codes' cotangent: the twin dequantises `a` with `sa`, so perturbing one code by `eps`
+and holding `dx_code` against that difference is the same derivative. A separate check re-runs the
+same comparison on a small shape, with a random direction over every code, and prints its error.
+One more check pins the frozen positions of every row against the table above, so this page and the
+registration cannot drift apart.

@@ -11,7 +11,7 @@ stand beside.
 
 | op | reads | writes | frozen | served |
 | --- | --- | --- | --- | --- |
-| `gemm_nt_q` | `a`, `b`, `b_scale` | the cotangent of `a` | `a_scale`, `b`, `b_scale` | `dtype` `i8a8h` at `group` 128 |
+| `gemm_nt_q` | `a`, `a_scale`, `b`, `b_scale` | the cotangent of `a` | `a_scale`, `b`, `b_scale` | `dtype` `i8a8h` at `group` 128 |
 | `gemm_nt` | `a`, `b` | the cotangent of `a` | `b` | `dtype` `bf16` |
 | `gather_rows` | `x`, `idx` | the cotangent of `x` | `idx` | `dtype` `bf16` |
 
@@ -27,18 +27,23 @@ schema positions; a later change can register the name against the same kernel.
 
 ## The arithmetic
 
-`gemm_nt_q` at `i8a8h`: the forward is `y[m,n] = sum_g s_b[n,g] * sum_{k in g} a_code[m,k] *
-b_code[n,k]` with `g = k / 128`. The weight is frozen, so the adjoint in the dequantised activation
-basis is
+`gemm_nt_q` at `i8a8h`: the forward is `y[m,n] = sum_g s_a[m,g] * s_b[n,g] * sum_{k in g}
+a_code[m,k] * b_code[n,k]` with `g = k / 128`. The weight is frozen, so the adjoint -- in the
+codes' activation basis, the basis the quantiser above consumes -- is
 
 ```text
-dx[m,k] += sum_n dy[m,n] * b_code[n,k] * s_b[n, k/128]        dy: [M,N]  b: [N,K]  dx: [M,K]
+dx[m,k] += s_a[m, k/128] * sum_n dy[m,n] * b_code[n,k] * s_b[n, k/128]   dy: [M,N]  dx: [M,K]
 ```
 
 The scale varies along the reduction as well as along `k`, so the sum is not one product: a 128-wide
 block of `dx` is the product of the gradient with that block's codes, each column of it scaled by its
 own `s_b[:, block]`. One CTA owns one block, so `k`'s block index is the CTA's `blockIdx.y` and every
 lane holds the eight scales its own fragment columns need.
+
+`s_a` is the activation's grid, not the kernel's: the row multiplies the kernel's result by it after
+the download (`linear_dx_adjoint`, which is where the host row's rule is mirrored), so the kernel's
+own arithmetic is still the weight's scale over the codes. That factor cancels with the activation
+quantiser's adjoint above, which divides the code cotangent by the same `s_a`.
 
 `gemm_nt` is the same kernel with the weight already bf16 and no scale to apply.
 

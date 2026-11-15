@@ -741,7 +741,6 @@ inline void prepare_adjoint_record(const OpRecord& rec, OpRecord* out) {
             if (key == "M") {
                 if (int64_t* m = std::get_if<int64_t>(&value)) *m = rows;
             }
-    if (out->op == "gemm_nt_q") out->params.push_back({"r97host", int64_t{1}});
 }
 
 // The weight a lora record belongs to, from the adapter factor it names: lora.<weight>.a or .b.

@@ -1,12 +1,11 @@
 // r97/adjoint/host/linear.cpp -- host twins and adjoints for the frozen linears.
 //
 // Every op here has a frozen weight: only the input cotangent is produced. The int8 linear's
-// cotangent is in the dequantised (rotated) activation basis, so the weight is dequantised in the
-// adjoint but the activation scale is not applied again.
+// cotangent is in the CODES' (rotated) activation basis -- the basis the trunk's quantisers
+// consume, each dividing the code cotangent by its own group scale -- so the adjoint dequantises
+// the weight AND applies the activation's own group scale to the dequantised row.
 
 #include "r97/adjoint.h"
-
-#include "host_step_record.h"
 
 #include "parallel.h"
 
@@ -212,14 +211,17 @@ void gemm_nt_q_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     });
 }
 
-// dx in the dequantised activation basis: dy * W, where W dequantises the int8 weight codes.
+// dx in the codes' activation basis: the dequantised product dy * W, times the activation's group
+// scale s_a -- the cotangent a downstream quantiser consumes (gemm_nt_q_twin:208 applies s_a to `a`).
 void gemm_nt_q_adjoint(const AdjointCall& call) {
     const int ia = operand_pos(call.rec, "a");
     const int ib = operand_pos(call.rec, "b");
+    const int ias = operand_pos(call.rec, "a_scale");
     const int ibs = operand_pos(call.rec, "b_scale");
     if (ia < 0 || ib < 0 || call.cot.empty()) return;
     const AdValue& a = call.fwd[static_cast<std::size_t>(ia)];
     const AdValue& b = call.fwd[static_cast<std::size_t>(ib)];
+    const AdValue* as = ias >= 0 ? &call.fwd[static_cast<std::size_t>(ias)] : nullptr;
     const AdValue* bs = ibs >= 0 ? &call.fwd[static_cast<std::size_t>(ibs)] : nullptr;
     if (b.raw != nullptr) refuse_stored(call.rec, ib);
     if (bs != nullptr && bs->raw != nullptr) refuse_stored(call.rec, ibs);
@@ -239,7 +241,7 @@ void gemm_nt_q_adjoint(const AdjointCall& call) {
                        b.value[static_cast<std::size_t>(n * K + k)] *
                        scale_at(bs, n, g, N, groups);
             }
-            dx.value[static_cast<std::size_t>(m * K + k)] += acc;
+            dx.value[static_cast<std::size_t>(m * K + k)] += acc * scale_at(as, m, g, M, groups);
         }
     });
 }
@@ -367,27 +369,6 @@ void embed_lookup_twin(const OpRecord& rec, const std::vector<AdValue>& operands
 
 void embed_lookup_adjoint(const AdjointCall&) {}
 
-// The host step's int8 walk consumes code operands: its quantisers divide the code cotangent by
-// the group scale. The family row's cotangent is for the dequantised activation, so this wrapper
-// multiplies it by the activation scale to hand the codes' cotangent back.
-void gemm_nt_q_code_adjoint(const AdjointCall& call) {
-    gemm_nt_q_adjoint(call);
-    const int ia = operand_pos(call.rec, "a");
-    const int ias = operand_pos(call.rec, "a_scale");
-    if (ia < 0 || ias < 0) return;
-    const AdValue& a = call.fwd[static_cast<std::size_t>(ia)];
-    const AdValue* as = &call.fwd[static_cast<std::size_t>(ias)];
-    const int64_t K = param_int(call.rec, "K", a.shape.size() >= 2 ? a.shape[1] : 0);
-    const int64_t M = a.shape.empty() ? param_int(call.rec, "M", 0) : a.shape[0];
-    const int64_t group = param_int(call.rec, "group", K > 0 ? K : 1);
-    const int64_t groups = group > 0 ? (K + group - 1) / group : 1;
-    AdValue& dx = (*call.dc)[static_cast<std::size_t>(ia)];
-    parallel_for(M, kRowChunk, [&](int64_t m) {
-        for (int64_t k = 0; k < K; ++k)
-            dx.value[static_cast<std::size_t>(m * K + k)] *= scale_at(as, m, k / group, M, groups);
-    });
-}
-
 }  // namespace
 
 R97_REGISTER_TWIN("gemm_nt", gemm_nt_twin)
@@ -395,7 +376,6 @@ R97_REGISTER_ADJOINT_F("gemm_nt", host, gemm_nt_adjoint, 1)
 
 R97_REGISTER_TWIN("gemm_nt_q", gemm_nt_q_twin)
 R97_REGISTER_ADJOINT_F("gemm_nt_q", host, gemm_nt_q_adjoint, 1, 2, 3)
-R97_REGISTER_ADJOINT_IF_F("gemm_nt_q", host, gemm_nt_q_code_adjoint, host_step_record, 1, 2, 3)
 
 R97_REGISTER_TWIN("logits_gemm", logits_gemm_twin)
 R97_REGISTER_ADJOINT_F("logits_gemm", host, logits_gemm_adjoint, 1)

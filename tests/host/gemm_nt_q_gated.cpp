@@ -3,8 +3,9 @@
 // K = 256, N = 512, M = 4, group = 128: the fold's schema at a size the band serves, out_bf16
 // bound and unbound. The twin is held to a plain f64 reference of the same chain -- the grouped
 // GEMM, the gate, the rotation and the quantiser -- and the adjoint to the reference's
-// straight-through cotangents at 1e-9 relative: the activation's, in the dequantised basis, the
-// weight's in its codes and its scale's per (row, K block). The seed carries nonzero
+// straight-through cotangents at 1e-9 relative: the activation's, in the codes' basis (the row
+// applies the activation's own group scale), the weight's in its codes and its scale's per
+// (row, K block). The seed carries nonzero
 // cotangents on the codes and on out_bf16 at once, and on the scale, which the row drops. A gate
 // that loses its factor on the gate half's cotangent must be seen. Label: host.
 #include "support/adjoint_check.h"
@@ -141,7 +142,7 @@ Ref ref_forward(const std::vector<double>& a, const std::vector<double>& as,
 // The reference's straight-through cotangents: `gate_factor` false drops the gate's slope on the
 // gate half, so a row that loses it is what the check compares against.
 struct RefGrad {
-    std::vector<double> da;  // [M, K], the dequantised activation's basis
+    std::vector<double> da;  // [M, K], the codes' basis: the row applies a_scale
     std::vector<double> dw;  // [N, K], the weight's codes
     std::vector<double> ds;  // [N, K / group]
 };
@@ -185,7 +186,10 @@ RefGrad ref_grad(const Ref& r, const std::vector<double>& a, const std::vector<d
                        dzu[i] * (b[static_cast<size_t>((kFused + j) * kK + k)] *
                                  bs[static_cast<size_t>((kFused + j) * kGroupsK + gg)]);
             }
-            g.da[static_cast<size_t>(m * kK + k)] = acc;
+            // The row hands back the codes' cotangent: the dequantised product times the
+            // activation's own group scale, the same factor this reference applies to `a`.
+            g.da[static_cast<size_t>(m * kK + k)] =
+                acc * as[static_cast<size_t>(m * kGroupsK + gg)];
         }
     g.dw.assign(kN * kK, 0.0);
     g.ds.assign(kN * kGroupsK, 0.0);
