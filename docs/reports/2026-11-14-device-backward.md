@@ -220,6 +220,16 @@ Measured on the 512 case with those in place: **`forward_all_finite true`**, hea
 `a_changed == b_changed == 378`, descent holding `7371.59135 -> 6347.88397` (-1023.71), step
 309.3 s (forward 46.7, head 0.8, backward 259.7). **`all_finite` is still false.**
 
+**Re-measured on 2026-11-15** (`/tmp/r97-dstep-device_step_tape-i9Nlis`, the same case with
+`R97_CENTRAL=1`): `forward_all_finite true`, head `rmsnorm` `512 readable / 0 zeroed / 0 refused`,
+`n_zero_a == n_zero_b == 0`, both `all_nonzero true`, `a_changed == b_changed == 375`, descent
+holding `7371.59135 -> 6347.88397`, step 316.2 s (forward 46.6, head 0.8, backward 266.6). **The
+counts the run adds:** `n_a_finite_nonzero == n_b_finite_nonzero == 82` of 400, so 318 leaves of each
+factor hold a **non-finite** gradient and none is exactly zero. The first non-finite the accounting
+sees is now `lora_shrink` at position 1150, operand `h.s8`, index 6 -- moved down from
+`rmsnorm_had_quant_i8g`@1176. **`all_finite` is still false.** The leaf gradient and the central
+difference are in "The verdict" below.
+
 ## The open defect: measured, not inferred
 
 The first non-finite the accounting sees is the cotangent of `rmsnorm_had_quant_i8g`'s in-place
