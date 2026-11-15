@@ -851,6 +851,41 @@ buffer names repeat across the 64 layers, so a lower position of the same name m
 The own-output test needs neither assumption and gave 511 of 512 -- and that property turned out to be
 one the walk does not depend on.
 
+**Four things the retraction turned up, all recorded rather than assumed.**
+
+**#138 is fixed on this branch, not open.** `src/adjoint/device/lora.hip:117-154` now resolves each
+pool row's destination through `factor_grad_name`/`grad_dest`, honouring `AdjointCall::fused_slots`
+and `slot_prefix` exactly as the host row does (`src/adjoint/host/lora.cpp:212-215,271-273,299`), so a
+record with several fused slots writes each slot's `dA` to the leaf the caller named instead of
+summing them into one. `tests/gpu/adjoint_lora.cpp:309-342` builds the device and host calls under
+both namings and compares them, which is the two-slot device-versus-host case the issue asked for.
+It arrived in `64a437d`; the issue predates that commit and stayed open.
+
+**#144: five in-place ops are never FD-checked with their output aliased over their input.** An
+in-place operand is one schema slot holding two values, and only one can go in `fwd[i]`. This report's
+walk puts the **pre-op** value there (`src/step_device.cpp:1251` serves `before`); `check_adjoint` puts
+the twin's **post-op** output there (`tests/support/adjoint_check.h:389-408`). The convention is
+deliberate and asserted -- `tests/host/backward_core.cpp:342-367`, "the adjoint receives what it read
+from, not what it wrote" -- **but that test's op is `bwd_scale`, whose adjoint is value-independent,
+so it cannot distinguish the two points.** Of the ops the probe found aliased, exactly one is ever
+aliased in a test (`tests/host/adjoint_quant.cpp:682`, `{1}` for `rmsnorm_quant_fp8`);
+`i8g_fd_check` (`:796-803`) passes no `in_place` at all. `R97_FD_PREOP=1` moves the harness to the
+production point and is live for the one case that exists.
+
+**And `gdn_gated_rmsnorm` is not one of them.** It is absent from the 511: its record keeps four
+separate schema slots (`nRmsnormOperands = 4`, `src/adjoint/device/gdn_prep.hip:69`) and
+`tests/host/adjoint_gdn_prep.cpp:170-175` models exactly that, so its FD test is faithful. Its
+aliasing is between **buffers**, not slots, which is why the earlier reading of it as a slot defect
+was wrong.
+
+**#143: the `all`-mode walk aborts at position 565** with the card free -- `iqr dx declined: op
+gemm_nt_q: the decode's scratch could not be allocated (N 5120 K 17408 G 136 ...)`. A VRAM-headroom
+refusal on a path the 4096 case does not take, absent from the earlier `all` runs.
+
+**The oracle is now a ladder.** `R97_CENTRAL_BLKS` measures several blocks in one run, and the
+evaluations are cheap because `step_device.cpp:413` returns early on a null `grads`, so the oracle's
+five calls per block are forward-only.
+
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
