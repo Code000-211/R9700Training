@@ -658,6 +658,28 @@ block 51 that is **1.19e34**, against a measured over-statement of **6.9e31** at
 the same order. **Three independent facts agree on the same per-layer rate**, which is what the earlier
 `~984x` never had.
 
+**And a fourth check, from a different instrument on a different run.** The retained
+`R97_DUMP_POS=all` walk of the 512 case (`/tmp/r97-dstep-512q.log`) prints each record's *incoming*
+cotangent magnitude in walk order. Over its 392 records -- positions 1459 down to 1157, **13.26
+layers** -- the magnitude runs `1.86e-04` to `1.96e35`, i.e. **39.023 decades**:
+
+| | this dump | the DC trace |
+|---|---|---|
+| per record | 0.0998 decades = **1.26x** | 0.140 decades = 1.38x |
+| per decoder layer | 2.944 decades = **878x** | 3.190 decades = 1.55e3 |
+
+Same order, within a factor of 1.8 per layer and 1.4 per record, from a completely independent
+instrument. **So the defensible statement is: the walk multiplies by ~1.3x per record and ~1e3 per
+decoder layer**, and the two instruments bracket it.
+
+**Two sites carry the biggest single jumps in that sequence**, and they are the prime suspects:
+`gdn_chunk_scan` writing `gdn_o` (9 occurrences, x6.7e3 to x1.5e4) and `rmsnorm_had_quant_i8g` writing
+`h.s8` (25 occurrences, x9.6e2 to x1.6e3). **Neither is yet a verdict.** A ratio between two
+consecutive records' operands is not a hop product -- the two may be different buffers, or different
+versions of one buffer, which is precisely the error this section has already had to retract twice.
+Turning these into a named record needs the per-record handed-vs-left probe below, on one buffer with
+its read and write identified.
+
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
