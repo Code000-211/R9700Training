@@ -1263,24 +1263,41 @@ eliminated.** The cotangent side is the same shape and is also right: `cot` hold
 *written* operand (`src/backward.cpp:511-515`), copied out of the version store before the row runs,
 so the row is handed its incoming cotangent and not one it has already produced.
 
-**And the growth is per block, not per sublayer -- which withdraws the "87%".** Measuring the residual
-cotangent on `h` at **the same op in every block** (`rmsnorm_had_quant_i8g`, the slot this report's own
-per-block table uses) gives a level for each of the fourteen blocks the log covers:
+**And the growth is per block, not per sublayer -- and the forward does not have it at all.** The
+decisive measurement is the forward activation and the backward cotangent of **the same buffer at the
+same op in the same block** (`h` at `rmsnorm_had_quant_i8g`), which `R97_DUMP_FWD` and `R97_DUMP_DC`
+both record:
 
 | block | 63 | 62 | 61 | 60 | **59** | 58 | 57 | 56 |
 |---|---|---|---|---|---|---|---|---|
-| `h` maxabs | 9.23e-4 | 0.9805 | 1360 | 1.376e+06 | **3.775e+09** | 6.769e+12 | 1.231e+16 | 8.323e+18 |
-| dec from previous | -- | 3.026 | 3.142 | 3.005 | **3.438** | 3.254 | 3.260 | 2.830 |
+| forward `h` max | 6.5 | 6.53 | 6.91 | 6.53 | 6.56 | 7.03 | 6.53 | 6.28 |
+| **forward dec/block** | -- | +0.002 | +0.024 | -0.024 | +0.002 | +0.030 | -0.032 | -0.017 |
+| backward `h` cot max | 7.24e-6 | 0.01386 | 34 | 35072 | 8.336e+07 | 8.644e+10 | 1.561e+14 | 2.286e+17 |
+| **backward dec/block** | -- | +3.282 | +3.390 | +3.013 | **+3.376** | +3.016 | +3.257 | +3.166 |
 
 | block | 55 | 54 | 53 | 52 | 51 | 50 |
 |---|---|---|---|---|---|---|
-| `h` maxabs | 1.719e+22 | 2.327e+25 | 3.791e+28 | 8.05e+31 | 9.476e+34 | 2.658e+36 |
-| dec from previous | 3.315 | 3.131 | 3.212 | 3.327 | 3.071 | 1.448 |
+| forward `h` max | 6.09 | 6.19 | 5.94 | 5.88 | 5.84 | 5.66 |
+| **forward dec/block** | -0.013 | +0.007 | -0.018 | -0.005 | -0.002 | -0.014 |
+| backward `h` cot max | 4.058e+20 | 4.345e+23 | 6.335e+26 | 9.458e+29 | 1.612e+33 | 2.659e+36 |
+| **backward dec/block** | +3.249 | +3.030 | +3.164 | +3.174 | +3.232 | +3.217 |
 
-**The rate is 3.0 to 3.4 decades per block for every block, and block 59 -- the attention block, the
-one with no `gdn_o` row at all -- is the fastest of the twelve at 3.438.** The three GDN blocks in the
-same range (62, 61, 60) run 3.026, 3.142 and 3.005. **So the growth is type-independent: it does not
-matter whether a block is gated-delta or full attention.**
+**The forward is flat to within +-0.03 decades per block; the backward cotangent grows +3.2 decades per
+block, in all thirteen blocks, over 42 decades.** The backward amplification is therefore a property
+the forward does not share -- it is in the backward plumbing, and it is not a scale of the activation.
+
+**And the rate is the same in both block types, which withdraws the "87%".** The eight gated-delta
+blocks (62, 61, 60, 58, 57, 55, 53, 51) run 3.282, 3.390, 3.013, 3.016, 3.257, 3.249, 3.164, 3.232 --
+**mean 3.200**; the five attention blocks (59, 56, 54, 52, 50) run 3.376, 3.166, 3.030, 3.174, 3.217 --
+**mean 3.193**. **The attention block 59 at +3.376 is the second fastest of all thirteen, and the block
+has no `gdn_o` row at all.** An earlier reading gave the GDN path 87% of the growth; that is
+withdrawn below.
+
+**A second measurement agrees.** Taking the maximum `h` cotangent over *all* ops in a block rather than
+the one fixed op gives 9.23e-4, 0.9805, 1360, 1.376e+06, 3.775e+09, 6.769e+12, ... -- the same series
+two to three orders of magnitude higher, because a different op in the block carries the larger value,
+and the same 3.0 to 3.4 decades per block (3.026, 3.142, 3.005, **3.438**, 3.254, 3.260, ...). **Both
+measurements put block 59 among the fastest and the gated-delta blocks in the middle of the range.**
 
 **That withdraws "the GDN path accounts for 87%", which was circular.** It multiplied the `gdn_o`
 per-block rate (3.217) by the number of GDN blocks and divided by the walk's own per-block rate
