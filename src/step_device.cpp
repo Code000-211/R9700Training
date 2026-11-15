@@ -1102,8 +1102,50 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 out.value.assign(w.value.begin(), w.value.begin() + need);
                 return out;
             };
+            // A strided read of a buffer the block wrote: the writer's capture is the declared
+            // buffer, row-major, and the operand's view_off/view_stride/view_shape index that same
+            // flattened space -- the walk `snapshot` already does over a live buffer at
+            // join_common.h:246-273, run here over the capture instead. Serving the read from the
+            // capture is the only correct source for the same reason the row capture exists: the
+            // arena is reused between one op and the next, so the live pull at the *reader's* issue
+            // is the later op's values. The q-norm's q|gate view is where this bites. A capture that
+            // cannot describe the view -- a plugin-private tensor with no f64 value, or an offset
+            // off the end of the capture -- keeps the live pull, and the caller says so.
+            const auto writer_view = [](const AdValue& w, const Operand& o, const AdValue& r,
+                                        bool* served) {
+                *served = false;
+                AdValue out;
+                out.dtype = r.dtype;
+                out.shape = r.shape;
+                out.raw = w.raw;
+                out.enc = w.enc;
+                // The reader's shape is the operand's view shape (snapshot, join_common.h:247), so
+                // the strides and the extents are the same rank and index the same space.
+                if (w.value.empty() || r.shape.empty() || o.view_shape.empty()) return out;
+                if (o.view_stride.size() != r.shape.size() || o.view_shape.size() != r.shape.size())
+                    return out;
+                int64_t n = 1;
+                for (int64_t d : r.shape) n *= std::max<int64_t>(d, 0);
+                if (n <= 0) return out;
+                out.value.assign(static_cast<size_t>(n), 0.0);
+                const size_t rank = r.shape.size();
+                int64_t idx[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                for (int64_t e = 0; e < n; ++e) {
+                    int64_t off = o.view_off;
+                    for (size_t d = 0; d < rank; ++d) off += idx[d] * o.view_stride[d];
+                    if (off < 0 || static_cast<size_t>(off) >= w.value.size()) return out;
+                    out.value[static_cast<size_t>(e)] = w.value[static_cast<size_t>(off)];
+                    for (size_t d = rank; d-- > 0;) {
+                        if (++idx[d] < r.shape[d]) break;
+                        idx[d] = 0;
+                    }
+                }
+                *served = true;
+                return out;
+            };
             replay.replay(layer, [&snaps, &snap_record, &note_produced, &before, &block_wrote,
-                                  &covered, &same_layout, &writer_rows, &options, &layer](
+                                  &covered, &same_layout, &writer_rows, &writer_view, &options,
+                                  &layer](
                                      const OpRecord& op,
                                      const std::vector<OperandContent>& content) {
                 // The adjoint sees the step's rows and, for attention, the q view its family
@@ -1184,6 +1226,16 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                                                      " read of '" + read.buffer + "' by '" + op.op +
                                                      "' at position " + std::to_string(op.position) +
                                                      " wants rows the block's write of it does not cover");
+                        }
+                        // A strided read: the writer's capture already holds every row of the
+                        // declared buffer, so the reader's view is a gather out of it, not the
+                        // arena's later values. Only a view the capture cannot express keeps the
+                        // live pull, and that stays visible.
+                        bool served = false;
+                        AdValue viewed = writer_view(prev->second, read, snapped.now[j], &served);
+                        if (served) {
+                            snapped.now[j] = std::move(viewed);
+                            continue;
                         }
                         std::string ws, rs;
                         for (int64_t d : prev->second.shape) ws += " " + std::to_string(d);
