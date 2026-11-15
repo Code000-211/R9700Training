@@ -1135,6 +1135,42 @@ host walk now running will show whether the host row does the same -- if it does
 shared and the FD is what says it is wrong; if it does not, it is a device-row defect and the host
 walk's per-block cotangents will show it directly.
 
+**And the amplification is the norm's own scale, not a defect in the row's shape.** The `gdn_o`
+cotangent series over the walk, from the same log, is:
+
+| pos | row that left it | cotangent maxabs |
+|---|---|---|
+| 1417 | `had_quant_act_i8g` | 0.105469 |
+| 1416 | `gdn_gated_rmsnorm` | 1128 |
+| 1396 | `had_quant_act_i8g` | 153 |
+| 1395 | `gdn_gated_rmsnorm` | 1.66298e+06 |
+| 1375 | `had_quant_act_i8g` | 220160 |
+| 1374 | `gdn_gated_rmsnorm` | 2.03004e+09 |
+| 1326 | `had_quant_act_i8g` | 7.81684e+11 |
+| 1325 | `gdn_gated_rmsnorm` | 9.64052e+15 |
+
+The four step ratios are **1.069e4, 1.087e4, 9.22e3, 1.233e4** -- the same number every GDN layer,
+and the layer-to-layer relaxation (1128 -> 153, 1.66e6 -> 220160) is a factor of ~7.4. Net growth is
+**~1.1e3 per GDN layer** over the thirteen GDN layers between positions 1417 and 1143, which is
+0.105469 -> 3.38953e+38: **3.2e39, i.e. 3.04 decades per GDN layer -- the same 3.2 decades per block
+the residual table measures.** **The ladder's growth is the GDN path, and it is this row.**
+
+**And the forward shows the row does the same thing in the forward direction.** `gdn_o` at its
+`gdn_chunk_scan` writer is maxabs **0.42, 0.62, 0.56, 0.32, 0.57, 0.50, 0.43, 0.53, 0.62, 0.34**
+(positions 1415 ... 1142) and at its `gdn_gated_rmsnorm` writer is maxabs **278, 340, 251, 282, 288,
+266, 292, 272, 276, 182** (1416 ... 1143). The norm's output is **~656x** its input's max, every
+layer, and the forward is otherwise flat. **So `sc * w` is ~656 on this buffer, per layer, and a
+normalisation with `sc * w ~ 656` amplifies its input's cotangent by that same factor.** The
+cotangent step (1.1e4) and the forward step (6.6e2) differ only by the `1/ch` and second-term factors
+of the same Jacobian.
+
+**So the growth at this row is the RMS-norm Jacobian doing its job on a peaked row.** `gdn_o`'s max
+is 0.42 while its row RMS must be ~1e-3 for `sc` to be ~1e3 -- a few large channels and many small
+ones, which is what a gated recurrence output looks like. **That is not a bug in
+`gdn_gated_rmsnorm`.** What it does mean is that **the walk's cotangent to this sublayer grows 1.1e3
+per layer while the FD says the loss's gradient to the parameters does not grow at all** -- so the
+contradiction is now pinned to this row and to the cotangent it is handed, not to the ladder's shape.
+
 ### The host walk is not an available arbiter on this container
 
 `R97_HOST_WALK_AB=1 R97_DUMP_DC=1` was run on the 512-token case to settle device-rows-versus-plumbing
