@@ -907,28 +907,39 @@ well-behaved at every block -- so this is not an FD artefact:
 -74359. That is the strongest confirmation yet that the gradient is a well-behaved number at every
 depth, and that the walk's 6.28e35 is not a range artefact of a genuinely huge gradient.
 
-**And the walk is wrong at block 63, the first layer it touches.** There is no compounding above it:
-`self_attn.q_proj.lora_A` of the last decoder layer reads **0.00744629** where the loss's own central
-difference is **948.917** -- five decades too *small*. Whatever the per-layer amplification is, it is
-not the whole story, and the earlier framing ("the walk grows ~1.6e3 per layer where the truth grows
-1.24x") cannot account for a five-decade error with zero layers in between.
+**One rate fits all four finite points, and no family term is needed.** Taking the two `self_attn`
+points -- block 63 at -5.11 decades and block 55 at +19.89, eight layers apart -- gives **3.125
+decades per layer**:
 
-**The two families are off in opposite directions, by almost exactly the same factor.** Block 63 is a
-full-attention layer and reads **1.27e5 too small**; block 60 is a gated-delta layer and reads
-**1.35e5 too big**. The container is a 3:1 hybrid -- 48 linear-attention plus 16 full-attention layers
--- so the two readings are one leaf of each family, and their errors are equal and opposite to within
-6%: **-5.11 and +5.13 decades**. That is not a scale factor, and it is not a per-layer accumulation:
-it is a property that differs between the two attention families.
+| block | leaf | observed | predicted from block 63 | residual |
+|---|---|---|---|---|
+| 63 | `self_attn` | -5.11 | -5.11 | 0.00 |
+| 60 | `linear_attn` | **+5.13** | +4.26 | **+0.87** |
+| 55 | `self_attn` | +19.89 | +19.89 | 0.00 |
+| 51 | `self_attn` | +31.86 | +32.39 | -0.53 |
 
-**Below block 60 the error compounds at ~934x per layer** (60 -> 51 is 9 layers, 5.40e26, i.e. 10^26.73
-over 9), which is the same order as the ~1.55e3 per layer the growth curve gave over 22.78 records.
-So both statements hold: **a family-dependent error of ~±5 decades at the top, compounding at ~1e3 per
-layer as it descends.** The compounding was measured before; the ±5 decades at the top is new, and it
-is the one that has to be explained first, because it needs no accumulation to appear.
+The one point that crosses the family boundary -- block 60, a gated-delta layer -- sits on the same
+line as the three full-attention ones, within 0.87 decades against a per-layer rate of 3.1. The
+observed rates are 3.413 over 63->60, 2.970 over 60->51 and 3.125 over 63->55. **An earlier reading of
+this table called the block-63 and block-60 errors "equal and opposite to within 6% -- a property that
+differs between the two attention families"; that is withdrawn.** It was an artefact of picking two
+points three layers apart, where the sign happens to flip because the error passes through zero
+between them. The rate is 3.125 decades/layer, against the 3.190 the growth curve gave independently
+-- a 2% agreement from two instruments that share nothing but the container.
 
-**The next probe is therefore narrow**: two leaves of the *same* block, one from `self_attn` and one
-from `linear_attn`. If they are off by equal and opposite factors there too, the defect is a
-per-family mis-assignment of the adapter gradient rather than anything in the backward's arithmetic.
+**And the walk is wrong at block 63, the first layer it touches.** `self_attn.q_proj.lora_A` of the
+last decoder layer reads **0.00744629** where the loss's own central difference is **948.917** -- five
+decades too *small*. **That is 1.64 layers' worth of the same rate**, so the error does not start in
+the layers: it is already present when the walk enters the last block, at a size consistent with
+**one to two layers of it originating at or above block 63** -- the head or the objective. The earlier
+framing ("the walk grows ~1.6e3 per layer where the truth grows 1.24x") is consistent with this but
+does not localise it; this does.
+
+**So the next probe is the head and the objective, not the layers.** The walk's error is one rate all
+the way down, already ~1.6 layers deep at the top, and the layers themselves add nothing but that same
+rate. Measuring the cotangent where the loss hands it to the head -- `R97_DUMP_DC` on the objective's
+own boundary -- is the narrowest remaining question, and it is upstream of everything the bisect
+measured.
 
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
