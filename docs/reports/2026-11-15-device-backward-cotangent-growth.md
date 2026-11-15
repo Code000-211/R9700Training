@@ -898,6 +898,38 @@ that needs `weights_` plumbed into `elementwise.cpp`, which the twin does not cu
 data rules out is the rank-2 operand: it cannot be the weight, and any caller taking it is taking
 per-row data as a gain.
 
+### The adjoint reads a per-row tensor as a single gain vector
+
+`ADJGAIN` prints which snapshot `rmsnorm_host_adjoint` took:
+
+```
+ADJGAIN pos=1449 buffer=h w_rank=2 w0=512 values=2621440
+ADJGAIN pos=1429 buffer=h w_rank=2 w0=512 values=2621440
+```
+
+**The row differentiates with a `[512, 5120]` tensor read as a `[5120]` gain.** Row 0 of per-row data
+is used as a single vector, and the values it carries are not the weight's: the rank-1 snapshot's
+entries are `0.245117, 0.146484, ...` and the rank-2's are `0.347402, 0.648529, ...`, with the rank-2
+rows differing from each other by 4.99.
+
+**The schema-rank preference does not fix it, and that is the informative part.** Re-applying it left
+`w_rank=2`: the adjoint's operand vector contains *only* the rank-2 snapshot, so there is no rank-1
+option to prefer. The twin, by contrast, holds the rank-1 one (`FDRMS w_rank=1`). The two callers are
+handed different data for the same buffer.
+
+**This corrects an earlier conclusion of this report.** The preference was reverted as "inert" because
+`DUMPTWIN`'s numbers were byte-identical -- but `DUMPTWIN` measures the *twin*, which already had the
+good snapshot. The quantity the preference would change is the adjoint's, and the adjoint had nothing
+better to take.
+
+**It lands on `dc[h]`** (operand 0's cotangent, established above), so the norm's row differentiates
+the growing quantity with the wrong gain. The gradient stays finite (48.6156) -- this is a wrong
+derivative, not a blow-up -- which is why it never showed as a NaN.
+
+The fix is not in `norm_gain`: it is that the adjoint's operand vector should carry the same snapshot
+the twin gets. That is a snapshot/record-plumbing change in `backward.cpp`'s `fwd` construction, not a
+lookup preference.
+
 ## The quotient's guard## The quotient's guard## The quotient's guard
 
 The mask pass divides each code's cotangent by its group scale, and the quotient is exact only

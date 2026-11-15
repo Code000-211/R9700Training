@@ -545,6 +545,16 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
     const AdValue& dy = call.cot[0];
     const int64_t n = width_of(call.rec, x.shape);
     const AdValue* w = norm_gain(call.rec, call.fwd, n);
+    // R97_GAIN_POS=1: which snapshot the *adjoint* took. `GAINPOS` shows two at the same position --
+    // rank 1 `[n]` and rank 2 `[rows,n]` -- and `FDRMS` shows the twin takes the rank-1 one, so this
+    // names what the row itself differentiates with. A rank-2 gain read as row 0 is a per-row tensor
+    // used as a single vector, and it lands on `dc[0]`.
+    if (std::getenv("R97_GAIN_POS") != nullptr && w != nullptr)
+        std::fprintf(stderr, "ADJGAIN pos=%lld buffer=%s w_rank=%zu w0=%lld values=%zu n=%lld\n",
+                     (long long)call.rec.position,
+                     call.rec.operands.empty() ? "" : call.rec.operands[0].buffer.c_str(),
+                     w->shape.size(), w->shape.empty() ? -1LL : (long long)w->shape[0],
+                     w->value.size(), (long long)n);
     const int64_t rows = rows_of(x, n);
     if (rows <= 0) return;
     // A gain the record names but the tape could not give values for cannot be served: the row
