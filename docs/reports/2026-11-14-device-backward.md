@@ -289,11 +289,14 @@ is **~984x per block** (1377x to block 51's last finite value), against a **true
 (76 / 1.9e-4 = 4e5 over the same 13 steps). That is a **~365x per-block excess**, and
 365^13 = 2e33 -- the over-statement, reached without assuming any uniform factor.
 
-Within a block the largest single contributor is `gdn_gated_rmsnorm` -- its Jacobian grows ~1e4 when a
-row's `mean(x^2)` approaches `eps`, and it both reads and writes `gdn_o` (opnd 0 and opnd 3), which is
-what made the jump look like the scan's; each quantised row adds ~1e2; `gemm_nt_q` adds none. From
-position **1175** onward, **817 records** report a non-finite
-*incoming* cotangent -- the non-finite values propagated from 1176 and never became finite again.
+Inside a block the *largest single record-level jump* is `gdn_gated_rmsnorm`, whose Jacobian grows
+~1e4 when a row's `mean(x^2)` approaches `eps`; it both reads and writes `gdn_o` (opnd 0 and opnd 3),
+which is what made that jump look like the scan's. **That is a same-buffer measurement across one
+record, not the block's amplification**: it is offset by shrinks over the rest of the block, so it
+does not multiply with the ~1e2 a quantised row adds -- the block net is the ~984x above.
+
+From position **1175** onward, **817 records** report a non-finite *incoming* cotangent -- the
+non-finite values propagated from 1176 and never became finite again.
 
 `maxabs` counts finite values only (`src/backward.cpp:610`), so a fully non-finite vector reports the
 largest surviving finite magnitude rather than `inf`. That is why the curve appears to plateaus after
