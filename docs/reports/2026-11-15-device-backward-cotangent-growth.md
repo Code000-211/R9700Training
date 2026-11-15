@@ -756,6 +756,28 @@ the tape or in the replay's contract for a buffer that the same op writes, and i
 to `step_host.cpp`, since the information the correction needs (the pre-write value) is not present in
 `content` when no earlier op wrote the buffer.
 
+### The 1429 defect is in the backward, not only in the oracle
+
+`rmsnorm_host_adjoint` opens with `const AdValue& x = call.fwd[0];`
+(`src/adjoint/host/elementwise.cpp:527`) -- the same snapshot the twin reads. So when the tape hands
+an in-place read its post-write value, **the row computes its derivative at the wrong point too**:
+`ss`, `s` and both terms of the rule are taken from the op's own output instead of its input. The
+1429 finding is therefore a backward defect, not a broken instrument.
+
+Which cotangent it lands on is worth stating precisely rather than assuming. The record's operand 0 is
+the branch activation `h` (read) and operand 5 is `h` again (written in place), so `call.dc->at(0)`
+-- the row's `dx` -- is the cotangent of `h`, which is the quantity whose growth this ticket tracks.
+That would put the defect directly on the measured path rather than only on the residual. It has not
+been confirmed by a control that swaps the snapshot, so it is stated here as the reading of the record
+and not as a measurement.
+
+The natural mitigation is a refusal, in keeping with the rest of this path (`elementwise.cpp:533-540`
+already refuses a gain the tape could not give values for): when an in-place read's snapshot is
+bit-identical to the same op's own write snapshot, the value is provably the wrong one, and refusing
+names it instead of returning a gradient taken at the output. It is not applied here because it would
+make the host walk refuse at 1429, which is a change to what the A/B can run and is the maintainer's
+call.
+
 ## The quotient's guard## The quotient's guard
 
 The mask pass divides each code's cotangent by its group scale, and the quotient is exact only
