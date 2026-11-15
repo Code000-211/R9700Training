@@ -1261,16 +1261,25 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                         snapped.now[j].value.assign(snapped.now[j].value.size(), 0.0);
                     }
                     snaps.set(op.position, j, snapped.now[j]);
+                    // Only a write that states every row (`rows == shape[0]`) and is not strided
+                    // can be captured: the capture holds the buffer row-major, so a partial row
+                    // window or a view cannot be represented.
+                    //
+                    // `rows == 0` is the "no row window" sentinel and looks like a whole-buffer
+                    // write, so capturing it is tempting -- and it was tried: the 512 case then
+                    // reported `zero-gradient leaves: model.layers.51.self_attn.k_proj.lora_A
+                    // (4 of 400)` and moved the non-finite to `lora_shrink` at position 1150. Those
+                    // writes do not carry the whole buffer in their snapshot, so serving them
+                    // hands a reader a value it never saw. Leave them uncaptured.
                     if (operand.written && operand.view_shape.empty() && operand.rows > 0 &&
                         operand.rows == operand.shape[0]) {
                         before[operand.buffer] = std::move(snapped.now[j]);
                     } else if (operand.written) {
-                        // This write is not one the capture can hold -- a strided write, or a
-                        // partial row window -- so it must not be replaced by, or leave standing,
-                        // the value an *earlier* write put in the map. A reader after this point
-                        // saw this write, not that one, and serving the older value would be
-                        // silent and plausible: the class this effort exists to remove. Drop the
-                        // entry, so the walk refuses by name at `prev == before.end()` instead.
+                        // This write is not one the capture can hold, so it must not leave the
+                        // value an *earlier* write put in the map standing: a reader after this
+                        // point saw this write, not that one, and serving the older value would be
+                        // silent and plausible -- the class this effort exists to remove. Drop the
+                        // entry, so the walk refuses by name at `prev == before.end()`.
                         before.erase(operand.buffer);
                     }
                 }
