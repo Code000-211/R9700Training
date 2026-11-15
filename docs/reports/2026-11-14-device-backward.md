@@ -959,6 +959,30 @@ norm, i.e. `d_hout` itself. The report's 1128 at position 1416 is 8.7e9 above it
 grows from the top at the same rate everywhere, and block 63's -5.11 decades is that rate applied to
 the ~1.6 layers between position 1458 and block 63's own leaves.
 
+**And one accounting correction that moves every ratio in this report by 2.71 decades.** The reported
+loss is the **sum** over the scored positions -- `src/loss.cpp:48` does `out.loss += ce_position(...)`
+-- while the gradient is the **mean's**: `src/step_device.cpp:621` sets
+`grad_scale = 1.0 / scored`, and `src/loss.cpp:126` does the same on the reference path. For the
+512-token case `scored = 511` (`device_step_tape.json`), and `7371.591348 / 511 = 14.43` nats per
+token against `ln V = 12.42` for the 248044-way vocabulary, which is what a sum of 511 per-token
+cross-entropies looks like.
+
+**So `R97_CENTRAL`'s `central_bf16` is d(sum loss)/dw and the walk returns d(mean loss)/dw.** Every
+FD-versus-walk ratio must be divided by 511 to be comparable, and the ratios above are not:
+
+| block | walk | FD (sum) | FD / 511 | walk / (FD/511) |
+|---|---|---|---|---|
+| 63 | 0.00744629 | 948.917 | 1.85698 | **4.01e-3** |
+| 60 | 9.43718e+07 | 701.006 | 1.37183 | **6.88e+07** |
+| 55 | -1.04482e+23 | 1351.07 | 2.64397 | 3.95e+22 |
+| 51 | 6.59422e+35 | -9073.83 | -17.757 | **3.71e+34** |
+
+**The per-layer rate is a ratio of ratios and does not move: 3.125 decades/layer.** The block-63
+statement becomes "**249x too small**" rather than 1.3e5, and the headline over-statement becomes
+**3.71e34** rather than 6.9e31. Both are still enormous, and neither changes the shape of the
+conclusion -- but the numbers quoted earlier in this report and in the PR body are 2.71 decades too
+small, and are superseded by this table.
+
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
