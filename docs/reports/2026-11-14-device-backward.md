@@ -1171,6 +1171,35 @@ ones, which is what a gated recurrence output looks like. **That is not a bug in
 per layer while the FD says the loss's gradient to the parameters does not grow at all** -- so the
 contradiction is now pinned to this row and to the cotangent it is handed, not to the ladder's shape.
 
+### And the row is FD-verified correct, at exactly those magnitudes
+
+The host tier already carries the test for this, and it settles the question
+(`gdn_gradient_probe_gated_rmsnorm_matches_the_ops_own_derivative` and
+`adjoint_gdn_gated_rmsnorm_agrees_with_finite_differences`, `tests/host/gdn_gradient_probe.cpp` and
+`tests/host/adjoint_gdn_prep.cpp`; **4 tests, 0 failed**):
+
+```
+gdn_gated_rmsnorm ordinary-rows: kernel vs twin max err 0.0106
+gdn_gated_rmsnorm ordinary-rows: buffer-max amplification |dc|/|dy| = 2.844,
+    worst |adj-fd|/max 8.21e-08 (0 over the probes with |fd| > 1)
+  x[r5,i0] m=1e-06    fd +1621.2    adj +1621.2    adj/fd +1.000000
+  x[r5,i64] m=1e-06   fd +307.845   adj +307.845   adj/fd +1.000000
+```
+
+**The probe walks the row magnitude `m` from 3e-01 down to 1e-06, and the amplification is a function
+of `m`:** at ordinary magnitudes `|dc|/|dy|` is **2.844**; at `m = 1e-06` the gradient is **+1621.2**
+and the adjoint reproduces it to **adj/fd +1.000000**. **So the ~1e3 the walk shows is not merely
+plausible -- it is measured, and the adjoint is right to six digits at the magnitude that produces
+it.** The 2.844 for ordinary rows and the ~1e3 for the container's rows say the container's `gdn_o`
+rows really are at the small end of that range.
+
+**This closes `gdn_gated_rmsnorm` as a suspect.** The cotangent growth is correct math on this input
+distribution. **So the walk's gradient being enormous is not, by itself, a defect -- and the question
+becomes why the FD on the *loss* does not grow the same way.** Either the loss's finite difference was
+taken at a point whose rows are not small, or the loss does not read the rows that carry the growth
+(`scored` is 511 of 512). That is the next thing to measure, and it is measurable on the host tier
+without the container.
+
 ### The host walk is not an available arbiter on this container
 
 `R97_HOST_WALK_AB=1 R97_DUMP_DC=1` was run on the 512-token case to settle device-rows-versus-plumbing
