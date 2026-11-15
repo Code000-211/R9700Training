@@ -480,7 +480,7 @@ no incoming cotangent to scan. The one real over-claim is the comment at `:724-7
 on the `options.in_place_passthrough` path (`:709-718`): a slot the row left empty is filled with the
 cotangent the row was *handed*, after the pre-call scan.
 
-### Where the factor is not, and the one group it can still be in
+### Where the factor is not, and what is left
 
 An op-level probe (`tests/host/gdn_gradient_probe.cpp`, CPU only) central-differences each op's own
 host twin against its own host adjoint -- the method that found the `gemm_nt_q` scale, and one that a
@@ -512,20 +512,37 @@ shared-factor comparison that cannot see a factor both sides carry. **208 of the
 are the only op group on the path with no finite-difference check on either side.
 
 Auditing that row against its forward accepts the `/s` (it matches `src/adjoint/host/quant.cpp:299`),
-the `+ cot_h` fused-output term and the norm backward, so no factor is visible by inspection. What
-*is* visible is a range hazard: the row computes `cot / s` in f32 (`quant.hip:199`), and this record
-carries code cotangents of 2.44e30..2.62e33 while `gdn_o`'s reach 1e35..1e38 -- with live scales as
-small as 5.96e-05, the quotient crosses f32's 3.4e38. That is consistent with the report's
-first-non-finite being this row's in-place output, and it is a real defect on its own, though an
-overflow gives Inf rather than a large finite multiplier.
+the `+ cot_h` fused-output term and the norm backward, so no factor is visible by inspection. An
+earlier draft of this section then flagged a range hazard here -- `cot / s` in f32
+(`quant.hip:199`) against the 5.96e-05 smallest live scale -- **and that arithmetic is wrong for this
+row**: the quotient is safe where it is taken, because at position 1176 the code cotangent is 1.25e34
+against a group scale of 0.19, i.e. `6.6e34`, an order of magnitude under f32's 3.4e38. The
+5.96e-05 and 7.5e-3 scales belong to rows whose cotangents are far smaller. **What WAS a real
+device-versus-reference divergence on this path is the 5120-term f32 row reduction** in
+`rmsnorm_back_kernel`, fixed in the tree (`src/adjoint/device/quant.hip:248-290`, all-f64
+accumulators, only the store narrowing). Issue #140 is re-scoped to match.
 
 **That gap is now closed.** The three producers have host twins and host adjoints
 (`src/adjoint/host/quant.cpp`), built as the composition the GPU tier already had in its test TU, and
 each has a linearised `<op>_ste` row so that a finite difference can differentiate it -- these are
 quantisers, so their forward is a step unless the row is linearised at a base point. Held to their
 own differences at two shapes they read 1e-9 to 1e-11, against 1e-12 to 1e-9 for the fp8 control in
-the same run. So the three producers' **host** side is now excluded, and the remaining side no
-finite difference has reached is the **device** row's `cot / s`, which is #140.
+the same run. So the three producers' **host** side is now excluded.
+
+**What is still unprobed is the device side of every row on this path, not any one row.** A device row
+is checked against its host twin, and the host is now exact by finite difference -- but that
+transitivity holds only if the device-versus-host check exercises the magnitudes that matter. Those
+checks run on synthetic fixtures with small values, while the real container's cotangents reach
+1e37 by block 51; a clamp, an `rsqrtf` near zero, an f32 accumulate or a bf16 store that engages only
+at 1e34..1e37 would never fire on the fixture. **An earlier draft named the device row's `cot / s`
+here and that is wrong** -- the quotient is safe where it is taken (`1.25e34 / 0.19 = 6.6e34`, under
+f32's 3.4e38); see the re-scoped #140.
+
+The live lead is the **`1/s` round-trip**: a quantiser's adjoint divides the codes' cotangent by the
+group scale and its consumer must multiply it back, and at `s ~ 0.19` that is `5` per hop. ~5 such
+hops per block at `5` each is the measured order, so **a single hop missing its balance would not do
+it -- ~3 of them would.** That is an audit of which rows divide and which multiply, not a range
+question.
 
 ### Two defects found in passing
 
@@ -539,7 +556,7 @@ finite difference has reached is the **device** row's `cot / s`, which is #140.
 
 ## The 4096-token step, run to completion
 
-The run the issue asks for was made on one card against `/srv/models/rad/qwen3.8-27i-iq5r-s-v4.rad`.
+The run the issue asks for was made on one card against `/srv/models/rad/qwen3.8-27b-iq5r-s-v4.rad`.
 It completes: 4096 tokens, one AdamW update, 800 leaves (400 `lora_A`, 400 `lora_B`), 4095 scored
 positions, `names_match` and `shapes_match` both true and `n_other` zero, so the join hands back
 exactly the schema's leaves.
