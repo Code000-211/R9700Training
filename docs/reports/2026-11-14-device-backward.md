@@ -746,18 +746,20 @@ walk, jumps above 1.2x per occurrence: `kv_store` 4/10 (40 %), `gated_had_quant_
 the ops rather than concentrated in one.** Naming it needs a per-op finite difference -- each op's own
 adjoint against its own central difference at the real magnitudes -- not a jump census.
 
-**And the existing per-op FD tests cannot see it, for a checkable reason.** `tests/gpu/` already has
-per-op finite-difference checks for every op on the `h` path -- `adjoint_lora`, `adjoint_quant`,
+**And the per-op adjoints are already checked at the container's own widths.** `tests/gpu/` has
+finite-difference checks for every op on the `h` path -- `adjoint_lora`, `adjoint_quant`,
 `adjoint_linear`, `adjoint_elementwise`, `adjoint_gdn_prep`, `adjoint_gdn_scan`, `adjoint_gdn_kkt` --
-and they all pass. But they run at **`rows = 4, n = 128`** (`adjoint_quant.cpp:223`, and
-`codes_n = 6144` at `:342`) and at **`K = 300`** in three groups of 128, 128 and 44
-(`adjoint_lora.cpp:89`). The container's live rows are **5120 and 17408 wide over 512 or 4096 rows**.
+and they run at the real shapes, not only at toy ones: `adjoint_lora.cpp:103-112` covers `M = 1024` and
+`4096` at `K = 5120`, `N = 12288` and `K = 17408`; `adjoint_elementwise.cpp:303-320` covers hidden 5120
+and 17408 at 1024 and 4096 tokens; `adjoint_linear.cpp:728-730` covers `4096 x 5120 x 6144` and
+`4096 x 1024 x 5120`; and `adjoint_gdn_scan.cpp:103` covers 4096 tokens. **They all pass.**
 
-Three of the four defects this report has already landed are **width-dependent f32 row reductions**
-(`shrink_dx_kernel`'s 128-column group, `expand_dt_kernel`'s 17408-column sum, `rmsnorm_back_kernel`'s
-5120-term dot) -- every one of them found by a real-magnitude run and none of them reachable from a
-128-wide test. **The next probe is therefore the existing FD tests at the container's own widths**, not
-a new instrument.
+**That is a real constraint, and it rules the obvious explanation out.** A linear op's adjoint is linear
+in its cotangent, so a per-op factor cannot be magnitude-dependent; and the widths are already right. So
+**no single op on this path is wrong**, which is consistent with the jump census above finding four ops
+clustered at 31-40 % rather than one standout. The factor is in the **composition** -- how the ops'
+contributions accumulate into one buffer -- not in any one op's own derivative. That is where the next
+probe belongs.
 
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
