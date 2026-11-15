@@ -761,6 +761,20 @@ clustered at 31-40 % rather than one standout. The factor is in the **compositio
 contributions accumulate into one buffer -- not in any one op's own derivative. That is where the next
 probe belongs.
 
+**The specific composition to suspect is the saved forward, not the arithmetic.** If every op's adjoint
+is FD-correct at the real shapes and every accumulation is correct, then the walk is the **exact**
+gradient of *some* function -- and the only way for that to miss the real gradient by 1e31 is for the
+function it linearises to be a different one. That is what a **stale or mismatched snapshot** produces,
+and it is the one failure mode that no per-op FD can catch, because each op is being differentiated
+correctly at the values it was handed.
+
+It also fits the shape of the evidence: a per-record factor of ~1.38 applied uniformly, with the jump
+census finding no op, is what a small systematic difference in the saved operands would look like
+compounded 90 times per layer. The report already carries the two instruments for this -- `R97_DUMP_FWD`
+(the forward's own operands as they were computed) and `R97_DUMP_SNAP` (what the walk was handed) -- and
+the probe is to run both on one layer and compare operand by operand. **That is a cheaper and more
+decisive test than any further census, and it is the named next step.**
+
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
