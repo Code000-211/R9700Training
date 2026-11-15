@@ -1060,6 +1060,42 @@ touches, so it has had the fewest layers' worth of spurious gain applied to it, 
 is the error accumulated in the ~1.6 layers above it -- the head, the objective, and block 63's own
 records. Everything below compounds from there.
 
+### The gain is per block, multiplicative, and uniform: ~1600x every block
+
+The cotangent to compare across layers is the **residual** one -- the `lora_expand h` read slot, the
+value the block hands down -- and it must be read on that slot alone. (Taking the max over all of a
+block's rows instead measures the *scale* gradients, `h.s8` at ~1e-2, which are a sum over a
+quantisation group and naturally far larger; that mistake produces a spurious period-4 pattern by
+layer type, which is withdrawn here.)
+
+On the residual slot, from the same `/tmp/r97-head.log`:
+
+| block | residual cotangent | gain over the block below |
+|---|---|---|
+| 63 | 7.242e-06 | -- |
+| 62 | 0.01385 | **x1913** |
+| 61 | 34 | x2454 |
+| 60 | 3.507e+04 | x1032 |
+| 59 | 8.389e+07 | x2392 |
+| 58 | 8.751e+10 | x1043 |
+| 57 | 1.583e+14 | x1809 |
+| 56 | 2.297e+17 | x1451 |
+| 55 | 4.081e+20 | x1777 |
+| 54 | 4.392e+23 | x1076 |
+| 53 | 6.383e+26 | x1453 |
+| 52 | 9.507e+29 | x1489 |
+| 51 | 1.633e+33 | x1717 |
+| 50 | 2.679e+36 | x1641 |
+
+**3.198 decades per block, and the gain never leaves 3.01-3.39.** That is a factor of ~1600 every
+block, thirteen times over -- 10^41 in total -- where the FD says the true leaf gradients are flat.
+
+**The uniformity is the informative part.** The gain does not depend on the block's type (the 3:1
+hybrid would show a period-4 signature if it did), nor on its position, nor on whether the block
+contains the attention path at all. It is the same operation, done once per block, multiplying where
+it should add. That is a much tighter constraint than "the walk is wrong somewhere below the head",
+and it is where the next look goes: the per-block walk's own accumulation, not the layers' contents.
+
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
