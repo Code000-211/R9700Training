@@ -1,0 +1,488 @@
+# The device backward's `h` cotangent grows 3.2 decades per block
+
+Issue #145. The device step's backward grows the residual stream's cotangent by a factor of
+`10^3.2` per block over thirteen blocks, while the forward `h` is flat and the finite difference
+says the leaf gradients are flat. This is the measurement, the host rows the A/B needed, and what
+is left: the growth is in the composition, and the rule that supplies it is still open.
+
+## What was reported
+
+`tests/gpu/device_step.cpp`'s `device_step_tape` on
+`/srv/models/rad/qwen3.8-27b-iq5r-s-v4.rad`, 512 tokens, TP 1:
+
+| block | `maxabs` of `h`'s cotangent at the norm |
+|---|---|
+| 63 | 7.24e-6 |
+| 62 | 0.01386 |
+| 61 | 34 |
+| 60 | 35072 |
+| 59 | 8.336e7 |
+| 58 | 8.644e10 |
+| 57 | 1.561e14 |
+| 56 | 2.286e17 |
+| 55 | 4.058e20 |
+| 54 | 4.345e23 |
+| 53 | 6.335e26 |
+| 52 | 9.458e29 |
+| 51 | 1.612e33 |
+| 50 | 2.659e36 |
+
+The growth is 3.2 decades per block, in both the GDN (3.200) and the attention (3.193) blocks.
+There are two `h` records per block -- the mixer's norm and the FFN's -- and the walk's own
+deltas alternate between about 1.4 and 1.8 decades, median 1.60, so the per-block factor is the
+product of two rows' factors rather than one row's.
+The forward `h` over the same blocks is 5.66 to 7.03: flat to within 0.03 decades per block. The
+smallest group scale the quantiser uses on this container is 5.95831e-05, and the largest single
+cotangent element is 2.65846e36 -- finite, so nothing has overflowed yet; the first position whose
+output is entirely non-finite is 1134. No cotangent is below 1e-32.
+
+Within one block (62) the growth is not one row's: 1428 `add` 9.232e-4, 1421 FFN norm 0.013855
+(x15.0), 1412 mixer norm 0.478516 (x34.5), 1408 attention norm 0.980469 (x2.05). Each norm's
+adjoint multiplies by the block's own factor, so the per-block factor is the product of the rows'
+factors, not one row's.
+
+## The plan's premise was wrong, and that is why the first attempt could not run
+
+The plan said the host walk would read each operand's forward value out of `AdValue::raw`. It
+cannot: `raw` is the engine's VRAM pointer (`pulled_bytes` returns 0 for a dtype whose
+`elem_size` is 0, so `pull_operands` keeps `content.data = recorded.data`), and the bytes behind it
+are libr4d's unit-major rearranged layout, not a host `RadPlanesHeader`. The host rows have to
+decode from the container, which is what `src/vocab_head.cpp` already does for the head's weights.
+
+Three pieces carry that:
+
+- `src/iqr_form.h` derives the stored form from the encoding's own planes (as libr4d's `classify`
+  does), validates it with `r97_iqr_validate`, decodes with `r97_iqr_decode_host`, and folds
+  `scale.col` the way `iqr_plane.hip`'s `eff_scale` does -- `bf16(row_f32[n] * cf_f32[kb])`, the
+  round-to-nearest-even `bf16_bits` of libr4d's `r4d_iqr_dec.h`.
+- `src/stored_weight.{h,cpp}` holds the decoded weight as int8 codes plus bf16 group scales, keyed
+  by `(encoding, rows, cols)`. The encoding pointer is one per weight in the program, so keys
+  cannot collide; a process-wide store is what lets the walk reach a weight it decoded in an
+  earlier block.
+- `src/step_device.cpp`'s `register_stored_operand` runs on every snapshot the host walk takes. A
+  plain encoding (one codes plane, block 1x1, core float dtype) is widened to f64 values, so every
+  row works unchanged; anything else with a `cols % 128 == 0` is decoded into the store.
+
+`R97_DUMP_STORED=1` prints one line per stored operand, and the step end reports how many weights
+the walk decoded and how many bytes they held.
+
+## What the container's block 63 carries
+
+`blk.63.*` has six trellis weights and four plain bf16 norms. All six decode: `attn_qg`
+[12288,5120], `attn_k`/`attn_v` [1024,5120], `attn_output` [5120,6144] (bf16 per 128), `ffn_down`
+[5120,17408], `ffn_gate_up` [34816,5120]. RMS 0.00103 to 0.00233, 98.7% non-zero codes, scales
+1.5e-5 to 3.0e-4. `blk.63.ffn_norm.weight` is a plain `[1 5120] bf16`.
+
+The trunk form, in rad-info's spelling:
+
+```
+trellis:codes=u6[1x1],scale=f32[1x*],trellis=i8{65536x1},trellis.mad=u32{2x1},
+        scale.col=f32[*x128]/fwht128
+```
+
+The scheme is `trellis`, not `affine`; the trellis *table* carries `block[0]=256` (the run rows)
+and `block[1]=1` (the rb).
+
+## The host rows the walk needed
+
+The first two were named refusals the walk hit in order; the next two were silent, and each is a
+place where a row read a width, a position or a shape off the record's parameters or its own order,
+while the tape carries the fact on the operands:
+
+1. `rmsnorm_had_quant_i8g`'s gain arrives as `[512, 5120]` (2621440 values) as well as a single
+   row (`[5120]`). `norm_gain` required one dimension; a `[rows, n]` operand of the row's width is
+   now accepted.
+2. `gate_had_quant_i8g`'s record declares `n=256` while its codes are 6144 wide over a 48-group
+   scale, and its elementwise intermediate is `[512, 24, 256]` -- the codes' value count in the
+   elementwise op's own shape. `fused_adjoint` now derives `rows`, `n` and `group` from the codes
+   and the scale operands and tests the intermediate's value count, exactly as the device row does.
+3. `rmsnorm_had_quant_i8g`'s gain arrives as `[512, 5120]` with 2621440 values, and **its rows are
+   not the same one** -- for a weight the container holds as `[1, 5120]`. The record is
+   `h, x:inout, w`, so both rows do land on the weight (the device row's "second read" is the first
+   non-written operand after `h`, and `x` is written), and both index row 0. A row-identity test
+   that refused this would refuse the walk, so what it does instead is say so once:
+   `note_gain_rows` prints that the tape's gain is not the broadcast its shape claims, and the
+   gain is read from row 0. The tape's form is the thing to fix, and it is named here rather than
+   silently averaged away.
+4. The residual's cotangent: `fused_adjoint` read `call.cot[0]` and `[1]` positionally (below).
+5. The residual's *routing*: a frozen in-place operand's slot was never sized, so the walk dropped
+   the residual stream's cotangent at every fused norm (its own section below).
+
+The refusals were silent about *why* until they were given the operand list; the messages now
+carry it. Fix 4 is the one the A/B needed: it is the difference between a host walk that returns
+the same order of magnitude as the device walk and one that returns zero.
+
+`tests/host/adjoint_quant_cot_slot.cpp` pins fix 4 in milliseconds: it builds the
+fused rmsnorm record with the output's write before the codes and again after them, and requires
+the residual's gradient to be non-zero and identical both ways. Under the positional read the first
+order returns zero.
+
+One more was found by reading rather than by the walk, and is latent on this container:
+`gemm_nt` and `logits_gemm` took a stored weight's *code* as its value, without the group scale,
+which would have been a silent factor of `1/scale` on any plain weight the join decoded. The walk
+never takes that path -- the container's plain weights are widened to values, so `stored` is null --
+so it is fixed while there and not exercised.
+
+## The gate: the host walk grows where the device walk grows
+
+The plan's gate was to walk the same tape with the host rows and see whether the host's `h`
+cotangent grows like the device's (a composition defect) or is flat (a device-row defect). It
+could not run at first: the host rows refused record after record, and then -- once they served
+every record -- the host walk's cotangent went to *exactly zero* at the first block boundary while
+the device's grew 2.1 decades there.
+
+The cause was positional. `fused_adjoint` read the codes' and the scale's cotangents as
+`call.cot[0]` and `call.cot[1]`, but `cot` holds one entry per write in the record's own write
+order, and the record the walk prepares writes the elementwise output *before* the codes: `cot[0]`
+there is the output's slot, which no consumer of that producer fills. The quantiser's part
+therefore contributed nothing and only the head's seed survived. Reading the slots by role -- the
+write's index among the writes, which is what the device row does
+(`src/adjoint/device/quant.hip:532`'s `cot_slot`) -- fixed it:
+
+| position | `codes_cot` | `quant_dx` | `dx` \|sum\| (host, before) | after |
+|---|---|---|---|---|
+| 1449 (FFN norm) | 0.435 | 15.7 | 1.44 | 1.44 |
+| 1429 (mixer norm) | 4.49 | 174.7 | **0** | **191.9** |
+
+The host walk's gradient norm went from 4.905 to 48.616 on the same tape: the row had been
+contributing nothing below the first boundary.
+
+With the rows serving, the two walks grow by the same amount, and the factor between them widens
+with the block:
+
+| position | host `maxabs` | device `maxabs` | host delta | device delta |
+|---|---|---|---|---|
+| 1449 (block 63, FFN norm) | 1.95e-5 | 7.24e-6 | | |
+| 1429 (block 63, mixer norm) | 1.56e-3 | 9.23e-4 | +1.90 dec | +2.11 dec |
+| 1421 (block 62, FFN norm) | 6.44e-2 | 1.386e-2 | +1.62 dec | +1.18 dec |
+| 1408 (block 62, mixer norm) | 6.81 | 0.980 | +2.02 dec | +1.85 dec |
+| 1400 (block 61, FFN norm) | 271 | 34 | +1.60 dec | +1.54 dec |
+| 1387 (block 61, mixer norm) | 2.55e4 | 1360 | +1.97 dec | +1.60 dec |
+
+Over those five records the host grows 9.11 decades and the device 8.28, and the ratio between the
+two sides climbs with the block -- 1.69, 2.69, 4.65, 6.95, 7.97, 18.75 -- which is itself the second
+half of the answer: the rows contribute about 0.17 decades per record and the composition about 1.5.
+Per block, of the 3.2 decades, roughly 2.9 are the composition's and 0.3 the rows'.
+
+The whole A/B, on four blocks of the same tape (`R97_HOST_WALK_AB=1 R97_WALK_BLOCKS=4`; arm 2 runs
+the host walk alone, which is how the rows were measured without the device walk's NaN):
+
+| | device walk | host walk |
+|---|---|---|
+| gradient | **NaN** | finite, norm 3.38e11 |
+| leaves non-finite | -- | 0 of 800 |
+| first non-finite | `gdn_gated_rmsnorm` operand `gdn_o`[0] at 1143 | -- |
+| backward | 281.5 s | 526.6 s |
+
+The table predates the gain work and still describes this code: the tape's `x` is an in-place
+*write* (`x:inout`), so the host's `norm_gain` skipped it and the device row's first read after `h`
+was the weight either way -- both rows already read the weight's row 0. The one-block arm-2 run
+after the change reports the same loss (7371.591348) and 0 of 800 leaves non-finite; its gradient
+norm, 48.6, is over a one-block walk and so is not comparable with the four-block one above.
+
+So there are two separate defects, and the growth is only the first:
+
+1. The composition multiplies the residual stream's cotangent by about 1.6e3 per block, on both
+   sides. The finite difference says the true leaf gradients are flat, so the factor is not the
+   model's.
+2. The device `gdn_gated_rmsnorm` row turns the already huge cotangent into NaN at position 1143
+   where the host row stays finite. A row that is handed 1e30-odd values and returns NaN is a
+   different bug from the one that made them that large, and it is the one that makes the *device*
+   gradient non-finite while the host's is not.
+
+## The forward, measured on the buffer the backward's growth would need
+
+The premise above compares the norm's *output* `h`, which is O(1) by construction. The comparison
+that matters is the buffer the cotangent is measured on, so `R97_DUMP_FWD=2` was run on the same
+tape and the residual stream read at every block:
+
+| position | op | buffer | forward `maxabs` | per-block |
+|---|---|---|---|---|
+| 14 | `rmsnorm_had_quant_i8g` | `x` | 720 | +3.12 from the embedding |
+| 1429 | `rmsnorm_had_quant_i8g` | `x` | 14720 | +0.03 |
+| 1449 | `rmsnorm_had_quant_i8g` | `x` | 14720 | +0.00 |
+| 1457 | `add` | `x` | 14720 | +0.00 |
+
+720 to 14720 over thirteen blocks is +1.31 decades in total, 0.10 per block: the forward stream is
+flat at every block after the embedding, so the backward's 3.2 decades per block has no counterpart
+in the forward. The growth is a defect in the walk, not the model.
+
+## The composition defect the chain exposed, and why it is not the growth
+
+`R97_DUMP_REC=1` prints one line per record in walk order: the largest cotangent it was handed,
+the largest it left on its reads, and the ratio. Read per buffer instead (`DUMPPOS` beside
+`DUMPDC`), the residual stream's chain is four records long and it **stops**:
+
+| position | op | `cot[x]` | `dc[x]` |
+|---|---|---|---|
+| 1458 | `rmsnorm` (final) | -- | 1.3159e-7 |
+| 1457 | `add` | 1.3159e-7 | 1.3159e-7 |
+| 1449 | `rmsnorm_had_quant_i8g` | 1.3159e-7 | **sized=0** |
+| 1429 | `rmsnorm_had_quant_i8g` | **live=0** | -- |
+
+The fused norm's residual operand is a write the record also reads (`in_place`), and its row
+declares it **frozen**: the row does not compute that slot, the walk's passthrough does. But the
+freeze also kept the walk from *sizing* the slot, and the passthrough skips unsized slots ("not the
+row's to fill") while the distribution skips frozen operands -- so the residual's cotangent was
+dropped at every fused norm. `tests/host/backward_compose.cpp` pins the rule in milliseconds with
+stand-in rows, and the fix is one clause in each of the two `frozen_at` tests in `src/backward.cpp`.
+
+The rule has a second half, which the same file pins: the direct path is only the answer when no
+*separate* read of that buffer already answered. A record shaped `read x, write x` gives the row the
+read's slot, and that slot distributes to the same prior version the write's segments name -- so
+filling both would count the cotangent twice. The check is on the value the row produced, not the
+shape: a row that left the read empty has said nothing about the write either. Removing the guard
+makes the same-buffer case fail at three times the seed, which is what the case is for.
+
+The fix is proved on the live tape, not only in the unit case: with it, `x` is `sized=1` at both
+fused norms and carries **1.3159e-7 unchanged** through the block (`pos=1449` and `pos=1429`, the
+same value). Before it, `x` was `sized=0` at 1449 and `live=0` at 1429.
+
+It is a real defect and it is fixed, but it is **not** the growth: the residual stream's cotangent is
+flat across the block, and the growth is confined to the branch activations' cotangents (`h`, 1.95e-5
+at the FFN's norm and 1.56e-3 at the mixer's).
+
+## What the norms' own scale says
+
+`R97_DUMP_QUANT=1` now also prints each norm's `s = 1/rms` per row and its gain's largest
+magnitude, beside the sums it was handed and left:
+
+| position | op | `s = 1/rms` | `gain_max` | `dy_sum` | `dx_sum` | `dx/dy` |
+|---|---|---|---|---|---|---|
+| 1458 | `rmsnorm` (final) | 2.96e-4 .. 3.94e-4 | 2.71 | 42.5 | 0.0285 | 6.7e-4 |
+| 1449 | `rmsnorm_had_quant_i8g` (FFN) | 0.0215 .. 0.174 | 5.09 | 15.7 | 1.44 | 0.092 |
+| 1440 | `rmsnorm` (k-norm) | 0.0719 .. 0.256 | 2.61 | 26.9 | 4.93 | 0.18 |
+| 1439 | `rmsnorm` (q-norm) | 0.0598 .. 0.248 | 2.21 | 20.9 | 3.78 | 0.18 |
+| 1429 | `rmsnorm_had_quant_i8g` (mixer) | 0.875 .. 0.892 | 8.31 | 175 | 192 | 1.10 |
+
+Two facts follow, and both correct earlier reading of this report:
+
+1. **The row is its own scale.** `dx_sum/dy_sum = 6.7e-4` and `s_max * gain_max = 1.07e-3` -- the
+   same number, so `rmsnorm_host_adjoint` applies exactly `s * gain` and nothing else. No norm on
+   this tape has a Jacobian the forward does not imply.
+2. **`s` spans four decades across the tape's norms** -- 2.96e-4 at the final norm, 0.022..0.17 at
+   the FFN's, 0.88 at the mixer's -- because each norm is handed a different buffer. `R97_DUMP_FWD=2`
+   names them:
+
+   | position | record | buffer | forward `maxabs` |
+   |---|---|---|---|
+   | 1457 | `add` | `x` (the residual stream) | 14720 |
+   | 1449 | `rmsnorm_had_quant_i8g` | `h` (the mixer's output, normed in place) | 6.5 |
+   | 1458 | `rmsnorm` (final) | `x` (the residual stream) | 14720 |
+
+   So the final norm is handed the residual (rms 3400, hence `s = 3e-4`) and the fused norms are
+   handed the O(1) branch activations. The norm shrinks whatever it is handed by `s * gain`, and the
+   cotangent chain's steps are that same factor at every norm.
+
+   Every row here is consistent with its own forward, so **no norm on this tape has a Jacobian the
+   forward does not imply**, and the growth is not one of them. What the table does show is that the
+   mixer's norm is handed a cotangent 11x the FFN's and returns 133x, and both factors are `s`.
+
+The per-block factor is the product of two steps, and the table above separates them: the same
+block's two norms differ by 80x (1449 -> 1429) and 106x (1421 -> 1408), and one block's start
+differs from the next's by 41x (1429 -> 1421) and 40x (1408 -> 1400). So a block is about
+40 x 40 = 1.6e3, which is the figure at the top of this report -- the two factors are the two
+records, not one record's factor measured twice.
+
+## The two-block test that decides the rest
+
+One measurement separates "one branch's transpose is wrong by a constant" from "the chain multiplies
+per block": the walk's gradient against a central difference at two *adjacent* blocks, which is what
+`R97_CENTRAL=1 R97_CENTRAL_BLKS=model.layers.63.,model.layers.62.` runs. The prediction is written
+down before the run so the result cannot be read backwards:
+
+- the walk is 249x **small** at block 63;
+- if the per-block factor is the 1.6e3 the cotangent table shows, block 62 must come out about
+  `249 * 1.6e3 = 4e5` times **large** -- a sign flip between adjacent blocks, which no single row
+  error can produce and which pins the growth to a factor that compounds through the chain;
+- if block 62 comes out about 249x small too, the error is a constant in one branch and the chain is
+  not multiplying -- and then the cotangent table's growth is itself the thing to re-measure.
+
+### The result, read against that prediction
+
+Neither branch: the FD's own numbers show it is not measuring a derivative. At block 63, one weight and
+two perturbation sizes:
+
+| perturbation | loss change |
+|---|---|
+| +1% (`eps_big` = 1.14e-4) | +0.0797 |
+| -1% | -0.1364 |
+| +10% (the control) | **-0.2131** |
+
+A linear response gives the 10% move ten times the 1% move, +0.797. It gives -0.213, the *opposite
+sign*, and the two 1% points disagree with each other by 1.7x. The loss is 7371.59, whose bf16
+storage resolution is ~4e-3 relative, i.e. ~29 absolute: the ~0.2 the perturbations produce is 0.7% of
+one bf16 ulp of the loss, and it does not scale with the perturbation. The `central` the arm prints
+(948.9) is that 0.2 divided by 2*eps, so it is quantisation noise divided by a small number, not a
+gradient. Block 62 shows the same shape (10%: +0.123 and -0.024, a 5x asymmetry; its "control" is
+the +eps_big point because `eps_big` = 1e-4 is already 10% of its w = 0.0010075).
+
+So the two-block run does not separate "constant" from "compounding", and the earlier "249x small"
+framing rests on this same oracle. **The FD arm as built cannot adjudicate this gradient.** It needs a
+forward that resolves the loss's response -- f32 storage, or a loss with more dynamic range than 3e-5
+relative -- before it can be quoted either way. The control does its job (the params are live) and the
+sign of the walk's gradient is not in question; the magnitude is unmeasured.
+
+The cotangent rate is not an FD question at all: it is read directly off the walk's own buffer
+cotangents, one per block boundary, and that is the number the ticket is about.
+
+## The post-fix rate, measured over all thirteen blocks
+
+`R97_DUMP_DC=1` on the device walk, the `h` cotangent the fused norm leaves at each block boundary
+(walk order, so downwards through the stack):
+
+| pos | block | `h` cotangent maxabs | factor per block |
+|---|---|---|---|
+| 1449 | 63 | 7.24196e-06 | -- |
+| 1429 | 62 | 9.23157e-04 | 127x |
+| 1421 | 61 | 1.3855e-02 | 15.0x |
+| 1408 | 60 | 9.80469e-01 | 70.8x |
+| 1400 | 59 | 3.375e+01 | 34.4x |
+| 1387 | 58 | 1.36e+03 | 40.3x |
+| 1379 | 57 | 3.5072e+04 | 25.8x |
+| 1366 | 56 | 1.36806e+06 | 39.0x |
+| 1358 | 55 | 8.44104e+07 | 61.7x |
+| 1338 | 54 | 3.79165e+09 | 44.9x |
+
+Geometric mean 40.1x per block, **1.60 decades per block**. The pre-fix table measured 3.3, so the
+composition fix halved the rate and did not remove it. The **residual** stream's cotangent, the same
+walk, is 1.31316e-07 at every one of these boundaries: flat, before and after.
+
+The same walk on the host arm, from the chain table above, leaves `dc[h]` at 1.95e-05 on block 63's
+norm and 1.56e-03 on the next one: 1.9 decades per block. **Both arms grow at the same rate**, so this
+is not a device-row defect; the two arms' rows agree to a factor of 2.7 at block 63 (7.24e-06 device
+against 1.95e-05 host).
+
+## Where the growth is, record by record
+
+`R97_DUMP_REC=1` on the same walk, block 63, the largest ratio each record applies to the cotangent it
+is handed (`ratio` is the largest element's, `sum_ratio` the sum's):
+
+| pos | op | cot_max | dc_max | ratio | sum_ratio |
+|---|---|---|---|---|---|
+| 1455 | lora_shrink | 1.22e-06 | 1.88e-05 | 15.4 | 351 |
+| 1451 | lora_shrink | 1.14e-04 | 2.49e-03 | 21.9 | 31.3 |
+| 1447 | lora_shrink | 8.01e-05 | 1.47e-03 | 18.4 | 49.5 |
+| 1437 | lora_shrink | 1.79e-04 | 6.34e-03 | 35.5 | 43.9 |
+| 1434 | lora_shrink | 7.27e-04 | 1.82e-02 | 25.0 | 39.3 |
+| 1431 | lora_shrink | 4.24e-04 | 8.31e-03 | 19.6 | 42.7 |
+| 1427 | lora_shrink | 7.63e-03 | 8.53e-02 | 11.2 | 416 |
+| 1423 | lora_shrink | 5.27e-01 | 1.41e+01 | 26.7 | 31.6 |
+| 1450/1446/1436/1433/1430 | gemm_nt_q | -- | -- | 0.008-2.2 | 0.02-4.5 |
+| 1452/1448/1438/1435/1432 | lora_expand | -- | -- | 4.7-11.6 | 1.06-1.34 |
+| 1449/1429 | rmsnorm_had_quant_i8g | -- | -- | 0.003/0.04 | 0.23/2.65 |
+
+`lora_shrink` is the only record that multiplies on every instance, by 11-36 per element and 30-400 in
+sum. Its `sum_ratio` is the shape: the record's output carries one value per (row, rank) with rank 16
+and its input one per (row, channel) with 5120 channels, so a sum over 320 times as many elements
+returns 320 times as much. Its `ratio` is the matrix: `dx = A^T dy` over 16 rank terms reaches 15-36
+times `max|dy|` when `A`'s entries are of order one, which is what a trained LoRA's `A` is, and its
+`lora_expand` sibling (`dx = B^T dy` over 5120 channel terms) shows 4.7-11.6 for `B` of order 1e-3.
+Neither is a wrong transpose: they are the two halves of a rank-16 factorisation whose factors have
+different scales, and the adjoint of each is the other's transpose.
+
+So no single record is out of line with its siblings, which is what the growth would need. The branch's
+Jacobian is simply much worse conditioned than its forward: the forward's normed `h` is 6.5 at block
+63 and 11.06 at the top (flat), while the backward's `h` cotangent gains 1.6 decades per block. That
+is possible for a non-symmetric Jacobian and it is what an ill-conditioned block does.
+
+## What the device cannot hold
+
+The device path stores every cotangent as bf16 (`f32_to_bf16` in all nine device row files) and the
+host path keeps f64. At block 54 the `h` cotangent is 3.79e+09 and the rate carries it past bf16's
+3.4e+38 by block ~50, which is where the walk's first non-finite appears:
+
+```
+non-finite: cotangent op gdn_gated_rmsnorm, operand 'gdn_o'[0] at position 1143, value 0, from the row
+```
+
+with `DUMPDC side=device op=gdn_gated_rmsnorm pos=1143 buffer=gdn_o ... nonfinite=1184349
+maxabs=3.38953e+38`. 3.38953e+38 is bf16's largest finite value; the row is where the magnitude first
+exceeds it, not where the arithmetic goes wrong. The host walk, which keeps f64, ends finite with a
+gradient norm of 48.6156.
+
+## Status: what is fixed, what is measured, what is not
+
+**Fixed, with proof.** The composition defects (the frozen in-place slot that was never sized and
+never distributed; the passthrough that double-counted a buffer a separate read had already answered)
+are fixed in `src/backward.cpp` and pinned by three cases in `tests/host/backward_compose.cpp`. Their
+proof is direct: `DUMPDC` at the fused norm's `h` read goes from `sized=0` to `sized=1 maxabs=7.24e-06`,
+and the residual stream's cotangent is 1.31316e-07 at every block boundary, before and after.
+
+**Measured.** The branch's `h` cotangent grows 1.60 decades per block over thirteen blocks (40.1x,
+geometric mean), down from 3.3 before the fix. The host arm grows at the same rate (1.9 decades on the
+one block both arms measured), and the two arms agree to a factor of 2.7 at block 63. No record's
+ratio is out of line with its siblings: `lora_shrink`'s 11-36 per element is `A^T` over sixteen rank
+terms with `A` of order one, `lora_expand`'s 4.7-11.6 is `B^T` over 5120 terms with `B` of order 1e-3,
+and every other record shrinks.
+
+**Not resolved: whether that 1.60 decades is the true Jacobian.** The only oracle that could say so is
+the central difference, and the arm that computes it cannot resolve this gradient: at block 63 the same
+weight moves the loss +0.080 at 1% and -0.213 at 10%, a sign flip where a linear response gives +0.797,
+and the loss's bf16 storage resolves ~29 absolute against a ~0.2 response. A valid FD needs a forward
+whose loss responds above its own quantisation -- f32 activations, or many more tokens -- and the
+container is bf16 throughout. Until then the growth is *characterised*, not *explained*.
+
+**A consequence, not a second defect.** The device path stores cotangents as bf16 (all nine device row
+files call `f32_to_bf16`); the host keeps f64. At block 54 the branch cotangent is 3.79e+09 and the
+1.60-decade rate carries it past 3.4e+38 by block ~50, where `gdn_gated_rmsnorm`'s `gdn_o` reads
+`maxabs=3.38953e+38` and 1.18M of its 1.96M elements are non-finite. That value is bf16's largest
+finite number, so the row is where the magnitude first exceeds the format, not where its arithmetic
+fails. f32 would not help (the same 3.4e+38 ceiling); only f64 or a bounded cotangent would, and the
+growth's being real is exactly what is unresolved.
+
+## What this leaves
+
+The earlier hypothesis in this report -- that a factor of 1e4 per gemm was a `1/scale` applied once
+instead of twice -- is dead, and the per-record chain is what kills it. `gemm_nt_q`'s ratio is 0.008 to
+2.2, a *shrink*, because `dx = W^T dy` carries the weight matrix's own magnitude; the quantised
+producer's `1/scale` and the gemm's `scale` do cancel, which is the algebra at `src/adjoint/host/quant.cpp`
+line 365: the tape hands back the codes' cotangent, `gemm_nt_q` has already multiplied by `s` on its
+way to it, and dividing by `s` restores `W^T dy`. `lora_shrink` is the one record that multiplies, and
+its factor is its own matrix: `A^T` over sixteen rank terms with `A` of order one.
+
+So the growth is the branch's Jacobian, not a misapplied scale, and it is present in both arms at the
+same rate. Whether it is the *true* Jacobian is the one question this work could not answer, because
+the only oracle for it -- the central difference -- cannot resolve a loss response of 3e-5 relative
+through a bf16 forward (section above). What would answer it, in order of cost:
+
+- a central difference on a forward whose activations are f32, so the loss resolves the perturbation;
+- or the same bf16 forward over many more tokens, so the response's cancellation averages down;
+- or a per-block adjoint test that differentiates one block's rows against the block's own twin in
+  isolation -- `tests/host/backward_compose.cpp` is the shape of it, at block scope rather than record
+  scope.
+
+Until one of those runs, the honest statement is: the composition defects are fixed and pinned, the
+residual stream's cotangent is flat, the branch's cotangent grows 1.60 decades per block in both arms
+with no record out of line with its siblings, and the device path cannot carry that magnitude in bf16.
+
+## Why the int8 producers' twins have no kernel check
+
+`tests/host/adjoint_quant.cpp` checks the fp8 family's twins against radiance's host kernels
+(`adjoint_fused_quant_twin_matches_the_host_kernel`). The same check for the three int8 producers
+cannot exist: `check_kernel` asks the kernel table for `rmsnorm_had_quant_i8g` and gets
+
+```
+no host kernel for op 'rmsnorm_had_quant_i8g' in the kernel table
+```
+
+so those rows are FD-checked against their own twins and nothing else. The tape is the only other
+oracle, and it is a real one: a fused producer writes the part's output in place, so the walk can
+compare its twin's intermediate against the activation the kernel actually wrote. `R97_DUMP_QUANT=1`
+now prints that comparison as `DUMPTWIN pos= op= code_err= code_bad= scale_rel= act_at= act_err=
+act_rel=` -- the twin's re-quantisation against the tape's codes and scales, and the twin's
+intermediate against the activation at the record's in-place write. It is the check the kernel table
+cannot give, and it costs one pass.
+
+## The quotient's guard
+
+The mask pass divides each code's cotangent by its group scale, and the quotient is exact only
+while it stays inside f32. On this container it does not: 2.66e36 over a 5.96e-5 scale is 4.5e40.
+The kernel now counts the overflowing quotients where the division happens -- so an element the
+mask zeroed is not counted, and a group whose scale keeps the quotient finite is not either -- and
+reports `QUANTGUARD op=... pos=... nonfinite=N of M worst=... min_scale=...` on stderr. The count
+is of quotients that are not finite at all -- an Inf past f32's range, or a NaN the cotangent
+already carried -- because on this container both happen: the top blocks' cotangents are finite but
+huge, and the low blocks' are already NaN.
+`R97_QUANT_GUARD=1` turns the same count into a refusal; the default is to report, because a run
+whose cotangents already overflow must reach the measurement that says why.

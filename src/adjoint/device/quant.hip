@@ -169,16 +169,28 @@ bool serves_gate(const std::vector<OpParam>& params) {
 // butterflies of a stage are independent, so sharing a stage across threads changes no bit.
 __global__ void mask_rotate_kernel(const signed char* codes, const double* y, const double* scale,
                                    const float* cot, float* rotated_cot, int n, int group,
-                                   int ngrp) {
+                                   int ngrp, unsigned int* bad_count, unsigned int* bad_worst) {
     extern __shared__ char smem[];
     double* v = reinterpret_cast<double*>(smem);
     float* d = reinterpret_cast<float*>(smem + (size_t)group * sizeof(double));
+
+    // The quotient's guard: `cot / (float)s` is exact only while it stays inside f32, and an Inf
+    // here is not a per-group event -- it enters the inverse rotation and then the elementwise
+    // backprop, so one overflowing element poisons the whole row and the run's first non-finite
+    // value names a row that only did its own arithmetic. Counted where the division happens, so
+    // an element the mask zeroed is not counted: this is exact, not a bound.
+    __shared__ unsigned int block_bad;
+    __shared__ unsigned int block_worst;
 
     const int tid = (int)threadIdx.x;
     const int64_t row = (int64_t)blockIdx.x / ngrp;
     const int gi = (int)((int64_t)blockIdx.x - row * ngrp);
     const int64_t base = row * (int64_t)n + (int64_t)gi * (int64_t)group;
 
+    if (tid == 0) {
+        block_bad = 0u;
+        block_worst = 0u;
+    }
     v[tid] = y[base + tid];
     __syncthreads();
     for (int h = 1; h < group; h <<= 1) {
@@ -196,8 +208,17 @@ __global__ void mask_rotate_kernel(const signed char* codes, const double* y, co
     const signed char code = codes[base + tid];
     const bool top = code == 127 || code == -127;
     const bool live = top ? u <= 127.0 : true;
-    d[tid] = live ? cot[base + tid] / (float)s : 0.0f;
+    const float q = live ? cot[base + tid] / (float)s : 0.0f;
+    d[tid] = q;
+    if (!isfinite(q)) {
+        atomicAdd(&block_bad, 1u);
+        atomicMax(&block_worst, __float_as_uint(fabsf(q)));
+    }
     __syncthreads();
+    if (tid == 0 && block_bad != 0u) {
+        atomicAdd(bad_count, block_bad);
+        atomicMax(bad_worst, block_worst);
+    }
     for (int h = 1; h < group; h <<= 1) {
         if (tid < group / 2) {
             const int j = (tid / h) * (2 * h) + (tid % h);
@@ -337,7 +358,7 @@ std::string hip_error_name() {
 // schema's two-write shape.
 void mask_and_rotate(const AdValue& codes, const AdValue& scale, const AdValue& cot, int64_t rows,
                      int64_t n, int64_t group, int64_t ngrp, const std::vector<double>& y,
-                     RadStream s, void* d_rotated) {
+                     RadStream s, void* d_rotated, const char* op, int64_t position) {
     const int64_t total = rows * n;
 
     std::vector<double> h_y((size_t)total), h_scale((size_t)(rows * ngrp));
@@ -401,15 +422,71 @@ void mask_and_rotate(const AdValue& codes, const AdValue& scale, const AdValue& 
                                  "cotangent (" + std::to_string(total * 4) + " bytes, " +
                                  hip_error_name() + ")");
 
+    // Two counters the kernel fills where it divides: how many quotients left f32, and the largest
+    // one. Eight bytes the host zeroes before the launch and reads back after it, on the same
+    // stream, so the read costs one copy and no extra sync.
+    device::ScratchBlock d_bad(2 * (int64_t)sizeof(unsigned int));
+    if (!d_bad)
+        throw std::runtime_error("r97: quant adjoint: op '" + std::string(op) + "' at " +
+                                 std::to_string(position) +
+                                 ": the quotient guard's scratch was refused");
+    const unsigned int bad_zero[2] = {0u, 0u};
+    if (rad_memcpy_async(d_bad.p, bad_zero, sizeof bad_zero, s) != 0)
+        throw std::runtime_error("r97: quant adjoint: op '" + std::string(op) + "' at " +
+                                 std::to_string(position) +
+                                 ": the quotient guard's counters would not clear (" +
+                                 hip_error_name() + ")");
+
     const size_t shared = (size_t)(group * ((int64_t)sizeof(double) + (int64_t)sizeof(float)));
     hipLaunchKernelGGL(mask_rotate_kernel, dim3((unsigned int)(rows * ngrp)),
                        dim3((unsigned int)group), shared, (hipStream_t)s,
                        (const signed char*)d_codes.p, (const double*)d_y.p,
                        (const double*)d_scale.p, (const float*)d_cot.p, (float*)d_rotated,
-                       (int)n, (int)group, (int)ngrp);
+                       (int)n, (int)group, (int)ngrp,
+                       (unsigned int*)d_bad.p,
+                       (unsigned int*)d_bad.p + 1);
     if (rad_stream_sync(s) != 0)
         throw std::runtime_error("r97: quant adjoint: the mask pass's kernel did not finish (" +
                                  hip_error_name() + ")");
+    unsigned int bad[2] = {0u, 0u};
+    if (rad_memcpy_async(bad, d_bad.p, sizeof bad, s) != 0)
+        throw std::runtime_error("r97: quant adjoint: op '" + std::string(op) + "' at " +
+                                 std::to_string(position) +
+                                 ": the quotient guard's counters would not read back (" +
+                                 hip_error_name() + ")");
+    if (rad_stream_sync(s) != 0)
+        throw std::runtime_error("r97: quant adjoint: the quotient guard's read did not finish (" +
+                                 hip_error_name() + ")");
+    if (bad[0] != 0) {
+        // The smallest scale in the launch, so the report says what made the quotient large.
+        double min_scale = 0.0;
+        for (int64_t i = 0; i < rows * ngrp; ++i)
+            if (i == 0 || scale.value[(size_t)i] < min_scale) min_scale = scale.value[(size_t)i];
+        float worst_f = 0.0f;
+        std::memcpy(&worst_f, &bad[1], sizeof worst_f);
+        const double worst = (double)worst_f;
+        std::fprintf(stderr,
+                     "QUANTGUARD op=%s pos=%lld nonfinite=%u of %lld worst=%.6g min_scale=%.6g\n",
+                     op, (long long)position, bad[0], (long long)(rows * n), worst, min_scale);
+        std::fflush(stderr);
+        // The refusal is the caller's to ask for. A container whose cotangents already divide past
+        // f32 -- this one does, 2.66e36 over a 5.96e-5 scale -- would otherwise abort the step
+        // before the A/B that exists to find out why, so the default is to report the count and
+        // carry on, and R97_QUANT_GUARD=1 is what turns the same count into the refusal
+        // tests/gpu/quant_guard.cpp asserts. Read per call, not cached: one test exercises both
+        // arms in one process, and the knob is a getenv against one launch per record.
+        const char* knob = std::getenv("R97_QUANT_GUARD");
+        if (knob != nullptr && knob[0] == '1')
+            throw std::runtime_error(
+                "r97: quant adjoint: op '" + std::string(op) + "' at " + std::to_string(position) +
+                ": " + std::to_string(bad[0]) + " of " + std::to_string(rows * n) +
+                " codes' cotangents divide to something that is not finite -- an Inf past f32's "
+                "range, or a NaN the cotangent already carried (worst |cot / scale| = " +
+                std::to_string(worst) + ", the smallest group scale in this record is " +
+                std::to_string(min_scale) + "); the quotient is exact only while it stays inside "
+                "f32, and a non-finite value there enters the inverse rotation and the elementwise "
+                "backprop as a whole-row event, so this refuses rather than emitting it");
+    }
 }
 
 // The tape's cotangents are f64 and are added to, never overwritten: other ops share them.
@@ -623,13 +700,20 @@ void quant_adjoint(const AdjointCall& call, Part part) {
     // The gated producer answers for gate_up's two halves; the gate answers for two operands.
     const int64_t out_slot = part == Part::gated ? 2 * total : total;
     const int64_t out_count = part == Part::gated || part == Part::gate ? 2 * total : total;
-    // The elementwise op's second operand (`rmsnorm`'s weight, `gate`'s input) is the record's
-    // second READ -- never `fwd[1]`, which on the live tape's fused records is the phantom
-    // `none:1` write with no values. That mistake made this row return silently: the schema's
-    // two-write shape hid it and the fused record's guard failed on the phantom.
+    // The elementwise op's second operand (`rmsnorm`'s weight, `gate`'s input). For the gate it is
+    // the record's second READ -- never `fwd[1]`, which on the live tape's fused records is the
+    // phantom `none:1` write with no values. For the norm it is the gain, and the second read is
+    // NOT it on the live record: that record is `h, x, w`, so the second read is the norm's own
+    // input and using it made the kernel's `w` a per-row activation. The gain is the operand whose
+    // rows are all the same one (`gain_row`), which the input never is.
     int64_t second_at = -1;
     for (int64_t k = 1; k < operands && second_at < 0; ++k)
         if (!call.rec.operands[(size_t)k].written) second_at = k;
+    // The norm's `x` is an in-place write on the live record (`h, x:inout, w`), so the first read
+    // after 0 is the gain and the rule above already finds it. The shape test `gain_row` would not
+    // separate them -- both are [rows, n] -- and the tape's gain rows are not even identical
+    // (src/adjoint/host/elementwise.cpp's `note_gain_rows` says so once), so position is what is
+    // left to go on and the host row's scan lands on the same operand.
     if ((part == Part::rmsnorm || part == Part::gate) && second_at < 0)
         throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "': a " +
                                  part_name(part) + " record with no second read");
@@ -710,7 +794,8 @@ void quant_adjoint(const AdjointCall& call, Part part) {
         throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
                                  "': the rotated cotangent's scratch (" +
                                  std::to_string(rows * codes_n * 4) + " bytes) was refused");
-    mask_and_rotate(codes, scale, cot, rows, codes_n, group, ngrp, y[0].value, s, d_rotated.p);
+    mask_and_rotate(codes, scale, cot, rows, codes_n, group, ngrp, y[0].value, s, d_rotated.p,
+                    call.rec.op.c_str(), call.rec.position);
 
     // R97_DUMP_QUANT=1: what the row's stages produced, so a zero names its stage instead of the
     // whole row. `cot` and `y` are the host inputs; `rotated` is read back off the card.

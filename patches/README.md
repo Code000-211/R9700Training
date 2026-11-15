@@ -34,3 +34,5 @@ and line budget. `ci/patch_audit.sh` holds the patches, that ledger and this tab
 | `patches/training/0120-view-operands.patch` | training | the issue record naming a narrowing view and where its values are, so the tape can read them | not-submitted |
 | `patches/training/0121-issue-inout-mark.patch` | training | marking an operand whose kernel also reads the value it replaces | not-submitted |
 | `patches/training/0122-issue-stream.patch` | training | the stream a step's ops issue on, so an observer can order its own copy behind the op it saw | not-submitted |
+| `patches/training/0123-view-unspannable.patch` | training | the issue observer describing the tensor a kernel receives whenever it cannot state a byte span: a weight as well as a strided view, and a packed tensor of a dtype with no element size | not-submitted |
+| `patches/training/0124-encoding-on-record.patch` | training | the issue observer carrying a plugin-private weight's stored encoding, so a consumer derives the form from its planes as the layout hook did | not-submitted |

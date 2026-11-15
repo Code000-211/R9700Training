@@ -7,7 +7,9 @@
 
 #include "r97/adjoint.h"
 
+#include "iqr_decode.h"  // r97_iqr_bf16_to_f32
 #include "parallel.h"
+#include "stored_weight.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -119,6 +121,74 @@ double scale_at(const AdValue* scale, int64_t row, int64_t group, int64_t rows, 
                              "' is stored in a plugin-private encoding the host row cannot read");
 }
 
+// The weight a frozen-linear row differentiates against: the f64 values the tape carried, or the
+// stored form the join decoded for it (src/stored_weight.h) -- the int8 codes and the form's bf16
+// scale, which is the pair the device row's kernel reads from its own planes, so the two sides of
+// the A/B multiply the same numbers.
+//
+// `at` is the weight's value at (output row, input column) and `scale` its quantisation group's
+// factor; a row whose weight the tape gave values for takes its scale from the operand beside it,
+// exactly as before this existed.
+struct LinearWeight {
+    const std::vector<double>* value = nullptr;  // [rows, cols], when the tape carried values
+    const StoredWeight* stored = nullptr;        // [rows, cols] codes + [rows, cols/128] scale
+    const AdValue* scale_operand = nullptr;      // the values path's scale (a_scale/b_scale)
+    int64_t rows = 0;
+    int64_t cols = 0;
+    int64_t groups = 1;
+
+    bool valid() const { return value != nullptr || stored != nullptr; }
+
+    double at(int64_t n, int64_t k) const {
+        if (stored != nullptr)
+            return static_cast<double>(stored->codes[static_cast<std::size_t>(n * cols + k)]);
+        return (*value)[static_cast<std::size_t>(n * cols + k)];
+    }
+    double group_scale(int64_t n, int64_t g) const {
+        if (stored != nullptr)
+            return static_cast<double>(
+                r97_iqr_bf16_to_f32(stored->scale[static_cast<std::size_t>(n * groups + g)]));
+        return scale_at(scale_operand, n, g, rows, groups);
+    }
+    // The weight's value: a stored code times its group's scale, or the value the tape carried.
+    // The `_q` rows take the code and the scale separately -- they fold the activation's own group
+    // scale into the same product -- so they use `at`/`group_scale`. A plain `gemm_nt` has no
+    // activation scale to fold and must take the whole weight here: reading the code alone is a
+    // silent factor of 1/scale on a stored operand.
+    double value_at(int64_t n, int64_t k) const {
+        if (stored == nullptr) return (*value)[static_cast<std::size_t>(n * cols + k)];
+        const int64_t group = groups > 0 ? cols / groups : cols;
+        return at(n, k) * group_scale(n, group > 0 ? k / group : 0);
+    }
+};
+
+// Resolve one weight operand. A stored operand is looked up in the join's decode by the encoding
+// the tape carried beside it; one the join never decoded is refused by name, as every stored
+// operand was before the decode existed, so a stored weight never reaches this file's loops.
+// `groups` is the scale grid the row reads, or 0 for the weight's own (one a 128 columns).
+void stored_weight_of(const OpRecord& rec, int pos, const AdValue& v, int64_t rows, int64_t cols,
+                      int64_t groups, const AdValue* scale_operand, LinearWeight* out) {
+    out->rows = rows;
+    out->cols = cols;
+    out->groups = groups > 0 ? groups : (cols > 0 ? cols / 128 : 1);
+    if (v.raw == nullptr) {
+        // A values operand that does not hold the record's shape is not a weight this row can
+        // index: it names itself rather than reading past the end.
+        if (rows > 0 && cols > 0 && v.value.size() != static_cast<std::size_t>(rows * cols))
+            throw std::runtime_error(
+                "r97: host adjoint: op '" + rec.op + "': operand '" +
+                rec.operands[static_cast<std::size_t>(pos)].buffer + "' holds " +
+                std::to_string(v.value.size()) + " values for its " + std::to_string(rows) + " x " +
+                std::to_string(cols) + " shape");
+        out->value = &v.value;
+        out->scale_operand = scale_operand;
+        return;
+    }
+    const StoredWeight* w = stored_weight_find(v.enc, rows, cols);
+    if (w == nullptr || w->groups != out->groups) refuse_stored(rec, pos);
+    out->stored = w;
+}
+
 // y[M,N] = a[M,K] * b[N,K]^T, with the f32 accumulation of the host kernel done in f64.
 void gemm_nt_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
                   std::vector<AdValue>* out) {
@@ -126,23 +196,22 @@ void gemm_nt_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     const AdValue* b = read_at(rec, operands, operand_pos(rec, "b"));
     if (a == nullptr || b == nullptr) return;
     const int ia = operand_pos(rec, "a");
-    const int ib = operand_pos(rec, "b");
     if (a->raw != nullptr) refuse_stored(rec, ia);
-    if (b->raw != nullptr) refuse_stored(rec, ib);
     const int64_t K = param_int(rec, "K", a->shape.size() >= 2 ? a->shape[1] : 0);
     const int64_t N = param_int(rec, "N", b->shape.size() >= 2 ? b->shape[0] : 0);
     // `M` is the weight's capacity; the operand's own first dimension is how many rows this call
     // actually has, and the one a tightened record carries.
     const int64_t M = a->shape.empty() ? param_int(rec, "M", 0) : a->shape[0];
-    const Operand* w = first_write(rec);
-    out->push_back(make_value(w != nullptr ? w->dtype : a->dtype, {M, N}));
+    LinearWeight w;
+    stored_weight_of(rec, operand_pos(rec, "b"), *b, N, K, 0, nullptr, &w);
+    const Operand* wo = first_write(rec);
+    out->push_back(make_value(wo != nullptr ? wo->dtype : a->dtype, {M, N}));
     AdValue& y = out->back();
     parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t n = 0; n < N; ++n) {
             double acc = 0.0;
             for (int64_t k = 0; k < K; ++k) {
-                acc += a->value[static_cast<std::size_t>(m * K + k)] *
-                       b->value[static_cast<std::size_t>(n * K + k)];
+                acc += a->value[static_cast<std::size_t>(m * K + k)] * w.value_at(n, k);
             }
             y.value[static_cast<std::size_t>(m * N + n)] = acc;
         }
@@ -156,17 +225,17 @@ void gemm_nt_adjoint(const AdjointCall& call) {
     const AdValue& a = call.fwd[static_cast<std::size_t>(ia)];
     const AdValue& b = call.fwd[static_cast<std::size_t>(ib)];
     const AdValue& dy = call.cot[0];
-    if (b.raw != nullptr) refuse_stored(call.rec, ib);
     const int64_t K = param_int(call.rec, "K", a.shape.size() >= 2 ? a.shape[1] : 0);
     const int64_t N = param_int(call.rec, "N", b.shape.size() >= 2 ? b.shape[0] : 0);
     const int64_t M = param_int(call.rec, "M", a.shape.empty() ? 0 : a.shape[0]);
+    LinearWeight w;
+    stored_weight_of(call.rec, ib, b, N, K, 0, nullptr, &w);
     AdValue& dx = (*call.dc)[static_cast<std::size_t>(ia)];
     parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t k = 0; k < K; ++k) {
             double acc = 0.0;
             for (int64_t n = 0; n < N; ++n) {
-                acc += dy.value[static_cast<std::size_t>(m * N + n)] *
-                       b.value[static_cast<std::size_t>(n * K + k)];
+                acc += dy.value[static_cast<std::size_t>(m * N + n)] * w.value_at(n, k);
             }
             dx.value[static_cast<std::size_t>(m * K + k)] += acc;
         }
@@ -182,16 +251,18 @@ void gemm_nt_q_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     const AdValue* bs = read_at(rec, operands, operand_pos(rec, "b_scale"));
     if (a == nullptr || b == nullptr) return;
     if (a->raw != nullptr) refuse_stored(rec, operand_pos(rec, "a"));
-    if (b->raw != nullptr) refuse_stored(rec, operand_pos(rec, "b"));
     if (as != nullptr && as->raw != nullptr) refuse_stored(rec, operand_pos(rec, "a_scale"));
-    if (bs != nullptr && bs->raw != nullptr) refuse_stored(rec, operand_pos(rec, "b_scale"));
+    if (bs != nullptr && bs->raw != nullptr && b->raw == nullptr)
+        refuse_stored(rec, operand_pos(rec, "b_scale"));
     const int64_t K = param_int(rec, "K", a->shape.size() >= 2 ? a->shape[1] : 0);
     const int64_t N = param_int(rec, "N", b->shape.size() >= 2 ? b->shape[0] : 0);
     const int64_t M = a->shape.empty() ? param_int(rec, "M", 0) : a->shape[0];
     const int64_t group = param_int(rec, "group", K > 0 ? K : 1);
     const int64_t groups = group > 0 ? (K + group - 1) / group : 1;
-    const Operand* w = first_write(rec);
-    out->push_back(make_value(w != nullptr ? w->dtype : a->dtype, {M, N}));
+    LinearWeight w;
+    stored_weight_of(rec, operand_pos(rec, "b"), *b, N, K, groups, bs, &w);
+    const Operand* wo = first_write(rec);
+    out->push_back(make_value(wo != nullptr ? wo->dtype : a->dtype, {M, N}));
     AdValue& y = out->back();
     parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t n = 0; n < N; ++n) {
@@ -201,10 +272,9 @@ void gemm_nt_q_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
                 const int64_t k1 = std::min(K, k0 + group);
                 double sub = 0.0;
                 for (int64_t k = k0; k < k1; ++k) {
-                    sub += a->value[static_cast<std::size_t>(m * K + k)] *
-                           b->value[static_cast<std::size_t>(n * K + k)];
+                    sub += a->value[static_cast<std::size_t>(m * K + k)] * w.at(n, k);
                 }
-                acc += sub * scale_at(as, m, g, M, groups) * scale_at(bs, n, g, N, groups);
+                acc += sub * scale_at(as, m, g, M, groups) * w.group_scale(n, g);
             }
             y.value[static_cast<std::size_t>(m * N + n)] = acc;
         }
@@ -212,7 +282,7 @@ void gemm_nt_q_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
 }
 
 // dx in the codes' activation basis: the dequantised product dy * W, times the activation's group
-// scale s_a -- the cotangent a downstream quantiser consumes (gemm_nt_q_twin:208 applies s_a to `a`).
+// scale s_a -- the cotangent a downstream quantiser consumes (gemm_nt_q_twin applies s_a to `a`).
 void gemm_nt_q_adjoint(const AdjointCall& call) {
     const int ia = operand_pos(call.rec, "a");
     const int ib = operand_pos(call.rec, "b");
@@ -223,23 +293,23 @@ void gemm_nt_q_adjoint(const AdjointCall& call) {
     const AdValue& b = call.fwd[static_cast<std::size_t>(ib)];
     const AdValue* as = ias >= 0 ? &call.fwd[static_cast<std::size_t>(ias)] : nullptr;
     const AdValue* bs = ibs >= 0 ? &call.fwd[static_cast<std::size_t>(ibs)] : nullptr;
-    if (b.raw != nullptr) refuse_stored(call.rec, ib);
-    if (bs != nullptr && bs->raw != nullptr) refuse_stored(call.rec, ibs);
+    if (bs != nullptr && bs->raw != nullptr && b.raw == nullptr) refuse_stored(call.rec, ibs);
     const AdValue& dy = call.cot[0];
     const int64_t K = param_int(call.rec, "K", a.shape.size() >= 2 ? a.shape[1] : 0);
     const int64_t N = param_int(call.rec, "N", b.shape.size() >= 2 ? b.shape[0] : 0);
     const int64_t M = a.shape.empty() ? param_int(call.rec, "M", 0) : a.shape[0];
     const int64_t group = param_int(call.rec, "group", K > 0 ? K : 1);
     const int64_t groups = group > 0 ? (K + group - 1) / group : 1;
+    LinearWeight w;
+    stored_weight_of(call.rec, ib, b, N, K, groups, bs, &w);
     AdValue& dx = (*call.dc)[static_cast<std::size_t>(ia)];
     parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t k = 0; k < K; ++k) {
             const int64_t g = group > 0 ? k / group : 0;
             double acc = 0.0;
             for (int64_t n = 0; n < N; ++n) {
-                acc += dy.value[static_cast<std::size_t>(m * N + n)] *
-                       b.value[static_cast<std::size_t>(n * K + k)] *
-                       scale_at(bs, n, g, N, groups);
+                acc += dy.value[static_cast<std::size_t>(m * N + n)] * w.at(n, k) *
+                       w.group_scale(n, g);
             }
             dx.value[static_cast<std::size_t>(m * K + k)] += acc * scale_at(as, m, g, M, groups);
         }
@@ -253,10 +323,11 @@ void logits_gemm_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     const AdValue* w = read_at(rec, operands, operand_pos(rec, "lm_head"));
     if (x == nullptr || w == nullptr) return;
     if (x->raw != nullptr) refuse_stored(rec, operand_pos(rec, "x"));
-    if (w->raw != nullptr) refuse_stored(rec, operand_pos(rec, "lm_head"));
     const int64_t K = param_int(rec, "n_embd", x->shape.size() >= 2 ? x->shape[1] : 0);
     const int64_t N = param_int(rec, "n_vocab", w->shape.size() >= 2 ? w->shape[0] : 0);
     const int64_t M = x->shape.empty() ? 0 : x->shape[0];
+    LinearWeight hw;
+    stored_weight_of(rec, operand_pos(rec, "lm_head"), *w, N, K, 0, nullptr, &hw);
     const Operand* y = first_write(rec);
     out->push_back(make_value(y != nullptr ? y->dtype : x->dtype, {M, N}));
     AdValue& logits = out->back();
@@ -264,8 +335,7 @@ void logits_gemm_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
         for (int64_t n = 0; n < N; ++n) {
             double acc = 0.0;
             for (int64_t k = 0; k < K; ++k) {
-                acc += x->value[static_cast<std::size_t>(m * K + k)] *
-                       w->value[static_cast<std::size_t>(n * K + k)];
+                acc += x->value[static_cast<std::size_t>(m * K + k)] * hw.value_at(n, k);
             }
             logits.value[static_cast<std::size_t>(m * N + n)] = acc;
         }
@@ -278,18 +348,18 @@ void logits_gemm_adjoint(const AdjointCall& call) {
     if (ix < 0 || iw < 0 || call.cot.empty()) return;
     const AdValue& x = call.fwd[static_cast<std::size_t>(ix)];
     const AdValue& w = call.fwd[static_cast<std::size_t>(iw)];
-    if (w.raw != nullptr) refuse_stored(call.rec, iw);
     const AdValue& dy = call.cot[0];
     const int64_t K = param_int(call.rec, "n_embd", x.shape.size() >= 2 ? x.shape[1] : 0);
     const int64_t N = param_int(call.rec, "n_vocab", w.shape.size() >= 2 ? w.shape[0] : 0);
     const int64_t M = x.shape.empty() ? 0 : x.shape[0];
+    LinearWeight hw;
+    stored_weight_of(call.rec, iw, w, N, K, 0, nullptr, &hw);
     AdValue& dx = (*call.dc)[static_cast<std::size_t>(ix)];
     parallel_for(M, kRowChunk, [&](int64_t m) {
         for (int64_t k = 0; k < K; ++k) {
             double acc = 0.0;
             for (int64_t n = 0; n < N; ++n) {
-                acc += dy.value[static_cast<std::size_t>(m * N + n)] *
-                       w.value[static_cast<std::size_t>(n * K + k)];
+                acc += dy.value[static_cast<std::size_t>(m * N + n)] * hw.value_at(n, k);
             }
             dx.value[static_cast<std::size_t>(m * K + k)] += acc;
         }

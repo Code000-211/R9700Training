@@ -642,7 +642,13 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             const size_t k = static_cast<size_t>(j);
             dc[k].dtype = fwd[k].dtype;
             dc[k].shape = fwd[k].shape;
-            if (frozen_at.count(k)) return;
+            // A frozen operand is one the row does not compute. That is a statement about the
+            // ROW, not about the cotangent: an in-place write the record also reads still carries
+            // the write's cotangent to the value it replaced, and the passthrough below is what
+            // fills it. Leaving such a slot unsized is what dropped the residual stream's
+            // cotangent at every fused norm -- the row froze it, the passthrough skipped it for
+            // being unsized, and only the branch term reached the block's input.
+            if (frozen_at.count(k) && !in_place_read(rec, k)) return;
             if (rec.operands[k].written && !in_place_read(rec, k)) return;
             dc[k].value.assign(static_cast<size_t>(numel(dc[k].shape)), 0.0);
             sized[k] = 1;
@@ -718,6 +724,22 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             // An empty slot on an in-place operand is the op's direct path: the value the write
             // replaced carries the write's cotangent unchanged (an expand adds its branch to y
             // without touching the read's slot; a mul, a rope or a state update fill theirs).
+            //
+            // The direct path is only the answer when no *separate* read of the same buffer
+            // already answered it. A record with `read x, write x` gives the row the read's slot to
+            // fill, and that slot distributes to the same prior version this write's segments name
+            // -- so filling this one too would add the cotangent twice. The check is on the value
+            // the row actually produced, not on the shape: a row that leaves the read empty has
+            // said nothing about the write either, and the direct path is still the answer.
+            const auto read_answered = [&](size_t j) {
+                for (size_t k = 0; k < rec.operands.size(); ++k) {
+                    if (k == j || rec.operands[k].written || !sized[k]) continue;
+                    if (rec.operands[k].buffer != rec.operands[j].buffer) continue;
+                    for (double v : dc[k].value)
+                        if (v != 0.0) return true;
+                }
+                return false;
+            };
             for (size_t j = 0; j < rec.operands.size(); ++j) {
                 if (!in_place_read(rec, j) || cot_index[j] < 0) continue;
                 // A slot the walk did not size is not the row's to fill: it is frozen, and the
@@ -725,7 +747,7 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                 if (!sized[j]) continue;
                 double written = 0.0;
                 for (double v : dc[j].value) written += std::fabs(v);
-                if (written == 0.0)
+                if (written == 0.0 && !read_answered(j))
                     dc[j].value = cot[static_cast<size_t>(cot_index[j])].value;
             }
         }
@@ -779,14 +801,57 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                         maxabs = std::max(maxabs, std::fabs(v));
                     }
                 std::fprintf(stderr,
-                             "DUMPDC op=%s pos=%s buffer=%s shape=%s sized=%d nonzero=%lld "
+                             "DUMPDC side=%s op=%s pos=%s buffer=%s shape=%s sized=%d nonzero=%lld "
                              "nonfinite=%lld maxabs=%.6g fwd_at=%lld\n",
-                             rec.op.c_str(), std::to_string(rec.position).c_str(),
+                             options.side == Side::host ? "host" : "device", rec.op.c_str(),
+                             std::to_string(rec.position).c_str(),
                              rec.operands[j].buffer.c_str(), shape_text(dc[j].shape).c_str(),
                              static_cast<int>(sized[j]), static_cast<long long>(nonzero),
                              static_cast<long long>(nonfinite), maxabs,
                              static_cast<long long>(fwd_non_finite[j]));
             }
+            std::fflush(stderr);
+        }
+
+        // R97_DUMP_REC=1: one line per record, the whole chain in walk order. `cot` is the largest
+        // magnitude the record was handed (its writes' incoming cotangents), `dc` the largest it
+        // left on its reads; `ratio` is the record's effective Jacobian. A row whose own adjoint is
+        // FD-proven still shows a large ratio when the *walk* hands it the wrong cotangent, and the
+        // first record whose ratio is out of line with its siblings is where the growth enters.
+        // Sums travel beside the maxima because a row that is handed one huge element and returns
+        // a dense small answer has the same maximum and a very different chain.
+        if (const char* dr = std::getenv("R97_DUMP_REC"); dr != nullptr && dr[0] == '1') {
+            double cot_max = 0.0, dc_max = 0.0, cot_sum = 0.0, dc_sum = 0.0;
+            int64_t cot_slot = -1, dc_slot = -1;
+            for (size_t j = 0; j < rec.operands.size(); ++j) {
+                if (rec.operands[j].written && cot_index[j] >= 0)
+                    for (double v : cot[static_cast<size_t>(cot_index[j])].value) {
+                        const double a = std::fabs(v);
+                        if (!std::isfinite(a)) continue;
+                        cot_sum += a;
+                        if (a > cot_max) {
+                            cot_max = a;
+                            cot_slot = static_cast<int64_t>(j);
+                        }
+                    }
+                if (!sized[j]) continue;
+                for (double v : dc[j].value) {
+                    const double a = std::fabs(v);
+                    if (!std::isfinite(a)) continue;
+                    dc_sum += a;
+                    if (a > dc_max) {
+                        dc_max = a;
+                        dc_slot = static_cast<int64_t>(j);
+                    }
+                }
+            }
+            std::fprintf(stderr,
+                         "DUMPREC pos=%s op=%s cot_max=%.6g cot_sum=%.6g cot_slot=%lld dc_max=%.6g "
+                         "dc_sum=%.6g dc_slot=%lld ratio=%.6g sum_ratio=%.6g\n",
+                         std::to_string(rec.position).c_str(), adjoint_rec->op.c_str(), cot_max,
+                         cot_sum, (long long)cot_slot, dc_max, dc_sum, (long long)dc_slot,
+                         cot_max > 0.0 ? dc_max / cot_max : 0.0,
+                         cot_sum > 0.0 ? dc_sum / cot_sum : 0.0);
             std::fflush(stderr);
         }
 
@@ -828,7 +893,9 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         for (size_t j = 0; j < rec.operands.size(); ++j) {
             const bool in_place = in_place_read(rec, j);
             if (rec.operands[j].written && !in_place) continue;
-            if (frozen_at.count(j)) continue;
+            // The same rule the sizing uses: a frozen in-place read's slot is the passthrough's
+            // to fill, so it must reach the versions its read names.
+            if (frozen_at.count(j) && !in_place) continue;
             by_buffer[plan.by_name.at(rec.operands[j].buffer)].push_back(j);
         }
         // Create the storage the units write before a worker runs: creation moves the live-byte

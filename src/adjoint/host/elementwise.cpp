@@ -364,21 +364,56 @@ void cast_host_adjoint(const AdjointCall& call) {
 
 /* ------------------------------------------------------------------ rmsnorm */
 
-/* The rmsnorm family's gain: the one non-written operand after x whose shape is a single row of
- * `n` columns. The plain record is x, w{n}, y; the engine's fused producer is
- * x, residual?:inout, w{n}, q{rows,n}, scale{rows,n/128}, out?. Picking by shape is what makes
- * both work: operand 1 is the residual on the fused shape (written -- a silently wrong gain if
- * used), and a merely positional rule falls through to q or scale whenever the gain's values are
- * missing, which is a wrong gain (or a non-finite gradient) instead of a refusal. A gain the tape
- * gave no values for is absent: the schema's `wadd` says whether the record needs one at all, so a
- * plain norm still computes and a record that needs a gain refuses by name. */
+/* The rmsnorm family's gain: the one non-written operand after x that is a row of `n` columns,
+ * alone or materialised once per row. The plain record is x, w{n}, y; the engine's fused producer
+ * is h, x, w{n or rows x n}, q{rows,n}, scale{rows,n/128}, out?, and its gain arrives either way.
+ *
+ * A shape test alone is not enough on that record: the norm's own *input* `x` is a `[rows, n]`
+ * read sitting beside the gain with the same shape, so a `[rows, n]` operand is a gain only when
+ * every row is the same one. `gain_row` decides that, and it is also what keeps a positional rule
+ * from taking the input for the gain -- which is what both rows did before it existed: the device
+ * row took the record's second read (the input) and this one the first shape match (also the
+ * input), so the norm's adjoint used a per-row activation as its gain.
+ *
+ * A gain the tape gave no values for is absent: the schema's `wadd` says whether the record needs
+ * one at all, so a plain norm still computes and a record that needs a gain refuses by name. */
+bool gain_row(const AdValue& v, int64_t n) {
+    if (n <= 0 || v.value.empty()) return false;
+    if (v.shape.size() == 1) return v.shape[0] == n && static_cast<int64_t>(v.value.size()) >= n;
+    if (v.shape.size() != 2 || v.shape[1] != n || v.shape[0] <= 0) return false;
+    return static_cast<int64_t>(v.value.size()) >= n * v.shape[0];
+}
+
+// The tape materialises a fused producer's gain as `[rows, n]`, and the rows are supposed to be
+// the same one. On the live record they are not: `blk.63.ffn_norm.weight` arrives as 2621440
+// values that differ row to row, for a weight the container holds as `[1, 5120]`. Both rows index
+// row 0, which is the gain if the tape's first row is the weight's -- so this says once per
+// process that the tape's form is not what it claims, rather than refusing a walk that has no
+// other way to read the weight.
+void note_gain_rows(const AdValue& v, int64_t n, const std::string& buffer, int64_t position) {
+    if (v.shape.size() != 2 || n <= 0) return;
+    const size_t row = static_cast<size_t>(n);
+    if (v.value.size() <= row) return;
+    for (size_t i = row; i < v.value.size(); ++i) {
+        if (v.value[i] == v.value[i % row]) continue;
+        static bool warned = false;
+        if (warned) return;
+        warned = true;
+        std::fprintf(stderr,
+                     "r97: rmsnorm adjoint: operand '%s' at %lld is [%lld, %lld] and its rows are "
+                     "not the same one, so the gain is read from row 0\n",
+                     buffer.c_str(), (long long)position, (long long)v.shape[0], (long long)n);
+        std::fflush(stderr);
+        return;
+    }
+}
+
 const AdValue* norm_gain(const OpRecord& rec, const std::vector<AdValue>& op, int64_t n) {
     const size_t count = std::min(op.size(), rec.operands.size());
     for (size_t j = 1; j < count; ++j) {
         if (rec.operands[j].written) continue;
-        const std::vector<int64_t>& shape = op[j].shape;
-        if (shape.size() != 1 || shape[0] != n) continue;
-        if (op[j].value.empty()) return nullptr;  // named, but the tape could not give it
+        if (!gain_row(op[j], n)) continue;
+        note_gain_rows(op[j], n, rec.operands[j].buffer, rec.position);
         return &op[j];
     }
     return nullptr;
@@ -445,10 +480,29 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
     const double eps = param_num(call.rec, "eps", 1e-6);
     const double wadd = param_num(call.rec, "wadd", 0.0);
     const double mult = param_num(call.rec, "mult", 1.0);
-    if (!w && wadd != 0.0)
+    if (!w && wadd != 0.0) {
+        // Name every operand the gain lookup passed over, and why: the refusal is otherwise a
+        // statement that something is absent with no way to tell a written operand from an empty
+        // one from one of the wrong shape.
+        std::string seen;
+        for (size_t j = 0; j < std::min(call.fwd.size(), call.rec.operands.size()); ++j) {
+            const Operand& o = call.rec.operands[j];
+            std::string dims;
+            for (size_t d = 0; d < call.fwd[j].shape.size(); ++d) {
+                if (d != 0) dims += 'x';
+                dims += std::to_string(call.fwd[j].shape[d]);
+            }
+            seen += " [" + std::to_string(j) + "] '" + o.buffer + "' written=" +
+                    std::to_string(o.written ? 1 : 0) +
+                    " in_place=" + std::to_string(o.in_place ? 1 : 0) + " shape=[" + dims +
+                    "] values=" + std::to_string(call.fwd[j].value.size()) +
+                    " raw=" + std::to_string(call.fwd[j].raw != nullptr ? 1 : 0);
+        }
         throw std::runtime_error("r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +
                                  std::to_string(call.rec.position) +
-                                 ": the record adds a gain offset and the tape names no gain");
+                                 ": the record adds a gain offset and the tape names no gain"
+                                 " (n=" + std::to_string(n) + "):" + seen);
+    }
 
     AdValue& dx = call.dc->at(0);
     std::vector<char> readable((size_t)rows, 0);
@@ -491,6 +545,37 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
             dx.value[(size_t)(b + i)] += mult * (s * c * dy.value[(size_t)(b + i)] - shared);
         }
     });
+
+    // R97_DUMP_QUANT=1: the two numbers that decide what this row's Jacobian is -- `s` is the
+    // per-row 1/rms of the activation and `gain` the largest `|w + wadd|` -- beside the sums it was
+    // handed and left. A branch that grows by two decades per block shows here as an `s` or a
+    // `gain` the forward does not imply, or as a `dx`/`dy` ratio that is neither. The range is
+    // printed rather than a mean: one row with a tiny rms is enough to make the maximum large, and
+    // that is a different story from every row being large.
+    if (const char* dq = std::getenv("R97_DUMP_QUANT"); dq != nullptr && dq[0] == '1') {
+        double s_min = 0.0, s_max = 0.0, gain_max = 0.0, dy_sum = 0.0, dx_sum = 0.0;
+        for (int64_t r = 0; r < rows; ++r) {
+            if (!readable[(size_t)r]) continue;
+            const int64_t b = r * n;
+            double ss = 0.0;
+            for (int64_t i = 0; i < n; ++i)
+                ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
+            const double s = 1.0 / std::sqrt(ss / (double)n + eps);
+            if (s_min == 0.0 || s < s_min) s_min = s;
+            if (s > s_max) s_max = s;
+        }
+        if (w)
+            for (int64_t i = 0; i < n && i < (int64_t)w->value.size(); ++i)
+                gain_max = std::max(gain_max, std::fabs(w->value[(size_t)i] + wadd));
+        for (const double v : dy.value) dy_sum += std::fabs(v);
+        for (const double v : dx.value) dx_sum += std::fabs(v);
+        std::fprintf(stderr,
+                     "DUMPNORM pos=%lld op=%s rows=%lld n=%lld s_min=%.6g s_max=%.6g gain_max=%.6g "
+                     "dy_sum=%.6g dx_sum=%.6g\n",
+                     (long long)call.rec.position, call.rec.op.c_str(), (long long)rows,
+                     (long long)n, s_min, s_max, gain_max, dy_sum, dx_sum);
+        std::fflush(stderr);
+    }
 }
 
 }  // namespace
