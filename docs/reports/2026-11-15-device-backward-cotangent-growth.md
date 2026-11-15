@@ -1,3 +1,35 @@
+## The amplifying record: `gdn_gated_rmsnorm` at ~10,000x per instance
+
+`R97_DUMP_REC=1` over layers 60..63 names one record family. `gdn_gated_rmsnorm`, on the **live** slot
+(`dc_slot=0`), amplifies by a near-constant factor at every instance:
+
+| pos | ratio | cot_max | dc_max |
+|---|---|---|---|
+| 1416 | 9795.44 | 0.1119 | 1096.11 |
+| 1395 | 10977.7 | 146.243 | 1.60541e+06 |
+| 1374 | 10484.3 | 205608 | 2.15566e+09 |
+
+Three instances multiply to 1.1e12 -- about 12 decades over three blocks. That is the growth.
+
+**The `lora_shrink` / `lora_expand` ratios (5-37x) are not.** Every shrink reports `dc_slot=1` and every
+expand `dc_slot=0`, a constant slot -- the dead-slot signature the per-record skill records, where that
+slot is `h.s8` and the live slot actually shrank. `sum_ratio=2` on an `add` is likewise correct: two
+inputs each carry the full cotangent.
+
+**The row itself is the standard gated-RMS Jacobian** (`gdn_prep.cpp:517-522`):
+
+```
+A = sum_e (x_e * w_e * g(z_e) * do_e)
+dx_i = w_i * g(z_i) * sc * do_i - x_i * sc^3 / channels * A
+dz_i = do_i * x_i * sc * w_i * g'(z_i)
+```
+
+which matches the textbook form with `dy = g*do`. So the question is not whether the algebra is wrong
+but whether this is the **true** Jacobian at the tape's own operands -- and only a live-scale FD
+answers that. Note the two terms' magnitudes: with `sc = 1/rms(x)`, the second term is
+`sc^3 * |x|^2 / n = sc * (|x|^2 / (n rms^2)) = sc`, so both terms should scale as **`sc`**, not
+`sc^3`. A `~1e4` factor is `sc^2`, which is what a `sc^3` term with one `sc` too many would give.
+
 ## The gate: the growth reproduces on the host walk (Gate A)
 
 `R97_HOST_WALK_AB=2 R97_WALK_BLOCKS=4 R97_DUMP_DC=1`, layers 60..63, 535.5 s:
