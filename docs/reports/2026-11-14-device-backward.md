@@ -255,10 +255,11 @@ An earlier draft of this section claimed the opposite -- that a per-group mechan
 that buffer" because all 20480 groups would have to be degenerate. **That was wrong and is
 retracted**: the row-wide reduction carries a single group's overflow across the whole row.
 
-### The measurement: the cotangent grows ~1e3.4 per layer
+### The measurement: ~984x per block on average, and accelerating
 
 `R97_DUMP_POS=all` prints the largest finite magnitude of every record's incoming cotangent in walk
-order (63 -> 0). The curve is neither a spike nor a range limit -- it is **geometric and monotone**:
+order (63 -> 0). The curve is neither a spike nor a range limit -- it is **monotone** but **not
+uniform**, so it is worth reading as a sequence of intervals rather than as one rate:
 
 | position | approx block | largest finite max abs cot |
 |---|---|---|
@@ -270,10 +271,27 @@ order (63 -> 0). The curve is neither a spike nor a range limit -- it is **geome
 | 1267 | 52 | 3.2e24 |
 | **1176** | **51** | **1.214e37** -- and the next row produces non-finite |
 
-Every layer multiplies the cotangent by **~2500**. Within a layer the largest single contributor is
-`gdn_chunk_scan` (x1e4); each quantised row adds ~1e2; `gemm_nt_q` adds none. From position **1175**
-onward, **817 records** report a non-finite *incoming* cotangent -- the non-finite values propagated
-from 1176 and never became finite again.
+The curve is **not uniform**, and that matters -- an earlier draft averaged it into "~2500 per layer",
+which is neither the net nor constant:
+
+| interval | blocks | ratio | x per block |
+|---|---|---|---|
+| head -> 63 | 1 | 14.2 | 14 |
+| 63 -> 59 | 4 | 7.4e6 | 52 |
+| 59 -> 56 | 3 | 2.2e6 | 129 |
+| 56 -> 54 | 2 | 7.9e6 | 2812 |
+| 54 -> 52 | 2 | 9.4e6 | 3068 |
+| 52 -> 51 | 1 | **3.8e12** | **3.8e12** |
+
+The amplification **accelerates**: ~52x per block early, ~3e3 in the middle, then 3.8e12 in the single
+step before the non-finite. Averaged over the **13 steps** from the head to the block-51 leaf the net
+is **~984x per block** (1377x to block 51's last finite value), against a **true ~2.70x per block**
+(76 / 1.9e-4 = 4e5 over the same 13 steps). That is a **~365x per-block excess**, and
+365^13 = 2e33 -- the over-statement, reached without assuming any uniform factor.
+
+Within a block the largest single contributor is `gdn_chunk_scan` (x1e4); each quantised row adds
+~1e2; `gemm_nt_q` adds none. From position **1175** onward, **817 records** report a non-finite
+*incoming* cotangent -- the non-finite values propagated from 1176 and never became finite again.
 
 `maxabs` counts finite values only (`src/backward.cpp:610`), so a fully non-finite vector reports the
 largest surviving finite magnitude rather than `inf`. That is why the curve appears to plateaus after
@@ -285,10 +303,10 @@ The growth is **not** an unbalanced quant `1/s`. The quant row divides the code'
 group scale (`d[tid] = cot / s`, both twins -- in f64 on the host, `src/adjoint/host/quant.cpp:299`),
 and the *consumer* of the code multiplies it back by `s`: `gemm_nt_q`'s adjoint works "in the
 dequantised activation basis" and applies `dy * s` column by column
-(`src/adjoint/device/linear.hip:121,129`). So the `1/s` round-trip is balanced, and the ~2500x per
-layer is the product of the **weight matrices' spectral norms** -- the backward's genuine
-straight-through Jacobian, or a scale bug that one layer's norm would expose. The growth curve cannot
-tell those apart.
+(`src/adjoint/device/linear.hip:121,129`). So the `1/s` round-trip is balanced, and the growth is
+either the product of the **weight matrices' spectral norms** -- the backward's genuine
+straight-through Jacobian -- or a scale bug that one block's norm would expose. The growth curve
+cannot tell those apart; only a per-op finite difference can, and that is what closed it below.
 
 One thing the curve does settle, and where the device is wrong on its own: `rmsnorm_back_kernel`
 accumulates its row reduction `t` in **f32** (`src/adjoint/device/quant.hip:256-260`, 5120 terms)
@@ -336,10 +354,13 @@ dL/dw ~ 0.102922558275 / 1.3567836955189706e-03 = 75.9
 
 **So the backward's leaf gradient is wrong by ~2e33** -- not a range limit, not an accumulator width,
 not a bf16 store, and not something any widening fixes. The true gradient is O(1e2), exactly what a
-27B model on 512 tokens should give; the walk's cotangents reach 1e37 because it amplifies ~1e3 per
-layer where the true amplification is ~1.2x per layer (76 / 1.9e-4 = 4e5 over 64 layers). The head
-cotangent is right -- 1.9e-4 is the CE gradient of a 511-token mean. **`descent` held only because
-AdamW is scale-free.**
+27B model on 512 tokens should give; the walk's cotangents reach 1e37 because it amplifies **~984x per
+block** over the 13 steps from the head to the block-51 leaf, where the true amplification is **~2.70x
+per block** (76 / 1.9e-4 = 4e5 over those same 13 steps) -- a ~365x per-block excess. (Stated over
+64 blocks the same pair is 4.06x against 1.22x; that framing is wrong here, because the leaf is in
+block 51 and the walk only passes 13 blocks to reach it. Both framings compound to the same 2e33.)
+The head cotangent is right -- 1.9e-4 is the CE gradient of a 511-token mean. **`descent` held only
+because AdamW is scale-free.**
 
 ### The growth is one global per-layer factor, not one op
 
@@ -362,12 +383,14 @@ across that record), and it is offset by shrinks across the rest of the layer, s
 per-layer factor nor the primary suspect. A per-op verdict needs the op's Jacobian applied to the
 real cotangent (`R97_DUMP_DC`), not the ratio of two adjacent records' peaks.
 
-**A uniform ~1e3 per layer is the right size for ~5 quantised ops per layer each contributing
-`1/s ~ 5`** (`s ~ 0.2`, so 5^5 ~ 3125). That is the working hypothesis: one or more quant-consuming
-adjoints convert the code's cotangent with the wrong derivative factor, so `1/s` compounds on every
-pass through the layer's quantisers. `gemm_nt_q` (`src/adjoint/device/linear.hip:121,129`) and
-`lora_shrink` (`src/adjoint/host/lora.cpp:255-258`) both handle it correctly, so the hunt is the
-remaining producers and consumers of a `.q8`/`.s8` buffer.
+**A ~1e3 per block is the right size for ~5 quantised ops per block each contributing `1/s ~ 5`**
+(`s ~ 0.2`, so 5^5 ~ 3125), so the working hypothesis at the time was that one or more
+quant-consuming adjoints convert the code's cotangent with the wrong derivative factor, letting `1/s`
+compound on every pass through the block's quantisers. **Superseded**: the two contributors that
+carry the most of the curve -- `gdn_gated_rmsnorm` and `gdn_chunk_scan` -- are both exact (see "Where
+the factor is not"), and `gemm_nt_q` (`src/adjoint/device/linear.hip:121,129`) and `lora_shrink`
+(`src/adjoint/host/lora.cpp:255-258`) both handle `1/s` correctly. What survives is that the three
+i8g fused producers cannot be reached by any finite difference at all.
 
 ### One real scale bug, found and fixed -- and measured NOT to be the 2e33
 
@@ -399,18 +422,23 @@ The contradiction was visible in the file: `gemm_nt_q_twin:208` multiplies `a` b
 | `all_finite` | false | **false** |
 | `gdn_o` at `gdn_chunk_scan`, block 62 -> 61 | 4.160e3 -> 7.602e6 | 1.128e3 -> 1.655e6 |
 
-The gradient moved by ~4x and the growth curve's rate is unchanged (~1e3 per layer). **A missing
+The gradient moved by ~4x and the growth curve's rate is unchanged (~984x per block). **A missing
 `a_scale` worth ~5x per hop cannot account for a 2e33 over-statement**; this is a genuine defect on
 its own and it stays fixed, but the amplification that makes `all_finite` false is still
-unexplained. The strongest remaining lead is the *within-layer* jump the post-fix curve still shows:
-`gdn_o`'s cotangent grows ~1e4 as the walk passes the `gdn_chunk_scan` record, at every block
-(`pos 1416 -> 1415` 1.07e4, `1395 -> 1394` 1.08e4, `1234 -> 1233` 1.13e4, ...). That is a
-same-buffer measurement, not a cross-operand ratio, so it is the op's own Jacobian -- and a chunked
-linear attention should not amplify by 1e4.
+unexplained. The strongest remaining lead was the *within-layer* jump the post-fix curve still
+shows: `gdn_o`'s cotangent grows ~1e4 as the walk passes the `gdn_chunk_scan` record, at every block
+(`pos 1416 -> 1415` 1.07e4, `1395 -> 1394` 1.08e4, `1234 -> 1233` 1.13e4, ...). **That lead is now
+closed, and the site it pointed at is cleared** -- see "Where the factor is not" below. The x1e4
+straddles `gdn_gated_rmsnorm`, which *reads* `gdn_o` at opnd 0 and *writes* it at opnd 3, and an
+op-level central difference reproduces it as that op's own conditioning when `mean(x^2)` sits near
+`eps = 1e-6`. The scan's own `dy -> max|dc|` ratio is 0.03..0.12: it shrinks.
 
-**Every producer is clean.** All four quantisers divide by `s` correctly on both sides, and
-`lora_shrink` multiplies by `a_scale` unconditionally on both (`host/lora.cpp:312`,
-`device/lora.hip:296`).
+**The producers are not all checkable, and that is the gap.** All four quantisers that *have* a host
+twin divide by `s` correctly on both sides, and `lora_shrink` multiplies by `a_scale` unconditionally
+on both (`host/lora.cpp:312`, `device/lora.hip:296`). But `rmsnorm_had_quant_i8g`,
+`gated_had_quant_i8g` and `gate_had_quant_i8g` have **no host twin and no host adjoint**, so no finite
+difference reaches them at all; they are 208 of the walk's 1459 records and they produce every code
+plane the `gemm_nt_q` consumers read.
 
 Separately, the `all`-mode walk **aborted at position 565** (~block 24) with the card free:
 
@@ -480,5 +508,6 @@ it is the named next step.
   **shadows `h`** with the loop `for (int64_t h = 0; h < g.H; ++h)`, so each of the `N*H` units
   replays every head of its sequence -- values unchanged, `H`x the work (`H=48` live). The adjoint is
   free of it.
-- `src/adjoint/device/quant.hip:359-377`: leftover `SCALERANGE ...` instrumentation prints 256 lines
-  per window to stderr.
+- `src/adjoint/device/quant.hip:359-377`: the `SCALERANGE ...` instrumentation used to print 256 lines
+  per window unconditionally; it is now gated behind `R97_DUMP_QUANT=1` like the two existing sites
+  in that file. The range hazard it reports is real and is #140.
