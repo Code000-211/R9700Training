@@ -655,6 +655,27 @@ schema changes nothing (`code_err` 254 at 1449, 45 at 1429, byte-identical), so 
 already returning the rank-matched operand and the change is reverted rather than kept as an unproven
 branch.
 
+### The gain is exonerated on every axis
+
+`GAINPOS` at both norm positions shows **one operand (`j=2`) on one buffer** with two snapshots:
+
+| pos | buffer | schema | snapshot 1 | snapshot 2 |
+|---|---|---|---|---|
+| 1449 | `blk.63.ffn_norm.weight` | `[5120]` | rank 1, `[5120]` | rank 2, `[512,5120]` |
+| 1429 | `blk.63.attn_norm.weight` | `[5120]` | rank 1, `[5120]` | rank 2, `[512,5120]` |
+
+So the twin and the other caller are handed **different snapshots of the same weight buffer**, not
+different tensors. `FDRMS` confirms which one the twin gets: `w_rank=1 w0=5120 per_row=0`. The rank-1
+snapshot is the weight itself and is the shape the record declares, so the twin's gain is the right
+buffer, the right shape, the right `wadd` and the right `eps`.
+
+That kills the per-row theory twice over: `R97_GAIN_ROW` only re-indexes the tensor the twin already
+holds, and the twin does not hold a per-row tensor.
+
+**The gain is therefore exonerated on every axis** -- buffer, shape, offset, epsilon. What is left in
+the norm's twin is its quantiser's scale or rounding, or the tape's snapshot of `h`; the histogram
+says the difference is structural (a broad spread to 128), not a rounding artefact.
+
 ## The quotient's guard## The quotient's guard
 
 The mask pass divides each code's cotangent by its group scale, and the quotient is exact only

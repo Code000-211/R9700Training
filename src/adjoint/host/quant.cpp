@@ -1064,19 +1064,33 @@ void fused_adjoint(const AdjointCall& call, Part part) {
         const TwinFn qt = twin_find(q.op, q.params, nullptr);
         double code_err = 0.0, scale_rel = 0.0;
         int64_t code_bad = 0;
+        int64_t hist[10] = {0};
         if (qt != nullptr) {
             qt(q, qin, &twin_out);
+            // `code_bad` counts any nonzero difference, so it cannot tell a uniform sub-LSB
+            // mismatch (which flips nearly every code) from a structural one. The histogram can: a
+            // tight 1-2 with a few outliers is a small systematic difference in the gain or the
+            // precision, a broad spread is what a layout difference would need.
             if (!twin_out.empty() && twin_out[0].value.size() == codes.value.size())
                 for (size_t i = 0; i < codes.value.size(); ++i) {
                     const double d = std::fabs(twin_out[0].value[i] - codes.value[i]);
                     if (d > 0.0) ++code_bad;
                     if (d > code_err) code_err = d;
+                    ++hist[d == 0.0 ? 0
+                                    : d <= 1.0 ? 1
+                                    : d <= 2.0 ? 2
+                                    : d <= 4.0 ? 3
+                                    : d <= 8.0 ? 4
+                                    : d <= 16.0 ? 5
+                                    : d <= 32.0 ? 6
+                                    : d <= 64.0 ? 7
+                                    : d <= 128.0 ? 8 : 9];
                 }
-            // The same re-quantisation with the group's Hadamard applied first. `i8g` names the
-            // rotation, but `had_quant_record` sets no `rotated` param, so the twin quantises the
-            // unrotated activation. If the kernel rotates, the unrotated comparison disagrees on
-            // almost every code while this one matches -- which is the question the norm's 99.4%
-            // asks and the gated producers' 5.9% does not.
+            // A *second* Hadamard on top of the one the twin already applies: `geometry()` sets
+            // `rotated = is_rotated(op)` and `Op::had` is rotated, so the plain comparison above is
+            // the single-rotation arm. This arm is therefore a control for "twice rotated", not an
+            // "unrotated" arm -- the gated producers collapse here (99%) and match above (5.9%),
+            // which is what makes it useful.
             double rot_err = 0.0;
             int64_t rot_bad = 0;
             {
@@ -1138,11 +1152,16 @@ void fused_adjoint(const AdjointCall& call, Part part) {
         }
         std::fprintf(stderr,
                      "DUMPTWIN pos=%lld op=%s twin=%d codes=%zu code_err=%.6g code_bad=%lld/%zu "
-                     "scale_rel=%.6g act_at=%lld act_err=%.6g act_rel=%.6g best_of=[%s]\n",
+                     "scale_rel=%.6g act_at=%lld act_err=%.6g act_rel=%.6g "
+                     "hist=[%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld] best_of=[%s]\n",
                      (long long)call.rec.position, call.rec.op.c_str(), qt != nullptr ? 1 : 0,
                      codes.value.size(), code_err, (long long)code_bad, codes.value.size(),
                      scale_rel, (long long)act_at, act_err,
-                     act_scale > 0.0 ? act_err / act_scale : act_err, act_all.c_str());
+                     act_scale > 0.0 ? act_err / act_scale : act_err,
+                     (long long)hist[0], (long long)hist[1], (long long)hist[2],
+                     (long long)hist[3], (long long)hist[4], (long long)hist[5],
+                     (long long)hist[6], (long long)hist[7], (long long)hist[8],
+                     (long long)hist[9], act_all.c_str());
         std::fflush(stderr);
     }
 
