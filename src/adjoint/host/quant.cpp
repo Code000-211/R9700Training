@@ -1072,6 +1072,35 @@ void fused_adjoint(const AdjointCall& call, Part part) {
                     if (d > 0.0) ++code_bad;
                     if (d > code_err) code_err = d;
                 }
+            // The same re-quantisation with the group's Hadamard applied first. `i8g` names the
+            // rotation, but `had_quant_record` sets no `rotated` param, so the twin quantises the
+            // unrotated activation. If the kernel rotates, the unrotated comparison disagrees on
+            // almost every code while this one matches -- which is the question the norm's 99.4%
+            // asks and the gated producers' 5.9% does not.
+            double rot_err = 0.0;
+            int64_t rot_bad = 0;
+            {
+                std::vector<AdValue> rot = {y[0]};
+                const int64_t rn = n;
+                const int64_t rgrp = group;
+                for (int64_t r = 0; r < rows; ++r)
+                    for (int64_t gi = 0; gi < rn / rgrp; ++gi) {
+                        const int64_t k0 = gi * rgrp;
+                        const int64_t w = std::min(rgrp, rn - k0);
+                        if (w == rgrp) fwht(rot[0].value.data() + r * rn + k0, rgrp);
+                    }
+                std::vector<AdValue> rot_out;
+                qt(q, rot, &rot_out);
+                if (!rot_out.empty() && rot_out[0].value.size() == codes.value.size())
+                    for (size_t i = 0; i < codes.value.size(); ++i) {
+                        const double d = std::fabs(rot_out[0].value[i] - codes.value[i]);
+                        if (d > 0.0) ++rot_bad;
+                        if (d > rot_err) rot_err = d;
+                    }
+            }
+            std::fprintf(stderr, "DUMPROT pos=%lld op=%s rot_err=%.6g rot_bad=%lld/%zu\n",
+                         (long long)call.rec.position, call.rec.op.c_str(), rot_err,
+                         (long long)rot_bad, codes.value.size());
             if (twin_out.size() > 1 && twin_out[1].value.size() == scale.value.size())
                 for (size_t i = 0; i < scale.value.size(); ++i) {
                     const double t = std::fabs(twin_out[1].value[i] - scale.value[i]);

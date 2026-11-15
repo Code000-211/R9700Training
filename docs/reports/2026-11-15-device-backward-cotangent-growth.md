@@ -598,6 +598,31 @@ was tried and reverted: with `norm_gain` skipping the rank-mismatched snapshot, 
 mismatch is real and is not the cause of the norm's twin disagreeing with the kernel; the cause is
 still the twin's norm parameters or the quantiser's rotation.
 
+## The quantiser's rotation is right; the norm's activation is not
+
+`geometry()` sets `rotated = is_rotated(op)` and `is_rotated` is true for `Op::had`, which is what
+`had_quant_record` names. **The twin quantiser therefore already applies the FWHT** -- there is no
+"unrotated" arm. `DUMPROT` adds a second rotation on top of the twin's own, so the table reads:
+
+| producer | twin's own rotation (one FWHT) | `DUMPROT` (two FWHTs) |
+|---|---|---|
+| `gated_had_quant_i8g` | **5.9%** | 99.2% |
+| `gate_had_quant_i8g` | **5.9%** | 99.3% |
+| `rmsnorm_had_quant_i8g` | 99.4% | 99.4% |
+| `rmsnorm_had_quant_i8g` (1429) | 93.9% | 99.3% |
+
+The gated rows match at one rotation and collapse at two: their twins reproduce the kernel's codes to
+**1 LSB**, so both the rotation and the activation are right. The norm rows disagree at both counts,
+so no rotation explains them -- the twin's **normed activation** differs from the kernel's, and that
+is where the next test goes.
+
+**The earlier schema test was the wrong shape.** It *skipped* a snapshot whose rank disagreed with the
+schema, which for `rmsnorm_had_quant_i8g` leaves `norm_gain` with no gain at all (`w == nullptr`) --
+the twin then normalises without a weight, a different wrong answer rather than a fix, which is why
+`code_err` stayed at 254 and the walk's test failed. The right shape is to **prefer** the
+schema-matching snapshot and fall back only when there is none; `GAINPOS` already shows both snapshots
+at the same position, so the tape carries what decides it.
+
 ## The quotient's guard
 
 The mask pass divides each code's cotangent by its group scale, and the quotient is exact only
