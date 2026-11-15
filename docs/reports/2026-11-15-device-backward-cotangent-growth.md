@@ -998,6 +998,22 @@ With the compacted record, `norm_gain` sees `{h (read), weight (read), y (writte
 intermediate and takes the weight. The intermediate's own slot has no fused counterpart, so its
 cotangent is dropped rather than misrouted into the weight's slot.
 
+**Verified on the live tape**, `R97_HOST_WALK_AB=2 R97_WALK_BLOCKS=1 R97_GAIN_POS=1`:
+
+```
+GAINPOS pos=1449 who=twin    j=2 ... value_rank=1 value0=5120 values=5120 vals=[0.245117,0.146484,0.209961,0.213867]
+GAINPOS pos=1449 who=adjoint j=1 ... value_rank=1 value0=5120 values=5120 vals=[0.245117,0.146484,0.209961,0.213867]
+ADJGAIN  pos=1449 buffer=h w_rank=1 w0=5120 values=5120 n=5120
+GAINPOS pos=1429 who=twin    j=2 ... value_rank=1 value0=5120 values=5120 vals=[0.075684,0.171875,0.113281,0.080078]
+GAINPOS pos=1429 who=adjoint j=1 ... value_rank=1 value0=5120 values=5120 vals=[0.075684,0.171875,0.113281,0.080078]
+ADJGAIN  pos=1429 buffer=h w_rank=1 w0=5120 values=5120 n=5120
+```
+
+The adjoint's operand index is 1 rather than the twin's 2 because the compacted record puts the weight
+first after the input; the **values are identical**, which is the fact that matters. The host walk's
+gradient norm moved from 48.6156 to **51.349**, finite with 0 of 800 leaves non-finite -- the fix
+changed the gradient, as a wrong gain must.
+
 **The device row already had this right, and its comment says so.** `src/adjoint/device/quant.hip:709-716`
 finds the elementwise part's second operand as the first **non-written** operand after 0:
 
