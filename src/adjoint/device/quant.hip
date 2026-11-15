@@ -356,7 +356,7 @@ void mask_and_rotate(const AdValue& codes, const AdValue& scale, const AdValue& 
     // inverse rotation and the elementwise backprop, which is a whole-row event, not a per-group
     // one. Report the smallest scale and where it sits, and how many are below the range where a
     // quotient of order 1 already reaches f32's ceiling (3.4e38).
-    {
+    if (const char* dq = std::getenv("R97_DUMP_QUANT"); dq != nullptr && dq[0] == '1') {
         double min_s = 0.0;
         int64_t min_r = -1, min_g = -1, extreme = 0;
         for (int64_t i = 0; i < rows * ngrp; ++i) {

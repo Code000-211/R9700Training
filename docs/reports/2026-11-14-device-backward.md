@@ -429,3 +429,56 @@ blind spot: `cot[]` is what a row consumes and `dc[]` what it produces, and a re
 no incoming cotangent to scan. The one real over-claim is the comment at `:724-725`, which is false
 on the `options.in_place_passthrough` path (`:709-718`): a slot the row left empty is filled with the
 cotangent the row was *handed*, after the pre-call scan.
+
+### Where the factor is not, and the one group it can still be in
+
+An op-level probe (`tests/host/gdn_gradient_probe.cpp`, CPU only) central-differences each op's own
+host twin against its own host adjoint -- the method that found the `gemm_nt_q` scale, and one that a
+device-vs-host *relative* comparison cannot replace. Every op it reached is the exact derivative of
+its own forward (`adj/fd = 1.000000` at every probed element, worst relative error 1e-9..1e-7), and
+it was shown to see a factor of 2 when one is injected, so it would see 2e33.
+
+| op | fixtures | result |
+|---|---|---|
+| `gdn_chunk_scan` | 6, incl. ragged, `ht` live, and `scale` **absent** | `adj/fd = 1.000000` x12 each; worst 1.8e-7 |
+| `gdn_gated_rmsnorm` | live conditioning + ordinary rows | every x ratio **exactly 1.000000** |
+
+**The two largest jumps in the growth curve are therefore not defects.** The x1e4 at
+`pos 1416 -> 1415` straddles `gdn_gated_rmsnorm` (it *reads* `gdn_o` at opnd 0 and *writes* it at
+opnd 3), so it is the norm's Jacobian, not the scan's, and the probe reproduces it as the op's own
+conditioning: **amp 1.543e4** against the dump's 1.07e4, with `mean(x^2)` walking down to
+`eps = 1e-6`. A 1e4 cotangent step at a gated RMS norm whose input sits near `eps` is what that op
+does. The scan's own `dy -> max|dc|` ratio is 0.03..0.12 -- it *shrinks*. `scale` is absent from the
+tape (it holds ints and strings, no double), and both sides fall back to `1/sqrt(head_k)`, which is
+the value the engine passes anyway (`third_party/radiance/arch/common/rad_block_gdn.h:209`); the
+absent run reproduces the explicit one value for value.
+
+**The gap is named.** `rmsnorm_had_quant_i8g`, `gated_had_quant_i8g` and `gate_had_quant_i8g` have
+**no host twin and no host adjoint** -- the only registration is the device row
+(`src/adjoint/device/quant.hip:874-876`), and the existing test checks that row against a host
+*composition* of the same parts (`tests/gpu/adjoint_quant.cpp:535-543`), which is exactly the
+shared-factor comparison that cannot see a factor both sides carry. **208 of the walk's 1459 records
+(14%) are these three ops**, and they produce every code plane the `gemm_nt_q` consumers read. They
+are the only op group on the path with no finite-difference check on either side.
+
+Auditing that row against its forward accepts the `/s` (it matches `src/adjoint/host/quant.cpp:299`),
+the `+ cot_h` fused-output term and the norm backward, so no factor is visible by inspection. What
+*is* visible is a range hazard: the row computes `cot / s` in f32 (`quant.hip:199`), and this record
+carries code cotangents of 2.44e30..2.62e33 while `gdn_o`'s reach 1e35..1e38 -- with live scales as
+small as 5.96e-05, the quotient crosses f32's 3.4e38. That is consistent with the report's
+first-non-finite being this row's in-place output, and it is a real defect on its own, though an
+overflow gives Inf rather than a 2e33 multiplier.
+
+Closing this needs a host twin and host adjoint for those three fused producers (the linearised
+composition already written in `tests/gpu/adjoint_quant.cpp:568`, pinned first against `libref`),
+after which the probe above can run on them. That is a card-free but non-trivial piece of work, and
+it is the named next step.
+
+### Two defects found in passing
+
+- `src/adjoint/host/gdn_scan.cpp:446-455`: the twin's `unit()` computes `n = u/H`, `h = u%H`, then
+  **shadows `h`** with the loop `for (int64_t h = 0; h < g.H; ++h)`, so each of the `N*H` units
+  replays every head of its sequence -- values unchanged, `H`x the work (`H=48` live). The adjoint is
+  free of it.
+- `src/adjoint/device/quant.hip:359-377`: leftover `SCALERANGE ...` instrumentation prints 256 lines
+  per window to stderr.
