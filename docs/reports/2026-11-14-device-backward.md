@@ -267,11 +267,11 @@ retracted**: the row-wide reduction carries a single group's overflow across the
 
 ### The measurement: ~984x per block on average, and accelerating
 
-> **Superseded.** The central difference has since been taken at a second, earlier block, and the
-> leaves behind this curve are **not all finite** -- the leaf at block 40 is NaN, and so is the first
-> leaf in parameter order. See "The per-block factor, measured at last -- and it does not exist"
-> below. The curve is kept because it is what the earlier conclusion rested on; it is not a
-> description of a compounding scale factor.
+> **Confirmed in substance, corrected in number.** The curve is real: tracking one buffer across blocks
+> (`gdn_in`, blocks 62 to 58) measures **~1.6e3 per block**, and that is why the walk saturates to
+> non-finite around block 50. What the curve's own reading got wrong is the *value* -- `~984x` from a
+> logit-space division against `~1.6e3` measured directly -- and the "accelerating" framing. See "The
+> per-block factor, measured at last: ~1.6e3, and it is real" below.
 
 `R97_DUMP_POS=all` prints the largest finite magnitude of every record's incoming cotangent in walk
 order (63 -> 0). The curve is neither a spike nor a range limit -- it is **monotone** but **not
@@ -351,8 +351,8 @@ and it is the only open question now.
 ### The verdict: the true gradient is O(1e4), and the walk reports 6.28e35
 
 > **Superseded in part.** The `-9073.8` reading stands -- it is re-measured below and unchanged -- but
-> "the walk reports 6.28e35" is true of only *one* leaf: at block 40 the walk is **NaN**, and the
-> first leaf in parameter order is non-finite too. There is no uniform per-block growth to name.
+> "the walk reports 6.28e35" is true of only *one* leaf: at block 40 the walk is **NaN**, because the
+> cotangent has already crossed the f32 ceiling by block 50. See the per-block section below.
 
 `R97_CENTRAL=1` was run on the 512-token case with a control proving the forward reads the params it
 is handed. The run of 2026-11-15 (`/tmp/r97-dstep-device_step_tape-i9Nlis`) is the first with
@@ -406,9 +406,10 @@ non-finite has moved down from `rmsnorm_had_quant_i8g`@1176 since the f64 row re
 
 ### The growth is one global per-layer factor, not one op
 
-> **Superseded.** This section names a per-layer factor from the growth curve. The central difference
-> at an earlier block shows the truth growing only **1.24x per block**, and the walk going
-> **non-finite** rather than growing to a large finite number. There is no single per-layer factor.
+> **Confirmed in substance, restated in number.** This section names a per-layer factor from the growth
+> curve. The curve is real and now measured directly (**~1.6e3 per block**, one buffer across four
+> blocks), and the truth grows 1.24x per block, so the error per block is ~1.3e3. Only the figure
+> drawn from the logit-space division is superseded.
 
 An earlier reading of the curve named `gdn_chunk_scan` (x1e4 per layer) the largest single
 contributor. **That is wrong, and the measurement that refutes it is the same buffer tracked across
@@ -584,46 +585,54 @@ not merely the same rule. The grids agree at all four live widths (5120/40, 5120
 the same rule in f64 (`host/quant.cpp:365` divides, `host/linear.cpp:244` and `host/lora.cpp:312`
 multiply).
 
-### The per-block factor, measured at last -- and it does not exist
+### The per-block factor, measured at last: ~1.6e3, and it is real
 
-**The measurement is in, and it retires the growth curve rather than explaining it.** `R97_CENTRAL_BLK`
-already selects the block (the spec is a substring of the param name), so the same 512-token case was
-run a second time with the central difference taken at an earlier block. Two leaves, one run each,
-against each leaf's own finite difference:
+**Two measurements, and they say different things -- which is the whole point.**
+
+**The walk's cotangent in one buffer, tracked across blocks** (`gdn_in`, the `lora_expand` operand,
+from the `R97_DUMP_DC=1` pass):
+
+| block | position | maxabs |
+|---|---|---|
+| 62 | 1416 | 0.652 |
+| 61 | 1395 | 664 |
+| 60 | 1369 | 1.02e+06 |
+| 58 | 1320 | 4.36e+12 |
+
+Block to block that is **1018x, 1530x, and 2073x** -- geometric mean over the four blocks, **1.6e3 per
+block**. Same buffer, same op, adjacent records: this is not a ratio of two different quantities.
+
+**The true gradient, from the central difference at two leaves:**
 
 | leaf | walk's gradient | true (central, bf16 step) | over-statement |
 |---|---|---|---|
-| `model.layers.40.linear_attn.in_proj_qkv.lora_A` | **not finite (NaN)** | **876.06** | unbounded |
 | `model.layers.51.self_attn.q_proj.lora_A` | 6.2827e35 | **-9073.83** | 6.9e31 |
-| `model.layers.0.linear_attn.in_proj_qkv.lora_A` | not finite | -- | (first leaf in param order) |
+| `model.layers.40.linear_attn.in_proj_qkv.lora_A` | **NaN** | **876.06** | unbounded |
+| `model.layers.0.linear_attn.in_proj_qkv.lora_A` | NaN | -- | (first leaf in param order) |
 
-Two things fall out, and both contradict the model this report was built on.
+The truth grows **1.24x per block** (876.06 at block 40 to 9073.83 at block 51, 10.4x over 11 blocks):
+a well-behaved O(1e3) number at every depth. **So the walk carries ~1e3 too much per block and the
+truth carries ~1.24x** -- and the per-block factor the earlier sections argued for is real, it is just
+**~1.6e3 rather than ~984**, and it is measured now rather than divided out of a logit-space ratio.
 
-**First, the truth grows modestly, not by 984x per block.** 876.06 at block 40 to 9073.83 at block 51 is
-a factor of **10.4 over 11 blocks, 1.24x per block**. Different modules, so this is not a
-within-module comparison -- but both are the model's own true gradient and both are O(1e2..1e4), which
-is the whole point: the truth is a well-behaved O(1e3) number at every depth.
+**The two measurements also predict each other.** From `0.652` at block 62, crossing f32's `3.4e38` at
+`1.6e3` per block takes `log10(3.4e38/0.652) / log10(1.6e3)` = **12.1 blocks**, i.e. **block 50**. The
+first non-finite in the walk is at position 1150, in block 50. That is not a coincidence, and it is
+what makes the rate credible.
 
-**Second, and more decisive, the walk does not grow to a large finite number -- it goes non-finite
-almost immediately.** The leaf at block 40 is **NaN**, and the first leaf in parameter order
-(`model.layers.0.linear_attn.in_proj_qkv.lora_A`) is non-finite too. So there is no smooth "~984x per
-block, accelerating" curve to explain: the walk saturates to `+-Inf`/NaN well before the deepest block,
-and the one leaf that stayed finite (block 51) sits at 6.9e31 over its own truth.
+**Which also explains the NaN leaves without contradicting the rate.** The walk's cotangent grows
+geometrically until it crosses the f32 ceiling, then stays non-finite. Leaves at block 40 and block 0
+are *downstream* of that crossing, so they read NaN -- not because the per-block growth stops, but
+because it has already saturated. An earlier draft of this section read that saturation as evidence
+that no per-block factor existed; that reading was wrong, and the buffer trace above is what corrects
+it.
 
-**That is the f32 range defect's signature, not a compounding scale factor's.** The three row
-reductions fixed on this branch cross `3.4e38` at the cotangent magnitudes the walk actually carries,
-which yields `+-Inf` and then NaN through `rsqrtf` -- and the leaf at block 40 is exactly that. The
-earlier "growth curve" was read off magnitudes that were in part already non-finite.
-
-**What the corrected picture says to look at next is therefore not a per-block multiplier but the
-finite stretch.** One leaf, at block 51, is finite and 6.9e31 too large; the rest are non-finite. The
-instrument for the finite ones is unchanged and still unused: every retained log has **zero**
-`R97_DUMP_DC` lines, so **no device row has ever been checked per-hop at the container's real
-magnitudes**.
-
-*(The audit section above, written before this run, argues the per-block division is unmeasured and
-that `3.9` and `250` are both derived. The run confirms it, and adds that the number the curve was
-built from is not finite at depth at all.)*
+**What remains unexplained is why the rate is ~1.6e3.** A quantiser hop contributes `1/s ~ 5` and
+there are ~5 per block, so a *balanced* chain contributes ~1; an unbalanced one at every hop would
+give 5^5 ~ 3e3, which is the right size. The `1/s` audit above shows all eight producer x consumer
+pairs balanced at product exactly 1.0, so it is not the quantiser scales. **It is a per-block factor
+of ~1.6e3 made somewhere the scale audit does not cover**, and the instrument that now narrows it is
+`R97_DUMP_DC` at real magnitudes -- which is what the pass above demonstrates works.
 
 **Two mechanical findings came out of the audit and are acted on.** The f32 row reductions: the
 report's own f64 fix landed at one of three sites on this path, and the other two
