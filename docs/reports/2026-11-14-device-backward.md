@@ -983,6 +983,40 @@ statement becomes "**249x too small**" rather than 1.3e5, and the headline over-
 conclusion -- but the numbers quoted earlier in this report and in the PR body are 2.71 decades too
 small, and are superseded by this table.
 
+### The head probe: where the cotangent starts and what the walk does with it
+
+`R97_DUMP_DC=1` on the same case (`/tmp/r97-head.log`, 408 s, 5851 rows, 231 of them at positions
+1450-1458). Read slots only, highest position first:
+
+| position | op | buffer | cotangent `maxabs` | nonzero |
+|---|---|---|---|---|
+| 1458 | `rmsnorm` | `x` | **1.31316e-07** | 2616320 |
+| 1457 | `add` | `h`, `x` | 1.31316e-07 | 2616320 |
+| 1456 | `lora_expand` | `h` | 1.31316e-07 | 2616320 |
+| 1456 | `lora_expand` | `lora.t.r16.lane0` | **1.22032e-06** | 8176 |
+| 1455 | `lora_shrink` | `ffn.q8` | **1.25364e-06** | 8895488 |
+| 1455 | `lora_shrink` | `ffn.s8` | 1.87708e-05 | 69496 |
+| 1454 | `gemm_nt_q` | `ffn.q8` | 2.43376e-07 | 8895487 |
+| 1453 | `gated_had_quant_i8g` | `gate_up` | 1.27554e-05 | 17790976 |
+
+**`d_hout` is 1.31316e-07**, the cotangent the head hands the output norm, and it is the same value at
+1457's `add` and 1456's `lora_expand h` -- one value carried through the top of the block, as it
+should be.
+
+**And the walk under-amplifies it by a factor of 249.** From `d_hout` = 1.31316e-07 the walk reaches
+0.00744629 at block 63's `self_attn.q_proj.lora_A` -- **5.67e4**. The mean-corrected FD is 1.85698, so
+the true amplification over the same span is **1.41e7**. The ratio is **249.4**.
+
+**249.4 is 2.6% below 256 = 2^8, which is a lead and not yet a finding.** An eighth-bit or
+power-of-two factor would fit the arithmetic, and the int8 path is full of 128s (`the 1/s` audit in
+this report found all eight producer×consumer pairs with product exactly 1.0, so that particular
+round-trip is clean). But 2.6% is a wide miss for an exact power of two and the case has no
+independent measurement of a 256 anywhere. It is recorded as a direction, not as a cause.
+
+**The artifact for this run:** `all_finite` false, loss 7371.591348378961, `n_a_finite_nonzero` **82**
+of 400 (the 4096 case gives 0), `a_changed` 374, `b_changed` 375, step 312.17 s of which 264.06 s is
+backward.
+
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
