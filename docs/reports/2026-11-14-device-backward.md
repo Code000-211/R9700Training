@@ -864,6 +864,29 @@ next step is to make the tape keep the pre-op value for an in-place read (a copy
 device-side snapshot of the slot), then re-measure the walk's growth. If the ~1.6e3 per layer falls
 out, this was the cause; if it drops by 656x only, this was one term and the census resumes.
 
+**And it is systemic, measured without any heuristic.** The sound test needs no "last writer" guess: for
+an in-place operand the record's read slot is the same buffer the op writes, so if the tape captured
+the read value the snapshot must **differ** from the op's own recorded output, and if it captured the
+write the two must **agree**. Comparing each in-place snapshot against that op's own `DUMPFWD`
+`maxabs` at the same `(op, pos, buffer)`, on the re-run that prints each operand's role
+(`/tmp/r97-snap-probe2.log`, 490 s, `fa88d75`):
+
+| | |
+|---|---|
+| in-place operands (`written=1 in_place=1`) | **512** |
+| snapshot equals the op's **own output** -- read value lost | **511** |
+| snapshot differs from it -- read value preserved | **0** |
+| no forward line to compare against | 1 |
+
+By op, the 511 are `lora_expand` **288**, `rmsnorm_had_quant_i8g` **127**, `gdn_conv_prep` **48**,
+`rope` **32**, `kv_store` **16** -- every one of them on the adapter's gradient path.
+
+**A naive "last writer" count is not usable and is recorded only to be withdrawn**: comparing every
+read against the highest position below it that wrote the same buffer name gives 471 of 2579
+read-only operands and 441 of 509 in-place ones "differing", but a buffer written in place records its
+post-op value as that writer's copy, so the model is wrong for exactly the buffers in question. The
+own-output test above needs no model and gives 511 of 512.
+
 **The curve then clips, and that is the whole of `all_finite false`.** At position 1143 the magnitude
 reaches `3.38953e38`, f32's ceiling, and 1196561 of its 3145728 values are already non-finite; from
 position 1122 down, `gdn_o` is non-finite in every value (3145728 of 3145728). **The clip is visible in
