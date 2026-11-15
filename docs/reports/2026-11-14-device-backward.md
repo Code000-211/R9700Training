@@ -1168,10 +1168,14 @@ cotangent series over the walk, from the same log, is:
 | 1325 | `gdn_gated_rmsnorm` | 9.64052e+15 |
 
 The four step ratios are **1.069e4, 1.087e4, 9.22e3, 1.233e4** -- the same number every GDN layer,
-and the layer-to-layer relaxation (1128 -> 153, 1.66e6 -> 220160) is a factor of ~7.4. Net growth is
-**~1.1e3 per GDN layer** over the thirteen GDN layers between positions 1417 and 1143, which is
-0.105469 -> 3.38953e+38: **3.2e39, i.e. 3.04 decades per GDN layer -- the same 3.2 decades per block
-the residual table measures.** **The ladder's growth is the GDN path, and it is this row.**
+and the layer-to-layer relaxation (1128 -> 153, 1.66e6 -> 220160) is a factor of ~7.4. **The net rate
+is what matters and it is 3.217 decades per block**: taking the `had_quant_act_i8g` level, which is
+the walk's incoming cotangent for the sublayer, it runs 0.105469 (block 62), 153 (61), 220160 (60) and
+7.81684e11 (58) -- x1451, x1439 and x3.55e6 over two blocks, i.e. 3.162, 3.158 and 3.275 decades per
+block. **The walk-versus-FD table's own rate is 3.413, 3.124 and 3.081 decades per block**, so the two
+agree inside the spread of the walk's own estimates. (An earlier reading of this called the net
+"~1.1e3 per GDN layer" and compared it against a per-block figure; the net is per block, not per
+layer, and the two are not comparable that way.)
 
 **And the forward shows the row does the same thing in the forward direction.** `gdn_o` at its
 `gdn_chunk_scan` writer is maxabs **0.42, 0.62, 0.56, 0.32, 0.57, 0.50, 0.43, 0.53, 0.62, 0.34**
