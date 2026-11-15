@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -1060,13 +1061,49 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             StoredSnapshots snaps;
             // This block's own values answer every key the step's frozen store does not hold.
             shared.set_base(&snaps);
-            // The post-issue observer runs after the op, so an operand an op replaces in place
-            // holds the value the op wrote. A read of that same buffer is the value before the
-            // op: the last write it saw, which is the previous op's post-issue content. Keep the
-            // latter per buffer and give the in-place read that, or the adjoint differentiates
-            // the op at its output instead of its input (the gated norm's gdn_o, above all).
+            // The replay's pull-back is at the replayed op's issue, and the engine reuses its
+            // arena between one op and the next: a read of a buffer an earlier op in the block
+            // wrote is pulled after that slot has been handed to another op, so it holds the later
+            // op's values, not the writer's (a -7.87e33 where the writer left a finite row). An
+            // in-place read is the same defect with the writer being this op's own earlier state.
+            // Capture every buffer the block writes, at the write's issue, and serve a read of it
+            // from that capture: the adjoint then sees the value the op read, not what the arena
+            // holds a moment later (the gated norm's gdn_o, above all). A buffer the block never
+            // wrote -- a frozen input, the boundary, or the recurrent state the engine cleared
+            // before the replay -- is not in the capture and keeps the live pull, entering zero for
+            // a kv: the block reads cold.
             std::map<std::string, AdValue> before;
-            replay.replay(layer, [&snaps, &snap_record, &note_produced, &before, &options](
+            std::set<std::string> block_wrote;
+            // The writer's capture covers the read when the read's rows are a prefix the writer
+            // wrote with the same trailing layout (row-major: the writer wrote every row the read
+            // wants). A read wanting a row the writer left unwritten is not covered.
+            const auto same_layout = [](const AdValue& w, const AdValue& r) {
+                if (w.shape.size() != r.shape.size()) return false;
+                for (size_t d = 1; d < r.shape.size(); ++d)
+                    if (w.shape[d] != r.shape[d]) return false;
+                return true;
+            };
+            const auto covered = [&same_layout](const AdValue& w, const AdValue& r) {
+                return same_layout(w, r) && (r.shape.empty() || w.shape[0] >= r.shape[0]);
+            };
+            // The writer's value restricted to the read's row prefix: the read's span is the
+            // writer's, not whatever the arena now holds. A plugin-private tensor has no f64 value,
+            // so its pointer and encoding travel as a block, as an in-place read already does.
+            const auto writer_rows = [](const AdValue& w, const AdValue& r) {
+                AdValue out;
+                out.dtype = r.dtype;
+                out.shape = r.shape;
+                out.raw = w.raw;
+                out.enc = w.enc;
+                if (w.value.empty()) return out;
+                size_t per_row = 1;
+                for (size_t d = 1; d < r.shape.size(); ++d) per_row *= (size_t)r.shape[d];
+                const size_t need = r.shape.empty() ? w.value.size() : (size_t)r.shape[0] * per_row;
+                out.value.assign(w.value.begin(), w.value.begin() + need);
+                return out;
+            };
+            replay.replay(layer, [&snaps, &snap_record, &note_produced, &before, &block_wrote,
+                                  &covered, &same_layout, &writer_rows, &options, &layer](
                                      const OpRecord& op,
                                      const std::vector<OperandContent>& content) {
                 // The adjoint sees the step's rows and, for attention, the q view its family
@@ -1081,24 +1118,90 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 for (size_t j = 0; j < shaped.operands.size(); ++j) {
                     const Operand& read = shaped.operands[j];
                     if (read.written || snapped.frozen[j]) continue;
-                    bool in_place = false;
-                    for (size_t k = 0; k < shaped.operands.size(); ++k) {
-                        const Operand& write = shaped.operands[k];
-                        if (write.written && write.buffer == read.buffer) in_place = true;
+                    if (!block_wrote.count(read.buffer)) {
+                        // No op before this one wrote it: a frozen input, the boundary, or a
+                        // recurrent state the block reads cold. The kv: state the engine cleared
+                        // before the replay enters zero; everything else keeps the live pull.
+                        if (read.buffer.rfind("kv:", 0) == 0)
+                            snapped.now[j].value.assign(snapped.now[j].value.size(), 0.0);
+                        continue;
                     }
-                    if (!in_place) continue;
                     const auto prev = before.find(read.buffer);
-                    if (prev != before.end() && prev->second.shape == snapped.now[j].shape) {
-                        snapped.now[j] = prev->second;
-                    } else if (read.buffer.rfind("kv:", 0) == 0) {
-                        // The engine cleared the recurrent state before the replay, so a carried
-                        // state read that no op in the block wrote yet enters zero.
-                        snapped.now[j].value.assign(snapped.now[j].value.size(), 0.0);
+                    if (prev == before.end()) {
+                        // A `kv:` buffer is the engine's paged pool, not an activation the capture
+                        // holds: the block's kv_store writes it by paging, so it lands in
+                        // block_wrote but never in `before` (its write is a block view). Its reader
+                        // (attn_paged) must see the live pool the replay just wrote; the pool is its
+                        // own allocation, not the reused activation arena, so the live pull is the
+                        // reader's value and not a stale one.
+                        if (read.buffer.rfind("kv:", 0) == 0) continue;
+                        // The block wrote it, but the capture did not record it (a view, or a
+                        // partial-row write): the capture is not complete for the read. A pull here
+                        // reads a reused arena, and a zero would hide the defect -- name it.
+                        throw std::runtime_error("device step: block " + std::to_string(layer) +
+                                                 " read of '" + read.buffer + "' by '" + op.op +
+                                                 "' at position " + std::to_string(op.position) +
+                                                 " is not covered by the block's write of it");
                     }
+                    if (!covered(prev->second, snapped.now[j])) {
+                        // A row-prefix the writer left short is a gap the live pull would fill from
+                        // a reused arena: name it. A different layout (rank or trailing dims) is a
+                        // strided or column view -- q_proj's query half, its gate half -- that the
+                        // writer's row-major capture cannot express; the buffer is live at this
+                        // read's issue (a read is always of a live buffer), so the live pull IS the
+                        // reader's view, and it is kept.
+                        if (same_layout(prev->second, snapped.now[j]) &&
+                            prev->second.shape[0] < snapped.now[j].shape[0]) {
+                            // Both sides named: the writer's captured AdValue and the reader's
+                            // snapshot, each as [shape] plus the row window and value count, and
+                            // the operand's own view declaration. The refusal is right whenever
+                            // these disagree about rows; when they agree on rows and differ on
+                            // the view, the coverage test has asked the wrong question.
+                            std::string ws, rs, vs;
+                            for (int64_t d : prev->second.shape) ws += " " + std::to_string(d);
+                            for (int64_t d : snapped.now[j].shape) rs += " " + std::to_string(d);
+                            for (int64_t d : read.view_shape) vs += " " + std::to_string(d);
+                            const int64_t w_rows =
+                                prev->second.shape.empty() ? 0 : prev->second.shape[0];
+                            const int64_t r_rows =
+                                snapped.now[j].shape.empty() ? 0 : snapped.now[j].shape[0];
+                            std::fprintf(stderr,
+                                         "r97: block %lld coverage '%s' op=%s pos=%lld: "
+                                         "writer[%s ] rows=%lld vals=%llu | read[%s ] rows=%lld "
+                                         "vals=%llu | operand rows=%lld row_lo=%lld view[%s ] "
+                                         "view_off=%lld in_place=%d written=%d\n",
+                                         static_cast<long long>(layer), read.buffer.c_str(),
+                                         op.op.c_str(), static_cast<long long>(op.position),
+                                         ws.c_str(), static_cast<long long>(w_rows),
+                                         static_cast<unsigned long long>(prev->second.value.size()),
+                                         rs.c_str(), static_cast<long long>(r_rows),
+                                         static_cast<unsigned long long>(snapped.now[j].value.size()),
+                                         static_cast<long long>(read.rows),
+                                         static_cast<long long>(read.row_lo), vs.c_str(),
+                                         static_cast<long long>(read.view_off),
+                                         read.in_place ? 1 : 0, read.written ? 1 : 0);
+                            throw std::runtime_error("device step: block " + std::to_string(layer) +
+                                                     " read of '" + read.buffer + "' by '" + op.op +
+                                                     "' at position " + std::to_string(op.position) +
+                                                     " wants rows the block's write of it does not cover");
+                        }
+                        std::string ws, rs;
+                        for (int64_t d : prev->second.shape) ws += " " + std::to_string(d);
+                        for (int64_t d : snapped.now[j].shape) rs += " " + std::to_string(d);
+                        std::fprintf(stderr,
+                                     "r97: block %lld read of '%s' by '%s' at %lld: writer [%s ] vs "
+                                     "read [%s ] -- a view, live pull kept\n",
+                                     static_cast<long long>(layer), read.buffer.c_str(),
+                                     op.op.c_str(), static_cast<long long>(op.position),
+                                     ws.c_str(), rs.c_str());
+                        continue;
+                    }
+                    snapped.now[j] = writer_rows(prev->second, snapped.now[j]);
                 }
                 for (size_t j = 0; j < shaped.operands.size(); ++j) {
                     const Operand& operand = shaped.operands[j];
                     if (snapped.frozen[j]) continue;  // bound to the shared store by snap_record
+                    if (operand.written) block_wrote.insert(operand.buffer);
                     if (operand.written && operand.buffer.rfind("kv:", 0) == 0 &&
                         before.find(operand.buffer) == before.end()) {
                         // A carried state this block has not written yet enters cold; the op's
