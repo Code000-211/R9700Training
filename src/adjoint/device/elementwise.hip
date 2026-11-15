@@ -246,22 +246,29 @@ __global__ void act_mul_adjoint_kernel(const float* a, const float* b, const flo
     b_dc.set(i, d * act_value(act, a[i]));
 }
 
-// One pass over the row sums both x^2 (the rms) and dy*x*c (the shared term), in f32; the row's
-// gain is formed here, at f32, before the store's one rounding.
+// One pass over the row sums both x^2 (the rms) and dy*x*c (the shared term); the row's gain is
+// formed here before the store's one rounding.
+//
+// Both sums are f64 for the reason `rmsnorm_back_kernel` is (device/quant.hip:248-290): the host
+// twin accumulates `double ss` and `double t` over the same row (host/elementwise.cpp:480-487),
+// and the cotangent this row is handed reaches 1e35..1e38 by block 51 of the real container. An
+// f32 `tt` over 5120 terms crosses 3.4e38 there and an f64 one does not, so the width is a
+// device-versus-reference divergence, not a tolerance. `ss` rides the same reduction because the
+// shared term uses `s^3`. The operands stay the f32 ones the record carries.
 __global__ void rmsnorm_adjoint_kernel(const float* x, const float* w, const float* y_cot,
                                        OutStore x_dc, int64_t n, float eps, float wadd, float mult) {
-    __shared__ float sum_sq[256];
-    __shared__ float sum_t[256];
+    __shared__ double sum_sq[256];
+    __shared__ double sum_t[256];
     const int64_t row = blockIdx.x;
     const int64_t base = row * n;
     const int t = (int)threadIdx.x;
     const int str = (int)blockDim.x;
-    float ss = 0.0f, tt = 0.0f;
+    double ss = 0.0, tt = 0.0;
     for (int64_t i = t; i < n; i += str) {
-        const float xi = x[base + i];
-        const float c = w ? w[i] + wadd : 1.0f;
+        const double xi = (double)x[base + i];
+        const double c = w ? (double)w[i] + (double)wadd : 1.0;
         ss += xi * xi;
-        tt += y_cot[base + i] * xi * c;
+        tt += (double)y_cot[base + i] * xi * c;
     }
     sum_sq[t] = ss;
     sum_t[t] = tt;
@@ -273,15 +280,16 @@ __global__ void rmsnorm_adjoint_kernel(const float* x, const float* w, const flo
         }
         __syncthreads();
     }
-    const float inv_n = 1.0f / (float)n;
-    const float s = rsqrtf(sum_sq[0] * inv_n + eps);
-    const float t_shared = sum_t[0];
-    const float s3 = s * s * s;
+    const double inv_n = 1.0 / (double)n;
+    const double s = 1.0 / sqrt(sum_sq[0] * inv_n + (double)eps);
+    const double t_shared = sum_t[0];
+    const double s3 = s * s * s;
+    const double mult_d = (double)mult;
     for (int64_t i = t; i < n; i += str) {
-        const float xi = x[base + i];
-        const float c = w ? w[i] + wadd : 1.0f;
-        const float shared = s3 * xi * t_shared * inv_n;
-        x_dc.set(base + i, mult * (s * c * y_cot[base + i] - shared));
+        const double xi = (double)x[base + i];
+        const double c = w ? (double)w[i] + (double)wadd : 1.0;
+        const double shared = s3 * xi * t_shared * inv_n;
+        x_dc.set(base + i, (float)(mult_d * (s * c * (double)y_cot[base + i] - shared)));
     }
 }
 
