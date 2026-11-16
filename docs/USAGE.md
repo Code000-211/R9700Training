@@ -341,15 +341,16 @@ run is then `build/r97train train --config that-file`. `train` writes the contai
 
 The smallest run there is, over the tiny fixture container — no card and no data of your own; the
 checks a run needs around the commands are `docs/RUNBOOK.md`'s. `docs/FIXTURES.md` owns the
-fixture: the host tests make it, and it lands in their temporary directory as
-`<tmpdir>/tiny_qwen35_bf16/tiny_qwen35_bf16.rad`. These commands find it and keep the path in
-`$tiny`:
+fixture: the host tests make it, and it lands in the build's fixture directory as
+`build/fixture/tiny_qwen35_bf16.rad`. These commands name it and keep the path in `$tiny`:
 
 ```sh
 ctest --test-dir build -L host          # once: the host tests make the tiny container
-tiny=$(find "${RAD_TEST_TMPDIR:-${TMPDIR:-/tmp}}" \
-            -path '*tiny_qwen35_bf16/tiny_qwen35_bf16.rad' -printf '%T@ %p\n' \
-       | sort -rn | head -1 | cut -d' ' -f2-)
+tiny=build/fixture/tiny_qwen35_bf16.rad
+[ -e "$tiny" ] || {
+    echo "no tiny container at $tiny; run ctest --test-dir build -L host" >&2
+    exit 1
+}
 ```
 
 `$tiny` is the tiny run's `model`; the file below is its configuration, not the real one above:
