@@ -1,3 +1,16 @@
+# Device backward: the cotangent growth is the rows' own Jacobians, and the quotient needs a guard
+
+Issue #145. The device step's backward grows the residual stream's cotangent ~3.2 decades per block over
+13 blocks while the forward is flat, and the quantiser's `cot / (float)s` overflows f32. **The growth is
+correct mathematics**; the ticket's four acceptance criteria are refuted criteria. The deliverable is the
+guard, plus the explanation, and this report is the evidence for both. Code in PR #147.
+
+**Related issues.** #140 — the quotient overflow; the measurement in this report answers its open
+question. #144 — the FD harness never checks five in-place ops with their output aliased; the tests'
+hole, not the walk's. #148 — the device walk keeps the live pull for an in-place read with no earlier
+writer (63 live reads, the first at 1429). #149 — whether the GDN branch's pre-norm activation scale is
+correct; the growth's explanation rests on it.
+
 ## The guard, verified
 
 `R97_QUANT_GUARD=1` on the device walk:
