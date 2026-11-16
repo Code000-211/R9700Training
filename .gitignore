@@ -28,3 +28,6 @@ wandb/
 build/
 build-*/
 compile_commands.json
+# Agent session state (plan copies, scratch). The durable plan lives outside the repo and the
+# findings live in docs/reports/.
+.omp/
