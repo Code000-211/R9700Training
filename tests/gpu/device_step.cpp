@@ -361,6 +361,78 @@ void card_case(const char* test, int64_t n, bool probe) {
     r97::DeviceStepReport report;
     const r97::StepFn step = r97::device_step(*driver, model, options, &report);
 
+    // R97_HOST_WALK_AB=2: the host walk alone, first, for iterating on a host row that refuses a
+    // record. The A/B below runs after the device step and only when that walk's gradient is not
+    // finite, so a refusing host row otherwise costs a whole device walk -- minutes on the real
+    // container -- per attempt. This arm runs the same walk and returns: a refusal throws and fails
+    // the case, which is the whole answer the iteration is after.
+    if (const char* ab = std::getenv("R97_HOST_WALK_AB");
+        ab != nullptr && std::strcmp(ab, "2") == 0) {
+        // R97_CENTRAL is read far below this arm's return, and it differences the *device* walk's
+        // gradient. Asking for both would run the host walk, return, and never difference anything:
+        // a flag that silently measures nothing is worse than one that refuses.
+        if (std::getenv("R97_CENTRAL") != nullptr)
+            throw std::runtime_error(
+                "device step: R97_CENTRAL with R97_HOST_WALK_AB=2 is not a measurement: the central "
+                "difference reads the device walk's gradient and this arm returns before it runs. "
+                "Run R97_CENTRAL without R97_HOST_WALK_AB for the device gradient, or R97_FD_REC=<pos> "
+                "on this arm for a per-row check at the tape's own operands.");
+        r97::DeviceStepOptions host_options = options;
+        host_options.host_walk = true;
+        r97::DeviceStepReport host_report;
+        const r97::StepFn host_step = r97::device_step(*driver, model, host_options, &host_report);
+        r97::ParamSet host_grads;
+        const auto t_ab = std::chrono::steady_clock::now();
+        const r97::StepResult host_result = host_step(batch, params, &host_grads);
+        const double host_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t_ab).count();
+        bool host_all_finite = true;
+        int64_t host_non_finite_leaves = 0;
+        double host_norm_sq = 0.0;
+        for (const r97::Param& g : host_grads) {
+            bool leaf_finite = true;
+            for (float v : g.value) {
+                if (!std::isfinite(v)) leaf_finite = false;
+                host_norm_sq += double(v) * double(v);
+            }
+            if (!leaf_finite) {
+                host_all_finite = false;
+                ++host_non_finite_leaves;
+            }
+        }
+        std::printf("%s: host walk only: %lld scored, loss %.6f, gradient %s (grad norm %.6g, "
+                    "%lld of %lld leaves non-finite), cotangent op '%s' operand '%s'[%lld] pos "
+                    "%lld value %lld, forward_all_finite %d, %.1f s\n",
+                    test, (long long)host_result.scored, host_result.loss,
+                    host_all_finite ? "all finite" : "NOT finite", std::sqrt(host_norm_sq),
+                    (long long)host_non_finite_leaves, (long long)host_grads.size(),
+                    host_report.first_non_finite_op.c_str(),
+                    host_report.first_non_finite_operand.c_str(),
+                    (long long)host_report.first_non_finite_operand_index,
+                    (long long)host_report.first_non_finite_position,
+                    (long long)host_report.first_non_finite_index,
+                    host_report.forward_all_finite ? 1 : 0, host_seconds);
+        // The parent reads a results file whatever the child did, and this arm ran no device step
+        // for it to assert on. The file carries the host walk's own numbers and a marker, so the
+        // parent checks what this arm actually measured instead of reporting a missing file.
+        if (const char* dir = std::getenv(kOutVar)) {
+            nlohmann::json hj;
+            hj["name"] = test;
+            hj["host_walk_only"] = true;
+            hj["tokens"] = n;
+            hj["scored"] = host_result.scored;
+            hj["loss"] = host_result.loss;
+            hj["host_finite"] = host_all_finite;
+            hj["host_non_finite_leaves"] = host_non_finite_leaves;
+            hj["host_norm"] = std::sqrt(host_norm_sq);
+            hj["host_seconds"] = host_seconds;
+            std::ofstream out(std::string(dir) + "/" + test + ".json");
+            if (!out) throw std::runtime_error(std::string(test) + ": cannot write the results");
+            out << hj.dump(2) << "\n";
+        }
+        return;
+    }
+
     nlohmann::json j;
     j["name"] = test;
 
@@ -992,6 +1064,21 @@ static void device_step_case(const char* test, int64_t n, bool probe) {
     if (!in) throw std::runtime_error(std::string(test) + ": no results at " + path);
     nlohmann::json j;
     in >> j;
+
+    // R97_HOST_WALK_AB=2's arm walked the host rows alone and wrote its own numbers: there is no
+    // device step here to hold to the invariants below. A host walk that is not finite fails,
+    // which is the one thing this arm's contract says.
+    if (j.value("host_walk_only", false)) {
+        std::printf("%s: host walk only: %lld scored, loss %.9g, gradient %s (norm %.6g, %lld "
+                    "leaves non-finite), %.1f s\n",
+                    test, (long long)j.value("scored", int64_t(0)), j.value("loss", 0.0),
+                    j.value("host_finite", false) ? "all finite" : "NOT finite",
+                    j.value("host_norm", 0.0),
+                    (long long)j.value("host_non_finite_leaves", int64_t(0)),
+                    j.value("host_seconds", 0.0));
+        R97_CHECK(j.value("host_finite", false));
+        return;
+    }
 
     const int64_t tokens = j.at("tokens").get<int64_t>();
     const int64_t scored = j.at("scored").get<int64_t>();

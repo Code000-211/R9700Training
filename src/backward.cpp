@@ -468,6 +468,23 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                 refuse("op '" + rec.op + "' at position " + std::to_string(rec.position) +
                        ": operand '" + rec.operands[k].buffer + "' is snapped with shape " +
                        shape_text(v->shape) + ", not " + shape_text(want));
+            // R97_DUMP_VIEW=1: what a view operand's strides say about its span. A view whose
+            // numel exceeds its operand's reads past the declared buffer unless every excess
+            // stride is zero, and a nonzero row stride over a one-row buffer is that read.
+            if (std::getenv("R97_DUMP_VIEW") != nullptr && !rec.operands[k].view_shape.empty()) {
+                std::string stride;
+                for (int64_t d : rec.operands[k].view_stride)
+                    stride += (stride.empty() ? "" : ",") + std::to_string(d);
+                std::fprintf(stderr,
+                             "VIEW pos=%lld j=%zu buffer=%s shape=%s view=%s stride=[%s] off=%lld "
+                             "values=%zu numel=%lld\n",
+                             (long long)rec.position, k, rec.operands[k].buffer.c_str(),
+                             shape_text(rec.operands[k].shape).c_str(),
+                             shape_text(rec.operands[k].view_shape).c_str(), stride.c_str(),
+                             (long long)rec.operands[k].view_off, v->value.size(),
+                             (long long)numel(rec.operands[k].shape));
+                std::fflush(stderr);
+            }
             // A plugin-private operand (the w8a8_fwht128 trunk's weight and its scale) has no
             // f64 form: the snapshot carries its shape and the tape's pointer but no values, and
             // a device row decodes the engine's stored layout from that pointer. An operand with
@@ -642,7 +659,13 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             const size_t k = static_cast<size_t>(j);
             dc[k].dtype = fwd[k].dtype;
             dc[k].shape = fwd[k].shape;
-            if (frozen_at.count(k)) return;
+            // A frozen operand is one the row does not compute. That is a statement about the
+            // ROW, not about the cotangent: an in-place write the record also reads still carries
+            // the write's cotangent to the value it replaced, and the passthrough below is what
+            // fills it. Leaving such a slot unsized is what dropped the residual stream's
+            // cotangent at every fused norm -- the row froze it, the passthrough skipped it for
+            // being unsized, and only the branch term reached the block's input.
+            if (frozen_at.count(k) && !in_place_read(rec, k)) return;
             if (rec.operands[k].written && !in_place_read(rec, k)) return;
             dc[k].value.assign(static_cast<size_t>(numel(dc[k].shape)), 0.0);
             sized[k] = 1;
@@ -718,6 +741,22 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             // An empty slot on an in-place operand is the op's direct path: the value the write
             // replaced carries the write's cotangent unchanged (an expand adds its branch to y
             // without touching the read's slot; a mul, a rope or a state update fill theirs).
+            //
+            // The direct path is only the answer when no *separate* read of the same buffer
+            // already answered it. A record with `read x, write x` gives the row the read's slot to
+            // fill, and that slot distributes to the same prior version this write's segments name
+            // -- so filling this one too would add the cotangent twice. The check is on the value
+            // the row actually produced, not on the shape: a row that leaves the read empty has
+            // said nothing about the write either, and the direct path is still the answer.
+            const auto read_answered = [&](size_t j) {
+                for (size_t k = 0; k < rec.operands.size(); ++k) {
+                    if (k == j || rec.operands[k].written || !sized[k]) continue;
+                    if (rec.operands[k].buffer != rec.operands[j].buffer) continue;
+                    for (double v : dc[k].value)
+                        if (v != 0.0) return true;
+                }
+                return false;
+            };
             for (size_t j = 0; j < rec.operands.size(); ++j) {
                 if (!in_place_read(rec, j) || cot_index[j] < 0) continue;
                 // A slot the walk did not size is not the row's to fill: it is frozen, and the
@@ -725,7 +764,7 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                 if (!sized[j]) continue;
                 double written = 0.0;
                 for (double v : dc[j].value) written += std::fabs(v);
-                if (written == 0.0)
+                if (written == 0.0 && !read_answered(j))
                     dc[j].value = cot[static_cast<size_t>(cot_index[j])].value;
             }
         }
@@ -779,14 +818,153 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                         maxabs = std::max(maxabs, std::fabs(v));
                     }
                 std::fprintf(stderr,
-                             "DUMPDC op=%s pos=%s buffer=%s shape=%s sized=%d nonzero=%lld "
+                             "DUMPDC side=%s op=%s pos=%s buffer=%s shape=%s sized=%d nonzero=%lld "
                              "nonfinite=%lld maxabs=%.6g fwd_at=%lld\n",
-                             rec.op.c_str(), std::to_string(rec.position).c_str(),
+                             options.side == Side::host ? "host" : "device", rec.op.c_str(),
+                             std::to_string(rec.position).c_str(),
                              rec.operands[j].buffer.c_str(), shape_text(dc[j].shape).c_str(),
                              static_cast<int>(sized[j]), static_cast<long long>(nonzero),
                              static_cast<long long>(nonfinite), maxabs,
                              static_cast<long long>(fwd_non_finite[j]));
             }
+            std::fflush(stderr);
+        }
+
+        // R97_FD_REC=<pos>[,<pos>...]: a live-scale finite difference of the row that just ran, on
+        // the tape's own operands and cotangents. Every row check in the suite runs at O(1)
+        // synthetic values (`tests/support/adjoint_check.h` seeds with `urand`), and the quantisers'
+        // clamp masks are scale-dependent, so a row can pass there and be wrong where the walk
+        // actually is. This compares `dc[i][e]` against the twin's own derivative of
+        // `<twin, cot>` at that element, at the tape's magnitude, for the largest few elements of
+        // each read. Host arm only: the device rows round their cotangents to bf16, so there the
+        // comparison would be measuring the rounding.
+        if (const char* fr = std::getenv("R97_FD_REC"); fr != nullptr && options.side == Side::host) {
+            const std::string list(fr);
+            const std::string pos = std::to_string(rec.position);
+            bool want = false;
+            for (size_t at = 0; at <= list.size();) {
+                const size_t comma = list.find(',', at);
+                const std::string piece =
+                    list.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                if (piece == pos) want = true;
+                if (comma == std::string::npos) break;
+                at = comma + 1;
+            }
+            if (want) {
+                std::string terr;
+                TwinFn twin = twin_find(rec.op, rec.params, &terr);
+                if (twin == nullptr) {
+                    std::fprintf(stderr, "FDREC pos=%s op=%s no twin: %s\n", pos.c_str(),
+                                 rec.op.c_str(), terr.c_str());
+                } else {
+                    std::vector<size_t> read_at;
+                    std::vector<AdValue> reads;
+                    for (size_t i = 0; i < rec.operands.size(); ++i) {
+                        const bool inout = rec.operands[i].written && sized[i];
+                        if (rec.operands[i].written && !inout) continue;
+                        read_at.push_back(i);
+                        reads.push_back(fwd[i]);
+                    }
+                    const auto loss_at = [&](const std::vector<AdValue>& x) {
+                        std::vector<AdValue> y;
+                        twin(rec, x, &y);
+                        double sum = 0.0;
+                        for (size_t o = 0; o < y.size() && o < cot.size(); ++o)
+                            for (size_t e = 0; e < y[o].value.size() && e < cot[o].value.size(); ++e)
+                                sum += y[o].value[e] * cot[o].value[e];
+                        return sum;
+                    };
+                    for (size_t k = 0; k < reads.size(); ++k) {
+                        const size_t i = read_at[k];
+                        if (!sized[i] || dc[i].value.empty()) continue;
+                        // The elements that matter: the largest |dc| and the largest |value| in
+                        // this read. A row whose adjoint departs at magnitude shows it on both.
+                        size_t by_dc = 0, by_val = 0;
+                        for (size_t e = 1; e < dc[i].value.size(); ++e) {
+                            if (std::fabs(dc[i].value[e]) > std::fabs(dc[i].value[by_dc])) by_dc = e;
+                            if (e < reads[k].value.size() &&
+                                std::fabs(reads[k].value[e]) > std::fabs(reads[k].value[by_val]))
+                                by_val = e;
+                        }
+                        for (const size_t e : {by_dc, by_val}) {
+                            if (e >= reads[k].value.size() || e >= dc[i].value.size()) continue;
+                            const double x0 = reads[k].value[e];
+                            // The row's own RMS, which is what sets an RMS norm's scale: the
+                            // element's value says nothing about it, and a row at 5e-4 rms and a row
+                            // with one element at 5e-4 are different claims. `sc` is the norm's
+                            // rsqrt(mean(x^2)+eps) with the op's default eps.
+                            double row_ss = 0.0;
+                            const int64_t rch = reads[k].shape.empty() ? 0 : reads[k].shape.back();
+                            if (rch > 0 && (int64_t)reads[k].value.size() % rch == 0) {
+                                const int64_t row = (int64_t)e / rch;
+                                for (int64_t t = 0; t < rch; ++t) {
+                                    const double v = reads[k].value[(size_t)(row * rch + t)];
+                                    row_ss += v * v;
+                                }
+                                row_ss /= (double)rch;
+                            }
+                            const double row_sc = row_ss > 0.0 ? 1.0 / std::sqrt(row_ss + 1e-6) : 0.0;
+                            const double eps = 1e-6 * std::max(1.0, std::fabs(x0));
+                            std::vector<AdValue> xp = reads, xm = reads;
+                            xp[k].value[e] += eps;
+                            xm[k].value[e] -= eps;
+                            const double numeric = (loss_at(xp) - loss_at(xm)) / (2.0 * eps);
+                            const double analytic = dc[i].value[e];
+                            const double scale = std::max(std::fabs(analytic), std::fabs(numeric));
+                            std::fprintf(stderr,
+                                         "FDREC pos=%s op=%s read=%zu buffer=%s elem=%zu x=%.6g "
+                                         "row_ss=%.6g row_sc=%.6g "
+                                         "analytic=%.6g numeric=%.6g ratio=%.6g\n",
+                                         pos.c_str(), rec.op.c_str(), i,
+                                         rec.operands[i].buffer.c_str(), e, x0, row_ss, row_sc,
+                                         analytic, numeric,
+                                         scale > 0.0 ? analytic / numeric : 0.0);
+                        }
+                    }
+                }
+                std::fflush(stderr);
+            }
+        }
+
+        // R97_DUMP_REC=1: one line per record, the whole chain in walk order. `cot` is the largest
+        // magnitude the record was handed (its writes' incoming cotangents), `dc` the largest it
+        // left on its reads; `ratio` is the record's effective Jacobian. A row whose own adjoint is
+        // FD-proven still shows a large ratio when the *walk* hands it the wrong cotangent, and the
+        // first record whose ratio is out of line with its siblings is where the growth enters.
+        // Sums travel beside the maxima because a row that is handed one huge element and returns
+        // a dense small answer has the same maximum and a very different chain.
+        if (const char* dr = std::getenv("R97_DUMP_REC"); dr != nullptr && dr[0] == '1') {
+            double cot_max = 0.0, dc_max = 0.0, cot_sum = 0.0, dc_sum = 0.0;
+            int64_t cot_slot = -1, dc_slot = -1;
+            for (size_t j = 0; j < rec.operands.size(); ++j) {
+                if (rec.operands[j].written && cot_index[j] >= 0)
+                    for (double v : cot[static_cast<size_t>(cot_index[j])].value) {
+                        const double a = std::fabs(v);
+                        if (!std::isfinite(a)) continue;
+                        cot_sum += a;
+                        if (a > cot_max) {
+                            cot_max = a;
+                            cot_slot = static_cast<int64_t>(j);
+                        }
+                    }
+                if (!sized[j]) continue;
+                for (double v : dc[j].value) {
+                    const double a = std::fabs(v);
+                    if (!std::isfinite(a)) continue;
+                    dc_sum += a;
+                    if (a > dc_max) {
+                        dc_max = a;
+                        dc_slot = static_cast<int64_t>(j);
+                    }
+                }
+            }
+            std::fprintf(stderr,
+                         "DUMPREC pos=%s op=%s cot_max=%.6g cot_sum=%.6g cot_slot=%lld dc_max=%.6g "
+                         "dc_sum=%.6g dc_slot=%lld ratio=%.6g sum_ratio=%.6g\n",
+                         std::to_string(rec.position).c_str(), adjoint_rec->op.c_str(), cot_max,
+                         cot_sum, (long long)cot_slot, dc_max, dc_sum, (long long)dc_slot,
+                         cot_max > 0.0 ? dc_max / cot_max : 0.0,
+                         cot_sum > 0.0 ? dc_sum / cot_sum : 0.0);
             std::fflush(stderr);
         }
 
@@ -828,7 +1006,9 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         for (size_t j = 0; j < rec.operands.size(); ++j) {
             const bool in_place = in_place_read(rec, j);
             if (rec.operands[j].written && !in_place) continue;
-            if (frozen_at.count(j)) continue;
+            // The same rule the sizing uses: a frozen in-place read's slot is the passthrough's
+            // to fill, so it must reach the versions its read names.
+            if (frozen_at.count(j) && !in_place) continue;
             by_buffer[plan.by_name.at(rec.operands[j].buffer)].push_back(j);
         }
         // Create the storage the units write before a worker runs: creation moves the live-byte

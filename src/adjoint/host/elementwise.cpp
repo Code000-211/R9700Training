@@ -364,21 +364,88 @@ void cast_host_adjoint(const AdjointCall& call) {
 
 /* ------------------------------------------------------------------ rmsnorm */
 
-/* The rmsnorm family's gain: the one non-written operand after x whose shape is a single row of
- * `n` columns. The plain record is x, w{n}, y; the engine's fused producer is
- * x, residual?:inout, w{n}, q{rows,n}, scale{rows,n/128}, out?. Picking by shape is what makes
- * both work: operand 1 is the residual on the fused shape (written -- a silently wrong gain if
- * used), and a merely positional rule falls through to q or scale whenever the gain's values are
- * missing, which is a wrong gain (or a non-finite gradient) instead of a refusal. A gain the tape
- * gave no values for is absent: the schema's `wadd` says whether the record needs one at all, so a
- * plain norm still computes and a record that needs a gain refuses by name. */
-const AdValue* norm_gain(const OpRecord& rec, const std::vector<AdValue>& op, int64_t n) {
+/* The rmsnorm family's gain: the one non-written operand after x that is a row of `n` columns,
+ * alone or materialised once per row. The plain record is x, w{n}, y; the engine's fused producer
+ * is h, x, w{n or rows x n}, q{rows,n}, scale{rows,n/128}, out?, and its gain arrives either way.
+ *
+ * A shape test alone is not enough on that record: the norm's own *input* `x` is a `[rows, n]`
+ * read sitting beside the gain with the same shape, so a `[rows, n]` operand is a gain only when
+ * every row is the same one. `gain_row` decides that, and it is also what keeps a positional rule
+ * from taking the input for the gain -- which is what both rows did before it existed: the device
+ * row took the record's second read (the input) and this one the first shape match (also the
+ * input), so the norm's adjoint used a per-row activation as its gain.
+ *
+ * A gain the tape gave no values for is absent: the schema's `wadd` says whether the record needs
+ * one at all, so a plain norm still computes and a record that needs a gain refuses by name. */
+bool gain_row(const AdValue& v, int64_t n) {
+    if (n <= 0 || v.value.empty()) return false;
+    if (v.shape.size() == 1) return v.shape[0] == n && static_cast<int64_t>(v.value.size()) >= n;
+    if (v.shape.size() != 2 || v.shape[1] != n || v.shape[0] <= 0) return false;
+    return static_cast<int64_t>(v.value.size()) >= n * v.shape[0];
+}
+
+// The tape materialises a fused producer's gain as `[rows, n]`, and the rows are supposed to be
+// the same one. On the live record they are not: `blk.63.ffn_norm.weight` arrives as 2621440
+// values that differ row to row, for a weight the container holds as `[1, 5120]`. Both rows index
+// row 0, which is the gain if the tape's first row is the weight's -- so this says once per
+// process that the tape's form is not what it claims, rather than refusing a walk that has no
+// other way to read the weight.
+void note_gain_rows(const AdValue& v, int64_t n, const std::string& buffer, int64_t position) {
+    if (v.shape.size() != 2 || n <= 0) return;
+    const size_t row = static_cast<size_t>(n);
+    if (v.value.size() <= row) return;
+    for (size_t i = row; i < v.value.size(); ++i) {
+        if (v.value[i] == v.value[i % row]) continue;
+        static bool warned = false;
+        if (warned) return;
+        warned = true;
+        std::fprintf(stderr,
+                     "r97: rmsnorm adjoint: operand '%s' at %lld is [%lld, %lld] and its rows are "
+                     "not the same one, so the gain is read from row 0\n",
+                     buffer.c_str(), (long long)position, (long long)v.shape[0], (long long)n);
+        std::fflush(stderr);
+        return;
+    }
+}
+
+const AdValue* norm_gain(const OpRecord& rec, const std::vector<AdValue>& op, int64_t n,
+                        const char* who) {
     const size_t count = std::min(op.size(), rec.operands.size());
     for (size_t j = 1; j < count; ++j) {
         if (rec.operands[j].written) continue;
-        const std::vector<int64_t>& shape = op[j].shape;
-        if (shape.size() != 1 || shape[0] != n) continue;
-        if (op[j].value.empty()) return nullptr;  // named, but the tape could not give it
+        if (!gain_row(op[j], n)) continue;
+        note_gain_rows(op[j], n, rec.operands[j].buffer, rec.position);
+        // R97_GAIN_POS=1: which operand was taken as the gain, and with what shape and size. The
+        // schema's shape and the snapshot's can differ, and a gain that is `[rows, n]` in the record
+        // but `[n]` in the snapshot (or the reverse) decides whether row 0 is the whole gain.
+        if (std::getenv("R97_GAIN_POS") != nullptr) {
+            std::string schema;
+            for (int64_t d : rec.operands[j].shape)
+                schema += (schema.empty() ? "" : ",") + std::to_string(d);
+            // The values themselves, not just the shape: the gain was exonerated on buffer, shape
+            // and rank, but never on the numbers. A rank-2 snapshot whose rows differ from each
+            // other is not a broadcast of the rank-1 vector, and a rank-1 vector that is not the
+            // container's weight makes every elementwise comparison against the kernel wrong.
+            std::string vals;
+            for (size_t i = 0; i < std::min<size_t>(op[j].value.size(), 4); ++i)
+                vals += (vals.empty() ? "" : ",") + std::to_string(op[j].value[i]);
+            double row0_vs_row1 = -1.0;
+            if (op[j].shape.size() == 2 && op[j].shape[0] > 1 && op[j].shape[1] > 0) {
+                const int64_t wcol = op[j].shape[1];
+                row0_vs_row1 = 0.0;
+                for (int64_t i = 0; i < wcol; ++i)
+                    row0_vs_row1 = std::max(row0_vs_row1,
+                                            std::fabs(op[j].value[(size_t)i] -
+                                                      op[j].value[(size_t)(wcol + i)]));
+            }
+            std::fprintf(stderr, "GAINPOS pos=%lld who=%s j=%zu buffer=%s schema=[%s] value_rank=%zu "
+                                 "value0=%lld values=%zu n=%lld vals=[%s] row0_vs_row1=%.6g\n",
+                         (long long)rec.position, who, j, rec.operands[j].buffer.c_str(),
+                         schema.c_str(), op[j].shape.size(),
+                         op[j].shape.empty() ? -1LL : (long long)op[j].shape[0],
+                         op[j].value.size(), (long long)n, vals.c_str(), row0_vs_row1);
+            std::fflush(stderr);
+        }
         return &op[j];
     }
     return nullptr;
@@ -393,24 +460,71 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
     if (op.empty()) return;
     const AdValue& x = op[0];
     const int64_t n = width_of(rec, x.shape);
-    const AdValue* w = norm_gain(rec, op, n);
+    const AdValue* w = norm_gain(rec, op, n, "twin");
     const int64_t rows = rows_of(x, n);
     if (rows <= 0) return;
     if (w && (int64_t)w->value.size() < n) return;
     const double eps = param_num(rec, "eps", 1e-6);
-    const double wadd = param_num(rec, "wadd", 0.0);
+    // R97_NORM_WADD0=1: force the offset off, as a control only. The record's `wadd=1` is *right*
+    // for this container: `docs/OPS-qwen35-device.md` declares `eps=1e-06 wadd=1` on every
+    // `rmsnorm_had_quant_i8g` row, and `docs/adjoints/elementwise.md` records that Qwen3.5 uses
+    // GemmaRMSNorm's `w + 1` with a zero-centred gain. Forcing 0 therefore makes `w + 0` near zero
+    // and collapses the twin's activation, which is a negative control, not a candidate fix.
+    const double wadd = std::getenv("R97_NORM_WADD0") != nullptr ? 0.0
+                                                                : param_num(rec, "wadd", 0.0);
     const double mult = param_num(rec, "mult", 1.0);
     if (!w && wadd != 0.0) return;
 
+    // R97_GAIN_ROW=1: index a `[rows, n]` gain by the row instead of reading row 0 for all of
+    // them. The tape materialises a fused producer's gain once per row and the rows differ, so
+    // whether the kernel reads row `r` or row 0 is a question only the tape can answer: with the
+    // flag on, `DUMPTWIN`'s activation comparison either collapses to bf16 rounding (per-row is
+    // right) or stays where it is (row 0 is).
+    const bool gain_row_flag = std::getenv("R97_GAIN_ROW") != nullptr;
+    const bool per_row = w != nullptr && w->shape.size() == 2 && w->shape[0] == rows && gain_row_flag;
+    if (gain_row_flag) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr,
+                         "FDRMS pos=%lld rows=%lld w_rank=%zu w0=%lld per_row=%d\n",
+                         (long long)rec.position, (long long)rows,
+                         w != nullptr ? w->shape.size() : 0,
+                         w != nullptr && !w->shape.empty() ? (long long)w->shape[0] : -1,
+                         per_row ? 1 : 0);
+            std::fflush(stderr);
+        }
+    }
     AdValue y = write_value(rec, 2, x.shape);
+    // R97_DUMP_QUANT=1: the twin's own normalisation constants for row 0. `DUMPTWIN`'s `best_of`
+    // field is a *relative error* (`max|f - y| / max|f|`), not a match ratio: `1:x:1` is a 100%
+    // error, and an identity would print `1:x:0`. These constants are what tell the norm's
+    // disagreement from the quantiser's.
+    if (std::getenv("R97_DUMP_QUANT") != nullptr) {
+        double ss = 0.0, xmax = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            const double v = x.value[(size_t)i];
+            ss += v * v;
+            xmax = std::max(xmax, std::fabs(v));
+        }
+        const double s0 = 1.0 / std::sqrt(ss / (double)n + eps);
+        std::fprintf(stderr,
+                     "NORMTWIN pos=%lld n=%lld rows=%lld w=%s eps=%.6g wadd=%.6g mult=%.6g "
+                     "xmax=%.6g ss_mean=%.6g s=%.6g\n",
+                     (long long)rec.position, (long long)n, (long long)rows,
+                     w != nullptr ? "yes" : "NULL", eps, wadd, mult, xmax, ss / (double)n, s0);
+        std::fflush(stderr);
+    }
     parallel_for(rows, kRowChunk, [&](int64_t r) {
         const int64_t b = r * n;
         double ss = 0.0;
         for (int64_t i = 0; i < n; ++i) ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
         const double s = 1.0 / std::sqrt(ss / (double)n + eps);
         for (int64_t i = 0; i < n; ++i)
-            y.value[(size_t)(b + i)] =
-                x.value[(size_t)(b + i)] * s * (w ? w->value[(size_t)i] + wadd : 1.0) * mult;
+            y.value[(size_t)(b + i)] = x.value[(size_t)(b + i)] * s *
+                                       (w ? w->value[per_row ? (size_t)(b + i) : (size_t)i] + wadd
+                                          : 1.0) *
+                                       mult;
     });
     out->push_back(std::move(y));
 }
@@ -431,7 +545,17 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
     const AdValue& x = call.fwd[0];
     const AdValue& dy = call.cot[0];
     const int64_t n = width_of(call.rec, x.shape);
-    const AdValue* w = norm_gain(call.rec, call.fwd, n);
+    const AdValue* w = norm_gain(call.rec, call.fwd, n, "adjoint");
+    // R97_GAIN_POS=1: which snapshot the *adjoint* took. `GAINPOS` shows two at the same position --
+    // rank 1 `[n]` and rank 2 `[rows,n]` -- and `FDRMS` shows the twin takes the rank-1 one, so this
+    // names what the row itself differentiates with. A rank-2 gain read as row 0 is a per-row tensor
+    // used as a single vector, and it lands on `dc[0]`.
+    if (std::getenv("R97_GAIN_POS") != nullptr && w != nullptr)
+        std::fprintf(stderr, "ADJGAIN pos=%lld buffer=%s w_rank=%zu w0=%lld values=%zu n=%lld\n",
+                     (long long)call.rec.position,
+                     call.rec.operands.empty() ? "" : call.rec.operands[0].buffer.c_str(),
+                     w->shape.size(), w->shape.empty() ? -1LL : (long long)w->shape[0],
+                     w->value.size(), (long long)n);
     const int64_t rows = rows_of(x, n);
     if (rows <= 0) return;
     // A gain the record names but the tape could not give values for cannot be served: the row
@@ -445,10 +569,29 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
     const double eps = param_num(call.rec, "eps", 1e-6);
     const double wadd = param_num(call.rec, "wadd", 0.0);
     const double mult = param_num(call.rec, "mult", 1.0);
-    if (!w && wadd != 0.0)
+    if (!w && wadd != 0.0) {
+        // Name every operand the gain lookup passed over, and why: the refusal is otherwise a
+        // statement that something is absent with no way to tell a written operand from an empty
+        // one from one of the wrong shape.
+        std::string seen;
+        for (size_t j = 0; j < std::min(call.fwd.size(), call.rec.operands.size()); ++j) {
+            const Operand& o = call.rec.operands[j];
+            std::string dims;
+            for (size_t d = 0; d < call.fwd[j].shape.size(); ++d) {
+                if (d != 0) dims += 'x';
+                dims += std::to_string(call.fwd[j].shape[d]);
+            }
+            seen += " [" + std::to_string(j) + "] '" + o.buffer + "' written=" +
+                    std::to_string(o.written ? 1 : 0) +
+                    " in_place=" + std::to_string(o.in_place ? 1 : 0) + " shape=[" + dims +
+                    "] values=" + std::to_string(call.fwd[j].value.size()) +
+                    " raw=" + std::to_string(call.fwd[j].raw != nullptr ? 1 : 0);
+        }
         throw std::runtime_error("r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +
                                  std::to_string(call.rec.position) +
-                                 ": the record adds a gain offset and the tape names no gain");
+                                 ": the record adds a gain offset and the tape names no gain"
+                                 " (n=" + std::to_string(n) + "):" + seen);
+    }
 
     AdValue& dx = call.dc->at(0);
     std::vector<char> readable((size_t)rows, 0);
@@ -491,6 +634,37 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
             dx.value[(size_t)(b + i)] += mult * (s * c * dy.value[(size_t)(b + i)] - shared);
         }
     });
+
+    // R97_DUMP_QUANT=1: the two numbers that decide what this row's Jacobian is -- `s` is the
+    // per-row 1/rms of the activation and `gain` the largest `|w + wadd|` -- beside the sums it was
+    // handed and left. A branch that grows by two decades per block shows here as an `s` or a
+    // `gain` the forward does not imply, or as a `dx`/`dy` ratio that is neither. The range is
+    // printed rather than a mean: one row with a tiny rms is enough to make the maximum large, and
+    // that is a different story from every row being large.
+    if (const char* dq = std::getenv("R97_DUMP_QUANT"); dq != nullptr && dq[0] == '1') {
+        double s_min = 0.0, s_max = 0.0, gain_max = 0.0, dy_sum = 0.0, dx_sum = 0.0;
+        for (int64_t r = 0; r < rows; ++r) {
+            if (!readable[(size_t)r]) continue;
+            const int64_t b = r * n;
+            double ss = 0.0;
+            for (int64_t i = 0; i < n; ++i)
+                ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
+            const double s = 1.0 / std::sqrt(ss / (double)n + eps);
+            if (s_min == 0.0 || s < s_min) s_min = s;
+            if (s > s_max) s_max = s;
+        }
+        if (w)
+            for (int64_t i = 0; i < n && i < (int64_t)w->value.size(); ++i)
+                gain_max = std::max(gain_max, std::fabs(w->value[(size_t)i] + wadd));
+        for (const double v : dy.value) dy_sum += std::fabs(v);
+        for (const double v : dx.value) dx_sum += std::fabs(v);
+        std::fprintf(stderr,
+                     "DUMPNORM pos=%lld op=%s rows=%lld n=%lld s_min=%.6g s_max=%.6g gain_max=%.6g "
+                     "dy_sum=%.6g dx_sum=%.6g\n",
+                     (long long)call.rec.position, call.rec.op.c_str(), (long long)rows,
+                     (long long)n, s_min, s_max, gain_max, dy_sum, dx_sum);
+        std::fflush(stderr);
+    }
 }
 
 }  // namespace

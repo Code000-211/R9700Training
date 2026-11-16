@@ -845,6 +845,13 @@ int64_t numel(const std::vector<int64_t>& shape) {
     return shape.empty() ? 0 : n;
 }
 
+// A shape as `[a,b]`, for the refusals that have to say what the tape carried.
+std::string shape_text(const std::vector<int64_t>& shape) {
+    std::string s = "[";
+    for (size_t d = 0; d < shape.size(); ++d) s += (d == 0 ? "" : ",") + std::to_string(shape[d]);
+    return s + "]";
+}
+
 // The quantiser's own record over the part's output: the fused producer's intermediate is the
 // quantiser's activation, so the part is served by the family's existing twin and adjoint under
 // had_quant_act_i8g. Under `<op>_ste` the quantiser's own linearised row is used instead, and its
@@ -862,6 +869,21 @@ OpRecord had_quant_record(int64_t rows, int64_t n, int64_t group, bool linearise
     q.operands.push_back(Operand{"q", "i8", {rows, n}, 0, rows, true});
     q.operands.push_back(Operand{"scale", "f32", {rows, n / group}, 0, rows, true});
     return q;
+}
+
+// The cotangent slot of a written operand: `cot` holds one entry per write, in the record's write
+// order, so this is the write's index among the writes -- the device row's rule
+// (`src/adjoint/device/quant.hip:531`). Reading `cot[0]` positionally is wrong on the live fused
+// rmsnorm record, which writes the normed value in place *before* the codes: cot[0] there is a slot
+// no consumer fills, and the quantiser's part then contributes nothing.
+int64_t cot_slot(const OpRecord& rec, int64_t operand) {
+    int64_t at = 0;
+    for (int64_t j = 0; j < (int64_t)rec.operands.size(); ++j) {
+        if (!rec.operands[j].written) continue;
+        if (j == operand) return at;
+        ++at;
+    }
+    return -1;
 }
 
 // The codes and the scale among the record's writes, found by dtype and shape as the device row
@@ -886,7 +908,6 @@ void written_codes_and_scale(const AdjointCall& call, int64_t* codes_at, int64_t
 // record's read operands, then the quantiser over its output.
 void fused_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
                 std::vector<AdValue>* out, Part part) {
-    const int64_t n = required(rec, "n");
     const int64_t group = required(rec, "group");
     const bool linearised = is_linearised(rec.op);
 
@@ -895,18 +916,19 @@ void fused_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     if (elem == nullptr)
         throw std::invalid_argument(std::string("quant: no twin for ") + part_op(part));
     elem(rec, operands, &y);
-    if (y.empty() || y[0].shape.size() != 2)
+    if (y.empty() || y[0].shape.empty() || y[0].shape[0] <= 0)
         throw std::invalid_argument(std::string("quant: ") + part_op(part) +
                                     " wrote no [rows, n] intermediate for the quantiser");
-    // The quantiser's record is built from the parameters, so the intermediate's width must be
-    // the record's `n`. The live tape's gate record carries a wider codes plane than its `n`
-    // names; a width this row cannot build a record for refuses rather than computing another op.
-    if (y[0].shape[1] != n)
-        throw std::invalid_argument(std::string("quant: ") + part_op(part) + " wrote a " +
-                                    std::to_string(y[0].shape[1]) +
-                                    "-wide intermediate and the record's 'n' is " +
-                                    std::to_string(n));
+    // The quantiser's width is the intermediate's value count over its rows, not the record's `n`:
+    // the live gate record declares `n=256` while its codes are 6144 wide, and the elementwise
+    // part hands back its own shape (`[rows, heads, dim]`) whose flattened width is the codes'
+    // width. The device row reads the same fact off the codes; this is the forward's half of it.
     const int64_t rows = y[0].shape[0];
+    if ((int64_t)y[0].value.size() % rows != 0)
+        throw std::invalid_argument(std::string("quant: ") + part_op(part) + " wrote " +
+                                    std::to_string(y[0].value.size()) + " values over " +
+                                    std::to_string(rows) + " rows, which is not a whole width");
+    const int64_t n = (int64_t)y[0].value.size() / rows;
 
     const OpRecord q = had_quant_record(rows, n, group, linearised);
     TwinFn quant = twin_find(q.op, q.params, nullptr);
@@ -941,8 +963,6 @@ void fused_adjoint(const AdjointCall& call, Part part) {
             "quant: the record writes the codes and the scale, so the walk hands two cotangents");
     if (call.dc == nullptr || call.dc->size() < reads)
         throw std::invalid_argument("quant: the walk handed no room for the activation's cotangent");
-    const int64_t n = required(call.rec, "n");
-    const int64_t group = required(call.rec, "group");
     // The codes and the scale by dtype and shape, never by position -- under `_ste` the base point
     // is appended after the writes, so counting the reads lands one slot past the codes.
     int64_t codes_at = -1, scale_at = -1;
@@ -959,17 +979,43 @@ void fused_adjoint(const AdjointCall& call, Part part) {
     if (elem == nullptr)
         throw std::invalid_argument(std::string("quant: no twin for ") + part_op(part));
     elem(call.rec, call.fwd, &y);
-    if (y.empty() || y[0].shape.size() != 2 || codes.shape.size() != 2)
-        throw std::invalid_argument(std::string("quant: ") + call.rec.op + ": the " +
-                                    part_op(part) + " intermediate and the codes must be [rows, n]");
-    // As in fused_twin: the quantiser's record is built from the parameters, so the codes' width
-    // must be the record's `n`, and a record whose codes are another width refuses by name.
-    if (codes.shape[1] != n)
-        throw std::invalid_argument(std::string("quant: ") + call.rec.op + ": the codes are " +
-                                    std::to_string(codes.shape[1]) +
-                                    " wide and the record's 'n' is " + std::to_string(n));
 
-    const OpRecord q = had_quant_record(codes.shape[0], n, group, linearised);
+    // The widths are the operands', as the device row reads them: the live gate record declares
+    // `n=256` while its codes are 6144 wide over a 48-group scale, and its elementwise
+    // intermediate carries its own shape (`[rows, heads, dim]`) with the codes' value count. A
+    // rank test on that intermediate refused a record the device row serves; the value count is
+    // the fact both sides need.
+    if (codes.shape.size() != 2 || codes.shape[0] <= 0 || codes.shape[1] <= 0)
+        throw std::invalid_argument(std::string("quant: ") + call.rec.op + ": the codes are " +
+                                    shape_text(codes.shape) + ", not [rows, n]");
+    if (scale.shape.size() != 2 || scale.shape[0] != codes.shape[0] || scale.shape[1] <= 0 ||
+        codes.shape[1] % scale.shape[1] != 0)
+        throw std::invalid_argument(std::string("quant: ") + call.rec.op + ": the codes are " +
+                                    shape_text(codes.shape) + " and the scale " +
+                                    shape_text(scale.shape) +
+                                    ", which is not a group scale over the codes");
+    const int64_t rows = codes.shape[0];
+    const int64_t n = codes.shape[1];
+    const int64_t group = n / scale.shape[1];
+    const int64_t total = rows * n;
+    if (y.empty() || (int64_t)y[0].value.size() != total) {
+        std::string detail = " intermediate=" + (y.empty() ? std::string("none")
+                                                           : shape_text(y[0].shape) + " with " +
+                                                                 std::to_string(y[0].value.size()) +
+                                                                 " values") +
+                             " codes=" + shape_text(codes.shape) + " (" + std::to_string(total) +
+                             " values)";
+        for (size_t j = 0; j < call.rec.operands.size(); ++j) {
+            const Operand& o = call.rec.operands[j];
+            detail += " [" + std::to_string(j) + "] '" + o.buffer + "' " + o.dtype + " " +
+                      shape_text(o.shape) + (o.written ? " written" : "");
+        }
+        throw std::invalid_argument(std::string("quant: ") + call.rec.op + ": the " +
+                                    part_op(part) +
+                                    " intermediate does not carry the codes' values" + detail);
+    }
+
+    const OpRecord q = had_quant_record(rows, n, group, linearised);
     std::vector<AdValue> qfwd = {y[0]};
     if (linearised) {
         if (call.fwd.empty() || call.fwd.back().value.size() != y[0].value.size())
@@ -979,7 +1025,17 @@ void fused_adjoint(const AdjointCall& call, Part part) {
     }
     qfwd.push_back(codes);
     qfwd.push_back(scale);
-    std::vector<AdValue> qcot = {call.cot[0], call.cot[1]};
+    const int64_t codes_cot_at = cot_slot(call.rec, codes_at);
+    const int64_t scale_cot_at = cot_slot(call.rec, scale_at);
+    if (codes_cot_at < 0 || (size_t)codes_cot_at >= call.cot.size() || scale_cot_at < 0 ||
+        (size_t)scale_cot_at >= call.cot.size())
+        throw std::invalid_argument(std::string("quant: ") + call.rec.op + ": the codes' write " +
+                                    std::to_string(codes_at) + " and the scale's " +
+                                    std::to_string(scale_at) + " need cotangent slots " +
+                                    std::to_string(codes_cot_at) + " and " +
+                                    std::to_string(scale_cot_at) + " of the " +
+                                    std::to_string(call.cot.size()) + " the walk handed");
+    std::vector<AdValue> qcot = {call.cot[(size_t)codes_cot_at], call.cot[(size_t)scale_cot_at]};
     std::vector<AdValue> qdc;
     for (const Operand& o : q.operands) {
         AdValue v;
@@ -994,20 +1050,329 @@ void fused_adjoint(const AdjointCall& call, Part part) {
         throw std::invalid_argument("quant: no host adjoint for had_quant_act_i8g");
     quant(qcall);
 
+    // R97_DUMP_QUANT=1: the twin's intermediate against the codes the tape's own kernel wrote.
+    // Radiance's kernel table has no host entry for the int8 fused producers (`rmsnorm_had_quant_i8g`
+    // and its two siblings), so `check_kernel` cannot check their twins and their FD differentiates a
+    // row against the twin it is testing. The tape is the oracle instead: re-quantising the twin's
+    // intermediate must reproduce the codes and the scale the kernel actually wrote, and `code_err`
+    // is the largest disagreement. A non-zero one means the row's mask and its dx are taken at an
+    // activation the kernel never had.
+    if (const char* dq = std::getenv("R97_DUMP_QUANT"); dq != nullptr && dq[0] == '1') {
+        std::vector<AdValue> twin_out;
+        std::vector<AdValue> qin = {y[0]};
+        if (linearised && !call.fwd.empty()) qin.push_back(call.fwd.back());
+        const TwinFn qt = twin_find(q.op, q.params, nullptr);
+        double code_err = 0.0, scale_rel = 0.0;
+        int64_t code_bad = 0;
+        int64_t hist[10] = {0};
+        if (qt != nullptr) {
+            qt(q, qin, &twin_out);
+            // `code_bad` counts any nonzero difference, so it cannot tell a uniform sub-LSB
+            // mismatch (which flips nearly every code) from a structural one. The histogram can: a
+            // tight 1-2 with a few outliers is a small systematic difference in the gain or the
+            // precision, a broad spread is what a layout difference would need.
+            if (!twin_out.empty() && twin_out[0].value.size() == codes.value.size())
+                for (size_t i = 0; i < codes.value.size(); ++i) {
+                    const double d = std::fabs(twin_out[0].value[i] - codes.value[i]);
+                    if (d > 0.0) ++code_bad;
+                    if (d > code_err) code_err = d;
+                    ++hist[d == 0.0 ? 0
+                                    : d <= 1.0 ? 1
+                                    : d <= 2.0 ? 2
+                                    : d <= 4.0 ? 3
+                                    : d <= 8.0 ? 4
+                                    : d <= 16.0 ? 5
+                                    : d <= 32.0 ? 6
+                                    : d <= 64.0 ? 7
+                                    : d <= 128.0 ? 8 : 9];
+                }
+            // A *second* Hadamard on top of the one the twin already applies: `geometry()` sets
+            // `rotated = is_rotated(op)` and `Op::had` is rotated, so the plain comparison above is
+            // the single-rotation arm. This arm is therefore a control for "twice rotated", not an
+            // "unrotated" arm -- the gated producers collapse here (99%) and match above (5.9%),
+            // which is what makes it useful.
+            double rot_err = 0.0;
+            int64_t rot_bad = 0;
+            {
+                std::vector<AdValue> rot = {y[0]};
+                const int64_t rn = n;
+                const int64_t rgrp = group;
+                for (int64_t r = 0; r < rows; ++r)
+                    for (int64_t gi = 0; gi < rn / rgrp; ++gi) {
+                        const int64_t k0 = gi * rgrp;
+                        const int64_t w = std::min(rgrp, rn - k0);
+                        if (w == rgrp) fwht(rot[0].value.data() + r * rn + k0, rgrp);
+                    }
+                std::vector<AdValue> rot_out;
+                qt(q, rot, &rot_out);
+                if (!rot_out.empty() && rot_out[0].value.size() == codes.value.size())
+                    for (size_t i = 0; i < codes.value.size(); ++i) {
+                        const double d = std::fabs(rot_out[0].value[i] - codes.value[i]);
+                        if (d > 0.0) ++rot_bad;
+                        if (d > rot_err) rot_err = d;
+                    }
+            }
+            // The kernel's own activation, reconstructed from its codes and scale: `codes * scale` is
+            // the rotated activation and `fwht` is unnormalised (H*H = n*I), so the inverse is
+            // `fwht(.)/group`. Comparing this to `y[0]` tests the twin's *activation* without going
+            // through the twin's quantiser at all, which is what separates "the norm is wrong" from
+            // "the quantiser's scale is wrong".
+            double deq_err = 0.0, deq_scale = 0.0;
+            {
+                const int64_t ngrp = n / group;
+                std::vector<double> dq(codes.value.size());
+                for (size_t i = 0; i < dq.size(); ++i) dq[i] = (double)codes.value[i];
+                for (int64_t r = 0; r < rows; ++r)
+                    for (int64_t gi = 0; gi < ngrp; ++gi) {
+                        const int64_t k0 = gi * group;
+                        const double sc = scale.value[(size_t)(r * ngrp + gi)];
+                        for (int64_t i = 0; i < group; ++i)
+                            dq[(size_t)(r * n + k0 + i)] *= sc;
+                        fwht(dq.data() + r * n + k0, group);
+                        for (int64_t i = 0; i < group; ++i)
+                            dq[(size_t)(r * n + k0 + i)] /= (double)group;
+                    }
+                for (size_t i = 0; i < dq.size() && i < y[0].value.size(); ++i) {
+                    const double d = std::fabs(dq[i] - y[0].value[i]);
+                    if (d > deq_err) deq_err = d;
+                    if (std::fabs(dq[i]) > deq_scale) deq_scale = std::fabs(dq[i]);
+                }
+                // The kernel's activation against the tensors around it: its own input (`op[0]`) and
+                // the in-place write. Whichever it matches names what the kernel actually computed,
+                // and whichever it does not names the snapshot the twin should have been given.
+                double vs_in = 0.0, vs_wr = 0.0, in_vs_wr = 0.0, in_scale = 0.0;
+                for (size_t i = 0; i < dq.size() && i < call.fwd[0].value.size(); ++i) {
+                    const double a = std::fabs(dq[i] - call.fwd[0].value[i]);
+                    if (a > vs_in) vs_in = a;
+                    if (std::fabs(call.fwd[0].value[i]) > in_scale)
+                        in_scale = std::fabs(call.fwd[0].value[i]);
+                    if (i < call.fwd.back().value.size()) {
+                        const double b = std::fabs(dq[i] - call.fwd.back().value[i]);
+                        if (b > vs_wr) vs_wr = b;
+                        const double c = std::fabs(call.fwd[0].value[i] - call.fwd.back().value[i]);
+                        if (c > in_vs_wr) in_vs_wr = c;
+                    }
+                }
+                // The twin's activation against the kernel's by magnitude: if the twin's is a scalar
+                // multiple of the kernel's, `ymax/deqmax` is that multiple and the difference is one
+                // factor (a scale or a gain), not a different tensor.
+                double ymax = 0.0, dqmax = 0.0;
+                for (size_t i = 0; i < dq.size() && i < y[0].value.size(); ++i) {
+                    if (std::fabs(y[0].value[i]) > ymax) ymax = std::fabs(y[0].value[i]);
+                    if (std::fabs(dq[i]) > dqmax) dqmax = std::fabs(dq[i]);
+                }
+                // Per-row magnitude ratio. A `s` that differs per row shows as a spread here; a
+                // single elementwise difference (a gain vector) leaves every row's ratio the same
+                // only when the max sits in the same column, so also report the ratio of the row
+                // sums, which a per-row scale moves exactly.
+                double rmin = 1e300, rmax = -1e300, sum_y = 0.0, sum_d = 0.0;
+                for (int64_t r = 0; r < rows; ++r) {
+                    double ry = 0.0, rd = 0.0;
+                    for (int64_t i = 0; i < n; ++i) {
+                        ry += std::fabs(y[0].value[(size_t)(r * n + i)]);
+                        rd += std::fabs(dq[(size_t)(r * n + i)]);
+                    }
+                    sum_y += ry;
+                    sum_d += rd;
+                    if (rd > 0.0) {
+                        const double q = ry / rd;
+                        rmin = std::min(rmin, q);
+                        rmax = std::max(rmax, q);
+                    }
+                }
+                // Two tests that `row_ratio` cannot make, because it is an L1 ratio: an exact
+                // permutation preserves it, a Hadamard preserves it approximately, and a different
+                // gain with similar L1 also fits. (1) Sorting each row of `y` and of `deq` separates
+                // a permutation (sorted rows equal) from everything else. (2) `deq` under a
+                // gain-after-rotation kernel is `R^-1(g * R(n))` where `n = x*s` is the *ungained*
+                // normalised activation, so building `y2 = R^-1(g * R(n))` from the twin's own `y`
+                // and `x` and comparing it to `deq` tests that kernel shape directly.
+                double sort_rel = 0.0, y2_rel = 0.0, y2_scale = 0.0;
+                {
+                    std::vector<double> a(n), b(n);
+                    for (int64_t r = 0; r < rows; ++r) {
+                        for (int64_t i = 0; i < n; ++i) {
+                            a[(size_t)i] = y[0].value[(size_t)(r * n + i)];
+                            b[(size_t)i] = dq[(size_t)(r * n + i)];
+                        }
+                        std::sort(a.begin(), a.end());
+                        std::sort(b.begin(), b.end());
+                        for (int64_t i = 0; i < n; ++i) {
+                            const double d = std::fabs(a[(size_t)i] - b[(size_t)i]);
+                            if (d > sort_rel) sort_rel = d;
+                        }
+                    }
+                    // n = x * s, g = y / n, y2 = R^-1(g * R(n)).
+                    std::vector<double> nn(n), gg(n), tmp(n);
+                    for (int64_t r = 0; r < rows; ++r) {
+                        double ss = 0.0;
+                        for (int64_t i = 0; i < n; ++i) {
+                            const double v = call.fwd[0].value[(size_t)(r * n + i)];
+                            ss += v * v;
+                        }
+                        const double sr = 1.0 / std::sqrt(ss / (double)n + 1e-6);
+                        for (int64_t i = 0; i < n; ++i) {
+                            const double xv = call.fwd[0].value[(size_t)(r * n + i)];
+                            nn[(size_t)i] = xv * sr;
+                            tmp[(size_t)i] = nn[(size_t)i];
+                        }
+                        for (int64_t gi = 0; gi < n / group; ++gi)
+                            fwht(tmp.data() + gi * group, group);
+                        for (int64_t i = 0; i < n; ++i) {
+                            const double nv = nn[(size_t)i];
+                            gg[(size_t)i] = nv != 0.0 ? y[0].value[(size_t)(r * n + i)] / nv : 0.0;
+                        }
+                        for (int64_t gi = 0; gi < n / group; ++gi) {
+                            const int64_t k0 = gi * group;
+                            for (int64_t i = 0; i < group; ++i)
+                                tmp[(size_t)(k0 + i)] *= gg[(size_t)(k0 + i)];
+                            fwht(tmp.data() + k0, group);
+                            for (int64_t i = 0; i < group; ++i)
+                                tmp[(size_t)(k0 + i)] /= (double)group;
+                        }
+                        for (int64_t i = 0; i < n; ++i) {
+                            const double d = std::fabs(tmp[(size_t)i] - dq[(size_t)(r * n + i)]);
+                            if (d > y2_rel) y2_rel = d;
+                            if (std::fabs(dq[(size_t)(r * n + i)]) > y2_scale)
+                                y2_scale = std::fabs(dq[(size_t)(r * n + i)]);
+                        }
+                    }
+                }
+                std::fprintf(stderr,
+                             "DEQORACLE pos=%lld deq_vs_in=%.6g deq_vs_write=%.6g in_vs_write=%.6g "
+                             "in_max=%.6g ymax=%.6g deqmax=%.6g y_over_deq=%.6g row_ratio=[%.6g,%.6g] "
+                             "sum_ratio=%.6g sort_rel=%.6g y2_rel=%.6g\n",
+                             (long long)call.rec.position,
+                             in_scale > 0.0 ? vs_in / in_scale : vs_in,
+                             in_scale > 0.0 ? vs_wr / in_scale : vs_wr,
+                             in_scale > 0.0 ? in_vs_wr / in_scale : in_vs_wr, in_scale, ymax, dqmax,
+                             dqmax > 0.0 ? ymax / dqmax : 0.0, rmin, rmax,
+                             sum_d > 0.0 ? sum_y / sum_d : 0.0,
+                             y2_scale > 0.0 ? sort_rel / y2_scale : sort_rel,
+                             y2_scale > 0.0 ? y2_rel / y2_scale : y2_rel);
+            }
+            std::fprintf(stderr, "DUMPROT pos=%lld op=%s rot_err=%.6g rot_bad=%lld/%zu deq_rel=%.6g\n",
+                         (long long)call.rec.position, call.rec.op.c_str(), rot_err,
+                         (long long)rot_bad, codes.value.size(),
+                         deq_scale > 0.0 ? deq_err / deq_scale : deq_err);
+            if (twin_out.size() > 1 && twin_out[1].value.size() == scale.value.size())
+                for (size_t i = 0; i < scale.value.size(); ++i) {
+                    const double t = std::fabs(twin_out[1].value[i] - scale.value[i]);
+                    const double r = std::fabs(scale.value[i]) > 0.0
+                                         ? t / std::fabs(scale.value[i])
+                                         : t;
+                    if (r > scale_rel) scale_rel = r;
+                }
+        }
+        // The sharper comparison: the activation the kernel wrote. A fused producer writes the
+        // part's output in place (the norm's `h`, the gate's product), and that IS the intermediate
+        // the twin recomputes, so the two must agree up to bf16 rounding.
+        // The activation the kernel wrote, at *every* written operand of the same size: a record
+        // carries the residual and the branch at the same shape, so reporting the largest error
+        // would name the wrong tensor. The best match is the part's own output, and each candidate
+        // is printed so the pairing is visible rather than assumed.
+        double act_err = 0.0, act_scale = 0.0;
+        int64_t act_at = -1;
+        std::string act_all;
+        for (size_t i = 0; i < call.fwd.size(); ++i) {
+            const AdValue& f = call.fwd[i];
+            if (i >= call.rec.operands.size() || !call.rec.operands[i].written) continue;
+            if (f.value.size() != y[0].value.size()) continue;
+            double e = 0.0, sc = 0.0;
+            for (size_t j = 0; j < f.value.size(); ++j) {
+                const double d = std::fabs((double)f.value[j] - y[0].value[j]);
+                if (d > e) e = d;
+                if (std::fabs((double)f.value[j]) > sc) sc = std::fabs((double)f.value[j]);
+            }
+            char one[96];
+            std::snprintf(one, sizeof(one), "%zu:%s:%.3g ", i,
+                          call.rec.operands[i].buffer.c_str(), sc > 0.0 ? e / sc : e);
+            act_all += one;
+            if (act_at < 0 || e < act_err) { act_err = e; act_scale = sc; act_at = (int64_t)i; }
+        }
+        std::fprintf(stderr,
+                     "DUMPTWIN pos=%lld op=%s twin=%d codes=%zu code_err=%.6g code_bad=%lld/%zu "
+                     "scale_rel=%.6g act_at=%lld act_err=%.6g act_rel=%.6g "
+                     "hist=[%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld] best_of=[%s]\n",
+                     (long long)call.rec.position, call.rec.op.c_str(), qt != nullptr ? 1 : 0,
+                     codes.value.size(), code_err, (long long)code_bad, codes.value.size(),
+                     scale_rel, (long long)act_at, act_err,
+                     act_scale > 0.0 ? act_err / act_scale : act_err,
+                     (long long)hist[0], (long long)hist[1], (long long)hist[2],
+                     (long long)hist[3], (long long)hist[4], (long long)hist[5],
+                     (long long)hist[6], (long long)hist[7], (long long)hist[8],
+                     (long long)hist[9], act_all.c_str());
+        std::fflush(stderr);
+    }
+
     // The elementwise adjoint takes the parts' operands and the intermediate they wrote; it adds
     // its cotangents into the slots the parts' read operands hold. The two-way rule lives in that
     // row, so the read set the caller proved travels with it, as the device row hands its own.
-    std::vector<AdValue> efwd(call.fwd.begin(),
-                              call.fwd.begin() + static_cast<std::ptrdiff_t>(reads));
+    // The read operands are NOT a prefix of the record's: the live fused norm reads 0 and 2 and
+    // writes 1, 3, 4 and 5, so taking the first `reads` handed the elementwise row operand 1 -- a
+    // written activation -- in place of the weight, and put the intermediate in the weight's slot.
+    // `norm_gain` then took the intermediate as the gain: `[512, 5120]` where the operand is
+    // `[5120]`, row 0 of the norm's own output, and the row differentiated `dc[h]` with it.
+    //
+    // The part is called with its own operand list -- the record's read operands in order, then the
+    // intermediate it wrote -- and the slots it fills are mapped back onto the fused record's.
+    std::vector<size_t> slot;
+    std::vector<AdValue> efwd;
+    OpRecord erec = call.rec;
+    erec.operands.clear();
+    for (size_t j = 0; j < call.rec.operands.size(); ++j) {
+        if (call.rec.operands[j].written) continue;
+        slot.push_back(j);
+        efwd.push_back(call.fwd[j]);
+        erec.operands.push_back(call.rec.operands[j]);
+    }
+    Operand yop;
+    yop.buffer = part_op(part);
+    yop.shape = y[0].shape;
+    yop.written = true;
+    slot.push_back(call.rec.operands.size());
     efwd.push_back(y[0]);
+    erec.operands.push_back(yop);
+    std::vector<AdValue> edc(slot.size());
+    for (size_t i = 0; i < edc.size(); ++i) {
+        edc[i].dtype = efwd[i].dtype;
+        edc[i].shape = efwd[i].shape;
+        edc[i].value.assign(static_cast<size_t>(numel(efwd[i].shape)), 0.0);
+    }
     std::vector<AdValue> ecot = {qdc[0]};
-    AdjointCall ecall{call.rec, efwd, ecot, call.dc, nullptr, ""};
+    AdjointCall ecall{erec, efwd, ecot, &edc, nullptr, ""};
     ecall.read_rows = call.read_rows;
     ecall.row_count = call.row_count;
-    AdjointFn elem_adj = adjoint_find(part_op(part), Side::host, call.rec.params, nullptr);
+    AdjointFn elem_adj = adjoint_find(part_op(part), Side::host, erec.params, nullptr);
     if (elem_adj == nullptr)
         throw std::invalid_argument(std::string("quant: no host adjoint for ") + part_op(part));
     elem_adj(ecall);
+    // Fold the part's slots back onto the fused record's. The intermediate's own slot has no fused
+    // counterpart: it is not on the tape, and its cotangent belongs to the quantiser's output.
+    for (size_t i = 0; i < slot.size(); ++i) {
+        if (slot[i] >= call.dc->size()) continue;
+        AdValue& dst = call.dc->at(slot[i]);
+        if (dst.value.size() != edc[i].value.size()) continue;
+        for (size_t k = 0; k < dst.value.size(); ++k) dst.value[k] += edc[i].value[k];
+    }
+
+    // R97_DUMP_QUANT=1: the same stage sums the device row prints, so a host gradient that came
+    // back zero names its stage instead of the whole row. `quant_dx` is the cotangent the quantiser
+    // handed the elementwise part; `dx` is what the walk's slot holds after both parts ran.
+    if (const char* dq = std::getenv("R97_DUMP_QUANT"); dq != nullptr && dq[0] == '1') {
+        const auto sum = [](const AdValue& v) {
+            double s = 0.0;
+            for (double x : v.value) s += std::fabs(x);
+            return s;
+        };
+        std::fprintf(stderr,
+                     "DUMPQUANT side=host op=%s pos=%lld y=%.6g codes_cot=%.6g scale_cot=%.6g "
+                     "quant_dx=%.6g dx=%.6g\n",
+                     call.rec.op.c_str(), (long long)call.rec.position, sum(y[0]),
+                     sum(call.cot[(size_t)codes_cot_at]), sum(call.cot[(size_t)scale_cot_at]),
+                     sum(qdc[0]),
+                     call.dc->empty() ? 0.0 : sum(call.dc->at(0)));
+    }
 }
 
 void rmsnorm_had_quant_i8g_twin(const OpRecord& rec, const std::vector<AdValue>& operands,

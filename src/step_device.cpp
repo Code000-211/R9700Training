@@ -34,7 +34,9 @@
 
 #include "engine.h"       // the complete rad::Engine behind ForwardDriver's unique_ptr
 #include "rad_device.h"   // rad_dev_props / rad_dev_alloc / rad_memcpy_async / rad_stream_sync
+#include "rad_encoding.h"  // RadEncoding: a stored weight's planes and the decode's description
 #include "rad_plugin.h"   // the fp8 decoders join_common's read_elem calls
+#include "radfile.h"      // the container a host walk decodes a stored weight from
 #include "r97/adapter_io.h"
 #include "r97/adjoint.h"
 #include "r97/backward.h"
@@ -45,7 +47,9 @@
 #include "r97/tape.h"
 
 #include "adjoint/device/grad_stage.h"  // the card's per-leaf f32 accumulators
+#include "iqr_form.h"                   // a stored weight's planes as the decode's description
 #include "join_common.h"                // the join helpers both joins share
+#include "stored_weight.h"              // what the host walk's linear rows read instead
 #include "vocab_head.h"                 // the vocabulary head's transposed product
 
 namespace r97 {
@@ -737,6 +741,128 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 measured.first_non_finite_from_row = r.first_non_finite_from_row;
             }
         };
+        // An operand the tape stores in a plugin-private encoding reaches the join as one pointer
+        // into the card and the encoding beside it (snapshot()'s stored path): a host row cannot
+        // read that pointer, so the host walk would refuse the record by name and stop at the
+        // first one. The container holds the same tensor in its canonical planes, so a host walk
+        // resolves each such operand once here. Two forms, because the rows read them differently:
+        //
+        //  - A weight the container stores as its own elements (a norm gain, a bias) is a value the
+        //    tape could not widen. Give it the f64 values and it is an ordinary operand again, so
+        //    every row that reads it -- not only the linears -- works unchanged.
+        //  - A quantised weight is decoded with the decode the host tier already holds to libquant
+        //    (src/iqr_form.h) and registered under the encoding the tape carried, which is the key
+        //    the linear rows look it up by. Its int8 codes and bf16 scale are a quarter of the f64
+        //    grid's size, and a block's six trunk weights would not fit on this host in f64.
+        //
+        // An operand the container does not hold, or holds in a form this build does not read, is
+        // left as it was and the row refuses it by name: never a different value. The device walk
+        // never takes this path.
+        rad::RadFile stored_container;
+        bool stored_container_open = false;
+        bool stored_container_failed = false;
+        // R97_DUMP_STORED=1: why a stored operand was or was not resolved. A host walk that
+        // refuses a row names the operand; this names the reason before the refusal, so the fix is
+        // not a guess.
+        static const bool dump_stored = [] {
+            const char* e = std::getenv("R97_DUMP_STORED");
+            return e != nullptr && *e == '1';
+        }();
+        const auto stored_note = [&](const Operand& o, const AdValue& v, const char* why) {
+            if (!dump_stored) return;
+            std::string dims;
+            for (size_t i = 0; i < v.shape.size(); ++i) {
+                if (i != 0) dims += ',';
+                dims += std::to_string(v.shape[i]);
+            }
+            std::fprintf(stderr, "STORED buffer=%s shape=[%s] dtype=%s enc=%p -> %s\n",
+                         o.buffer.c_str(), dims.c_str(), o.dtype.c_str(), v.enc, why);
+            std::fflush(stderr);
+        };
+        const auto register_stored_operand = [&](const Operand& o, AdValue& v) {
+            if (!options.host_walk || v.raw == nullptr || v.enc == nullptr) return;
+            if (v.shape.empty()) {
+                stored_note(o, v, "no shape");
+                return;
+            }
+            int64_t rows = 0, cols = 0;
+            if (!stored_container_open) {
+                stored_container_open = true;
+                if (stored_container.open(driver.config().model.c_str()) != RAD_OK) {
+                    stored_container_failed = true;
+                    std::fprintf(stderr,
+                                 "device step: no container at '%s' to read a stored operand from; "
+                                 "the host walk will refuse those rows by name\n",
+                                 driver.config().model.c_str());
+                }
+            }
+            if (stored_container_failed) return;
+            const RadFileEntry* e = stored_container.find(o.buffer);
+            if (e == nullptr) {
+                stored_note(o, v, "the container holds no entry of that name");
+                return;
+            }
+            rad_enc_view(e->rank, e->shape, &rows, &cols);
+            if (rows <= 0 || cols <= 0) {
+                stored_note(o, v, "the entry's shape is empty");
+                return;
+            }
+            const RadEncoding& enc = stored_container.encoding(*e);
+            if (enc.n_planes < 1 || enc.n_planes > RAD_ENC_MAX_PLANES) {
+                stored_note(o, v, "the entry's encoding has no planes");
+                return;
+            }
+            std::vector<R97IqrStoredPlane> plane(static_cast<size_t>(enc.n_planes));
+            for (int32_t i = 0; i < enc.n_planes; ++i) {
+                const RadFilePlane& p = stored_container.plane(*e, i);
+                plane[static_cast<size_t>(i)].data = stored_container.data(p);
+                plane[static_cast<size_t>(i)].bytes = static_cast<int64_t>(p.bytes);
+            }
+            if (rad_enc_is(&enc, "plain") && enc.n_planes == 1 && !enc.transform[0] &&
+                enc.plane[0].block[0] == 1 && enc.plane[0].block[1] == 1) {
+                const RadEncPlane& p = enc.plane[0];
+                const int32_t st = iqr_detail::scale_type(p.dtype);
+                const int64_t n = rows * cols;
+                // The widened values must be the ones the operand's own shape indexes: a container
+                // entry that disagrees with the tape is not this operand.
+                int64_t want = 1;
+                for (int64_t d : v.shape) want *= std::max<int64_t>(d, 0);
+                if (st < 0 || n != want) {
+                    stored_note(o, v, "the entry's elements are not the operand's");
+                    return;
+                }
+                if (plane[0].data == nullptr || plane[0].bytes < rad_dtype_bytes(p.dtype, n)) {
+                    stored_note(o, v, "the entry's plane is short");
+                    return;
+                }
+                std::vector<double> values(static_cast<size_t>(n));
+                for (int64_t i = 0; i < n; ++i)
+                    values[static_cast<size_t>(i)] = r97_iqr_load_scalar(plane[0].data, st, i);
+                v.value = std::move(values);
+                v.raw = nullptr;
+                v.enc = nullptr;
+                stored_note(o, v, "widened to values");
+                return;
+            }
+            if ((cols & 127) != 0) {
+                stored_note(o, v, "the entry's columns are not a multiple of 128");
+                return;
+            }
+            if (stored_weight_find(v.enc, rows, cols) != nullptr) return;
+            R97IqrDecoded decoded;
+            if (!r97_iqr_decode_planes(&enc, plane.data(), rows, cols, &decoded)) {
+                stored_note(o, v, "the entry's form is not one this build decodes");
+                return;
+            }
+            StoredWeight w;
+            w.rows = rows;
+            w.cols = cols;
+            w.groups = cols / 128;
+            w.codes = std::move(decoded.codes);
+            w.scale = std::move(decoded.scale);
+            stored_weight_put(v.enc, std::move(w));
+            stored_note(o, v, "registered in the stored-weight table");
+        };
         // The step's frozen operands, widened once and shared by every walk. A block's weights are
         // the same f64 values in all 64 blocks; without this every block pulls them back from the
         // card and widens them again -- ~3.7 GiB of f64 a block on the real container, rebuilt 64
@@ -831,6 +957,7 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                     continue;
                 }
                 out.now[j] = snapshot(rec.operands[j], held[j].content, rec.op.c_str(), rec.position);
+                register_stored_operand(rec.operands[j], out.now[j]);
                 if (key[j].empty()) continue;
                 // The step's first read of a frozen operand: its one widen, which every later
                 // block binds instead of pulling and widening again.
@@ -1057,7 +1184,21 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                                    first_rows(*above, tokens, meta.hidden)};
 
         LayerReplay replay(*engine, driver.tape(), store);
-        for (int64_t layer = measured.layers - 1; layer >= 0; --layer) {
+        // R97_WALK_BLOCKS=<n> walks only the top n blocks, and only for the host walk. A host walk
+        // holds each block's decoded weights for the length of that block's walk, and a step's
+        // worth on the real container is more than this host has: the limit is what makes the A/B
+        // measurable here at all, and the top transitions already separate a growing cotangent
+        // from a flat one. The device walk is never limited: the A/B runs only when the device
+        // walk's gradient is not finite, and a truncated walk zero-fills the blocks it skipped --
+        // a finite gradient that would silence the very measurement this exists for. Unset, the
+        // host walk is the whole step too.
+        int64_t walk_blocks = 0;
+        if (const char* wb = std::getenv("R97_WALK_BLOCKS");
+            wb != nullptr && *wb != '\0' && options.host_walk)
+            walk_blocks = std::strtoll(wb, nullptr, 10);
+        const int64_t first_layer = walk_blocks > 0 ? std::max<int64_t>(0, measured.layers - walk_blocks)
+                                                    : 0;
+        for (int64_t layer = measured.layers - 1; layer >= first_layer; --layer) {
             StoredSnapshots snaps;
             // This block's own values answer every key the step's frozen store does not hold.
             shared.set_base(&snaps);
@@ -1164,6 +1305,27 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                         // No op before this one wrote it: a frozen input, the boundary, or a
                         // recurrent state the block reads cold. The kv: state the engine cleared
                         // before the replay enters zero; everything else keeps the live pull.
+                        //
+                        // `R97_DUMP_DEVICE_PULL=1` names the case where the op *itself* writes the
+                        // buffer it is reading: the live pull then holds the op's own output, and
+                        // the row would differentiate at its output. That is the host snapshotter's
+                        // defect (`step_host.cpp`, fixed there by restoring the boundary residual),
+                        // and this branch keys on the tape's `block_wrote` rather than the host's
+                        // `prev` map, so the host measurement says nothing about its reach here.
+                        if (std::getenv("R97_DUMP_DEVICE_PULL") != nullptr) {
+                            bool op_writes_it = false;
+                            for (const Operand& w : shaped.operands)
+                                if (w.written && w.buffer == read.buffer) op_writes_it = true;
+                            if (op_writes_it)
+                                std::fprintf(stderr,
+                                             "DEVPULL block=%lld pos=%lld op=%s buffer=%s "
+                                             "bytes=%lld named=%d\n",
+                                             static_cast<long long>(layer),
+                                             static_cast<long long>(op.position), op.op.c_str(),
+                                             read.buffer.c_str(),
+                                             static_cast<long long>(content[j].bytes),
+                                             content[j].named ? 1 : 0);
+                        }
                         if (read.buffer.rfind("kv:", 0) == 0)
                             snapped.now[j].value.assign(snapped.now[j].value.size(), 0.0);
                         continue;
@@ -1339,6 +1501,21 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             shared.set_base(nullptr);
             snaps = StoredSnapshots{};
         }
+        // The stored weights the host walk decoded belong to this step's container: release them
+        // so a store sized for one step's blocks does not outlive it. What it held is the check
+        // that the decode happened at all -- a zero here is a walk that refused every stored row.
+        if (options.host_walk) {
+            std::fprintf(stderr,
+                         "device step: the host walk decoded %lld stored weights (%lld bytes)%s\n",
+                         (long long)stored_weight_count(), (long long)stored_weight_bytes(),
+                         walk_blocks > 0 ? " over a limited walk" : "");
+            if (walk_blocks > 0)
+                std::fprintf(stderr, "device step: R97_WALK_BLOCKS walked layers %lld..%lld of %lld\n",
+                             (long long)first_layer, (long long)(measured.layers - 1),
+                             (long long)measured.layers);
+            std::fflush(stderr);
+        }
+        stored_weight_clear();
         measured.backward_seconds = seconds_since(backward_begin);
         // The op that produced the first non-finite forward value the step met, when a walked op
         // wrote it: the walk's own naming names the first reader of the value, this its writer.
