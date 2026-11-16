@@ -25,7 +25,13 @@ converts the result with `rad-convert` to a bf16 container that the `qwen35_bf16
 
 The checkpoint lands in the test binary's temporary directory (`radtest::tmpdir()`, which honours
 `RAD_TEST_TMPDIR` and otherwise makes one under `$TMPDIR`), in a directory `tiny_qwen35_bf16/`
-that holds the checkpoint and, beside it, the container `tiny_qwen35_bf16.rad`.
+that holds the checkpoint. The container lands in the build's fixture directory instead,
+`<build>/fixture/tiny_qwen35_bf16.rad`: the build owns that path, the conversion that fills it is
+deterministic (the checkpoint is seeded, the converter and plugins are the build's), and the
+documented flows (`docs/USAGE.md`'s first run) name it directly. An mtime search of the temporary
+directory cannot say which file is the build's: the host tier never removes its temporary
+directory, so every run leaves its containers in `/tmp`, and the newest one by mtime can belong
+to an older build.
 
 ## Obtaining it
 
@@ -61,9 +67,10 @@ const r97::Fixture& s = r97::shuffled_fixture();  // the control: rows rotated, 
 `r97::w8a8_fixture()` is the same checkpoint, converted a second time with
 `tests/fixtures/w8a8_fwht128.recipe`: radiance's
 `data/recipes/q38-27b-w8a8-df2.recipe` at this checkpoint's shapes, with one line left out. The
-container lands beside the bf16 one as `tiny_qwen35_w8a8.rad`, states the quantisation
-`w8a8_fwht128`, and the `qwen35_w8a8` plugin serves it on the same host kernel libraries (`libavx`,
-then `libref`).
+container lands beside the bf16 one as `<build>/fixture/tiny_qwen35_w8a8.rad`, the path
+`docs/RUNBOOK.md`'s settings default to, states the quantisation
+`w8a8_fwht128`, and the `qwen35_w8a8` plugin serves it on the same host kernel libraries
+(`libavx`, then `libref`).
 
 The recipe, as `tests/fixtures/w8a8_fwht128.recipe` holds it:
 

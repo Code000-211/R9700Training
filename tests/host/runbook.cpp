@@ -209,9 +209,10 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
         if (!out) throw std::runtime_error("runbook: cannot write " + script_path.string());
     }
 
-    // Run it the way the document says to: from the tree's top, with bash. The container is named
-    // the way the document finds it -- the newest tiny_qwen35_w8a8.rad under the temporary
-    // directory -- so the settings block is exercised rather than bypassed. Section 7's serve runs
+    // Run it the way the document says to: from the tree's top, with bash. The container is at
+    // the document's default path, the build's own fixture directory, which this process's
+    // w8a8_fixture() just filled; the test passes no R97_MODEL, so the settings block's default
+    // is exercised rather than bypassed. Section 7's serve runs
     // from the serving-only build the environment names, and is skipped as the document says when
     // it names none: building one costs minutes, so a bare `ctest -L host` runs the trainer's
     // measurement and the blocks' documented skip branch, not a serve. The tree that suits this
@@ -225,8 +226,7 @@ R97_TEST(runbook_script_runs_as_the_document_orders_it) {
     const std::string& serving = named_serving;
     const std::string command =
         "cd " + r97::detail::shell_quote(root.string()) + " && " +
-        "HIP_VISIBLE_DEVICES= ROCR_VISIBLE_DEVICES=99 R97_DEVICE= " + "RAD_TEST_TMPDIR=" +
-        r97::detail::shell_quote(dir.string()) + " " + "R97_BUILD=" +
+        "HIP_VISIBLE_DEVICES= ROCR_VISIBLE_DEVICES=99 R97_DEVICE= " + "R97_BUILD=" +
         r97::detail::shell_quote(r97::detail::build_dir()) + " " + "R97_RUN=" +
         r97::detail::shell_quote(run.string()) + " " + "R97_SERVING_BUILD=" +
         r97::detail::shell_quote(serving) + " bash " +

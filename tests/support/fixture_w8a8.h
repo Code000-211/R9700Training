@@ -105,7 +105,11 @@ inline const Fixture& w8a8_fixture() {
             throw std::runtime_error(
                 "fixture_w8a8: R97_FIXTURE_W8A8_RECIPE is unset: build through CMakeLists.txt");
         Fixture f = bf16;
-        f.container = bf16.checkpoint + "/tiny_qwen35_w8a8.rad";
+        // The container lands beside the bf16 one, in the build's fixture directory
+        // (fixture_dir()): docs/RUNBOOK.md's settings default to that path, and the build-bound
+        // location is what keeps the runbook's search from the machine's /tmp history.
+        const std::string fx = detail::fixture_dir();
+        f.container = (fx.empty() ? bf16.checkpoint : fx) + "/tiny_qwen35_w8a8.rad";
         detail_w8a8::convert(bf16, f.container, recipe);
         return f;
     }();
