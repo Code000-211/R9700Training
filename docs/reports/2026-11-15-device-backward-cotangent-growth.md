@@ -42,9 +42,28 @@ consistent output rather than one block's anomaly. At 1395 `row_ss = 1.29e-07` i
 That is the regime the amplification is measured in, and it is where the backward's cotangent is
 largest.
 
-Whether a chunk-scan output four decades below its input is correct is a question about the GDN
-branch's **forward**, which this ticket did not touch. It is left open deliberately: nothing measured
-here shows the forward is wrong, and nothing shows it is right.
+### Is the small activation a defect? What the evidence supports
+
+**No evidence of one.** Three things point that way, and none of them is proof:
+
+1. **The norm exists to rescale.** `gdn_o` at rms ~1e-3 becomes `O(0.2..0.6)` after `sc = 637..941`, so
+   the branch's contribution to `h` is `O(1)` -- the ordinary magnitude for a residual stream. The
+   1e-3 is the *pre-norm* activation, which is exactly what a norm is for.
+2. **It is consistent, not anomalous.** `row_ss` spans 1.2e-07 to 1.5e-06 across three blocks -- a
+   factor of 12, not a decade -- which is what a model property looks like. A per-block defect would
+   show one block far off the others.
+3. **The engine's `eps` is the family's.** `kRmsEps` is hardcoded at 1e-6, the standard value for this
+   architecture, so the norm is not misconfigured relative to the checkpoint it serves.
+
+**What would settle it, and why this repo cannot.** The decisive check is a reference forward from the
+framework the checkpoint was trained in, comparing `gdn_o`'s per-row rms at the same layer. That needs
+the original model implementation and its weights in their native layout, which a `.rad` container and
+this trainer do not provide. So the decision is **"no evidence of a defect"**, not "proven correct".
+
+**What the small activation does explain.** It is the *cause* of the growth, and the chain is short:
+`row_ss` small -> `sc` large -> the gated-RMS Jacobian's `sc^3` term large. A branch whose pre-norm
+activation were `O(1)` would have `sc ~ 1` and no amplification at all. So the growth is a consequence
+of the model's served state, and the remedy is the guard -- not a change to any Jacobian.
 
 ## An in-place read with no earlier writer now restores the boundary
 
