@@ -103,7 +103,15 @@ RESTORE boundary=1 pos=39 op=add buffer=x bytes=4096
 ```
 
 -- and the tier is 290/290 with no refusal. So the restore does what it claims where it is reached, and
-the live container simply never reaches it.
+the host branch is never reached on the live container.
+
+**The device walk has the same gap, and it is unsettled.**
+`src/step_device.cpp:1304-1311` keeps the live pull when `block_wrote` has no entry for the buffer.
+That is a *different* condition from the host's `prev` miss -- it keys on the tape's record of which
+ops wrote what, not on the snapshotter's `before` map -- so the host run's 0 restores says nothing
+about whether the device branch is reached. Nothing measured here establishes the device side's
+reachability, and changing the device walk's snapshots without that measurement would move the very
+gradient this report is about. It is named here, with its location, rather than guessed at.
 
 Two earlier attempts are recorded because they show what does **not** work. A rule in
 `src/backward.cpp` requiring a read and a write of one buffer to hold equal values failed 22 of the
