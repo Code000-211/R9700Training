@@ -57,6 +57,11 @@ void kv_store_twin(const OpRecord& rec, const std::vector<AdValue>& reads,
     int64_t n = 1;
     for (int64_t d : pool.shape) n *= d;
     pool.value.assign((size_t)n, 0.0);
+    // An in-place pool is also a read: the record marks the write over the pool it reads, and the
+    // read list carries the pool's old value last. The store overwrites the rows its slots name
+    // and leaves the rest, so the post-op slot value starts from the old pool.
+    if (w->in_place && reads.size() == 4 && reads[3].shape == w->shape)
+        pool.value = reads[3].value;
     const adjoint::qk::KvStoreShape shape = kv_shape(rec, reads, pool);
     const std::vector<int32_t> slot = slots_of(reads[2]);
     adjoint::qk::kv_store_forward_f64(reads[0].value.data(), reads[1].value.data(), slot.data(),
@@ -82,6 +87,35 @@ void kv_store_adjoint(const AdjointCall& call) {
     dv.value.assign(v.value.size(), 0.0);
     adjoint::qk::kv_store_adjoint_f64(call.cot[0].value.data(), slots.data(), shape,
                                       dk.value.data(), dv.value.data());
+
+    // The in-place pool's own slot: the store overwrites the rows its slots name, so those rows
+    // of the old pool are dead and their cotangent is the k's and v's -- dk and dv above. Only
+    // the pool the write leaves alone carries the pool's cotangent on. The rows the write
+    // covers, by the same (block, offset) arithmetic the forward scatters with.
+    for (size_t j = 0; j < call.rec.operands.size(); ++j)
+        if (call.rec.operands[j].written && call.rec.operands[j].in_place) {
+            AdValue& dp = call.dc->at(j);
+            if (dp.value.size() != call.cot[0].value.size()) continue;
+            const int64_t pool_rows = shape.n_blocks * shape.block_size;
+            std::vector<char> covered((size_t)pool_rows, 0);
+            for (int32_t s : slots)
+                if (s >= 0 && s < pool_rows) covered[(size_t)s] = 1;
+            for (int64_t row = 0; row < pool_rows; ++row) {
+                if (covered[(size_t)row]) continue;
+                const int64_t block = row / shape.block_size;
+                const int64_t off = row % shape.block_size;
+                for (int64_t h = 0; h < shape.kv_heads; ++h) {
+                    const int64_t base =
+                        ((block * shape.kv_heads + h) * shape.block_size + off) * 2 * shape.head_dim;
+                    for (int64_t d = 0; d < shape.head_dim; ++d) {
+                        dp.value[(size_t)(base + d)] +=
+                            call.cot[0].value[(size_t)(base + d)];
+                        dp.value[(size_t)(base + shape.head_dim + d)] +=
+                            call.cot[0].value[(size_t)(base + shape.head_dim + d)];
+                    }
+                }
+            }
+        }
 }
 
 }  // namespace
