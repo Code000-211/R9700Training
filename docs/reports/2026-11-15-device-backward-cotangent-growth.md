@@ -25,6 +25,60 @@ The guard names the record, the position and the count, and refuses. `worst=nan`
 `min_scale=0.16346` says the incoming cotangent already carried a NaN by position 1135 -- the same
 place the ticket's first all-non-finite value sits (1134).
 
+## The forward scale: `gdn_o` sits four decades below `gdn_in`, consistently
+
+`R97_FD_REC=1416,1395,1374 R97_WALK_BLOCKS=4` (layers 60..63) measured the same record at three
+positions. `row_ss` is the forward row's mean square, so `sc = 1/sqrt(row_ss + 1e-6)`:
+
+| pos | `gdn_o` row_ss | `sc` | `gdn_in` row_ss |
+|---|---|---|---|
+| 1416 | 1.46157e-06 | 637.374 | 54.4081 |
+| 1395 | **1.28881e-07** | **941.187** | 65.4568 |
+| 1374 | 1.19943e-06 | 674.288 | -- |
+
+**`gdn_o` is roughly `1e-4` of `gdn_in` at every block**, so the small activation is the GDN branch's
+consistent output rather than one block's anomaly. At 1395 `row_ss = 1.29e-07` is **below `eps =
+1e-6`**: the norm's epsilon dominates and `sc` sits at 941, close to the `1/sqrt(eps) = 1000` ceiling.
+That is the regime the amplification is measured in, and it is where the backward's cotangent is
+largest.
+
+Whether a chunk-scan output four decades below its input is correct is a question about the GDN
+branch's **forward**, which this ticket did not touch. It is left open deliberately: nothing measured
+here shows the forward is wrong, and nothing shows it is right.
+
+## An in-place read with no earlier writer now restores the boundary
+
+The defect is created in `src/step_host.cpp`, not in the backward. The snapshotter restores a read's
+pre-op value from `before` when an earlier op in the block wrote the buffer, and zeros a `kv:` carried
+state the engine cleared -- and for anything else it left `now[j]` holding what the op itself wrote,
+because the tape snapshots an operand after the op issued. That is position 1429 on the live tape: the
+norm reads `h` and writes `h` in place, nothing earlier in the block wrote `h`, so the read was snapped
+as the norm's own output and the row was differentiated at its output.
+
+The true value is available. `LayerReplay::replay` restores boundary `layer` into the step buffer
+before issuing the block (`src/replay.cpp:453-457`), and `ResidualStore` keeps those bytes:
+`residual(layer)` names the buffer and `read(layer, host)` copies them back. The snapshotter now uses
+that when the in-place read's span is the boundary's own size and shape, so the read gets what the
+buffer carried on entry. The buffer is not always the one the store copied out of -- the int8 path's
+`rmsnorm_quant_fp8` reads an `h` of its own -- so the test is the operand's byte count and declared
+shape, with the row offset kept when the pointer *is* inside the residual. The refusal is left for a
+read that matches neither, where no stored copy exists.
+
+**It changes nothing measurable.** With the restore the A/B completes with no refusal and reports
+`grad norm 56984.9` -- identical to six digits to the run before it. So the wrong snapshot at 1429,
+though provably wrong, is not on the path that produces the growth: the norm's row takes its
+cotangent from `h`'s adjoint, and the snapshot the walk used was not the quantity that enters it.
+
+Two earlier attempts are recorded because they show what does **not** work. A rule in
+`src/backward.cpp` requiring a read and a write of one buffer to hold equal values failed 22 of the
+host tier's 290 cases -- `backward_compose_same_buffer_counts_once` is a fixture whose whole purpose is
+one buffer read and written, and `loop_reference_resume_is_bit_identical` is an ordinary in-place add.
+Narrowing it to *equal and smaller* passed all 290 and was still dead code at the defect: 1429's read
+and write are both `h` at `[512, 5120]`, equal size, and the weight/`h` pair this report first named
+fails the same-buffer test because the read and the write name different buffers. Refusing
+unconditionally in `step_host.cpp` failed 15 step cases, every one an ordinary `add` at position 94
+whose buffer *is* the boundary residual -- which is what pointed at the restore.
+
 ## Why no non-circular oracle settles this
 
 The engine-level check would be `R97_CENTRAL`, a central difference of the loss against a LoRA weight.

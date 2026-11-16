@@ -255,7 +255,22 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
             // latter per buffer and give the in-place read that, or the adjoint differentiates
             // the op at its output instead of its input (the gated norm's gdn_o, above all).
             std::map<std::string, AdValue> before;
-            replay.replay(layer, [&snaps, &before, &options](const OpRecord& op,
+            // A boundary's residual is the block's [tokens, hidden] activation. The buffer an op
+            // reads it from is not always the one the store copied out of -- the int8 path's
+            // `rmsnorm_quant_fp8` reads an `h` of its own -- so the test is the operand's byte count
+            // and its declared shape, not its pointer. When the pointer *is* inside the residual,
+            // the copy keeps the operand's row offset.
+            const int64_t boundary_bytes = replay.store().boundary_bytes();
+            const int64_t boundary_tokens = replay.store().tokens();
+            const int64_t boundary_hidden = replay.store().hidden();
+            const uintptr_t residual_lo = reinterpret_cast<uintptr_t>(replay.residual(layer));
+            const auto in_boundary = [&](const OperandContent& c, const Operand& o) {
+                if (c.data == nullptr || c.bytes != boundary_bytes) return false;
+                return o.shape.size() == 2 && o.shape[0] == boundary_tokens &&
+                       o.shape[1] == boundary_hidden;
+            };
+            replay.replay(layer, [&snaps, &before, &options, &replay, layer, boundary_bytes,
+                                  residual_lo, &in_boundary](const OpRecord& op,
                                                    const std::vector<OperandContent>& content) {
                 // The adjoint sees the step's rows and, for attention, the q view its family
                 // reads; the snapshots must have the same shapes the walk will ask for.
@@ -281,6 +296,38 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
                         // The engine cleared the recurrent state before the replay, so a
                         // carried state read that no op in the block wrote yet enters zero.
                         now[j].value.assign(now[j].value.size(), 0.0);
+                    } else if (in_boundary(content[j], shaped.operands[j])) {
+                        // The operand's span lies inside this boundary's residual, and `replay()`
+                        // restored boundary `layer` into that buffer before issuing the block. The
+                        // tape snapshots after the op issued, so `now[j]` holds the op's own output;
+                        // the store still holds what the buffer carried on entry, which is what the
+                        // read consumed. Reading it back is the whole correction -- no refusal, and
+                        // the op differentiates at its input. Position 1429 on the live tape is this
+                        // case.
+                        std::vector<uint8_t> boundary(static_cast<size_t>(boundary_bytes));
+                        replay.store().read(layer, boundary.data());
+                        size_t offset = 0;
+                        const uintptr_t p = reinterpret_cast<uintptr_t>(content[j].data);
+                        if (residual_lo != 0 && p >= residual_lo &&
+                            p < residual_lo + static_cast<uintptr_t>(boundary_bytes))
+                            offset = static_cast<size_t>(p - residual_lo);
+                        OperandContent restored = content[j];
+                        restored.data = boundary.data() + offset;
+                        now[j] = snapshot(shaped.operands[j], restored, shaped.op.c_str(),
+                                          shaped.position);
+                    } else {
+                        // Nothing above applies, so `now[j]` still holds what the op wrote: the
+                        // tape snapshots an operand after the op issued, nothing in this block wrote
+                        // this buffer, and the buffer is not the boundary residual, so no stored
+                        // copy exists to restore. The read's cotangent would be differentiated at
+                        // the op's own output, and refusing is the only honest answer.
+                        throw std::runtime_error(
+                            std::string("step: op '") + shaped.op + "' at position " +
+                            std::to_string(shaped.position) + ": operand '" + read.buffer +
+                            "' is read in place and nothing earlier in this block wrote it, so the "
+                            "snapshot holds the op's own output -- the read is what the op consumed. "
+                            "This buffer is not the boundary residual either, so there is no stored "
+                            "copy to restore; refusing rather than differentiating at the output.");
                     }
                 }
                 for (size_t j = 0; j < shaped.operands.size(); ++j) {
