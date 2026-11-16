@@ -1305,6 +1305,27 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                         // No op before this one wrote it: a frozen input, the boundary, or a
                         // recurrent state the block reads cold. The kv: state the engine cleared
                         // before the replay enters zero; everything else keeps the live pull.
+                        //
+                        // `R97_DUMP_DEVICE_PULL=1` names the case where the op *itself* writes the
+                        // buffer it is reading: the live pull then holds the op's own output, and
+                        // the row would differentiate at its output. That is the host snapshotter's
+                        // defect (`step_host.cpp`, fixed there by restoring the boundary residual),
+                        // and this branch keys on the tape's `block_wrote` rather than the host's
+                        // `prev` map, so the host measurement says nothing about its reach here.
+                        if (std::getenv("R97_DUMP_DEVICE_PULL") != nullptr) {
+                            bool op_writes_it = false;
+                            for (const Operand& w : shaped.operands)
+                                if (w.written && w.buffer == read.buffer) op_writes_it = true;
+                            if (op_writes_it)
+                                std::fprintf(stderr,
+                                             "DEVPULL block=%lld pos=%lld op=%s buffer=%s "
+                                             "bytes=%lld named=%d\n",
+                                             static_cast<long long>(layer),
+                                             static_cast<long long>(op.position), op.op.c_str(),
+                                             read.buffer.c_str(),
+                                             static_cast<long long>(content[j].bytes),
+                                             content[j].named ? 1 : 0);
+                        }
                         if (read.buffer.rfind("kv:", 0) == 0)
                             snapped.now[j].value.assign(snapped.now[j].value.size(), 0.0);
                         continue;
