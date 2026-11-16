@@ -292,20 +292,30 @@ Consecutive ratios: 132.5, 14.1, 66.4, 33.5, 45.1, 23.1, 43.2 -- geometric mean 
 decades per boundary**, against the device walk's 40.1x and 1.60.
 
 **The host walk grows at the same rate as the device walk.** The rows are f64 host code
-(`elementwise.cpp`, `quant.cpp`, `linear.cpp`), so the device rows are exonerated: the defect is in
-what both walks share -- the composition (`src/backward.cpp`), the snapshot store, or the tape. This
-is the plan's Gate A, and Phase 2A is the next step: `R97_DUMP_VER=1`, the per-version dump, to name
-the first record whose effective Jacobian is not its row's own.
+(`elementwise.cpp`, `quant.cpp`, `linear.cpp`), so the device rows are exonerated -- a conclusion the FD
+below reached independently. At the gate that pointed at what both walks share -- the composition
+(`src/backward.cpp`), the snapshot store, or the tape -- and made Phase 2A the next step.
 
-**Note the residual `x` path stays flat** (1.3159e-07 at the block 63 `add`) while the `h` path grows,
-so whatever the composition does, it does to one branch and not the other.
+**The FD then removed that reading.** The row matches its twin exactly at the tape's own operands
+(`## The live-scale FD`), so the growth is the row's Jacobian at a small pre-norm activation, and there
+is no defect to find in the rows or in the composition. Gate A's value was to rule the device rows out
+and to prove the growth reproduces in f64; its conclusion about where the defect sits was wrong.
 
-# The device backward's `h` cotangent grows 3.2 decades per block
+**Note the residual `x` path stays flat** (1.3159e-07 at the block 63 `add`) while the `h` path grows --
+consistent with the growth being the `h`-side rows' own Jacobians, since the `x` path does not cross the
+gated norms that carry it.
+
+## The measurement that opened this: the reported growth
 
 Issue #145. The device step's backward grows the residual stream's cotangent by a factor of
 `10^3.2` per block over thirteen blocks, while the forward `h` is flat and the finite difference
-says the leaf gradients are flat. This is the measurement, the host rows the A/B needed, and what
-is left: the growth is in the composition, and the rule that supplies it is still open.
+says the leaf gradients are flat. This section is the measurement as it stood before the gate: what was
+reported, and the host rows the A/B needed to test it.
+
+**Its conclusion was superseded.** It read "the growth is in the composition, and the rule that
+supplies it is still open". The gate and the live-scale FD replaced that: the composition is not the
+cause, and the growth is the rows' own Jacobians at a small pre-norm activation -- see
+`## The gate: the growth reproduces on the host walk` and `## The live-scale FD` above.
 
 ## What was reported
 
@@ -783,8 +793,10 @@ The three open items at live scale:
 3. **the quantised producers' activations** -- a step function, which no central difference describes.
 
 So the claim this report can stand behind is: the amplifying rows' *adjoints* match their *twins*, the
-gated twins match the kernel, and the norm's twin does not. Whether the growth is the true Jacobian is
-still open, and now has a named suspect.
+gated twins match the kernel, and the norm's twin does not. Whether the growth is the true Jacobian was
+still open **at this point in the investigation**, with a named suspect; the live-scale FD above then
+settled it -- the amplifying row is the twin's exact derivative at the tape's own operands, so the growth
+is the row's own Jacobian and not a transcription or indexing error.
 
 
 **A consequence, not a second defect.** The device path stores cotangents as bf16 (all nine device row
