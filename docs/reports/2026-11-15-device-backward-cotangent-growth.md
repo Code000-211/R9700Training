@@ -18,8 +18,8 @@ place the ticket's first all-non-finite value sits (1134).
 
 ## What this leaves open
 
-The growth is the product of true Jacobians, so it cannot be made smaller without changing the
-mathematics. What remains is **why `gdn_o` is `~5e-4`**: the gated RMS norm is faithful, and it is
+The growth is the row's own Jacobian at the tape's scale, so it cannot be made smaller without changing
+the mathematics. What remains is **why `gdn_o` is `~5e-4`**: the gated RMS norm is faithful, and it is
 faithfully amplifying a recurrence output that is four decades below O(1). If `gdn_o` should be O(1),
 the defect is in the GDN branch's forward, upstream of every row this report examined -- and that is a
 different investigation from the one this ticket opened.
@@ -39,12 +39,24 @@ FDREC pos=1416 op=gdn_gated_rmsnorm read=1 buffer=gdn_in elem=2799348 x=-48.25  
 element of both reads. The last line is the expected `0 * inf`-shaped corner: a dead row of `gdn_in`
 whose analytic is `-3.9e-23`, i.e. zero.
 
-**The ~10,000x is the true Jacobian.** The amplifying element's `x` is **5.26e-4**: with
-`sc = 1/sqrt(mean(x^2) + 1e-6)`, a row whose rms is `~5e-4` gives `sc ~ 884`, `sc^3 ~ 6.9e8`, and the
-second term `x_i * sc^3/ch * A` lands at `~1e3-1e4` times `do`. The formula's bound is `sc <= 1/sqrt(eps)
-= 1000`, and the second term scales as `sc * (|x|^2 / (n rms^2)) = sc`, so an amplification of `1e4`
-needs `sc ~ 1e4` -- which the FD now shows is reached because `x` is that small, not because a factor
-is wrong.
+**The amplification is inside the formula's own range, and the row's scale is measured.** `R97_FD_REC`
+now prints the row's RMS and the norm's scale beside each element, because an element's value says
+nothing about the row:
+
+```
+FDREC pos=1416 op=gdn_gated_rmsnorm read=0 buffer=gdn_o elem=414281  x=0.000526428 row_ss=1.46157e-06 row_sc=637.374
+FDREC pos=1416 op=gdn_gated_rmsnorm read=0 buffer=gdn_o elem=1894879 x=0.423828    row_ss=0.00162962  row_sc=24.7642
+FDREC pos=1416 op=gdn_gated_rmsnorm read=1 buffer=gdn_in elem=2803378 x=1.25781     row_ss=54.4081     row_sc=0.135571
+```
+
+The amplifying row's rms is **1.21e-3** (`row_ss = 1.46e-6`) and its `sc` is **637.4**, so `sc^3 =
+2.6e8` and the second term `x_i * sc^3/ch * A` lands at `~1e3-1e4` times `do`. A different row of the
+same read is at `sc = 24.8`, so the scale is a per-row property, not a record-wide constant.
+
+**`sc = 637` is below the formula's ceiling of `1/sqrt(eps) = 1000`.** The second term scales as
+`sc * (|x|^2 / (n rms^2)) = sc`, so the amplification cannot exceed `sc <= 1000` times the `w` and `g`
+factors -- and `637` times an O(1..10) gain lands exactly on the measured `1e4`. **The amplification is
+what this Jacobian does at this row's scale, not a factor out of place.**
 
 **Gradient norm by blocks walked:**
 
@@ -61,10 +73,13 @@ recurrence's output `gdn_o` is `~5e-4`, which puts the gated RMS norm on the ste
 Jacobian.** Whether `gdn_o` should be that small is the next question, and it is not a defect in
 `gdn_gated_rmsnorm`.
 
-**Residual circularity, stated.** The FD compares the row's analytic `dc` against the *twin's*
-derivative, and the twin shares the row's formula -- so this validates the row against the twin, not
-against the kernel. What it rules out is a transcription or indexing error in the row; it does not
-independently confirm the formula. The formula does match the textbook gated-RMS Jacobian
+**Residual circularity, stated plainly.** The FD compares the row's analytic `dc` against the *twin's*
+derivative, and the twin shares the row's formula. **So `analytic == numeric` proves the row is the
+twin's exact derivative -- not that the twin matches the engine.** What it rules out is a transcription,
+indexing or slot error in the row; it does not independently confirm the formula. The same caveat
+applies to the fused quantised producers, whose twins `check_kernel` cannot check against a host kernel
+at all (`quant.cpp:1054-1056`). The formula's agreement with the textbook derivation is a separate
+argument, and the `sc` bound above is a third. The formula does match the textbook gated-RMS Jacobian
 (`o_i = x_i sc w_i g_i`, `dsc/dx_j = -x_j sc^3 / n`), which is the separate argument for it.
 
 ## The amplifying record: `gdn_gated_rmsnorm` at ~10,000x per instance

@@ -889,6 +889,21 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                         for (const size_t e : {by_dc, by_val}) {
                             if (e >= reads[k].value.size() || e >= dc[i].value.size()) continue;
                             const double x0 = reads[k].value[e];
+                            // The row's own RMS, which is what sets an RMS norm's scale: the
+                            // element's value says nothing about it, and a row at 5e-4 rms and a row
+                            // with one element at 5e-4 are different claims. `sc` is the norm's
+                            // rsqrt(mean(x^2)+eps) with the op's default eps.
+                            double row_ss = 0.0;
+                            const int64_t rch = reads[k].shape.empty() ? 0 : reads[k].shape.back();
+                            if (rch > 0 && (int64_t)reads[k].value.size() % rch == 0) {
+                                const int64_t row = (int64_t)e / rch;
+                                for (int64_t t = 0; t < rch; ++t) {
+                                    const double v = reads[k].value[(size_t)(row * rch + t)];
+                                    row_ss += v * v;
+                                }
+                                row_ss /= (double)rch;
+                            }
+                            const double row_sc = row_ss > 0.0 ? 1.0 / std::sqrt(row_ss + 1e-6) : 0.0;
                             const double eps = 1e-6 * std::max(1.0, std::fabs(x0));
                             std::vector<AdValue> xp = reads, xm = reads;
                             xp[k].value[e] += eps;
@@ -898,9 +913,11 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                             const double scale = std::max(std::fabs(analytic), std::fabs(numeric));
                             std::fprintf(stderr,
                                          "FDREC pos=%s op=%s read=%zu buffer=%s elem=%zu x=%.6g "
+                                         "row_ss=%.6g row_sc=%.6g "
                                          "analytic=%.6g numeric=%.6g ratio=%.6g\n",
                                          pos.c_str(), rec.op.c_str(), i,
-                                         rec.operands[i].buffer.c_str(), e, x0, analytic, numeric,
+                                         rec.operands[i].buffer.c_str(), e, x0, row_ss, row_sc,
+                                         analytic, numeric,
                                          scale > 0.0 ? analytic / numeric : 0.0);
                         }
                     }
