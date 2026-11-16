@@ -83,15 +83,20 @@ buffer carried on entry. The buffer is not always the one the store copied out o
 shape, with the row offset kept when the pointer *is* inside the residual. The refusal is left for a
 read that matches neither, where no stored copy exists.
 
-**It is inert on the live container, and the honest reason is not the one first written here.** With
-the restore the A/B completes with no refusal and reports `grad norm 56984.9`, identical to six digits
-to the run before it -- but `R97_DUMP_RESTORE=1` printed **nothing**, so the branch never ran. The
-restore is not reached at 1429: either an earlier op in the block wrote `h` (so `prev` matches and the
-restore is skipped), or the operand's span does not match the boundary's. The change is therefore a
-correctness guard for the case it names, **not** a fix for the growth, and the growth's explanation
-does not depend on it either way. An earlier draft of this paragraph concluded "the wrong snapshot is
-not on the path that produces the growth"; that conclusion was not supported, because a skipped branch
-proves nothing about the path.
+**It is inert on the live container, and the reason is the host-site substitution.** With the restore
+the A/B completes with no refusal and reports `grad norm 56984.9`, identical to six digits to the run
+before it -- but `R97_DUMP_RESTORE=1` printed **nothing**, so the branch never ran. The reason is not
+that `prev` matched or that the span failed to match: this container declares
+`rmsnorm_had_quant_i8g` among the eight ops with no host kernel, so the host walk substitutes it and
+**never processes position 1429 at all** -- there is no host record there to restore. The change is
+therefore a correctness guard for the case it names, **not** a fix for the growth, and the growth's
+explanation does not depend on it either way.
+
+**Two earlier drafts of this paragraph were wrong and are recorded so they are not re-derived.** The
+first concluded "the wrong snapshot is not on the path that produces the growth", which a skipped
+branch cannot show. The second explained the silence as `prev` matching or the span failing, which the
+substitution supersedes: a walk with no record at that position has neither. Both were written before
+the substitution was noticed.
 
 The path is exercised, on the host fixtures: `R97_DUMP_RESTORE=1` on the host tier counts **1028**
 restores, the first of them the case that used to refuse --
