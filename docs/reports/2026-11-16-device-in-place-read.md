@@ -1,4 +1,4 @@
-# Device walk: an in-place read with no earlier writer restores the boundary
+# Device walk: an in-place read with no earlier writer is served the block's stored copy
 
 2026-11-16. Issue 148. The device walk snapshots an operand **after** the op issues, so for an
 in-place read (`h` read, `h` written by the same op) the snapshot held the op's **own output**, and
@@ -105,9 +105,9 @@ below it, and the restore removes that source.
 The gradient is therefore **not** inert on the device, unlike the host branch (which the host-site
 substitution never reached): the wrong snapshot was a large part of the non-finite gradient. The
 descent after one AdamW step is smaller (-165.257 against -1023.71), which is consistent with a
-gradient that is less poisoned rather than with a scale change; the loss still falls and every leaf
-still moves. Whether the remaining gradient is *correct* is the row-level question issue 144's
-checks own, not this measurement's.
+gradient that is less poisoned rather than with a scale change; the loss still falls and no leaf
+has a zero gradient (`n_zero_a`/`n_zero_b` = 0). Whether the remaining gradient is *correct* is the
+row-level question issue 144's checks own, not this measurement's.
 
 ## What this does not claim
 
