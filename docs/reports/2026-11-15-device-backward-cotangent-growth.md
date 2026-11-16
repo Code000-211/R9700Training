@@ -64,10 +64,27 @@ buffer carried on entry. The buffer is not always the one the store copied out o
 shape, with the row offset kept when the pointer *is* inside the residual. The refusal is left for a
 read that matches neither, where no stored copy exists.
 
-**It changes nothing measurable.** With the restore the A/B completes with no refusal and reports
-`grad norm 56984.9` -- identical to six digits to the run before it. So the wrong snapshot at 1429,
-though provably wrong, is not on the path that produces the growth: the norm's row takes its
-cotangent from `h`'s adjoint, and the snapshot the walk used was not the quantity that enters it.
+**It is inert on the live container, and the honest reason is not the one first written here.** With
+the restore the A/B completes with no refusal and reports `grad norm 56984.9`, identical to six digits
+to the run before it -- but `R97_DUMP_RESTORE=1` printed **nothing**, so the branch never ran. The
+restore is not reached at 1429: either an earlier op in the block wrote `h` (so `prev` matches and the
+restore is skipped), or the operand's span does not match the boundary's. The change is therefore a
+correctness guard for the case it names, **not** a fix for the growth, and the growth's explanation
+does not depend on it either way. An earlier draft of this paragraph concluded "the wrong snapshot is
+not on the path that produces the growth"; that conclusion was not supported, because a skipped branch
+proves nothing about the path.
+
+The path is exercised, on the host fixtures: `R97_DUMP_RESTORE=1` on the host tier counts **1028**
+restores, the first of them the case that used to refuse --
+
+```
+RESTORE boundary=3 pos=94 op=add buffer=x bytes=4096
+RESTORE boundary=2 pos=63 op=add buffer=x bytes=4096
+RESTORE boundary=1 pos=39 op=add buffer=x bytes=4096
+```
+
+-- and the tier is 290/290 with no refusal. So the restore does what it claims where it is reached, and
+the live container simply never reaches it.
 
 Two earlier attempts are recorded because they show what does **not** work. A rule in
 `src/backward.cpp` requiring a read and a write of one buffer to hold equal values failed 22 of the
@@ -1277,44 +1294,14 @@ GAINPOS pos=1449 who=adjoint j=2 buffer=blk.63.ffn_norm.weight schema=[5120] val
 ADJGAIN  pos=1449 buffer=h w_rank=2 w0=512 values=2621440 n=5120
 ```
 
-The twin has a `[5120]` gain; the adjoint has `[512, 5120]` -- and `VIEW` prints **nothing** at 1449, so the
-record's `view_shape` is empty. The two callers are therefore reading **different records**:
+**Withdrawn.** This section used to read the two shapes as proof that the tape declares the weight with
+a `[512, 5120]` view and that the fix was to slice the row the declared `shape` names. That is wrong:
+`VIEW` prints nothing at 1449, so `view_shape` is empty and there is no view to slice. The two shapes
+are the *symptom* of the operand-prefix defect described above -- the adjoint's `[5120]` record is the
+prepared one, and the `[512, 5120]` value it received was the intermediate, not a view of the weight.
+The fix is the one in `## Root cause: fused_adjoint hands the elementwise row the wrong operand list`.
 
-- the snapshot acceptance compares against `rec`, the tape's record (`backward.cpp:452-483`);
-- `AdjointCall` is built with `*adjoint_rec`, the record `options.prepare_record` built
-  (`backward.cpp:556-560`, `:696`).
-
-| record | declared | snapshot | values |
-|---|---|---|---|
-| tape's `rec` (acceptance) | `[512, 5120]` | `[512, 5120]` | 2621440 |
-| prepared `adjoint_rec` (adjoint) | `[5120]` | `[512, 5120]` | 2621440 |
-
-So **the walk accepts a `[512, 5120]` snapshot against the tape's declaration and then hands it to a row
-whose prepared record declares `[5120]`.** `norm_gain` returns it because `[rows, n]` passes `gain_row`,
-and the adjoint reads row 0. The tape and the join disagree about the gain's shape for the same buffer at
-the same position, and nothing reconciles them.
-
-**The defect is the operand's view declaration.** `backward.cpp:464-470` compares a snapshot against
-`view_shape` whenever it is non-empty:
-
-```cpp
-const std::vector<int64_t>& want = rec.operands[k].view_shape.empty()
-                                       ? rec.operands[k].shape
-                                       : rec.operands[k].view_shape;
-if (v->shape != want) refuse(...);
-```
-
-`GAINPOS` reports `schema=[5120]` -- the operand's `shape` -- while the accepted snapshot is
-`[512, 5120]` (2621440 values, first dim 512). A snapshot is only accepted when it equals `want`, so
-**`view_shape` must be `[512, 5120]`: a 512x view of a 5120-element operand.** That is a view which
-multiplies the element count, and it is what lets a per-row tensor through the shape check.
-
-So the tape declares `blk.63.ffn_norm.weight` as a `[5120]` operand carrying a `[512, 5120]` view, the
-adjoint takes the whole view and `norm_gain` reads row 0 of it. **The fix is to slice the row the
-declared `shape` names rather than hand `norm_gain` the whole tensor** -- or to reject a view whose
-numel differs from its operand's, since no legitimate view of a weight does that.
-
-## The quotient's guard## The quotient's guard## The quotient's guard
+## The quotient's guard
 
 The mask pass divides each code's cotangent by its group scale, and the quotient is exact only
 while it stays inside f32. On this container it does not: 2.66e36 over a 5.96e-5 scale is 4.5e40.

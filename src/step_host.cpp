@@ -265,7 +265,9 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
             const int64_t boundary_hidden = replay.store().hidden();
             const uintptr_t residual_lo = reinterpret_cast<uintptr_t>(replay.residual(layer));
             const auto in_boundary = [&](const OperandContent& c, const Operand& o) {
-                if (c.data == nullptr || c.bytes != boundary_bytes) return false;
+                // `named` is the same test `replay.cpp`'s residual_bytes makes: a KV write's tape
+                // identity is synthetic, so it must never be read as the residual.
+                if (!c.named || c.data == nullptr || c.bytes != boundary_bytes) return false;
                 return o.shape.size() == 2 && o.shape[0] == boundary_tokens &&
                        o.shape[1] == boundary_hidden;
             };
@@ -296,6 +298,18 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
                         // The engine cleared the recurrent state before the replay, so a
                         // carried state read that no op in the block wrote yet enters zero.
                         now[j].value.assign(now[j].value.size(), 0.0);
+                    } else if (const void* extra = replay.store().source_extra(layer);
+                               replay.store().extra_at(layer) && extra != nullptr &&
+                               content[j].data == extra) {
+                        // A block that reads a second boundary-sized buffer -- the fwht fixture's
+                        // `x` -- gets that buffer's own copy back, not the residual's. The pointer
+                        // is exact here, so this test is stronger than the shape one below.
+                        std::vector<uint8_t> boundary(static_cast<size_t>(boundary_bytes));
+                        replay.store().read_extra(layer, boundary.data());
+                        OperandContent restored = content[j];
+                        restored.data = boundary.data();
+                        now[j] = snapshot(shaped.operands[j], restored, shaped.op.c_str(),
+                                          shaped.position);
                     } else if (in_boundary(content[j], shaped.operands[j])) {
                         // The operand's span lies inside this boundary's residual, and `replay()`
                         // restored boundary `layer` into that buffer before issuing the block. The
@@ -306,6 +320,13 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
                         // case.
                         std::vector<uint8_t> boundary(static_cast<size_t>(boundary_bytes));
                         replay.store().read(layer, boundary.data());
+                        if (std::getenv("R97_DUMP_RESTORE") != nullptr)
+                            std::fprintf(stderr,
+                                         "RESTORE boundary=%lld pos=%lld op=%s buffer=%s bytes=%lld\n",
+                                         static_cast<long long>(layer),
+                                         static_cast<long long>(shaped.position), shaped.op.c_str(),
+                                         read.buffer.c_str(),
+                                         static_cast<long long>(boundary_bytes));
                         size_t offset = 0;
                         const uintptr_t p = reinterpret_cast<uintptr_t>(content[j].data);
                         if (residual_lo != 0 && p >= residual_lo &&
