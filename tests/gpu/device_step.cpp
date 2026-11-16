@@ -368,6 +368,15 @@ void card_case(const char* test, int64_t n, bool probe) {
     // the case, which is the whole answer the iteration is after.
     if (const char* ab = std::getenv("R97_HOST_WALK_AB");
         ab != nullptr && std::strcmp(ab, "2") == 0) {
+        // R97_CENTRAL is read far below this arm's return, and it differences the *device* walk's
+        // gradient. Asking for both would run the host walk, return, and never difference anything:
+        // a flag that silently measures nothing is worse than one that refuses.
+        if (std::getenv("R97_CENTRAL") != nullptr)
+            throw std::runtime_error(
+                "device step: R97_CENTRAL with R97_HOST_WALK_AB=2 is not a measurement: the central "
+                "difference reads the device walk's gradient and this arm returns before it runs. "
+                "Run R97_CENTRAL without R97_HOST_WALK_AB for the device gradient, or R97_FD_REC=<pos> "
+                "on this arm for a per-row check at the tape's own operands.");
         r97::DeviceStepOptions host_options = options;
         host_options.host_walk = true;
         r97::DeviceStepReport host_report;

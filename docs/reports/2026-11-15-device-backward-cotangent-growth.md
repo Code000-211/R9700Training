@@ -25,6 +25,24 @@ The guard names the record, the position and the count, and refuses. `worst=nan`
 `min_scale=0.16346` says the incoming cotangent already carried a NaN by position 1135 -- the same
 place the ticket's first all-non-finite value sits (1134).
 
+## Why no non-circular oracle settles this
+
+The engine-level check would be `R97_CENTRAL`, a central difference of the loss against a LoRA weight.
+It cannot be pointed at the host walk: the `R97_HOST_WALK_AB=2` arm returns at
+`tests/gpu/device_step.cpp:424`, and the `R97_CENTRAL` block begins at `:689` and reads `g0` from the
+device walk's `grads`. **So `R97_CENTRAL=1 R97_HOST_WALK_AB=2` used to run the host walk, return, and
+difference nothing.** The arm now refuses that combination by name rather than silently measuring
+nothing.
+
+Even hoisted, it would not settle the question. The central difference was already run on this
+container and it is noise: at block 63 the same weight moves the loss **+0.0797 at 1%** and
+**-0.2131 at 10%** -- a sign flip where linearity would give `+0.797`. The loss is not smooth under a
+1% perturbation of a LoRA weight, which is what a quantised trunk does when codes flip. So the engine
+FD cannot resolve a factor of `1e4` here, and **no oracle available on this build is both non-circular
+and usable for this quantity.** That is the honest state, and it is why the conclusion rests on three
+weaker arguments together: the row matches its twin exactly, the formula matches the textbook
+derivation, and `sc` sits below its `eps` bound.
+
 ## What this leaves open
 
 The growth is the row's own Jacobian at the tape's scale, so it cannot be made smaller without changing
