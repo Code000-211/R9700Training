@@ -1,3 +1,46 @@
+## The live-scale FD: the amplifying row is correct, and the amplification is real
+
+`R97_FD_REC=1416 R97_WALK_BLOCKS=2` (position 1416 is in **layer 62**, so one block never reached it):
+
+```
+FDREC pos=1416 op=gdn_gated_rmsnorm read=0 buffer=gdn_o elem=414281  x=0.000526428 analytic=-1096.11      numeric=-1096.11      ratio=1
+FDREC pos=1416 op=gdn_gated_rmsnorm read=0 buffer=gdn_o elem=1894879 x=0.423828    analytic=0.0352436      numeric=0.0352437     ratio=0.999999
+FDREC pos=1416 op=gdn_gated_rmsnorm read=1 buffer=gdn_in elem=2803378 x=1.25781     analytic=0.698325       numeric=0.698325      ratio=1
+FDREC pos=1416 op=gdn_gated_rmsnorm read=1 buffer=gdn_in elem=2799348 x=-48.25      analytic=-3.93756e-23   numeric=0             ratio=-inf
+```
+
+**`analytic == numeric` to the printed digits** at the largest `|dc|` element and at the largest `|value|`
+element of both reads. The last line is the expected `0 * inf`-shaped corner: a dead row of `gdn_in`
+whose analytic is `-3.9e-23`, i.e. zero.
+
+**The ~10,000x is the true Jacobian.** The amplifying element's `x` is **5.26e-4**: with
+`sc = 1/sqrt(mean(x^2) + 1e-6)`, a row whose rms is `~5e-4` gives `sc ~ 884`, `sc^3 ~ 6.9e8`, and the
+second term `x_i * sc^3/ch * A` lands at `~1e3-1e4` times `do`. The formula's bound is `sc <= 1/sqrt(eps)
+= 1000`, and the second term scales as `sc * (|x|^2 / (n rms^2)) = sc`, so an amplification of `1e4`
+needs `sc ~ 1e4` -- which the FD now shows is reached because `x` is that small, not because a factor
+is wrong.
+
+**Gradient norm by blocks walked:**
+
+| blocks | layers | gradient norm |
+|---|---|---|
+| 1 | 63 | 51.349 |
+| 2 | 62..63 | 56984.9 |
+| 4 | 60..63 | 4.37994e+10 |
+
+`56984.9 / 51.349 = 1109` for one block -- **3.04 decades per block**, against the ticket's 3.2.
+
+**So the growth is the product of true Jacobians, and its source is upstream of this row: the GDN
+recurrence's output `gdn_o` is `~5e-4`, which puts the gated RMS norm on the steep part of its
+Jacobian.** Whether `gdn_o` should be that small is the next question, and it is not a defect in
+`gdn_gated_rmsnorm`.
+
+**Residual circularity, stated.** The FD compares the row's analytic `dc` against the *twin's*
+derivative, and the twin shares the row's formula -- so this validates the row against the twin, not
+against the kernel. What it rules out is a transcription or indexing error in the row; it does not
+independently confirm the formula. The formula does match the textbook gated-RMS Jacobian
+(`o_i = x_i sc w_i g_i`, `dsc/dx_j = -x_j sc^3 / n`), which is the separate argument for it.
+
 ## The amplifying record: `gdn_gated_rmsnorm` at ~10,000x per instance
 
 `R97_DUMP_REC=1` over layers 60..63 names one record family. `gdn_gated_rmsnorm`, on the **live** slot
