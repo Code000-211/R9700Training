@@ -410,7 +410,13 @@ inline FdReport check_adjoint(const OpRecord& rec, const std::vector<AdValue>& i
         for (size_t i = 0; i < rec.operands.size(); ++i) {
             const bool reads = !rec.operands[i].written || inout_at(i);
             const bool from_read = reads && (preop || !rec.operands[i].written);
-            fwd[i] = from_read ? in_use[r] : out_vals[w++];
+            fwd[i] = from_read ? in_use[r] : out_vals[w];
+            // The twin's outputs span every write in write order, in-place write included:
+            // the pre-op value takes the slot's place in `fwd`, but the twin still produced
+            // the post-op one, and the writes after the in-place take their outputs from
+            // past it. Not advancing `w` on an in-place write shifts every later write to
+            // the output that precedes it.
+            if (rec.operands[i].written) ++w;
             if (reads) ++r;
         }
     }

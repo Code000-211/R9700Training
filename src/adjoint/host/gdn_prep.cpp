@@ -248,19 +248,37 @@ void l2_normalise(const ConvGeom& g, const std::vector<double>& u, AdValue* o, i
 /* Twin: gdn_conv_prep's forward in f64, at a prefill from position 0.
  *
  * Reads, in schema order: x, w, b, A_log, dt_bias, cu, a, b_gate, cache_idx,
- * has_init. Writes, in schema order: conv_state, q, k, v, g, beta. */
+ * has_init. Writes, in schema order: conv_state, q, k, v, g, beta. The live tape
+ * marks the state's write in place -- the buffer is aliased over the value an
+ * earlier layer left -- so a caller may carry the state between dt_bias and cu
+ * as an eleventh read. The forward this family serves is cold (has_init
+ * zero), so the state the op writes depends on x alone and the read is not
+ * used; it is positioned, not required.
+ *
+ * Reads are addressed by schema position, skipping the writes that precede a
+ * read in the read list the caller builds -- a plain write always, and the
+ * in-place one only when the caller left it out of the list. */
 void gdn_conv_prep_twin(const OpRecord& rec, const std::vector<AdValue>& op,
                         std::vector<AdValue>* out) {
     if (op.size() < (size_t)rConvPrepReads) return;
-    const AdValue& x = op[rX];
-    const AdValue& w = op[rW];
-    const AdValue& bias = op[rBias];
-    const AdValue& a_log = op[rALog];
-    const AdValue& dt_bias = op[rDtBias];
-    const AdValue& cu = op[rCu];
-    const AdValue& a = op[rA];
-    const AdValue& b_gate = op[rBGate];
-    const AdValue& sidx = op[rSidx];
+    const bool state_in_list =
+        rec.operands.size() > (size_t)kState && rec.operands[kState].in_place &&
+        op.size() >= (size_t)(rConvPrepReads + 1);
+    const auto read_at = [&](int64_t schema) -> const AdValue& {
+        int64_t skip = 0;
+        for (int64_t i = 0; i < schema; ++i)
+            if (rec.operands[i].written && (!rec.operands[i].in_place || !state_in_list)) ++skip;
+        return op[static_cast<size_t>(schema - skip)];
+    };
+    const AdValue& x = read_at(kX);
+    const AdValue& w = read_at(kW);
+    const AdValue& bias = read_at(kBias);
+    const AdValue& a_log = read_at(kALog);
+    const AdValue& dt_bias = read_at(kDtBias);
+    const AdValue& cu = read_at(kCu);
+    const AdValue& a = read_at(kA);
+    const AdValue& b_gate = read_at(kBGate);
+    const AdValue& sidx = read_at(kSidx);
     ConvGeom g;
     if (!conv_geom(rec, x, cu, &g)) return;
     if (a.value.size() < (size_t)(g.T * g.H) || b_gate.value.size() < (size_t)(g.T * g.H))

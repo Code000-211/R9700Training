@@ -339,6 +339,17 @@ struct Expand {
     int64_t M = 0, N = 0, R = 0, S = 0;
 };
 
+/* The record's write is marked in place: the tape's INOUT mark, the shape
+ * `src/join_common.h` gives every lora_expand record, because the engine adds the
+ * adapter's branch to the buffer the trunk's GEMM already wrote. One schema slot
+ * then holds two values -- the buffer's old one the op reads and the new one it
+ * writes -- and the caller's read list carries the old one last. */
+bool expand_in_place(const OpRecord& rec) {
+    for (const Operand& o : rec.operands)
+        if (o.written && o.in_place) return true;
+    return false;
+}
+
 /* The scale the expand reads for y(m, n), or the 1 a float trunk's record leaves it at. */
 double expand_scale(const Expand& ex, int64_t s, int64_t n) {
     return ex.sc ? ex.sc->value[(size_t)(s * ex.N + n)] : 1.0;
@@ -367,6 +378,16 @@ bool expand_layout(const OpRecord& rec, const AdValue* v, size_t n, Expand* ex) 
     if (sc && (sc->shape.size() != 2 || sc->shape[0] != S || sc->shape[1] != N ||
                (int64_t)sc->value.size() != S * N))
         return false;
+    // The in-place write's old value is the read list's last operand, the twin's, and it has to
+    // be the buffer the write names: [M, N] of the write's own width.
+    if (expand_in_place(rec)) {
+        const AdValue& base = v[n - 1];
+        // The slot's value is the write's own rows, dense in `M * N`. Its shape may be the
+        // walk's lane split ([M, N / lanes]) rather than the write's own [M, N], so the rows
+        // and the element count are the check, not the second dimension.
+        if (base.shape.empty() || base.shape[0] != M || (int64_t)base.value.size() != M * N)
+            return false;
+    }
     ex->t = &t;
     ex->slot = &slot;
     ex->lb = &lb;
@@ -386,18 +407,23 @@ int64_t row_slot(const Expand& ex, int64_t m) {
 }
 
 /* The expand writes y's increment and leaves y's base value alone: radiance's row rounds
- * `y + scale * sum_j t * B` into y in one step and skips a base row entirely. The twin has no
- * forward value of y to start from (the record writes it, so it is not among the operands), and
- * every caller hands the write a zeroed buffer, so the twin writes the increment. */
+ * `y + scale * sum_j t * B` into y in one step and skips a base row entirely. A plain write has
+ * no forward value of y to start from (the record writes it, so it is not among the operands),
+ * and every caller hands the write a zeroed buffer, so the twin writes the increment. An
+ * in-place write is also a read: the caller hands the buffer's old value as the last operand,
+ * and the slot's post-op value the tape records is `old + increment`, the value the kernel
+ * leaves in the buffer, with a base row keeping its old value unrounded. */
 void lora_expand_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
                       std::vector<AdValue>* out) {
     Expand ex;
     if (!expand_layout(rec, operands.data(), operands.size(), &ex)) return;
     const bool round_t = rec.op == "lora_expand_mm";
+    const AdValue* base = expand_in_place(rec) ? &operands.back() : nullptr;
     AdValue y;
     y.dtype = write_dtype(rec, "bf16");
     y.shape = {ex.M, ex.N};
     y.value.assign((size_t)(ex.M * ex.N), 0.0);
+    if (base) y.value = base->value;
     parallel_for(ex.M, kRowChunk, [&](int64_t m) {
         const int64_t s = row_slot(ex, m);
         if (s < 0) return;  // a base row: not read, not written
@@ -408,7 +434,7 @@ void lora_expand_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
                 acc += (round_t ? rounded_bf16(tv) : tv) *
                        ex.lb->value[(size_t)((s * ex.N + n) * ex.R + j)];
             }
-            y.value[(size_t)(m * ex.N + n)] = expand_scale(ex, s, n) * acc;
+            y.value[(size_t)(m * ex.N + n)] += expand_scale(ex, s, n) * acc;
         }
     });
     out->push_back(std::move(y));
@@ -430,6 +456,17 @@ void lora_expand_host_adjoint(const AdjointCall& call) {
     if ((int64_t)y_cot.value.size() != ex.M * ex.N) return;
     AdValue& t_cot = call.dc->at(0);
     if ((int64_t)t_cot.value.size() != ex.M * ex.R) return;
+
+    // The direct path of the in-place write: the buffer the write replaces reads its own
+    // cotangent back, unchanged. The walk passes it on when the row leaves the slot empty,
+    // so filling it here says the same thing the passthrough would -- and a check that calls
+    // the row without the walk, as the finite differences do, sees it either way.
+    for (size_t i = 0; i < call.rec.operands.size(); ++i)
+        if (call.rec.operands[i].written && call.rec.operands[i].in_place) {
+            AdValue& d_base = call.dc->at(i);
+            if (d_base.value.size() == y_cot.value.size())
+                for (size_t e = 0; e < y_cot.value.size(); ++e) d_base.value[e] += y_cot.value[e];
+        }
 
     const auto db_for = [&](int64_t s) -> Param* {
         const std::vector<int64_t> shape =

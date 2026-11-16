@@ -943,7 +943,26 @@ void fused_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
                                         ": the base point does not have the activation's shape");
         qin.push_back(operands.back());
     }
-    quant(q, qin, out);
+    std::vector<AdValue> qout;
+    quant(q, qin, &qout);
+    // The record's write may be marked in place: the buffer it read is the op's output over
+    // itself, and the tape's write order is the schema's. The slot's post-op value the twin
+    // writes is the elementwise part's output -- the value the engine's direct path claims to
+    // write and the only one the backward may read the slot for (the buffer's bytes are the
+    // int8 codes over a bf16 allocation, a reinterpretation nothing differentiates) --
+    // positioned where the schema's write order puts it.
+    size_t w = 0;
+    for (const Operand& o : rec.operands) {
+        if (!o.written) continue;
+        if (o.in_place) {
+            AdValue slot = y[0];
+            slot.shape = o.shape;
+            if (!o.dtype.empty()) slot.dtype = o.dtype;
+            out->push_back(std::move(slot));
+        } else {
+            out->push_back(std::move(qout[w++]));
+        }
+    }
 }
 
 // The adjoint of each fused producer: the parts' host adjoints, in the order the kernel undoes
@@ -952,9 +971,12 @@ void fused_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
 // too.
 void fused_adjoint(const AdjointCall& call, Part part) {
     const bool linearised = is_linearised(call.rec.op);
+    // The record's reads, and an in-place write is one: its slot's pre-op value is what the
+    // walk hands the row, so the elementwise part's read set is the record's reads plus the
+    // in-place write, in schema order.
     size_t reads = 0;
     for (const Operand& o : call.rec.operands)
-        if (!o.written) ++reads;
+        if (!o.written || o.in_place) ++reads;
     if (reads == 0 || call.fwd.size() < reads + 2)
         throw std::invalid_argument(
             "quant: the record must read the activation and write the codes and the scale");
@@ -1025,6 +1047,9 @@ void fused_adjoint(const AdjointCall& call, Part part) {
     }
     qfwd.push_back(codes);
     qfwd.push_back(scale);
+    // The cotangents by the writes' schema order: an in-place write is one of the writes, and it
+    // precedes the codes, so counting only the codes and the scale would hand the write's
+    // cotangent to the codes.
     const int64_t codes_cot_at = cot_slot(call.rec, codes_at);
     const int64_t scale_cot_at = cot_slot(call.rec, scale_at);
     if (codes_cot_at < 0 || (size_t)codes_cot_at >= call.cot.size() || scale_cot_at < 0 ||
@@ -1314,14 +1339,15 @@ void fused_adjoint(const AdjointCall& call, Part part) {
     // `norm_gain` then took the intermediate as the gain: `[512, 5120]` where the operand is
     // `[5120]`, row 0 of the norm's own output, and the row differentiated `dc[h]` with it.
     //
-    // The part is called with its own operand list -- the record's read operands in order, then the
-    // intermediate it wrote -- and the slots it fills are mapped back onto the fused record's.
+    // The part is called with its own operand list -- the record's read operands and in-place
+    // writes, in schema order, then the intermediate it wrote -- and the slots it fills are
+    // mapped back onto the fused record's.
     std::vector<size_t> slot;
     std::vector<AdValue> efwd;
     OpRecord erec = call.rec;
     erec.operands.clear();
     for (size_t j = 0; j < call.rec.operands.size(); ++j) {
-        if (call.rec.operands[j].written) continue;
+        if (call.rec.operands[j].written && !call.rec.operands[j].in_place) continue;
         slot.push_back(j);
         efwd.push_back(call.fwd[j]);
         erec.operands.push_back(call.rec.operands[j]);
@@ -1339,7 +1365,22 @@ void fused_adjoint(const AdjointCall& call, Part part) {
         edc[i].shape = efwd[i].shape;
         edc[i].value.assign(static_cast<size_t>(numel(efwd[i].shape)), 0.0);
     }
+    // The part's output cotangent: the quantiser's, plus the in-place write's own. The slot's
+    // post-op value the twin writes is the part's output, so the write's cotangent reaches the
+    // part's input through the part, exactly as the quantiser's does -- a passthrough would
+    // differentiate the slot at the identity, and the slot holds `part(x)`, not `x`.
     std::vector<AdValue> ecot = {qdc[0]};
+    for (int64_t j = 0; j < (int64_t)call.rec.operands.size(); ++j) {
+        const Operand& o = call.rec.operands[(size_t)j];
+        if (!o.written || !o.in_place) continue;
+        const int64_t at = cot_slot(call.rec, j);
+        if (at < 0 || (size_t)at >= call.cot.size()) continue;
+        const AdValue& oc = call.cot[(size_t)at];
+        if (oc.value.size() != ecot[0].value.size())
+            throw std::invalid_argument(
+                "quant: the in-place write's cotangent has no part output to differentiate");
+        for (size_t e = 0; e < oc.value.size(); ++e) ecot[0].value[e] += oc.value[e];
+    }
     AdjointCall ecall{erec, efwd, ecot, &edc, nullptr, ""};
     ecall.read_rows = call.read_rows;
     ecall.row_count = call.row_count;
