@@ -187,6 +187,25 @@ inline std::string write_checkpoint(const std::string& dir) {
     return dir;
 }
 
+// The directory the build keeps its fixture containers in: <build>/fixture, beside the test
+// binaries and the radiance build tree. A path the build owns, not a file somewhere in /tmp:
+// the documented flows (docs/USAGE.md's first run, docs/RUNBOOK.md's settings) name it directly,
+// and the conversion it holds is deterministic (the checkpoint is seeded, the converter and the
+// plugins are this build's), so the file at that path is the one this build wrote. An mtime
+// search of the temporary directory cannot be held to that: the host tier never removes its
+// temporary directory, so every run leaves its containers behind, and the newest one by mtime
+// anywhere under /tmp can belong to an older build. Empty when the build directory cannot be
+// read; a caller that gets none falls back to the test's own temporary directory.
+inline std::string fixture_dir() {
+    const std::string build = build_dir();
+    if (build.empty()) return {};
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path dir = fs::path(build) / "fixture";
+    fs::create_directories(dir, ec);
+    return ec ? std::string() : dir.string();
+}
+
 inline Fixture make() {
     namespace fs = std::filesystem;
 
@@ -194,10 +213,13 @@ inline Fixture make() {
     fs::remove_all(dir);
     write_checkpoint(dir.string());
     const tiny::Qwen35 s = qwen35_spec();
+    const std::string fx = fixture_dir();
 
     Fixture f;
     f.checkpoint = dir.string();
-    f.container  = (dir / "tiny_qwen35_bf16.rad").string();
+    // The container lands in the build's fixture directory; beside the checkpoint only when the
+    // build directory cannot be read (fixture_dir() says when).
+    f.container = ((fx.empty() ? dir : fs::path(fx)) / "tiny_qwen35_bf16.rad").string();
     f.n_vocab    = (int32_t)s.vocab;
     f.n_layers   = (int32_t)s.layers;
     f.hidden     = (int32_t)s.hidden;

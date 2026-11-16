@@ -34,9 +34,9 @@ Save the fenced blocks as one script under `runs/` and run it from the tree's to
   idempotent (it skips a split whose file exists), and `docs/CHATDATA.md` says what a file has to
   look like if you bring your own. The smoke run needs none of it: it trains on
   `tests/fixtures/chat_small.jsonl`, which is checked in.
-- **The tiny int8 fixture** (for the smoke run): `ctest --test-dir build -L host` once. It converts
-  the fixture checkpoint to `tiny_qwen35_w8a8.rad` in the test binary's temporary directory, which
-  is what the settings below find; `docs/FIXTURES.md` owns it.
+- **The tiny int8 fixture** (for the smoke run): `ctest --test-dir build -L host` once. It
+  converts the fixture checkpoint to `build/fixture/tiny_qwen35_w8a8.rad`, the path the settings
+  below name; `docs/FIXTURES.md` owns it.
 - **An output directory that does not exist yet.** A run makes it; one checkpoint every
   `checkpoint_every` steps holds a full copy of the adapter plus the optimiser's moments, so `du
   -sh` the first one before deciding the interval. The smoke run writes under `runs/`.
@@ -63,8 +63,9 @@ Save the fenced blocks as one script under `runs/` and run it from the tree's to
 ## 1. The run's settings
 
 One block sets the four inputs, so the rest of the file is the same whether it runs on the fixture
-or on a real container. The default container is the newest `tiny_qwen35_w8a8.rad` under the test
-temporary directory — the one `ctest -L host` just converted. `R97_DEVICE` is the card selector
+or on a real container. The default container is the int8 fixture `ctest -L host` just converted,
+at `$R97_BUILD/fixture/tiny_qwen35_w8a8.rad`: the build's own directory, so a container an older
+build left somewhere in `/tmp` cannot be the one a run trains on. `R97_DEVICE` is the card selector
 the `gpu` tests read (`docs/TESTING.md`), and it is empty here because the smoke run has no card:
 section 2's block then says what it skipped.
 
@@ -80,16 +81,11 @@ set -o pipefail
 : "${R97_SERVING_BUILD:=$PWD/build-serving}"     # the serving-only build, section 7
 : "${R97_DEVICE:=}"                              # the card's ordinal; empty = no card
 : "${RADIANCE_HOME:=$R97_BUILD/radiance-build/radiance_home}" # the build's plugins
+: "${R97_MODEL:=$R97_BUILD/fixture/tiny_qwen35_w8a8.rad}"     # the int8 fixture the host tier converted
 r97="$R97_BUILD/r97train"
 
-if [ -z "${R97_MODEL:-}" ]; then
-    containers=$(find "${RAD_TEST_TMPDIR:-${TMPDIR:-/tmp}}" -name tiny_qwen35_w8a8.rad \
-                      -printf '%T@ %p\n' | sort -rn)
-    newest=${containers%%$'\n'*}
-    R97_MODEL=${newest#* }
-fi
-[ -n "$R97_MODEL" ] || {
-    echo "runbook: no tiny container under ${RAD_TEST_TMPDIR:-${TMPDIR:-/tmp}};" \
+[ -e "$R97_MODEL" ] || {
+    echo "runbook: no tiny container at $R97_MODEL;" \
          "run 'ctest --test-dir $R97_BUILD -L host' once, or set R97_MODEL" >&2
     exit 1
 }
@@ -209,7 +205,8 @@ horizon, and `train.jsonl` the same numbers as fields.
 
 ```sh
 "$r97" train --config "$R97_RUN.conf" 2>&1 | tee "$R97_RUN.console.log" || {
-    echo "runbook: the run failed; section 9 has the frequent ones" >&2
+    echo "runbook: the run of $R97_STEPS steps on $R97_MODEL failed;" \
+         "section 9 has the frequent ones" >&2
     exit 1
 }
 
@@ -245,7 +242,7 @@ half=$((R97_STEPS / 2))
 "$r97" train --config "$R97_RUN.conf" \
     --resume "$R97_RUN/checkpoint-$(printf %09d "$half")" \
     --out "$R97_RUN-resumed" 2>&1 | tee "$R97_RUN-resumed.console.log" || {
-    echo "runbook: the resume failed; docs/CHECKPOINT.md has the refusals" >&2
+    echo "runbook: the resume of $R97_MODEL failed; docs/CHECKPOINT.md has the refusals" >&2
     exit 1
 }
 
