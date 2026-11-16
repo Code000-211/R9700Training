@@ -105,13 +105,21 @@ RESTORE boundary=1 pos=39 op=add buffer=x bytes=4096
 -- and the tier is 290/290 with no refusal. So the restore does what it claims where it is reached, and
 the host branch is never reached on the live container.
 
-**The device walk has the same gap, and it is unsettled.**
-`src/step_device.cpp:1304-1311` keeps the live pull when `block_wrote` has no entry for the buffer.
-That is a *different* condition from the host's `prev` miss -- it keys on the tape's record of which
-ops wrote what, not on the snapshotter's `before` map -- so the host run's 0 restores says nothing
-about whether the device branch is reached. Nothing measured here establishes the device side's
-reachability, and changing the device walk's snapshots without that measurement would move the very
-gradient this report is about. It is named here, with its location, rather than guessed at.
+**The device walk has the same gap, and it is reached.** `src/step_device.cpp:1304-1311` keeps the
+live pull when `block_wrote` has no entry for the buffer. `R97_DUMP_DEVICE_PULL=1` on one 2-block walk
+of the live container counts **111** such reads, of which **63** are the defect -- every one
+`rmsnorm_had_quant_i8g` reading `h` (`named=1`), the first at `pos=1429`, the position this report
+identified independently. The other 48 are `gdn_chunk_scan` reading `kv:2` with `named=0`, which the
+branch already zeroes. It is filed as #148 and left unfixed: nothing here measures whether changing it
+moves the gradient, and this report is about the gradient.
+
+**The host walk does not show the same case, and the reason is not a disagreement between the walks.**
+This container declares `rmsnorm_had_quant_i8g` among the eight ops with no host kernel, so the host
+walk substitutes it and never processes that position at all -- there is no host record at 1429 to
+compare against. An earlier draft of this paragraph read the host's 0 restores as the host's `before`
+matching while the device's `block_wrote` did not, and concluded that one of the two walks was wrong
+about block 63's write set. **That was wrong**: `block_wrote` is a superset of `before`'s keys, so a
+superset cannot miss what a subset has, and the correct reading was "the host has no record here".
 
 Two earlier attempts are recorded because they show what does **not** work. A rule in
 `src/backward.cpp` requiring a read and a write of one buffer to hold equal values failed 22 of the
