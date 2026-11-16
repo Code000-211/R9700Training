@@ -82,6 +82,14 @@ struct DeviceStepReport {
     // peak_snapshot_bytes + shared_snapshot_bytes.
     int64_t shared_snapshot_bytes = 0;
 
+    // The in-place reads with no earlier writer in their block that the walk served from the
+    // block's stored boundary (or the plan's second copy at it) instead of the live pull. The tape
+    // snapshots an operand after the op issued, so the live pull of a buffer the op itself writes
+    // holds the op's own output; the stored boundary is what the op read. A `kv:` state is not
+    // counted -- the engine cleared it before the replay, so the read enters zero -- and a read of
+    // any other buffer refuses by name.
+    int64_t in_place_restores = 0;
+
     // The card's gradient staging when the step ended (0 when the step ran without grads).
     int64_t grad_stage_bytes = 0;
 

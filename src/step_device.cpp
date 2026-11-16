@@ -1284,9 +1284,24 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 *served = true;
                 return out;
             };
+            // A boundary's residual is the block's [tokens, hidden] activation, and an in-place
+            // read with no earlier writer has no capture to serve it: the store still holds what
+            // the buffer carried on entry, which is what the read consumed.
+            const int64_t boundary_bytes = replay.store().boundary_bytes();
+            const int64_t boundary_tokens = replay.store().tokens();
+            const int64_t boundary_hidden = replay.store().hidden();
+            const uintptr_t residual_lo = reinterpret_cast<uintptr_t>(replay.residual(layer));
+            const auto in_boundary = [&](const OperandContent& c, const Operand& o) {
+                // `named` is the same test `replay.cpp`'s residual_bytes makes: a KV write's tape
+                // identity is synthetic, so it must never be read as the residual.
+                if (!c.named || c.data == nullptr || c.bytes != boundary_bytes) return false;
+                return o.shape.size() == 2 && o.shape[0] == boundary_tokens &&
+                       o.shape[1] == boundary_hidden;
+            };
             replay.replay(layer, [&snaps, &snap_record, &note_produced, &before, &block_wrote,
                                   &covered, &same_layout, &writer_rows, &writer_view, &options,
-                                  &layer](
+                                  &layer, &replay, &in_boundary, &measured, boundary_bytes,
+                                  residual_lo](
                                      const OpRecord& op,
                                      const std::vector<OperandContent>& content) {
                 // The adjoint sees the step's rows and, for attention, the q view its family
@@ -1303,32 +1318,87 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                     if (read.written || snapped.frozen[j]) continue;
                     if (!block_wrote.count(read.buffer)) {
                         // No op before this one wrote it: a frozen input, the boundary, or a
-                        // recurrent state the block reads cold. The kv: state the engine cleared
-                        // before the replay enters zero; everything else keeps the live pull.
-                        //
-                        // `R97_DUMP_DEVICE_PULL=1` names the case where the op *itself* writes the
-                        // buffer it is reading: the live pull then holds the op's own output, and
-                        // the row would differentiate at its output. That is the host snapshotter's
-                        // defect (`step_host.cpp`, fixed there by restoring the boundary residual),
-                        // and this branch keys on the tape's `block_wrote` rather than the host's
-                        // `prev` map, so the host measurement says nothing about its reach here.
-                        if (std::getenv("R97_DUMP_DEVICE_PULL") != nullptr) {
-                            bool op_writes_it = false;
-                            for (const Operand& w : shaped.operands)
-                                if (w.written && w.buffer == read.buffer) op_writes_it = true;
-                            if (op_writes_it)
+                        // recurrent state the block reads cold. `block_wrote` gains this op's own
+                        // writes below, so an op that writes the buffer it is reading is the
+                        // in-place case.
+                        bool op_writes_it = false;
+                        for (const Operand& w : shaped.operands)
+                            if (w.written && w.buffer == read.buffer) op_writes_it = true;
+                        // `R97_DUMP_DEVICE_PULL=1` names that case: the live pull holds the op's own
+                        // output, and the row would differentiate at its output.
+                        if (std::getenv("R97_DUMP_DEVICE_PULL") != nullptr && op_writes_it)
+                            std::fprintf(stderr,
+                                         "DEVPULL block=%lld pos=%lld op=%s buffer=%s "
+                                         "bytes=%lld named=%d\n",
+                                         static_cast<long long>(layer),
+                                         static_cast<long long>(op.position), op.op.c_str(),
+                                         read.buffer.c_str(),
+                                         static_cast<long long>(content[j].bytes),
+                                         content[j].named ? 1 : 0);
+                        // The engine cleared the recurrent state before the replay, so a carried
+                        // state read that no op in the block wrote yet enters zero.
+                        if (read.buffer.rfind("kv:", 0) == 0) {
+                            snapped.now[j].value.assign(snapped.now[j].value.size(), 0.0);
+                            continue;
+                        }
+                        if (!op_writes_it) continue;  // frozen input / boundary: pull is the read
+
+                        // In place with no earlier writer: the pull holds the op's own output. The
+                        // plan's second copy is tested by pointer (exact); the residual by byte
+                        // count and declared shape, as the host walk does (the int8 path reads an
+                        // `h` of its own). Either stored copy is what the op consumed.
+                        if (const void* extra = replay.store().source_extra(layer);
+                            replay.store().extra_at(layer) && extra != nullptr &&
+                            content[j].data == extra) {
+                            std::vector<uint8_t> copy(static_cast<size_t>(boundary_bytes));
+                            replay.store().read_extra(layer, copy.data());
+                            OperandContent restored = content[j];
+                            restored.data = copy.data();
+                            snapped.now[j] = snapshot(shaped.operands[j], restored, op.op.c_str(),
+                                                      op.position);
+                            ++measured.in_place_restores;
+                            if (std::getenv("R97_DUMP_RESTORE") != nullptr)
                                 std::fprintf(stderr,
-                                             "DEVPULL block=%lld pos=%lld op=%s buffer=%s "
-                                             "bytes=%lld named=%d\n",
+                                             "DEVRESTORE block=%lld pos=%lld op=%s buffer=%s "
+                                             "bytes=%lld extra=1\n",
                                              static_cast<long long>(layer),
                                              static_cast<long long>(op.position), op.op.c_str(),
                                              read.buffer.c_str(),
-                                             static_cast<long long>(content[j].bytes),
-                                             content[j].named ? 1 : 0);
+                                             static_cast<long long>(boundary_bytes));
+                            continue;
                         }
-                        if (read.buffer.rfind("kv:", 0) == 0)
-                            snapped.now[j].value.assign(snapped.now[j].value.size(), 0.0);
-                        continue;
+                        if (in_boundary(content[j], shaped.operands[j])) {
+                            std::vector<uint8_t> boundary(static_cast<size_t>(boundary_bytes));
+                            replay.store().read(layer, boundary.data());
+                            size_t offset = 0;
+                            const uintptr_t p = reinterpret_cast<uintptr_t>(content[j].data);
+                            if (residual_lo != 0 && p >= residual_lo &&
+                                p < residual_lo + static_cast<uintptr_t>(boundary_bytes))
+                                offset = static_cast<size_t>(p - residual_lo);
+                            OperandContent restored = content[j];
+                            restored.data = boundary.data() + offset;
+                            snapped.now[j] = snapshot(shaped.operands[j], restored, op.op.c_str(),
+                                                      op.position);
+                            ++measured.in_place_restores;
+                            if (std::getenv("R97_DUMP_RESTORE") != nullptr)
+                                std::fprintf(stderr,
+                                             "DEVRESTORE block=%lld pos=%lld op=%s buffer=%s "
+                                             "bytes=%lld offset=%zu\n",
+                                             static_cast<long long>(layer),
+                                             static_cast<long long>(op.position), op.op.c_str(),
+                                             read.buffer.c_str(),
+                                             static_cast<long long>(boundary_bytes), offset);
+                            continue;
+                        }
+                        throw std::runtime_error(
+                            "device step: block " + std::to_string(layer) + ": op '" + op.op +
+                            "' at position " + std::to_string(op.position) + ": operand '" +
+                            read.buffer +
+                            "' is read in place and nothing earlier in this block wrote it, so the "
+                            "live pull holds the op's own output -- the read is what the op "
+                            "consumed. This buffer is not the block's boundary residual or the "
+                            "plan's second copy at it, so there is no stored value to restore; "
+                            "refusing rather than differentiating at the output.");
                     }
                     const auto prev = before.find(read.buffer);
                     if (prev == before.end()) {
