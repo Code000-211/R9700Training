@@ -451,26 +451,24 @@ void gdn_chunk_scan_twin(const OpRecord& rec, const std::vector<AdValue>& op,
         const int64_t bos = bos_of[(size_t)n];
         const int64_t slen = len_of[(size_t)n];
         std::vector<double> S0, S1, qc, kc, vc, Ac, gc, bc, W, Vp, orow;
-        for (int64_t h = 0; h < g.H; ++h) {
-            load_state(g, op[(size_t)rH0], slot, h, &S0);
-            for (int64_t c0 = 0; c0 < slen; c0 += g.chunk) {
-                const int64_t L = (c0 + g.chunk < slen) ? g.chunk : slen - c0;
-                load_chunk(g, op, bos, h, c0, L, &qc, &kc, &vc, &Ac, &gc, &bc);
-                chunk_forward(g, qc, kc, vc, Ac, gc, bc, S0, &W, &Vp, &orow, &S1);
-                for (int64_t i = 0; i < L; ++i)
-                    for (int64_t e = 0; e < g.V; ++e)
-                        o.value[(size_t)(((bos + c0 + i) * g.H + h) * g.V + e)] =
-                            orow[(size_t)(i * g.V + e)];
-                S0.swap(S1);
-            }
-            const int64_t per = g.V * g.K;
-            const int64_t base = (slot * g.H + h) * per;
-            if (base >= 0 && base + per <= (int64_t)ht.value.size())
+        load_state(g, op[(size_t)rH0], slot, h, &S0);
+        for (int64_t c0 = 0; c0 < slen; c0 += g.chunk) {
+            const int64_t L = (c0 + g.chunk < slen) ? g.chunk : slen - c0;
+            load_chunk(g, op, bos, h, c0, L, &qc, &kc, &vc, &Ac, &gc, &bc);
+            chunk_forward(g, qc, kc, vc, Ac, gc, bc, S0, &W, &Vp, &orow, &S1);
+            for (int64_t i = 0; i < L; ++i)
                 for (int64_t e = 0; e < g.V; ++e)
-                    for (int64_t d = 0; d < g.K; ++d)
-                        ht.value[(size_t)(base + e * g.K + d)] =
-                            S0[(size_t)(d * g.V + e)];
+                    o.value[(size_t)(((bos + c0 + i) * g.H + h) * g.V + e)] =
+                        orow[(size_t)(i * g.V + e)];
+            S0.swap(S1);
         }
+        const int64_t per = g.V * g.K;
+        const int64_t base = (slot * g.H + h) * per;
+        if (base >= 0 && base + per <= (int64_t)ht.value.size())
+            for (int64_t e = 0; e < g.V; ++e)
+                for (int64_t d = 0; d < g.K; ++d)
+                    ht.value[(size_t)(base + e * g.K + d)] =
+                        S0[(size_t)(d * g.V + e)];
     };
     const int64_t units = g.N * g.H;
     if (aliased) {
