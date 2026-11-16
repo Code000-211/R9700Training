@@ -1,3 +1,29 @@
+## The guard, verified
+
+`R97_QUANT_GUARD=1` on the device walk:
+
+```
+QUANTGUARD op=rmsnorm_had_quant_i8g pos=1135 nonfinite=2608413 of 2621440 worst=nan min_scale=0.16346
+device_step_tape: threw: r97: quant adjoint: op 'rmsnorm_had_quant_i8g' at 1135: 2608413 of 2621440
+codes' cotangents divide to something that is not finite -- an Inf past f32's range, or a NaN the
+cotangent already carried (worst |cot / scale| = nan, the smallest group scale in this record is
+0.163460); the quotient is exact only while it stays inside f32, and a non-finite value there enters
+the inverse rotation and the elementwise backprop as a whole-row event, so this refuses rather than
+emitting it
+```
+
+The guard names the record, the position and the count, and refuses. `worst=nan` with
+`min_scale=0.16346` says the incoming cotangent already carried a NaN by position 1135 -- the same
+place the ticket's first all-non-finite value sits (1134).
+
+## What this leaves open
+
+The growth is the product of true Jacobians, so it cannot be made smaller without changing the
+mathematics. What remains is **why `gdn_o` is `~5e-4`**: the gated RMS norm is faithful, and it is
+faithfully amplifying a recurrence output that is four decades below O(1). If `gdn_o` should be O(1),
+the defect is in the GDN branch's forward, upstream of every row this report examined -- and that is a
+different investigation from the one this ticket opened.
+
 ## The live-scale FD: the amplifying row is correct, and the amplification is real
 
 `R97_FD_REC=1416 R97_WALK_BLOCKS=2` (position 1416 is in **layer 62**, so one block never reached it):
