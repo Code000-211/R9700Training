@@ -12,6 +12,15 @@ the inverse rotation and the elementwise backprop as a whole-row event, so this 
 emitting it
 ```
 
+The guard's own case, `R97_TEST_ONLY=quant_guard`, exercises all three arms and passes (**1 test, 0
+failed**):
+
+```
+quant guard, all groups:            r97: ... 1024 of 1024 codes' cotangents divide to something that is not finite ...
+quant guard, one group's scale large: r97: ...  512 of 1024 codes' cotangents divide to something that is not finite ...
+quant guard, quotient inside f32:   no refusal, 1024 finite values
+```
+
 The guard names the record, the position and the count, and refuses. `worst=nan` with
 `min_scale=0.16346` says the incoming cotangent already carried a NaN by position 1135 -- the same
 place the ticket's first all-non-finite value sits (1134).
