@@ -116,8 +116,10 @@ This does not fix the cotangent growth: issue 145 explains the growth as the row
 and issue 140 owns the quotient overflow. #140's fix is the mask pass's guard, not a numerical one:
 its default reports an overflowing `cot / s` and carries on, so the unguarded case still fails
 `all_finite` (two A leaves and one B leaf are non-finite, and the walk names
-`gdn_gated_rmsnorm`/`gdn_o` at position 9); `R97_QUANT_GUARD=1` turns that report into a named
-refusal, not into a finite gradient. What this measurement shows is that the walk no longer serves
+`gdn_gated_rmsnorm`/`gdn_o` at position 9). `R97_QUANT_GUARD=1` turns that report into a named
+refusal, not into a finite gradient: on the fixed tree it refuses at `rmsnorm_had_quant_i8g`
+position 1 -- 91,785 of 2,621,440 codes, worst |cot / scale| = NaN -- so the guarded run does not
+reach `all_finite` either. What this measurement shows is that the walk no longer serves
 the op's own output for any of the 63 reads, that the count is held to the tape's own count rather
 than a figure pinned to this container, and that the fix moves the gradient's finiteness by two
 orders of magnitude on the live container.
@@ -135,4 +137,6 @@ orders of magnitude on the live container.
 
 The case still fails its `all_finite` check on this container without `R97_QUANT_GUARD=1`: #140's
 default reports the overflowing quotient and carries on. With `R97_QUANT_GUARD=1` the same run
-refuses by name at that quotient; it does not make it finite. That is #140, not this change.
+refuses at `rmsnorm_had_quant_i8g` position 1 (91,785 of 2,621,440 codes, worst |cot / scale| =
+NaN); it does not make the quotient finite and does not reach `all_finite`. That is #140, not this
+change.
