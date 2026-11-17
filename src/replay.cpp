@@ -51,8 +51,8 @@ const char* plan_problem(const ResidualPlan& p) {
 
 }  // namespace
 
-ResidualStore::ResidualStore(const ResidualPlan& plan)
-    : tokens_(plan.tokens), hidden_(plan.hidden) {
+ResidualStore::ResidualStore(const ResidualPlan& plan, RadStream stream)
+    : tokens_(plan.tokens), hidden_(plan.hidden), stream_(stream) {
     if (const char* why = plan_problem(plan)) throw std::invalid_argument(why);
     extra_ = plan.extra;
     extra_slot_.assign((size_t)plan.boundaries, -1);
@@ -62,6 +62,20 @@ ResidualStore::ResidualStore(const ResidualPlan& plan)
             if (plan.extra[(size_t)b]) extra_slot_[(size_t)b] = idx++;
     }
     extra_sources_.assign((size_t)plan.boundaries, nullptr);
+    if (stream) {
+        // The device walk's form: one pinned host allocation with the card store's slot
+        // arithmetic, so a keep or a restore is a blit packet on the lane. Pageable memory would
+        // work, but the engine bounces it through an 8 MiB buffer and drains the stream per chunk
+        // (core/device/aql.cpp pageable_copy) -- a host stall at every boundary.
+        void* p = rad_dev_alloc(plan.store_bytes(), RAD_MEM_HOST_PINNED);
+        if (!p)
+            throw std::runtime_error("the host refused the residual store's pinned " +
+                                     std::to_string(plan.store_bytes()) +
+                                     " bytes: " + rad_dev_last_error());
+        host_pinned_ =
+            std::shared_ptr<void>(p, [](void* q) { rad_dev_free(q, RAD_MEM_HOST_PINNED); });
+        allocated_ = plan.store_bytes();
+    }
 }
 
 ResidualStore::ResidualStore(RadStream stream, const ResidualPlan& plan, int64_t budget_bytes)
@@ -97,6 +111,14 @@ void ResidualStore::keep(int64_t boundary, const void* data) {
             throw std::runtime_error(std::string("the card refused the boundary copy: ") +
                                        rad_dev_last_error());
         ++kept_;
+    } else if (on_pinned_host()) {
+        // The device walk: the boundary is the card's residual, so this is a stream-ordered copy
+        // into the pinned block, behind the op the observer just saw -- the ordering the card
+        // store's copy relies on too.
+        if (rad_memcpy_async(slot(boundary), data, boundary_bytes(), stream_) < 0)
+            throw std::runtime_error(std::string("the host store refused the boundary copy: ") +
+                                     rad_dev_last_error());
+        ++kept_;
     } else {
         values_.emplace_back((size_t)(tokens_ * hidden_));
         std::memcpy(values_.back().data(), data, (size_t)boundary_bytes());
@@ -117,6 +139,10 @@ void ResidualStore::keep_extra(int64_t boundary, const void* data) {
         if (rad_memcpy_async(extra_slot(boundary), data, boundary_bytes(), stream_) < 0)
             throw std::runtime_error(std::string("the card refused the extra copy: ") +
                                        rad_dev_last_error());
+    } else if (on_pinned_host()) {
+        if (rad_memcpy_async(extra_slot(boundary), data, boundary_bytes(), stream_) < 0)
+            throw std::runtime_error(std::string("the host store refused the extra copy: ") +
+                                     rad_dev_last_error());
     } else {
         extra_values_.resize((size_t)boundary + 1);
         extra_values_[(size_t)boundary].resize((size_t)(tokens_ * hidden_));
@@ -132,7 +158,9 @@ bool ResidualStore::has(int64_t boundary) const {
 
 const uint16_t* ResidualStore::at(int64_t boundary) const {
     if (on_device()) throw std::logic_error("a card-backed store has no host view; use read()");
-    return has(boundary) ? values_[(size_t)boundary].data() : nullptr;
+    if (!has(boundary)) return nullptr;
+    return on_pinned_host() ? static_cast<const uint16_t*>(slot(boundary))
+                            : values_[(size_t)boundary].data();
 }
 
 const void* ResidualStore::source(int64_t boundary) const {
@@ -150,21 +178,24 @@ const void* ResidualStore::source_extra(int64_t boundary) const {
 }
 
 int64_t ResidualStore::boundaries() const {
-    return on_device() ? kept_ : (int64_t)values_.size();
+    return on_device() || on_pinned_host() ? kept_ : (int64_t)values_.size();
 }
 
 int64_t ResidualStore::bytes() const {
-    if (on_device()) return allocated_;
+    if (on_device() || on_pinned_host()) return allocated_;
     return (boundaries() + extras_kept_) * boundary_bytes();
 }
 
 void* ResidualStore::slot(int64_t boundary) const {
-    return (uint8_t*)device_.get() + (size_t)boundary * (size_t)boundary_bytes();
+    uint8_t* base = on_device() ? static_cast<uint8_t*>(device_.get())
+                                : static_cast<uint8_t*>(host_pinned_.get());
+    return base + (size_t)boundary * (size_t)boundary_bytes();
 }
 
 void* ResidualStore::extra_slot(int64_t boundary) const {
-    return (uint8_t*)device_.get() + (size_t)extra_slot_[(size_t)boundary] *
-           (size_t)boundary_bytes();
+    uint8_t* base = on_device() ? static_cast<uint8_t*>(device_.get())
+                                : static_cast<uint8_t*>(host_pinned_.get());
+    return base + (size_t)extra_slot_[(size_t)boundary] * (size_t)boundary_bytes();
 }
 
 void ResidualStore::restore(int64_t boundary, void* dest) const {
@@ -183,6 +214,18 @@ void ResidualStore::restore(int64_t boundary, void* dest) const {
                                  extra_slot(boundary), boundary_bytes(), stream_) < 0)
                 throw std::runtime_error(std::string("the card refused the extra restore copy: ") +
                                            rad_dev_last_error());
+    } else if (on_pinned_host()) {
+        // The device walk: the block about to re-run reads these buffers on the card, so each
+        // restore is a stream-ordered copy out of the pinned block, ahead of its ops on the lane.
+        if (rad_memcpy_async(dest, slot(boundary), boundary_bytes(), stream_) < 0)
+            throw std::runtime_error(std::string("the host store refused the restore copy: ") +
+                                     rad_dev_last_error());
+        if (extra_at(boundary))
+            if (rad_memcpy_async(const_cast<void*>(source_extra(boundary)), extra_slot(boundary),
+                                 boundary_bytes(), stream_) < 0)
+                throw std::runtime_error(
+                    std::string("the host store refused the extra restore copy: ") +
+                    rad_dev_last_error());
     } else {
         std::memcpy(dest, values_[(size_t)boundary].data(), (size_t)boundary_bytes());
         if (extra_at(boundary))
@@ -199,6 +242,12 @@ void ResidualStore::read(int64_t boundary, void* host) const {
             rad_stream_sync(stream_) < 0)
             throw std::runtime_error(std::string("the card refused the read-back copy: ") +
                                        rad_dev_last_error());
+    } else if (on_pinned_host()) {
+        // The copies landed on the lane; the reader wants the bytes here and now.
+        if (rad_stream_sync(stream_) < 0)
+            throw std::runtime_error(std::string("the host store could not synchronize its "
+                                                 "stream: ") + rad_dev_last_error());
+        std::memcpy(host, slot(boundary), (size_t)boundary_bytes());
     } else {
         std::memcpy(host, values_[(size_t)boundary].data(), (size_t)boundary_bytes());
     }
@@ -214,6 +263,11 @@ void ResidualStore::read_extra(int64_t boundary, void* host) const {
             rad_stream_sync(stream_) < 0)
             throw std::runtime_error(std::string("the card refused the read-back copy: ") +
                                        rad_dev_last_error());
+    } else if (on_pinned_host()) {
+        if (rad_stream_sync(stream_) < 0)
+            throw std::runtime_error(std::string("the host store could not synchronize its "
+                                                 "stream: ") + rad_dev_last_error());
+        std::memcpy(host, extra_slot(boundary), (size_t)boundary_bytes());
     } else {
         std::memcpy(host, extra_values_[(size_t)boundary].data(), (size_t)boundary_bytes());
     }

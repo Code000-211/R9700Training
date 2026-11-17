@@ -1,7 +1,8 @@
 // r97/step_device.h -- the device join: one model's adapter gradient on one card, as a StepFn.
 //
 // The forward driver runs the batch on the device kernel tier, the residual at every layer
-// boundary is kept in one VRAM allocation, and each block is replayed from it on the card and
+// boundary is kept in one pinned host block and moved to and from the card as stream-ordered
+// copies on the step's lane, and each block is replayed from it on the card and
 // walked in reverse with the device adjoints (Side::device). The forward values the walk reads
 // are the operands' bytes: pulled back at the replay for a block, and copied at the issue for the
 // head's records, whose buffers the engine reuses before the walk runs (capture_head_record in
@@ -35,9 +36,10 @@ struct DeviceStepOptions {
     // host's headroom beside the walk's own store. A training loop never asks for them; a check
     // does, on a batch that fits.
     bool keep_boundaries = false;
-    // The VRAM the residual store may take. 0 means the card's free VRAM read when the engine is
-    // up -- after the model's load, before the step's serve -- and the store refuses with the
-    // plan's own numbers when the plan does not fit.
+    // The host memory the residual store may take. 0 means the host's available memory
+    // (/proc/meminfo's MemAvailable), read when the engine is up -- after the model's load,
+    // before the step's serve -- and the walk refuses with the plan's own numbers when the plan
+    // does not fit, before the store's pinned block is allocated.
     int64_t residual_budget_bytes = 0;
     // The rows of one head chunk: the CE loop's chunk, and the transposed product's.
     int64_t head_chunk_rows = kHeadChunkRows;
@@ -61,8 +63,8 @@ struct DeviceStepReport {
     int64_t hidden = 0;
     int64_t layers = 0;
 
-    // The card's residual store: the plan's copies, its bytes, and the free VRAM it was checked
-    // against.
+    // The residual store (pinned host, the device walk's form): the plan's copies, its bytes,
+    // and the host memory it was checked against.
     int64_t residual_boundaries = 0;
     int64_t residual_extras = 0;
     int64_t residual_store_bytes = 0;

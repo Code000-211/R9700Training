@@ -2,9 +2,9 @@
 // card, as a StepFn that comes back with the adapter's gradient.
 //
 // The join runs the batch through the forward driver on the device kernel tier (libr4d, the host
-// tier as the per-op fallback), keeps the residual at every layer boundary in one VRAM allocation
-// (r97/step_device.h's ResidualStore, on the stream the step's ops issue on -- patches/training/
-// 0122), walks each block back on the card with the device adjoints (Side::device, the rows
+// tier as the per-op fallback), keeps the residual at every layer boundary in one pinned host
+// block (r97/step_device.h's ResidualStore, over the stream the step's ops issue on -- patches/
+// training/0122), walks each block back on the card with the device adjoints (Side::device, the rows
 // libr97.so registers as the plugin loads), and flushes the adapter's gradients once, at the
 // step's end, into the ParamSet the caller passes as grads. docs/STEPS-DEVICE.md owns the path
 // and the memory it holds. A call with grads == nullptr is a true forward-only step: the forward
@@ -34,10 +34,12 @@
 //                          lora_B is exactly zero and lora_A is random at 1/sqrt(fan_in). The
 //                          forward peaks at 20.2 GiB of VRAM (docs/reports/2026-11-12-device-
 //                          forward.md, which records this exact batch's loss at 34682.089228),
-//                          the residual store adds 5 GiB -- 128 copies x 4096 x 5120 x 2 bytes,
-//                          the L+1 = 65 boundaries plus the L-1 = 63 second copies the int8 trunk
-//                          reads beside the residual (replay_layers' plan, on the card) -- so the
-//                          case declares 26 GiB to the guard. At the zero-B start the `.lora_A`
+//                          the residual store is 5 GiB of pinned host memory -- 128 copies x
+//                          4096 x 5120 x 2 bytes, the L+1 = 65 boundaries plus the L-1 = 63 second
+//                          copies the int8 trunk reads beside the residual (replay_layers' plan),
+//                          moved over the lane -- so the card's peak follows the store down and
+//                          the case's declaration follows the footprint (card_case below). At
+//                          the zero-B start the `.lora_A`
 //                          gradients are exactly zero (no cotangent reaches A's factor) while the
 //                          `.lora_B` gradients are not -- the pair that proves the chain reached
 //                          the adapter -- and one AdamW step moves only the lora_B's, at weight
@@ -287,10 +289,10 @@ void card_case(const char* test, int64_t n, bool probe) {
     const char* de = std::getenv("R97_DEVICE");
     o.device    = r97test::parse_device(de ? de : "0");
     // The container's device forward peaks at 20.2 GiB at 4096 tokens (weights, KV and the
-    // engine's arena), the residual store adds 5 GiB there and ~0.7 at 512, and the join's
-    // snapshots and the gradient staging sit beside them: the 4096 case declares 26 GiB, the
-    // 512 one 21.
-    o.need_vram = (n >= 4096) ? int64_t(26) << 30 : int64_t(21) << 30;
+    // engine's arena), the join's snapshots and the gradient staging sit beside it, and the
+    // residual store is off the card -- one pinned host block, moved over the lane: the 4096
+    // case measured ~23 GiB and declares 24, the 512 one 19.
+    o.need_vram = (n >= 4096) ? int64_t(24) << 30 : int64_t(19) << 30;
     o.bdf       = r97test::hip_bdf(o.device);  // HIP is inited only now: ROCR_VISIBLE_DEVICES is set
     wait_for_card_free(o);
     r97test::DeviceGuard guard(o);
@@ -1113,10 +1115,10 @@ static void device_step_case(const char* test, int64_t n, bool probe) {
               (n - 1 + r97::kHeadChunkRows - 1) / r97::kHeadChunkRows);
     R97_CHECK(j.at("d_hout_bytes").get<int64_t>() > 0);
 
-    // The card's residual store: the L+1 boundaries plus the second copy at every boundary a
-    // block after the first starts at -- this container's int8 trunk reads the previous block's
-    // output beside the residual -- in one VRAM allocation, checked against the card's free VRAM
-    // when the engine was up.
+    // The residual store: the L+1 boundaries plus the second copy at every boundary a block after
+    // the first starts at -- this container's int8 trunk reads the previous block's output beside
+    // the residual -- in one pinned host block, checked against the host's available memory when
+    // the engine was up.
     const int64_t store = j.at("residual_store_bytes").get<int64_t>();
     R97_CHECK(j.at("residual_boundaries").get<int64_t>() == layers + 1);
     R97_CHECK(j.at("residual_extras").get<int64_t>() == layers - 1);
@@ -1240,7 +1242,7 @@ const char* device_step_skip_reason() {
            "-DR97_PATCH_SKIP took it out (RAD_REPLAY_BLOCK is undefined)";
 #else
     return "the context-stream patch 0122 is not in this build: the store keeps its boundaries "
-           "in the card's VRAM on the stream the step's ops issue on";
+           "in one pinned host block, over the stream the step's ops issue on";
 #endif
 }
 

@@ -68,16 +68,22 @@ public:
     ResidualStore() = default;
     ResidualStore(int64_t tokens, int64_t hidden);
     // The host-backed store from a plan: the same shape as the card's, in host memory, for a run
-    // that keeps its boundaries there.
-    ResidualStore(const ResidualPlan& plan);
+    // that keeps its boundaries there. With `stream` (the device walk's use) the boundaries live
+    // in one pinned host allocation -- pinned so the card takes them in a blit packet; a pageable
+    // copy would stage through the engine's bounce buffer and drain the lane per chunk -- and
+    // keep()/restore() are stream-ordered copies on that stream (the step's lane,
+    // patches/training/0122). Copies of such a store share the allocation, as the card's do.
+    // Without `stream` (the host walk) the store keeps host vectors and memcpy()s between them.
+    ResidualStore(const ResidualPlan& plan, RadStream stream = nullptr);
     // The card-backed store: one device allocation of plan.store_bytes(), checked against
     // `budget_bytes` before it happens, kept and restored as stream-ordered copies on
     // `stream` (the step's lane, patches/training/0122). Copies of a store share the one
     // allocation; the last copy frees it.
     ResidualStore(RadStream stream, const ResidualPlan& plan, int64_t budget_bytes);
-    // Copy one boundary out of the step's buffer at `data`, a stream-ordered device copy on
-    // the card. Boundaries are kept in order from 0; a gap or a repeat throws
-    // std::out_of_range, and a null `data` std::invalid_argument.
+    // Copy one boundary out of the step's buffer at `data`: a stream-ordered copy when the store
+    // has a stream (device to host, or device to device on the card), host to host otherwise.
+    // Boundaries are kept in order from 0; a gap or a repeat throws std::out_of_range, and a
+    // null `data` std::invalid_argument.
     void keep(int64_t boundary, const void* data);
     // Keep the second copy at `boundary`, beside the residual keep() took at the same boundary:
     // the buffer the block at that boundary reads as its second input, holding what the block
@@ -96,8 +102,9 @@ public:
     // The stored bytes of `boundary`, or null when it was not kept. A card-backed store has
     // no host view; read() pulls the boundary back over the wire.
     const uint16_t* at(int64_t boundary) const;
-    // Copy the stored bytes of `boundary` back into the step buffer at `dest`, a
-    // stream-ordered device copy on the card. With it, the extra copy the plan holds at the
+    // Copy the stored bytes of `boundary` back into the step buffer at `dest`: a stream-ordered
+    // copy when the store has a stream (device to device on the card, host to device from a
+    // streamed host store), host to host otherwise. With it, the extra copy the plan holds at the
     // boundary goes back into the buffer it came out of, so the block that reads it as its
     // second input finds the forward's value. Throws std::out_of_range for a boundary that
     // was not kept and std::invalid_argument for a null `dest`.
@@ -109,8 +116,8 @@ public:
     bool extra_at(int64_t boundary) const;
     // The step buffer the extra copy at `boundary` came out of, or null when it was not kept.
     const void* source_extra(int64_t boundary) const;
-    // Copy the stored bytes of `boundary` into the host buffer at `host`; on the card the
-    // stream is synchronized. Throws like restore().
+    // Copy the stored bytes of `boundary` into the host buffer at `host`; a streamed store
+    // synchronizes that stream first. Throws like restore().
     void read(int64_t boundary, void* host) const;
 
     // The second copy the plan holds at `boundary`, read back the same way: a reader checking a
@@ -119,6 +126,9 @@ public:
 
     // True when the store is the card's one allocation rather than host memory.
     bool on_device() const { return device_ != nullptr; }
+    // True when the boundaries are one pinned host allocation the card is handed in copies: the
+    // streamed host form the device walk builds. False for the plain host store and the card's.
+    bool on_pinned_host() const { return host_pinned_ != nullptr; }
 
 private:
     void* slot(int64_t boundary) const;
@@ -129,10 +139,13 @@ private:
     std::vector<char> extra_;          // the plan's extra map, parallel to the boundaries
     std::vector<int64_t> extra_slot_;  // per boundary: the extra copy's slot in the allocation, -1
     RadStream stream_ = nullptr;
-    std::shared_ptr<void> device_;  // the one allocation; copies of the store share it
-    int64_t kept_ = 0;              // the boundaries kept so far, on the card
-    int64_t extras_kept_ = 0;       // the extra copies kept so far
-    int64_t allocated_ = 0;         // bytes of the allocation, on the card
+    std::shared_ptr<void> device_;  // the card's one allocation; copies of the store share it
+    // The streamed host store's one allocation (RAD_MEM_HOST_PINNED): the same slot arithmetic as
+    // the card's, shared by copies the same way. Null for the plain host store and the card's.
+    std::shared_ptr<void> host_pinned_;
+    int64_t kept_ = 0;         // the boundaries kept so far, card or pinned host store
+    int64_t extras_kept_ = 0;  // the extra copies kept so far
+    int64_t allocated_ = 0;    // bytes of the one allocation, card or pinned host
     std::vector<std::vector<uint16_t>> values_;
     std::vector<const void*> sources_;
     std::vector<std::vector<uint16_t>> extra_values_;  // host; per boundary
