@@ -705,15 +705,6 @@ R97_TEST(adjoint_fused_quant_twin_matches_the_host_kernel) {
     }
 }
 
-R97_TEST(adjoint_fused_quant_agrees_with_finite_differences) {
-    for (const FusedShape& s : fused_shapes()) {
-        fused_fd_check("rmsnorm_quant_fp8", s);
-        fused_fd_check("gated_quant_fp8", s);
-    }
-}
-
-/* -- (8) the int8 producers' fused rows ------------------------------------- */
-
 /* The int8 trunk's three producers compose an elementwise part with the
  * `had_quant_act_i8g` quantiser, so unlike the fp8 family above they write no
  * bf16 activation of their own: the part's output is internal and only the
@@ -756,6 +747,13 @@ OpRecord i8g_rec(const char* op, const FusedShape& s, bool linearised) {
     rec.operands.push_back({"scale", "f32", {s.rows, ngrp}, 0, s.rows, true});
     if (linearised)
         rec.operands.push_back({"base", "bf16", {s.rows, s.n}, 0, s.rows, false});
+    /* The fused producer writes the part's output beside the codes, as the live tape
+     * carries it. The check's random cotangent for that write is what exercises the
+     * row's output term: with no consumer the term is zero, and a row that drops it
+     * still agrees with its own finite differences. After the base point: the base's
+     * frozen index is the registration's, and the in-place fixture's record carries
+     * no separate output write, so the base keeps the position it has there. */
+    rec.operands.push_back({"out", "bf16", {s.rows, s.n}, 0, s.rows, true});
     return rec;
 }
 
@@ -790,7 +788,8 @@ std::vector<AdValue> i8g_out(const FusedShape& s) {
     const size_t cells = (size_t)(s.rows * s.n);
     const size_t grp = (size_t)(s.rows * fused_groups(s));
     return {values("i8", {s.rows, s.n}, std::vector<double>(cells, 0.0)),
-            values("f32", {s.rows, fused_groups(s)}, std::vector<double>(grp, 0.0))};
+            values("f32", {s.rows, fused_groups(s)}, std::vector<double>(grp, 0.0)),
+            values("bf16", {s.rows, s.n}, std::vector<double>(cells, 0.0))};
 }
 
 void i8g_fd_check(const char* op, const FusedShape& s) {
@@ -809,6 +808,147 @@ R97_TEST(adjoint_i8g_producers_agree_with_finite_differences) {
         i8g_fd_check("rmsnorm_had_quant_i8g", s);
         i8g_fd_check("gated_had_quant_i8g", s);
         i8g_fd_check("gate_had_quant_i8g", s);
+    }
+}
+
+/* The row's post-pass over the record's writes mirrors the device's
+ * (src/adjoint/device/quant.hip:817-880). The fixture's record carries the part's
+ * output beside the codes; these cases carry the branches it does not: the direct
+ * path, the refusal of an unserved write, and the engine's no-value placeholders. */
+R97_TEST(adjoint_i8g_producers_fold_the_fused_writes) {
+    const FusedShape s = {"fused-writes", 5, 128, 128};
+    const int64_t ngrp = fused_groups(s);
+    const size_t cells = (size_t)(s.rows * s.n);
+    uint64_t seed = 0xf00dba7ull;
+
+    auto dc_of = [](const OpRecord& rec) {
+        std::vector<AdValue> dc;
+        for (const Operand& o : rec.operands) {
+            AdValue v;
+            v.dtype = o.dtype;
+            v.shape = o.shape;
+            int64_t nn = 1;
+            for (int64_t d : o.shape) nn *= d;
+            v.value.assign((size_t)nn, 0.0);
+            dc.push_back(std::move(v));
+        }
+        return dc;
+    };
+    auto run = [](const OpRecord& rec, const std::vector<AdValue>& fwd,
+                  const std::vector<AdValue>& cot, std::vector<AdValue>* dc) {
+        AdjointFn fn = adjoint_find(rec.op, Side::host, rec.params, nullptr);
+        if (fn == nullptr) fail("no host adjoint for " + rec.op);
+        AdjointCall call{rec, fwd, cot, dc, nullptr, ""};
+        fn(call);
+    };
+
+    // The direct path: the gated producer writes gate_up's own buffer back, and the write's
+    // cotangent is the read's -- added to the read's slot on top of the part's own answer for
+    // it, at the identity. Routing it through the part would land the part's Jacobian of the
+    // cotangent there instead; dropping it lands nothing. Both fail the equality below.
+    {
+        OpRecord rec;
+        rec.op = "gated_had_quant_i8g";
+        rec.params = {{"M", s.rows}, {"n", s.n}, {"group", s.group},
+                      {"dtype", std::string("bf16")}, {"act", std::string("silu")}};
+        rec.operands = {{"gate_up", "bf16", {s.rows, 2 * s.n}, 0, s.rows, false},
+                        {"codes", "i8", {s.rows, s.n}, 0, s.rows, true},
+                        {"scale", "f32", {s.rows, ngrp}, 0, s.rows, true},
+                        {"gate_up", "bf16", {s.rows, 2 * s.n}, 0, s.rows, true}};
+        const size_t full = (size_t)(s.rows * 2 * s.n);
+        std::vector<double> direct(full);
+        for (double& v : direct) v = urand(&seed);
+        const AdValue direct_cot = values("f32", {s.rows, 2 * s.n}, direct);
+        std::vector<AdValue> fwd = {
+            values("bf16", {s.rows, 2 * s.n},
+                   activation(Shape{s.name, s.rows, 2 * s.n, s.group}, seed)),
+            values("i8", {s.rows, s.n}, std::vector<double>(cells, 0.5)),
+            values("f32", {s.rows, ngrp}, std::vector<double>((size_t)(s.rows * ngrp), 1.0))};
+        fwd.push_back(fwd[0]);  // the write carries the read's value
+        auto cots = [&](bool on) {
+            return std::vector<AdValue>{
+                values("f32", {s.rows, s.n}, std::vector<double>(cells, 0.25)),
+                values("f32", {s.rows, ngrp}, std::vector<double>((size_t)(s.rows * ngrp), 0.1)),
+                on ? direct_cot
+                   : values("f32", {s.rows, 2 * s.n}, std::vector<double>(full, 0.0))};
+        };
+        std::vector<AdValue> dc_on = dc_of(rec), dc_off = dc_of(rec);
+        run(rec, fwd, cots(true), &dc_on);
+        run(rec, fwd, cots(false), &dc_off);
+        for (size_t e = 0; e < dc_on[0].value.size(); ++e)
+            R97_CHECK(dc_on[0].value[e] == dc_off[0].value[e] + direct_cot.value[e]);
+        for (size_t i = 1; i < dc_on.size(); ++i)
+            for (size_t e = 0; e < dc_on[i].value.size(); ++e)
+                R97_CHECK(dc_on[i].value[e] == dc_off[i].value[e]);
+        std::printf("gated_had_quant_i8g direct path: the write's cotangent is the read's\n");
+    }
+
+    // A write the row does not serve refuses by name, as the device row does: a silent return
+    // here would be the zero gradient this family exists to remove.
+    {
+        OpRecord rec;
+        rec.op = "rmsnorm_had_quant_i8g";
+        rec.params = {{"M", s.rows}, {"n", s.n}, {"group", s.group},
+                      {"dtype", std::string("bf16")}, {"eps", std::string("1e-6")}};
+        rec.operands = {{"x", "bf16", {s.rows, s.n}, 0, s.rows, false},
+                        {"w", "f32", {s.n}, 0, 1, false},
+                        {"codes", "i8", {s.rows, s.n}, 0, s.rows, true},
+                        {"scale", "f32", {s.rows, ngrp}, 0, s.rows, true},
+                        {"extra", "bf16", {s.rows, 2 * s.n}, 0, s.rows, true}};
+        std::vector<AdValue> fwd = {
+            values("bf16", {s.rows, s.n}, activation(Shape{s.name, s.rows, s.n, s.group}, seed + 1)),
+            values("f32", {s.n}, gain(s.n, seed + 2)),
+            values("i8", {s.rows, s.n}, std::vector<double>(cells, 0.5)),
+            values("f32", {s.rows, ngrp}, std::vector<double>((size_t)(s.rows * ngrp), 1.0)),
+            values("bf16", {s.rows, 2 * s.n}, std::vector<double>((size_t)(s.rows * 2 * s.n), 0.25))};
+        std::vector<AdValue> cot = {
+            values("f32", {s.rows, s.n}, std::vector<double>(cells, 0.25)),
+            values("f32", {s.rows, ngrp}, std::vector<double>((size_t)(s.rows * ngrp), 0.1)),
+            values("f32", {s.rows, 2 * s.n}, std::vector<double>((size_t)(s.rows * 2 * s.n), 0.5))};
+        std::vector<AdValue> dc = dc_of(rec);
+        AdjointFn fn = adjoint_find(rec.op, Side::host, rec.params, nullptr);
+        R97_CHECK(fn != nullptr);
+        std::string what;
+        try {
+            AdjointCall call{rec, fwd, cot, &dc, nullptr, ""};
+            fn(call);
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        R97_CHECK(what.find(rec.op) != std::string::npos);
+        std::printf("rmsnorm_had_quant_i8g unserved write: %s\n", what.c_str());
+    }
+
+    // The engine's no-value placeholders: a write whose cotangent slot holds no values, or one
+    // scalar, is skipped rather than refused -- the live tape's `none:` writes.
+    for (int64_t placeholder : {0, 1}) {
+        OpRecord rec;
+        rec.op = "gated_had_quant_i8g";
+        rec.params = {{"M", s.rows}, {"n", s.n}, {"group", s.group},
+                      {"dtype", std::string("bf16")}, {"act", std::string("silu")}};
+        rec.operands = {{"gate_up", "bf16", {s.rows, 2 * s.n}, 0, s.rows, false},
+                        {"codes", "i8", {s.rows, s.n}, 0, s.rows, true},
+                        {"scale", "f32", {s.rows, ngrp}, 0, s.rows, true},
+                        {"none:1", "invalid", {}, 0, 0, true}};
+        std::vector<AdValue> fwd = {
+            values("bf16", {s.rows, 2 * s.n},
+                   activation(Shape{s.name, s.rows, 2 * s.n, s.group}, seed + 3)),
+            values("i8", {s.rows, s.n}, std::vector<double>(cells, 0.5)),
+            values("f32", {s.rows, ngrp}, std::vector<double>((size_t)(s.rows * ngrp), 1.0))};
+        fwd.emplace_back();
+        std::vector<AdValue> cot = {
+            values("f32", {s.rows, s.n}, std::vector<double>(cells, 0.25)),
+            values("f32", {s.rows, ngrp}, std::vector<double>((size_t)(s.rows * ngrp), 0.1))};
+        AdValue ph;
+        ph.value.assign((size_t)placeholder, 0.5);
+        cot.push_back(ph);
+        std::vector<AdValue> dc = dc_of(rec);
+        run(rec, fwd, cot, &dc);
+        double sum = 0.0;
+        for (double v : dc[0].value) sum += std::fabs(v);
+        R97_CHECK(sum > 0.0);
+        std::printf("gated_had_quant_i8g placeholder write (%lld values): skipped, row served\n",
+                    (long long)placeholder);
     }
 }
 

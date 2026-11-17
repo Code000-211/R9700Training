@@ -1845,6 +1845,10 @@ at those magnitudes f32 staging is not enough anywhere on this path.
   here -- closing it needs the `_ste` fixture to consume the bf16 output, or the new term ships
   untested.
 
+  **Fixed since, in the #142 branch:** the host row folds the writes' cotangents the device does
+  (`docs/reports/2026-11-17-int8-fused-output-cotangent.md`), and the fixtures consume the output,
+  so the term is no longer zero on either side of the argument.
+
 - `src/adjoint/host/gdn_scan.cpp:446-455`: the twin's `unit()` computes `n = u/H`, `h = u%H`, then
   **shadows `h`** with the loop `for (int64_t h = 0; h < g.H; ++h)`, so each of the `N*H` units
   replays every head of its sequence -- values unchanged, `H`x the work (`H=48` live). The adjoint is
