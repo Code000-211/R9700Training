@@ -66,7 +66,8 @@ record itself also writes, with no earlier op in the block writing the buffer an
 state. It then holds `DeviceStepReport::in_place_restores` to that count (and requires it positive)
 in the child, and checks the same two fields from the results JSON in the parent. The parent's
 check runs immediately after the results headline, before the `all_finite` check this container
-still fails under issue 140.
+still fails without `R97_QUANT_GUARD=1`: issue 140's guard reports the overflowing quotient and
+carries on by default.
 
 ## What was measured
 
@@ -84,7 +85,7 @@ the same run; every difference below is the walk's.
 | loss | 7371.591348378961 | 7371.591348378961 |
 | loss_after (one AdamW step) | 6347.883966664209 | 7206.33404700259 |
 | step (fwd / head / bwd) | 314.5 s (47.1 / 0.8 / 264.4) | 324.8 s (46.7 / 0.8 / 275.1) |
-| `all_finite` | false | false |
+| `all_finite` (no `R97_QUANT_GUARD`) | false | false |
 | first non-finite cotangent | `gdn_gated_rmsnorm`, `gdn_o`[0] at position **1143** | `gdn_gated_rmsnorm`, `gdn_o`[0] at position **9** |
 | `n_a_finite_nonzero` / `n_b_finite_nonzero` | **82 / 400**, **82 / 400** | **398 / 400**, **399 / 400** |
 | `n_zero_a` / `n_zero_b` | 0, 0 | 0, 0 |
@@ -112,11 +113,14 @@ row-level question issue 144's checks own, not this measurement's.
 ## What this does not claim
 
 This does not fix the cotangent growth: issue 145 explains the growth as the rows' own Jacobians,
-and issue 140 owns the quotient overflow. The case still fails `all_finite` (two A leaves and one B
-leaf are non-finite, and the walk names `gdn_gated_rmsnorm`/`gdn_o` at position 9). What this
-measurement shows is that the walk no longer serves the op's own output for any of the 63 reads,
-that the count is held to the tape's own count rather than a figure pinned to this container, and
-that the fix moves the gradient's finiteness by two orders of magnitude on the live container.
+and issue 140 owns the quotient overflow. #140's fix is the mask pass's guard, not a numerical one:
+its default reports an overflowing `cot / s` and carries on, so the unguarded case still fails
+`all_finite` (two A leaves and one B leaf are non-finite, and the walk names
+`gdn_gated_rmsnorm`/`gdn_o` at position 9); `R97_QUANT_GUARD=1` turns that report into a named
+refusal, not into a finite gradient. What this measurement shows is that the walk no longer serves
+the op's own output for any of the 63 reads, that the count is held to the tape's own count rather
+than a figure pinned to this container, and that the fix moves the gradient's finiteness by two
+orders of magnitude on the live container.
 
 ## Reproducing
 
@@ -129,4 +133,6 @@ that the fix moves the gradient's finiteness by two orders of magnitude on the l
 /home/juup/ai-setups/aijuus/looping/local-radiance-window.sh close
 ```
 
-The case still fails its `all_finite` check on this container: that is issue 140, not this change.
+The case still fails its `all_finite` check on this container without `R97_QUANT_GUARD=1`: #140's
+default reports the overflowing quotient and carries on. With `R97_QUANT_GUARD=1` the same run
+refuses by name at that quotient; it does not make it finite. That is #140, not this change.
