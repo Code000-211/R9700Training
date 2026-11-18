@@ -10,13 +10,10 @@
 //   * the harness rejects a deliberately wrong kernel rather than accepting anything plausible;
 //   * the scratch allocator reports its high-water mark, which the harness prints for a kernel.
 //
-// The reference is docs/adjoints/quant.md's: the composition of the host adjoints of the family's
-// parts. A fused producer's record is the quantiser's (a had_quant_act_i8g record over the
-// elementwise part's output) and the elementwise op's, so `reference()` runs those two host
-// adjoints in the order the kernel undoes them, and the twin the harness builds the forward with
-// is the same composition of the parts' twins. The host family registers that composition under
-// each producer's name (src/adjoint/host/quant.cpp), so the forward values, the device adjoint's
-// recomputed intermediate and the reference all read one definition of it.
+// The reference is the host row itself: the composition of the family's parts' host adjoints
+// (docs/adjoints/quant.md), which src/adjoint/host/quant.cpp registers under each producer's
+// name and the harness looks up. A reference that is not the row would compare the device
+// against a function the walk never runs, and the two could disagree where the walk runs.
 //
 // Needs one R9700 (gfx1201, 32 GB) or similar; runs under the GPU test guard. No container is
 // read: the real shapes are numbers from the design, so this test does not carry the `model` label.
@@ -45,100 +42,8 @@ using device_check::numel;
 // of had_quant_act_i8g, which is the whole of that op.
 enum class Part { none, rmsnorm, silu_mul, sigmoid_mul };
 
-const char* part_op(Part p) {
-    switch (p) {
-        case Part::rmsnorm: return "rmsnorm";
-        case Part::silu_mul: return "silu_mul";
-        case Part::sigmoid_mul: return "act_mul";
-        case Part::none: break;
-    }
-    return "";
-}
-
-// The params a part's host adjoint reads: rmsnorm's gain offset and its scale are the record's,
-// and act_mul needs the name of its activation. The fused records carry them already, so a part's
-// twin and adjoint are handed the fused record itself.
 Operand read_operand(const char* buffer, int64_t rows, int64_t width) {
     return Operand{buffer, "bf16", {rows, width}, 0, rows, false};
-}
-
-int64_t int_param(const std::vector<OpParam>& params, const char* name) {
-    for (const OpParam& p : params) {
-        if (p.first != name) continue;
-        if (const int64_t* i = std::get_if<int64_t>(&p.second)) return *i;
-        if (const std::string* s = std::get_if<std::string>(&p.second)) return std::stoll(*s);
-    }
-    throw std::runtime_error(std::string("the record has no integer parameter '") + name + "'");
-}
-
-// The quantiser's own record: the fused producer's intermediate is the quantiser's activation, so
-// the part is served by the family's existing host twin and host adjoint.
-OpRecord quant_record(int64_t rows, int64_t n, int64_t group) {
-    OpRecord q;
-    q.op = "had_quant_act_i8g";
-    q.params = {{"M", rows}, {"n", n}, {"group", group}, {"dtype", std::string("bf16")}};
-    q.operands = {
-        Operand{"x", "bf16", {rows, n}, 0, rows, false},
-        Operand{"q", "i8", {rows, n}, 0, rows, true},
-        Operand{"scale", "f32", {rows, n / group}, 0, rows, true},
-    };
-    return q;
-}
-
-// -- the reference: the parts' host adjoints, in the order the kernel undoes them -------------
-
-// One read operand's cotangent is the quantiser's output cotangent; the elementwise part's adjoint
-// then folds it into the read operands' slots, which is where the device kernel must land too.
-void reference(AdjointCall& call, Part part) {
-    size_t reads = 0;
-    for (const Operand& o : call.rec.operands)
-        if (!o.written) ++reads;
-    const int64_t n = int_param(call.rec.params, "n");
-    const int64_t group = int_param(call.rec.params, "group");
-    const AdValue& codes = call.fwd.at(reads);
-    const AdValue& scale = call.fwd.at(reads + 1);
-
-    std::vector<AdValue> y;  // the intermediate, when the fused part wrote one
-    const AdValue* x = &call.fwd.at(0);
-    if (part != Part::none) {
-        TwinFn elem = twin_find(part_op(part), call.rec.params, nullptr);
-        if (!elem) throw std::runtime_error(std::string("no twin for ") + part_op(part));
-        elem(call.rec, call.fwd, &y);
-        x = &y.at(0);
-    }
-
-    const OpRecord q = quant_record(codes.shape.at(0), n, group);
-    std::vector<AdValue> qfwd = {*x, codes, scale};
-    std::vector<AdValue> qcot = {call.cot.at(0), call.cot.at(1)};
-    std::vector<AdValue> qdc;
-    for (const Operand& o : q.operands) {
-        AdValue v;
-        v.dtype = o.dtype;
-        v.shape = o.shape;
-        v.value.assign((size_t)numel(o.shape), 0.0);
-        qdc.push_back(std::move(v));
-    }
-    AdjointCall qcall{q, qfwd, qcot, &qdc, nullptr, ""};
-    AdjointFn quant = adjoint_find(q.op, Side::host, q.params, nullptr);
-    if (!quant) throw std::runtime_error("no host adjoint for had_quant_act_i8g");
-    quant(qcall);
-
-    if (part == Part::none) {
-        AdValue& d = call.dc->at(0);
-        for (size_t i = 0; i < d.value.size(); ++i) d.value[i] += qdc.at(0).value[i];
-        return;
-    }
-
-    // The elementwise adjoint takes the parts' operands and the intermediate they wrote; it adds
-    // its cotangents into the slots the parts' read operands hold, which the harness zeroed.
-    std::vector<AdValue> efwd(call.fwd.begin(),
-                              call.fwd.begin() + static_cast<std::ptrdiff_t>(reads));
-    efwd.push_back(y.at(0));
-    std::vector<AdValue> ecot = {qdc.at(0)};
-    AdjointCall ecall{call.rec, efwd, ecot, call.dc, nullptr, ""};
-    AdjointFn elem = adjoint_find(part_op(part), Side::host, call.rec.params, nullptr);
-    if (!elem) throw std::runtime_error(std::string("no host adjoint for ") + part_op(part));
-    elem(ecall);
 }
 
 // -- the cases --------------------------------------------------------------
@@ -200,8 +105,14 @@ device_check::Case quant_case(const Shape& s, Part part, uint64_t seed) {
         c.in = {device_check::random_value("bf16", {rows, n}, &seed),
                 device_check::random_value("bf16", {rows, n}, &seed)};
     }
+    // The fused producer writes the part's output beside the codes, and a consumer's
+    // cotangent for it is what the row's output term differentiates. Without it the term is
+    // zero, and a row that drops it agrees with the other side anyway.
+    if (part != Part::none)
+        c.rec.operands.push_back(Operand{"out_bf16", "bf16", {rows, n}, 0, rows, true});
     c.cot = {device_check::random_value("f32", {rows, n}, &seed),
              device_check::random_value("f32", {rows, ngrp}, &seed)};
+    if (part != Part::none) c.cot.push_back(device_check::random_value("f32", {rows, n}, &seed));
     c.label = std::string(s.label);
     return c;
 }
@@ -461,6 +372,34 @@ void live_gate_shape() {
     }
 }
 
+// The direct path: a write over a buffer the record also reads. The engine writes the
+// elementwise input back, so the write's cotangent is the read's, and both rows must land it on
+// the read's slot at the identity. The schema's cases carry no such write, so the branch is
+// pinned here, where device and host are the registered rows -- the same function on both sides.
+void direct_path_case() {
+    const int64_t rows = 4, n = 128, group = 128, ngrp = n / group;
+    uint64_t seed = 0xd17ec5ull;
+    device_check::Case c;
+    c.rec.position = 0;
+    c.rec.op = "gated_had_quant_i8g";
+    c.rec.params = {{"M", rows}, {"n", n}, {"group", group}, {"dtype", std::string("bf16")}};
+    c.rec.operands = {read_operand("gate_up", rows, 2 * n),
+                      Operand{"q", "i8", {rows, n}, 0, rows, true},
+                      Operand{"scale", "f32", {rows, ngrp}, 0, rows, true},
+                      Operand{"gate_up", "bf16", {rows, 2 * n}, 0, rows, true}};
+    c.in = {device_check::random_value("bf16", {rows, 2 * n}, &seed)};
+    c.cot = {device_check::random_value("f32", {rows, n}, &seed),
+             device_check::random_value("f32", {rows, ngrp}, &seed),
+             device_check::random_value("f32", {rows, 2 * n}, &seed)};
+    c.label = "direct path, the write over the read's buffer";
+    const device_check::Report r = device_check::check(c);
+    device_check::require(r);
+    R97_CHECK(r.scratch_peak > 0);
+    std::printf("%s direct path: device == host, the write's cotangent on the read's slot, "
+                "scratch peak %lld KiB\n",
+                c.rec.op.c_str(), (long long)(r.scratch_peak / 1024));
+}
+
 void run() {
     const auto options = device_check::guard_options(int64_t(1) << 30);
     const r97test::DeviceGuard guard(options);
@@ -499,8 +438,10 @@ void run() {
     for (Part part : parts) {
         for (const Shape& s : kShapes) {
             const device_check::Case c = quant_case(s, part, seed++);
-            device_check::HostRef ref = [part](AdjointCall& call) { reference(call, part); };
-            const device_check::Report r = device_check::check(c, nullptr, ref);
+            // No explicit reference: the harness looks up the registered host row, the
+            // composition src/adjoint/host/quant.cpp registers under the producer's name, so
+            // device and host are the same function.
+            const device_check::Report r = device_check::check(c);
             device_check::require(r);
             R97_CHECK(r.scratch_peak > 0);  // the kernel took its buffers from the allocator
             std::printf("%s %s: device == the parts' host adjoints, scratch peak %lld KiB\n",
@@ -512,8 +453,7 @@ void run() {
     // A kernel that skips the rotation and the mask must be rejected, in x's slot.
     {
         const device_check::Case c = quant_case(kShapes[0], Part::rmsnorm, 0xa11ceull);
-        device_check::HostRef ref = [](AdjointCall& call) { reference(call, Part::rmsnorm); };
-        const device_check::Report wrong = device_check::check(c, wrong_quant_adjoint, ref);
+        const device_check::Report wrong = device_check::check(c, wrong_quant_adjoint);
         R97_CHECK(!wrong.ok);
         R97_CHECK(wrong.first_slot == 0);
         std::printf("rejected the wrong kernel: %s\n", wrong.note.c_str());
@@ -523,6 +463,7 @@ void run() {
     // gate record's own widths, which its params do not name.
     fused_tape_shapes();
     live_gate_shape();
+    direct_path_case();
 }
 
 }  // namespace

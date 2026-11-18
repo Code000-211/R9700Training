@@ -945,23 +945,54 @@ void fused_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
     }
     std::vector<AdValue> qout;
     quant(q, qin, &qout);
-    // The record's write may be marked in place: the buffer it read is the op's output over
-    // itself, and the tape's write order is the schema's. The slot's post-op value the twin
-    // writes is the elementwise part's output -- the value the engine's direct path claims to
-    // write and the only one the backward may read the slot for (the buffer's bytes are the
-    // int8 codes over a bf16 allocation, a reinterpretation nothing differentiates) --
-    // positioned where the schema's write order puts it.
-    size_t w = 0;
-    for (const Operand& o : rec.operands) {
+    // The record's writes, in the schema's write order. The codes and the scale are the
+    // quantiser's, found by dtype and shape as the row finds them. An in-place write is the
+    // elementwise part's output over the read buffer it covers -- the buffer's bytes are the
+    // int8 codes over a bf16 allocation, a reinterpretation nothing differentiates -- and a
+    // further write of the part's own width is that output to a fresh buffer, which the live
+    // tape's fused producers carry beside the codes. A write of neither role is the engine's
+    // direct path or no-value placeholder: over a buffer the record also reads it carries the
+    // read's value (the backward differentiates it at the identity), else it carries the
+    // operand's shape and no forward fact.
+    int64_t codes_at = -1, scale_at = -1;
+    for (size_t j = 0; j < rec.operands.size(); ++j) {
+        const Operand& o = rec.operands[j];
+        if (!o.written || o.dtype.empty() || o.shape.empty()) continue;
+        if (codes_at < 0 && (o.dtype == "i8" || o.dtype == "fp8_e4m3" || o.dtype == "fp8_e5m2") &&
+            o.shape.size() == 2)
+            codes_at = (int64_t)j;
+        else if (scale_at < 0 && o.dtype == "f32" && o.shape.size() == 2)
+            scale_at = (int64_t)j;
+    }
+    for (size_t j = 0; j < rec.operands.size(); ++j) {
+        const Operand& o = rec.operands[j];
         if (!o.written) continue;
-        if (o.in_place) {
-            AdValue slot = y[0];
-            slot.shape = o.shape;
-            if (!o.dtype.empty()) slot.dtype = o.dtype;
-            out->push_back(std::move(slot));
-        } else {
-            out->push_back(std::move(qout[w++]));
+        if (j == (size_t)codes_at || j == (size_t)scale_at) {
+            out->push_back(std::move(qout[(size_t)(j == (size_t)codes_at ? 0 : 1)]));
+            continue;
         }
+        AdValue slot;
+        slot.shape = o.shape;
+        if (!o.dtype.empty()) slot.dtype = o.dtype;
+        int64_t n_slot = 1;
+        for (int64_t d : o.shape) n_slot *= d;
+        if (o.in_place || n_slot == (int64_t)y[0].value.size())
+            slot.value = y[0].value;
+        else {
+            // The direct path: the write over a buffer the record also reads carries the read's
+            // value, and the backward differentiates it at the identity.
+            slot.value.assign((size_t)n_slot, 0.0);
+            size_t read_index = 0;
+            for (size_t k = 0; k < j; ++k) {
+                const Operand& p = rec.operands[k];
+                const bool in_list = !p.written || p.in_place;
+                if (!p.written && p.buffer == o.buffer &&
+                    (int64_t)operands[read_index].value.size() == n_slot)
+                    slot.value = operands[read_index].value;
+                if (in_list) ++read_index;
+            }
+        }
+        out->push_back(std::move(slot));
     }
 }
 
@@ -986,7 +1017,8 @@ void fused_adjoint(const AdjointCall& call, Part part) {
     if (call.dc == nullptr || call.dc->size() < reads)
         throw std::invalid_argument("quant: the walk handed no room for the activation's cotangent");
     // The codes and the scale by dtype and shape, never by position -- under `_ste` the base point
-    // is appended after the writes, so counting the reads lands one slot past the codes.
+    // is appended after the codes and the scale, so the reads and the writes are interleaved and
+    // a counted position is wrong.
     int64_t codes_at = -1, scale_at = -1;
     written_codes_and_scale(call, &codes_at, &scale_at);
     if (codes_at < 0 || scale_at < 0)
@@ -1039,11 +1071,21 @@ void fused_adjoint(const AdjointCall& call, Part part) {
 
     const OpRecord q = had_quant_record(rows, n, group, linearised);
     std::vector<AdValue> qfwd = {y[0]};
+    // The base point, when the row is linearised: the record's last read, the operand the check
+    // appends for the STE. Found by that role, not by `fwd.back()` -- the output's write is
+    // appended after the base in the producer's record, and `back()` would take it.
+    int64_t base_at = -1;
     if (linearised) {
-        if (call.fwd.empty() || call.fwd.back().value.size() != y[0].value.size())
+        for (int64_t k = (int64_t)call.rec.operands.size() - 1; k >= 0; --k)
+            if (!call.rec.operands[(size_t)k].written) {
+                base_at = k;
+                break;
+            }
+        if (base_at < 0 || (size_t)base_at >= call.fwd.size() ||
+            call.fwd[(size_t)base_at].value.size() != (size_t)y[0].value.size())
             throw std::invalid_argument(std::string("quant: ") + call.rec.op +
                                         ": the base point does not have the activation's shape");
-        qfwd.push_back(call.fwd.back());
+        qfwd.push_back(call.fwd[(size_t)base_at]);
     }
     qfwd.push_back(codes);
     qfwd.push_back(scale);
@@ -1085,7 +1127,8 @@ void fused_adjoint(const AdjointCall& call, Part part) {
     if (const char* dq = std::getenv("R97_DUMP_QUANT"); dq != nullptr && dq[0] == '1') {
         std::vector<AdValue> twin_out;
         std::vector<AdValue> qin = {y[0]};
-        if (linearised && !call.fwd.empty()) qin.push_back(call.fwd.back());
+        if (linearised && base_at >= 0 && (size_t)base_at < call.fwd.size())
+            qin.push_back(call.fwd[(size_t)base_at]);
         const TwinFn qt = twin_find(q.op, q.params, nullptr);
         double code_err = 0.0, scale_rel = 0.0;
         int64_t code_bad = 0;
@@ -1365,21 +1408,52 @@ void fused_adjoint(const AdjointCall& call, Part part) {
         edc[i].shape = efwd[i].shape;
         edc[i].value.assign(static_cast<size_t>(numel(efwd[i].shape)), 0.0);
     }
-    // The part's output cotangent: the quantiser's, plus the in-place write's own. The slot's
-    // post-op value the twin writes is the part's output, so the write's cotangent reaches the
-    // part's input through the part, exactly as the quantiser's does -- a passthrough would
-    // differentiate the slot at the identity, and the slot holds `part(x)`, not `x`.
+    // The part's output's own cotangent, summed in before the part's adjoint runs -- the host
+    // half of the device row's post-pass over the record's writes
+    // (src/adjoint/device/quant.hip:817-880), which this mirrors write for write. Every write
+    // that is not the codes or the scale is the part's output: one of the part's own width joins
+    // the quantiser's output cotangent the part differentiates, and a write over a buffer the
+    // record also reads is the direct path, added to that read's slot. Both are `+=`, never an
+    // assignment -- a slot the codes' path already wrote keeps its term. The slot's post-op
+    // value the twin writes is the part's output, so its cotangent reaches the part's input
+    // through the part, exactly as the quantiser's does -- a passthrough would differentiate
+    // the slot at the identity, and the slot holds `part(x)`, not `x`.
     std::vector<AdValue> ecot = {qdc[0]};
+    // The direct path's width, the elementwise input: both halves for the gated producer, one
+    // row of it for the rest -- the device row's `out_slot` (src/adjoint/device/quant.hip:700).
+    const int64_t out_slot = part == Part::silu_mul ? 2 * total : total;
     for (int64_t j = 0; j < (int64_t)call.rec.operands.size(); ++j) {
         const Operand& o = call.rec.operands[(size_t)j];
-        if (!o.written || !o.in_place) continue;
+        if (!o.written || j == codes_at || j == scale_at) continue;
         const int64_t at = cot_slot(call.rec, j);
-        if (at < 0 || (size_t)at >= call.cot.size()) continue;
+        if (at < 0 || (size_t)at >= call.cot.size())
+            throw std::invalid_argument(std::string("quant: ") + call.rec.op +
+                                        ": the write '" + o.buffer + "' has no cotangent slot");
         const AdValue& oc = call.cot[(size_t)at];
-        if (oc.value.size() != ecot[0].value.size())
+        const int64_t out_values = (int64_t)oc.value.size();
+        if (out_values == 0 || out_values == 1)
+            continue;  // no consumers, or the engine's no-value placeholder: nothing to add
+        if (out_values == total) {
+            for (size_t e = 0; e < oc.value.size(); ++e) ecot[0].value[e] += oc.value[e];
+            continue;
+        }
+        int64_t read_at = -1;
+        for (int64_t k = 0; k < (int64_t)call.rec.operands.size() && read_at < 0; ++k)
+            if (!call.rec.operands[(size_t)k].written &&
+                call.rec.operands[(size_t)k].buffer == o.buffer)
+                read_at = k;
+        if (read_at < 0 || out_values != out_slot)
             throw std::invalid_argument(
-                "quant: the in-place write's cotangent has no part output to differentiate");
-        for (size_t e = 0; e < oc.value.size(); ++e) ecot[0].value[e] += oc.value[e];
+                std::string("quant: ") + call.rec.op + ": the write '" + o.buffer + "' carries " +
+                std::to_string(out_values) + " values, not the part's " + std::to_string(total) +
+                " or the direct path's " + std::to_string(out_slot));
+        AdValue& into = call.dc->at((size_t)read_at);
+        if ((int64_t)into.value.size() != out_values)
+            throw std::invalid_argument(
+                std::string("quant: ") + call.rec.op + ": the direct path's slot for '" +
+                call.rec.operands[(size_t)read_at].buffer +
+                "' is not the size of its cotangent");
+        for (size_t e = 0; e < oc.value.size(); ++e) into.value[e] += oc.value[e];
     }
     AdjointCall ecall{erec, efwd, ecot, &edc, nullptr, ""};
     ecall.read_rows = call.read_rows;
@@ -1459,12 +1533,15 @@ R97_REGISTER_TWIN_IF("gate_had_quant_i8g", gate_had_quant_i8g_twin, serves_gate)
 R97_REGISTER_ADJOINT_IF("gate_had_quant_i8g", host, gate_had_quant_i8g_adjoint, serves_gate)
 
 // The three producers' linearised rows, for the finite-difference check. The base point is the
-// activation the quantiser saw -- the part's own output -- appended after the codes and the scale,
-// so one frozen index is that appended operand's schema position: 4 for the norm (`x, w, codes,
-// scale, base`), 3 for the gated one (`gate_up, codes, scale, base`), 4 for the gate (`a, b, codes,
-// scale, base`). The norm also freezes its gain at 1, as the plain row above does: the walk never
-// asks for it, so the row leaves that cotangent at zero and the finite differences must not measure
-// it either (`check_adjoint` skips frozen slots). The quantiser the composition reaches is then its
+// activation the quantiser saw -- the part's own output -- appended after the codes and the
+// scale, and the output's write after it, so one frozen index is that appended operand's schema
+// position: 4 for the norm (`x, w, codes, scale, base, out`), 3 for the gated one
+// (`gate_up, codes, scale, base, out`), 4 for the gate (`a, b, codes, scale, base, out`). The
+// in-place fixture's record carries no separate output write -- the in-place slot is the output --
+// so the base sits at the same position there, and one registration serves both layouts.
+// The norm also freezes its gain at 1, as the plain row above does: the walk never asks for it, so
+// the row leaves that cotangent at zero and the finite differences must not measure it either
+// (`check_adjoint` skips frozen slots). The quantiser the composition reaches is then its
 // own `_ste` row, which reads the base point as its second operand.
 R97_REGISTER_TWIN_IF("rmsnorm_had_quant_i8g_ste", rmsnorm_had_quant_i8g_twin, rotated)
 R97_REGISTER_ADJOINT_IF_F("rmsnorm_had_quant_i8g_ste", host, rmsnorm_had_quant_i8g_adjoint, rotated, 1, 4)
