@@ -164,6 +164,22 @@ the JSON carries it as `non_finite.forward_op`.
   leaves, and a second forward with the updated adapter is strictly lower — the gradient's
   direction, not just its shape.
 
+Both cases assert the contract issue #146 asks: the `StepFn` runs, the returned `ParamSet` has
+the params' names and shapes, the forward is finite, and the optimiser applied one update. The
+checks on the gradient's values — `all_finite`, the zero / non-zero split, the descent — are
+printed always and asserted when the walk's gradient is finite, so they re-arm the moment it
+becomes one. On the live container the walk's cotangents are non-finite by the rows' own
+mathematics (#145's verdict,
+[`reports/2026-11-15-device-backward-cotangent-growth.md`](reports/2026-11-15-device-backward-cotangent-growth.md)),
+and the work that makes them finite is #142's and #149's (PR #157's in-place mark);
+`R97_DSTEP_ASSERT_FINITE=1` forces the value checks while it is not.
+
+The 512-token case's row coverage is a separate check, because a device row is an optimisation
+and the walk falls back to the host row where `libr97` has none (`allow_host_fallback` in
+`src/step_device.cpp`). The ops that took the host path are named always, and only an op outside
+the case's `host_served_op()` list — today `rope`, whose imrope rows are the live container's one
+host-served op — fails; `R97_DSTEP_ASSERT_FINITE=1` also forces the coverage, naming even that.
+
 `device_step_tape` also prints which leaf of each factor has an exactly-zero gradient
 (`zero-gradient leaves: lora_A <name> (n of N), lora_B ...`), and the JSON carries
 `first_zero_a_leaf` / `first_zero_b_leaf` and the counts `n_zero_a` / `n_zero_b`: a
