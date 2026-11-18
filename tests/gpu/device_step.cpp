@@ -436,6 +436,10 @@ void card_case(const char* test, int64_t n, bool probe) {
     nlohmann::json j;
     j["name"] = test;
 
+    // The in-place reads with no earlier writer the tape names, when the probe ran: the walk must
+    // serve each from the block's stored boundary. -1 when no probe ran (the 4096 case).
+    int64_t in_place_expected = -1;
+
     // ---- the op-coverage probe: the join forward-only, then the step's tape
 
     double probe_seconds = 0.0;
@@ -497,6 +501,30 @@ void card_case(const char* test, int64_t n, bool probe) {
         j["probe_missing"]   = missing_list;
         j["probe_loss"]      = r0.loss;
         j["probe_scored"]    = r0.scored;
+
+        // The count the walk must report, derived from the tape and not from the run: an operand
+        // the record itself also writes, with no earlier op in its block writing the buffer, is
+        // the in-place read with no earlier writer. A kv: read enters zero, not the store.
+        in_place_expected = 0;
+        {
+            std::set<std::string> wrote;
+            int64_t block = -1;
+            for (const r97::OpRecord& rec : tape.ops()) {
+                if (rec.block < 0) continue;
+                if (rec.block != block) { block = rec.block; wrote.clear(); }
+                for (const r97::Operand& read : rec.operands) {
+                    if (read.written) continue;
+                    bool in_place = false;
+                    for (const r97::Operand& w : rec.operands)
+                        if (w.written && w.buffer == read.buffer) in_place = true;
+                    if (!in_place || wrote.count(read.buffer) != 0) continue;
+                    if (read.buffer.rfind("kv:", 0) == 0) continue;
+                    ++in_place_expected;
+                }
+                for (const r97::Operand& w : rec.operands)
+                    if (w.written) wrote.insert(w.buffer);
+            }
+        }
     }
 
     // ---- the step: one prefill piece with the adapter's gradient, VRAM at the peak
@@ -844,6 +872,10 @@ void card_case(const char* test, int64_t n, bool probe) {
     // every block: held beside the per-block store, so the step's total f64 snapshot payload at a
     // block is peak_snapshot_bytes + shared_snapshot_bytes.
     j["shared_snapshot_bytes"] = rep.shared_snapshot_bytes;
+    // The in-place reads with no earlier writer, and the count the tape named: equal on a walk
+    // that served every one from the store, -1 for the case whose probe did not run.
+    j["in_place_restores"] = rep.in_place_restores;
+    j["in_place_expected"] = in_place_expected;
     j["grad_stage_bytes"]     = rep.grad_stage_bytes;
     j["d_hout_bytes"]         = rep.d_hout_bytes;
     j["head_rows"]            = rep.head_rows;
@@ -946,6 +978,13 @@ void card_case(const char* test, int64_t n, bool probe) {
                 (long long)(rep.shared_snapshot_bytes / r97test::kMiB),
                 probe_seconds, step_seconds, rep.forward_seconds, rep.head_seconds,
                 rep.backward_seconds, after_seconds);
+
+    // The in-place reads with no earlier writer, before the walk-by-op lines: a count that differs
+    // from the tape's is the first thing a window reads.
+    if (in_place_expected >= 0)
+        std::printf("%s: in-place reads with no earlier writer: %lld restored of %lld the tape "
+                    "names\n", test, (long long)rep.in_place_restores,
+                    (long long)in_place_expected);
     // The same split, the few ops that hold the walk: the number that says whether a 4096-token
     // step needs a longer window, and which op to look at when it does.
     auto top = [](const std::vector<r97::OpTiming>& v) {
@@ -1033,6 +1072,13 @@ void card_case(const char* test, int64_t n, bool probe) {
     std::printf("%s: descent: loss %.9g -> %.9g (%+.6g) after %.1f s | scored %lld -> %lld\n", test,
                 result.loss, after.loss, after.loss - result.loss, after_seconds,
                 (long long)result.scored, (long long)after.scored);
+
+    // The walk served every in-place read with no earlier writer from the block's stored
+    // boundary: the tape's count and the report's must agree, and the tape names at least one.
+    if (in_place_expected >= 0) {
+        R97_CHECK(in_place_expected > 0);
+        R97_CHECK(rep.in_place_restores == in_place_expected);
+    }
     R97_CHECK(after_scored_same);
     R97_CHECK(after_finite);
     R97_CHECK(descended);
@@ -1095,6 +1141,18 @@ static void device_step_case(const char* test, int64_t n, bool probe) {
                 j.value("all_finite", false) ? 1 : 0, j.value("step_seconds", 0.0),
                 j.value("forward_seconds", 0.0), j.value("backward_seconds", 0.0),
                 j.value("head_seconds", 0.0));
+
+    if (probe) {
+        // Every in-place read with no earlier writer was served from the block's stored boundary:
+        // the walk's count equals the tape's, and the tape names at least one. Checked here,
+        // before the all_finite check this container currently fails (issue 140).
+        std::printf("%s: in-place reads with no earlier writer: %lld restored of %lld the tape "
+                    "names\n", test, (long long)j.at("in_place_restores").get<int64_t>(),
+                    (long long)j.at("in_place_expected").get<int64_t>());
+        R97_CHECK(j.at("in_place_expected").get<int64_t>() > 0);
+        R97_CHECK(j.at("in_place_restores").get<int64_t>() ==
+                  j.at("in_place_expected").get<int64_t>());
+    }
 
     const r97::ModelMeta meta = r97::read_model_meta(container);
 
