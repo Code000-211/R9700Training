@@ -442,9 +442,15 @@ void iqr_decline(const char* why, const OpRecord& rec, const AdValue& b, int64_t
                   "r97: iqr dx declined: op %s: %s (N %lld K %lld G %lld form %s)",
                   rec.op.c_str(), why, static_cast<long long>(N), static_cast<long long>(K),
                   static_cast<long long>(groups), device::iqr_plane_form(b.enc));
-    std::fprintf(stderr, "%s\n", text);
+    std::string what(text);
+    // The driver's refusal carries the number the run is missing: how much it had left to give,
+    // and who holds the rest. It drains a thread-local, so this is the call's own refusal, or
+    // nothing when no driver error is pending.
+    const char* err = rad_dev_last_error();
+    if (err != nullptr && err[0] != '\0') what += ": " + std::string(err);
+    std::fprintf(stderr, "%s\n", what.c_str());
     std::fflush(stderr);
-    throw std::runtime_error(text);
+    throw std::runtime_error(what);
 }
 
 // dx[m,k] = sum_n dy[m,n] * W[n,k], with W the int8 codes and their per-block scale (`quant`) or

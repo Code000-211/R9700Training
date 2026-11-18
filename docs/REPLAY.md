@@ -27,11 +27,19 @@ because a replay has to write its input back into that same buffer before it run
 `bytes()` is the copies kept, each `tokens * hidden * 2`: for the bf16 fixture (4 layers, 3
 sequences of 8, 5 and 13 tokens, hidden 128) that is `5 * 26 * 128 * 2 = 33280` bytes.
 
-The same store lives on the card: `ResidualStore(stream, plan, budget)` makes one device
-allocation, sized by a `ResidualPlan`, keeps each boundary as a stream-ordered device copy on
-the step's lane, and restores it the same way, so a keep orders behind the op the observer just
-saw and a restore ahead of the replayed block's reads. Copies of the store share the one
-allocation, and the last copy frees it.
+The same store has a card form and a streamed host form. `ResidualStore(stream, plan, budget)`
+makes one device allocation, sized by a `ResidualPlan`; copies of it share the one allocation and
+the last copy frees it. `ResidualStore(plan, stream)` keeps the boundaries in one *pinned* host
+allocation, shared by copies the same way: pinned so the card takes each boundary in a blit
+packet, because a pageable copy stages through the engine's 8 MiB bounce buffer and drains the
+lane per chunk, a host stall at every boundary. In both forms a keep is a stream-ordered copy on
+the step's lane and a restore is the copy back, so a keep orders behind the op the observer just
+saw and a restore ahead of the replayed block's reads; `read()` synchronizes the lane first, then
+copies to a host buffer. The card form's constructor refuses with the plan's numbers when the plan
+does not fit `budget`; the host form is what the device walk uses, so its 5 GiB of boundaries stay
+out of the card's VRAM and only the walk's per-op scratch competes for it (`docs/STEPS-DEVICE.md`).
+Without it the store held 5 GiB of the card and the walk's 85 MiB scratch was refused at position
+565 (issue #143).
 
 ## Memory plan
 

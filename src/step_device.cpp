@@ -1,8 +1,9 @@
 // src/step_device.cpp -- the device join. See include/r97/step_device.h and docs/STEPS-DEVICE.md.
 //
 // The forward runs the batch on the device kernel tier, the residual at every layer boundary is
-// kept in one VRAM allocation on the stream the step's ops issue on, and each block is replayed
-// from that store and walked in reverse with the device adjoints. The head is walked a chunk at a
+// kept in host memory and moved to and from the card as stream-ordered copies on the lane the
+// step's ops issue on, and each block is replayed from that store and walked in reverse with the
+// device adjoints. The head is walked a chunk at a
 // time: a logit row is 248320 wide, so its cotangent is never materialised -- the CE loop writes
 // one chunk's gradient, the vocabulary head's transposed product consumes it into d_hout, and
 // d_hout seeds the head's remaining records. The card's staging holds the step's gradients, one
@@ -64,6 +65,25 @@ double seconds_since(const Clock::time_point& t0) {
 void check_device(int rc, const char* what) {
     if (rc != 0)
         throw std::runtime_error(std::string("device step: ") + what + ": " + rad_dev_last_error());
+}
+
+// The host's available memory, from /proc/meminfo's MemAvailable -- the figure radiance's own
+// host checks read. -1 when it cannot be read. The device walk's residual store is host memory
+// and is checked against this, not the card's free VRAM. See the walk's construction below.
+int64_t host_available_bytes() {
+    std::FILE* f = std::fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char line[256];
+    int64_t out = -1;
+    while (std::fgets(line, sizeof line, f)) {
+        long long kb = 0;
+        if (std::sscanf(line, "MemAvailable: %lld kB", &kb) == 1) {
+            out = static_cast<int64_t>(kb) * 1024;
+            break;
+        }
+    }
+    std::fclose(f);
+    return out;
 }
 
 // One device allocation that goes back to the card's pool when the step leaves, by the end of it
@@ -365,9 +385,10 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         driver.set_lora(live ? 1 : 0, live ? std::max<int64_t>(max_rank, 1) : 0, targets,
                         live ? "train" : std::string(), live ? meta.input_basis : std::string());
 
-        // The residual store's plan, and the VRAM it is checked against. The hook runs after the
-        // model's load and before the step's serve, so the free VRAM it reads is the card's with
-        // the model on it.
+        // The residual store's plan, and the host memory it is checked against. The store is
+        // host-backed and its boundaries move over the step's lane, so what it must fit is what
+        // the host can still spare -- the card's VRAM is the scarcer resource the walk needs for
+        // its per-op scratch (issue #143).
         ResidualPlan plan;
         int64_t budget = options.residual_budget_bytes;
         std::shared_ptr<BoundaryRecorder> recorder;
@@ -400,20 +421,32 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             if (budget <= 0) {
                 RadDeviceProps props{};
                 if (rad_dev_props(0, &props) != 0)
-                    throw std::runtime_error("device step: cannot read the card's free VRAM: " +
+                    throw std::runtime_error("device step: cannot read the card's properties: " +
                                              std::string(rad_dev_last_error()));
                 if (props.is_host_backend)
                     throw std::runtime_error(
-                        "device step: the step's device is the host backend, which has no card "
-                        "residual store");
-                budget = props.vram_free;
+                        "device step: the step's device is the host backend; the device walk "
+                        "needs a card");
+                budget = host_available_bytes();
+                if (budget <= 0)
+                    throw std::runtime_error(
+                        "device step: cannot read the host's available memory, the residual "
+                        "store's budget");
             }
             RadStream stream = rad_ctx_cur_stream(engine.issue_ctx());
             if (!stream)
                 throw std::runtime_error(
                     "device step: the engine gave no stream for the step's lane");
-            recorder = std::make_shared<BoundaryRecorder>(
-                driver.tape(), ResidualStore(stream, plan, budget));
+            if (!plan.fits(budget))
+                throw std::runtime_error("device step: " + plan.refusal(budget));
+            // The boundaries live in one pinned host block, moved to and from the card as
+            // stream-ordered copies (pinned, so each copy is a blit packet and not the engine's
+            // pageable bounce, which drains the lane per chunk). 5 GiB of the card's VRAM was what
+            // the walk could not spare: with the store resident, the per-op scratch's 85 MiB was
+            // refused (issue #143). The copies order on the step's lane, so the forward's and the
+            // replay's values are what they would be with the store on the card, and the store's
+            // copies (the walk's, the replay's) share the one block.
+            recorder = std::make_shared<BoundaryRecorder>(driver.tape(), ResidualStore(plan, stream));
             if (!grads) return;
             // The recorder owns the tape's one issue hook, so wrap it rather than replace it: the
             // boundary store still sees every issue, and the capture copies the head's operands
