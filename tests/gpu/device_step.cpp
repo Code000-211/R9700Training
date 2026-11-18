@@ -376,7 +376,11 @@ void card_case(const char* test, int64_t n, bool probe) {
     const r97::Model model = r97::make_model(mc);
     r97::ParamSet params = model.delta->init(meta, mc.delta, /*seed=*/0);
     R97_CHECK(!params.empty());
-    if (probe) seed_adapter(params);
+    // R97_DSTEP_NO_SEED=1 leaves the factors as init left them (lora_B exactly zero), so the
+    // forward is the base container's: #149's reference comparison needs the GDN branch without
+    // the seed's delta over in_proj_qkv/in_proj_z, which the seed makes 4-9x the stored weights.
+    if (probe && std::getenv("R97_DSTEP_NO_SEED") == nullptr)
+        seed_adapter(params);
 
     // The driver for the tier: the card's library first, libr97 the plugin the device adjoints
     // load from (it serves no forward kernel; it is in the list so the engine dlopen()s it), the
