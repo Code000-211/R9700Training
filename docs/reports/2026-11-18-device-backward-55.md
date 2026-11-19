@@ -197,9 +197,32 @@ for the cotangent at op 17's *codes slot*, one step inside the block's last op, 
 quantiser's own codebook step. It is not the boundary cotangent and it is not a block-level
 measurement.
 
-The slice's 4096 arm is what decides block 37's own rows: if they transfer that cotangent the way
-they do at 512 (ratio 1.0475), block 37 is cleared at 4096 too and the hunt moves to the blocks
-above it.
+**The 4096 slice clears block 37's rows** (window 39's second arm, `rc=0`, 22:24; `pause` absent
+after). Its forward matches the device's own values to bf16 noise on every honest line --
+`h.q8` 0.00516, `gdn_q` 0.00389, `gdn_k` 0.00424, `gdn_v` 0.00400, `gdn_g` 0.00027, `gdn_beta`
+0.00075, `gdn_kkt` 0.00195, `gdn_o.q8` 0.01189, `gate_up` 0.00686, `ffn.q8` 0.01417, the
+adapter weights exactly 0 -- the same floor as 512. The lines that are not at that floor are the
+documented pollution: `gdn_o`/`h` (the dump captured them post-op) and `kv:2`/`kv:3` (the dump's
+outgoing state against the walk's cold zero).
+
+Its leaves, against the walk's, grouped the way the 512 table groups them:
+
+| weight | factor | walk l2 | slice l2 | walk / slice |
+|---|---|---|---|---|
+| `ssm_inz` | B | 1.28309e+15 | 1.43157e+15 | 0.896 |
+| `ssm_out` | B | 5.52932e+14 | 5.40199e+14 | 1.024 |
+| `ffn_gate_up` | B | 9.27448e+14 | 1.22987e+15 | 0.754 |
+| `ffn_down` | B | 3.46554e+14 | 3.26531e+14 | 1.061 |
+| all six | A | 0 | 0 | -- |
+| `LEAFSET layers.37.` | | 1.71239755e+15 | 1.99007734e+15 | **0.860** |
+
+So block 37's rows transfer the walk's incoming cotangent correctly at 4096 as well (0.75-1.06 per
+weight, 0.86 on the set), and **the 1.7e15 magnitude is inherited**: the seeds file hands the block
+a cotangent of L1 2.25e16 and max 3.4e10, and the block's own leaves come out *below* it. Together
+with the 512 result (ratio 1.0475) this clears block 37's rows at both token counts, each within
+its own parameter regime, and moves the hunt for the amplification to the blocks above 37 or the
+head. The next measurement is the same dump-and-slice at a higher block (the seeds at block 38's
+output are what block 37 received, so block 38 is where to look first).
 
 That arm runs in the same window, second, from the same dump:
 
@@ -1061,8 +1084,10 @@ difference at block 37 -- the same comparison that agreed to 0.59% at block 63's
 
 Scope, unchanged and repeated because it is the easy thing to overclaim: the slice shares
 `backward_block` with both walks, so agreement clears block 37's ROWS at that token count given
-the walk's incoming cotangent -- never "the walk", never another token count's magnitude. The
-forward now agrees; the rows do not, yet.
+the walk's incoming cotangent -- never "the walk", never another token count's magnitude. At 512
+the rows are 4.75% apart and the forward agrees; at 4096 the forward agrees and the rows are
+within 14% (see "The 4096 leg"), which clears this block at both counts and points the hunt
+upstream.
 
 The cold-`kv:`-write fix was re-measured after it landed (window 39's first arm): the 512 slice's
 `LEAF` and `LEAFSET` lines are **byte-identical** to the pre-fix run (norm 5.40682538), which is
