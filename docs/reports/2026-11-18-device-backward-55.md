@@ -614,30 +614,27 @@ ctest entry runs the binary unfiltered to exit 0. Red-run proof: with
 `options.in_place_passthrough = false`, case (b) fails on `dx`; with `true` both pass -- the
 case pins the option by construction, not by accident.
 
-**Serialization trap the harness now tests and the next step must honor:** `program_json`
-writes NO in-place field (`src/reference_step.cpp:168-173`), so a slice recorded via
-`r97train ops --record` silently loses every in-place marker and the runner would parse all
-operands `in_place=false` -- green-when-wrong at a GPU window's cost. The tape's own
-serialization carries it as `inout` (`src/tape.cpp:170`); the runner reads `inout` first. **The
-real block slice must be recorded via the tape's path**, not `program_json`.
+**Serialization trap — landed, and the gate is green again.** `program_json` originally wrote
+NO in-place field, so a slice recorded through it silently lost every in-place mark and would
+have parsed `in_place=false` everywhere. The writer fix landed (`tools/ops.cpp` now emits
+`"inout": o.in_place`), the trace test is green again (301/0), and the checked-in fixture
+(`tests/fixtures/programs/oracle.json`) was regenerated through the new `R97_RECORD_ORACLE_FIXTURE`
+env gate in `reference_step.cpp` — it now carries 6 real `inout: true` marks (all
+`gdn_conv_prep`'s kv:3 state buffer), matching the live trace bit-for-bit. The runner reads
+`inout` first, then `in_place` (a hand-written record convenience), so both forms parse.
 
 ### The remaining GPU-side run, mapped (2026-11-19, machine free after the foreign window was
 cleared on the owner's instruction at 11:38, logged in /tmp/window-handclose.log)
 
 Everything below is an existing API except one small env-gated dump in `step_device.cpp` (item 3); no new walk code is needed beyond that:
 
-1. **The block's op slice, tape-serialized.** The walk already has the tape:
-   `src/step_device.cpp:474-476` (`driver.last().tape()`, `tape.ops()`, `tape.blocks()`), and a
-   block's records are `ops[blocks[layer].begin .. blocks[layer].end)` (`:1573-1575`). The
-   JSON writer in `tools/ops.cpp:77-106` omits it (`:98-102` writes buffer/dtype/shape/row_lo/
-   rows/written only -- verified), so NO in-tree writer can produce a slice the runner parses
-   with its in-place marks intact. The one-line writer fix (`"inout": o.in_place`) must land in
-   `tools/ops.cpp` BEFORE the window, or the window produces a slice that silently parses all
-   operands `in_place=false`. Slice = one `Tape::Block` range, positions re-indexed 0..n-1 on
-   dump: `parse_slice` re-indexes to append order (`tests/host/slice_reference.cpp:161-162`)
-   because the snapshot store keys on (position, operand slot), and the walk's own backward uses
-   original positions -- a dumped slice that keeps tape positions 0..1463 would mis-key every
-   snapshot against the record the walk used.
+1. **The block's op slice, tape-serialized.** The walk already has the tape: `driver.last().tape()`
+   (`src/step_device.cpp:474-476`), and a block's records are `ops[blocks[layer].begin ..
+   blocks[layer].end)` (`:1573-1575`). **Landed** — the writer now emits `"inout": o.in_place`
+   (`90f7193`), so dump the slice with the fixed writer and re-index positions 0..n-1; the snapshot
+   store keys on (position, operand slot) and the walk's backward uses original positions, so a
+   dumped slice that keeps tape positions 0..1463 would mis-key every snapshot against the record
+   the walk used.
 2. **Boundary FORWARD values.** Already kept in memory under `keep_boundaries`: the report's
    own f64 copies `measured.boundary_value` / `boundary_cotangent` / `boundary_name`
    (`include/r97/step_device.h:126-128`), filled by `store_boundary` at
