@@ -245,7 +245,7 @@ That arm runs in the same window, second, from the same dump:
     --out /tmp/r97-55-serve-out-4096.txt
 ```
 
-`/tmp/r97-55-compare4096.py` groups both sides by weight (`ssm_inz` = `in_proj_qkv` +
+`/tmp/r97-55-compare-block.py --block 37` groups both sides by weight (`ssm_inz` = `in_proj_qkv` +
 `in_proj_z`, `ffn_gate_up` = `gate_proj` + `up_proj`) and prints the per-weight ratios and the
 leaf-set norms, against the walk's lines in `/tmp/r97-55-walk4096-leaves.txt`.
 
