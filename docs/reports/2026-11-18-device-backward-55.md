@@ -589,12 +589,21 @@ single-block f64 reference at the real container's shapes.
 - **The first slice**: one block below 63, one leaf, device vs f64. The leaf and the block's op list
   come from what exists; `parse_program` reads a **JSON** program (`program_json(prompts, ops)`), so
   a block's op slice is a filtered JSON file, not C++.
-- **The seed is not landed, and `R97_SPLIT_VALUES` is not it.** That dump prints the first n values at
-  *one* position -- a sample, useful for checking a seed but not a seed. `Seed`
-  (`include/r97/objective.h`) is `buffer + row_lo/row_hi + cotangent` over the block's whole row
-  range, and `ReferenceStep::run` starts its backward from `obj.seeds`. So the remaining work is two
-  things, not one: a full-range cotangent dump for one block, and a `seed_file` option that replaces
-  `obj.seeds` at that one call site.
+- **The closed gap, corrected: the slice cannot run through `ReferenceStep::run` at all.** Three
+  reasons, verified in the source before any code was written: (1) `make_layout` throws "the graph
+  writes no logits" unless some op wrote a `logits` buffer (`:611-615`) -- a single block's slice
+  never does; (2) `run` builds the objective over `RefTape(batch, run.logits, vocab)` and seeds the
+  backward from `obj.seeds` (`:572-579`) unconditionally -- a slice has no head, no loss, no seeds;
+  (3) `resolve_read` serves any buffer no slice-op wrote from `constants_` and then from the
+  *container weights by name* (`:972-982`) -- a block boundary's activations have no injection path
+  and would throw, or silently load a name-colliding weight as an activation. So the slice needs
+  **three inputs** the reference step does not have: boundary cotangents (planned), boundary
+  *forward values* (the twins must see the block's incoming activations to replay its ops), and an
+  objective-free run mode. Cleanest shape: a separate slice runner -- a tool or test-side harness --
+  that reuses `parse_program`'s JSON, the twins and the host-adjoint backward core directly, rather
+  than threading options through the whole-graph contract in `ReferenceStep`. As previously
+  written ("two pieces"), the first GPU-window run of a filtered program would have thrown at
+  `make_layout` before any comparison -- a whole window spent on an exception.
 - **Scope, stated once**: seeded from the device walk's incoming cotangent, this tests the block's
   rows given the same input -- the same limit as the host-walk arbiter, and not a whole-walk
   statement.
