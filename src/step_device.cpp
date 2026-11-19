@@ -1263,18 +1263,31 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         store_boundary(measured.layers, incoming, store.name(measured.layers));
 
         LayerReplay replay(*engine, driver.tape(), store);
-        // R97_WALK_BLOCKS=<n> walks only the top n blocks, and only for the host walk. A host walk
-        // holds each block's decoded weights for the length of that block's walk, and a step's
-        // worth on the real container is more than this host has: the limit is what makes the A/B
-        // measurable here at all, and the top transitions already separate a growing cotangent
-        // from a flat one. The device walk is never limited: the A/B runs only when the device
-        // walk's gradient is not finite, and a truncated walk zero-fills the blocks it skipped --
-        // a finite gradient that would silence the very measurement this exists for. Unset, the
-        // host walk is the whole step too.
+        // R97_WALK_BLOCKS=<n> walks only the top n blocks. A host walk holds each block's decoded
+        // weights for the length of that block's walk, and a step's worth on the real container is
+        // more than this host has: the limit is what makes the A/B measurable here at all, and the
+        // top transitions already separate a growing cotangent from a flat one.
+        //
+        // The device walk is limited only under R97_WALK_BLOCKS_DEBUG=1, and then it is not a
+        // step: a truncated walk zero-fills the blocks it skipped, so its gradient must never be
+        // read as one. What it is for is the boundary chain -- one `r97: boundary` line per walked
+        // block, each a real cotangent -- which is how issue #55 localises the growth: the top
+        // sixteen blocks cost ~15 min instead of the whole step's ~58. The model cases skip their
+        // gradient assertions when the debug flag is set, so a truncated walk cannot pass as a
+        // step by accident.
         int64_t walk_blocks = 0;
+        const bool truncated_device_walk =
+            !options.host_walk && std::getenv("R97_WALK_BLOCKS_DEBUG") != nullptr;
         if (const char* wb = std::getenv("R97_WALK_BLOCKS");
-            wb != nullptr && *wb != '\0' && options.host_walk)
+            wb != nullptr && *wb != '\0' && (options.host_walk || truncated_device_walk))
             walk_blocks = std::strtoll(wb, nullptr, 10);
+        if (truncated_device_walk && walk_blocks > 0)
+            std::fprintf(stderr,
+                         "r97: WALK-BLOCKS-DEBUG: the device walk covers blocks %lld..%lld only; "
+                         "blocks below %lld are zero-filled and this gradient is NOT a step's\n",
+                         static_cast<long long>(measured.layers - walk_blocks),
+                         static_cast<long long>(measured.layers - 1),
+                         static_cast<long long>(measured.layers - walk_blocks));
         const int64_t first_layer = walk_blocks > 0 ? std::max<int64_t>(0, measured.layers - walk_blocks)
                                                     : 0;
         for (int64_t layer = measured.layers - 1; layer >= first_layer; --layer) {

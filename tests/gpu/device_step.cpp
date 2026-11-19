@@ -1298,6 +1298,15 @@ static void device_step_case(const char* test, int64_t n, bool probe) {
         return;
     }
 
+    // A truncated debug walk (R97_WALK_BLOCKS_DEBUG) zero-fills every block it skipped, so its
+    // gradient is not a step's: the boundary lines in the log are the measurement, and every
+    // assertion below would be about a number this run never computed.
+    if (std::getenv("R97_WALK_BLOCKS_DEBUG") != nullptr) {
+        std::printf("%s: DEBUG-TRUNCATED walk: the `r97: boundary` lines are the measurement; the "
+                    "gradient assertions are skipped\n", test);
+        return;
+    }
+
     const int64_t tokens = j.at("tokens").get<int64_t>();
     const int64_t scored = j.at("scored").get<int64_t>();
     const double loss    = j.at("loss").get<double>();
