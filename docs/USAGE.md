@@ -55,6 +55,7 @@ there. A command that needs them says so, with the directory it looked in.
 | `loss` | the held-out loss, cross-checked against radiance's own KL record |
 | `objectives` | the registered losses, one per line |
 | `ops` | the op inventory of a container's forward pass, or the registry |
+| `slice-serve` | one op slice's f64 forward and backward from injected boundary values and cotangents |
 | `train` | the training loop, with the host step or, under `--reference`, the reference step |
 
 A command returns `0` on success, `2` for a usage error, and something other than `0` for a check
@@ -223,6 +224,27 @@ Answers "can this build run this container, on the host and on the card": the in
 tier prints is `docs/OPS-qwen35-host.md`, the card's is `docs/OPS-qwen35-device.md`, and
 `docs/RUNBOOK.md` section 2 runs both forms (`R97_DEVICE` names the card) and section 10 says when
 to ask it.
+
+### `slice-serve`
+
+```text
+usage: r97train slice-serve --program <slice.json> [--boundary <fwd.json>] [--seeds <seeds.json>] [--prefix <name>] [--out <report.txt>]
+```
+
+| flag | state | what it does |
+| --- | --- | --- |
+| `--program <slice.json>` | now | the op slice, in `r97-program` form; required |
+| `--boundary <fwd.json>` | now | the boundary forward values, as `{name: {dtype, shape, value[]}}`; absent means empty |
+| `--seeds <seeds.json>` | now | the boundary cotangents, as `[{buffer, row_lo, row_hi, cotangent[]}]`; absent means empty |
+| `--prefix <name>` | now | the leaf gradients' name prefix (`slice` is the default) |
+| `--out <report.txt>` | now | write the `BUF`/`LEAF` report here instead of stdout |
+
+Runs one op slice through its f64 twins and its host adjoints with the boundary values and
+cotangents injected, and prints `BUF`/`LEAF` lines — the criterion-two comparison's artifact.
+Every read that is neither injected nor written by a slice op is refused by name; nothing falls
+through to a container weight. The dump files come from `device_step_tape`'s window run
+(`R97_DUMP_LEAF`, the test's `keep_boundaries`), and the report is the file the comparison diffs —
+the `LEAF` lines against the walk's own.
 
 ### `train`
 

@@ -637,14 +637,18 @@ Everything below is an existing API except one small env-gated dump in `step_dev
    store keys on (position, operand slot) and the walk's backward uses original positions, so a
    dumped slice that keeps tape positions 0..1463 would mis-key every snapshot against the record
    the walk used.
-2. **Boundary FORWARD values.** Already kept in memory under `keep_boundaries`: the report's
-   own f64 copies `measured.boundary_value` / `boundary_cotangent` / `boundary_name`
-   (`include/r97/step_device.h:126-128`), filled by `store_boundary` at
-   `src/step_device.cpp:1229-1234` from the `ResidualStore` (`include/r97/replay.h:66+`, bf16,
-   `tokens*hidden*2` bytes per boundary; host read path `store.read` + `widen_bf16`, plus
-   `name`/`extra_at`/`read_extra` for the plan's second copy, `replay.h:94-99, 129-131`). So the
-   GPU-side dump reduces to ONE env-gated disk write of those three in-memory fields at a chosen
-   block. For the slice runner's `SliceInput::boundary`, each boundary is one f64
+2. **Boundary FORWARD values.** NOT in the report's `measured.*` fields: `store_boundary` returns
+   immediately when `options.keep_boundaries` is false (`src/step_device.cpp:1213`), and the
+   window's `device_step_tape` runs with it **off** (`tests/gpu/device_step.cpp:74-75, :404-406` —
+   the f64 copies are ~2.7 GiB per boundary at 512 tokens, and the case does not ask for them), so
+   `measured.boundary_value` / `boundary_cotangent` / `boundary_name` are **empty vectors** in a
+   dump run. The dump must read the store directly, the same way `store_boundary` does when it is
+   on: `store.read(boundary, host.data())` then `widen_bf16(host, &out)` (`:1232-1234`), on the
+   `reuse::` boundaries the `ResidualStore` keeps (`include/r97/replay.h:66+` — every boundary,
+   bf16, `tokens*hidden*2` bytes each; `store.name(boundary)` for the buffer name;
+   `store.extra_at`/`read_extra` where the plan holds a second copy). Gated on its own env var at
+   the `store_boundary` call site (`:1211-1237`) or beside `:1620-1623` so it costs nothing when
+   unset. For the slice runner's `SliceInput::boundary`, each boundary becomes one f64
    `AdValue{buffer=name, dtype, shape={tokens,hidden}}`.
 3. **Boundary COTANGENTS (full-range Seed).** `boundary_cotangents(...)` at
    `src/step_device.cpp:1620-1623` produces the `std::vector<IncomingCotangent>` for each block as
