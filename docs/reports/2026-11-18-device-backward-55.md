@@ -580,18 +580,21 @@ single-block f64 reference at the real container's shapes.
   leaf name, and a leaf is named `layers.N.self_attn...`, so `R97_DUMP_LEAF=layers.0.` prints block
   0's leaves. The device walk reaches all 64 blocks (`R97_WALK_BLOCKS` truncates the *host* arm
   only), so any block's leaves can be dumped today.
-- **Missing (3)**: the one real gap. The f64 block must start from the *device walk's* incoming
-  cotangent for that block, or the comparison is confounded by every layer above it. The SPLIT
-  instrumentation printed only the cotangent's L1; **`R97_SPLIT_VALUES=<n>` now dumps its first n
-  values at `%.17g`** (`src/adjoint/host/elementwise.cpp`, `R97_SPLIT_POS` to pick the position), so
-  the seed half exists. It carries the same scope limit as the host-walk arbiter: it tests this
-  block's rows given the same input, not the whole walk.
-- **The first slice**: one block below 63, one leaf, device vs f64. The leaf, the block's op list and
-  the seed all come from what now exists. Checked what the runner actually needs: `parse_program`
-  reads a **JSON** program (`program_json(prompts, ops)`), so a block's op slice is a filtered JSON
-  file, not C++. The one remaining code change is the **seed injection**: `ReferenceStep::run` starts
-  its backward from `obj.seeds`, and a block-scale run must start from the dumped cotangent instead.
-  That is an option plus one call site, and it is the last piece.
+- **Missing (3)**: the f64 block must start from the *device walk's* incoming cotangent for that
+  block, or the comparison is confounded by every layer above it. The SPLIT instrumentation printed
+  only the cotangent's L1; **`R97_SPLIT_VALUES=<n>` now dumps its first n values at `%.17g`**
+  (`src/adjoint/host/elementwise.cpp`, `R97_SPLIT_POS` to pick the position) -- a *sample*, which
+  checks a seed but is not one (see below). It carries the same scope limit as the host-walk arbiter:
+  it tests this block's rows given the same input, not the whole walk.
+- **The first slice**: one block below 63, one leaf, device vs f64. The leaf and the block's op list
+  come from what exists; `parse_program` reads a **JSON** program (`program_json(prompts, ops)`), so
+  a block's op slice is a filtered JSON file, not C++.
+- **The seed is not landed, and `R97_SPLIT_VALUES` is not it.** That dump prints the first n values at
+  *one* position -- a sample, useful for checking a seed but not a seed. `Seed`
+  (`include/r97/objective.h`) is `buffer + row_lo/row_hi + cotangent` over the block's whole row
+  range, and `ReferenceStep::run` starts its backward from `obj.seeds`. So the remaining work is two
+  things, not one: a full-range cotangent dump for one block, and a `seed_file` option that replaces
+  `obj.seeds` at that one call site.
 - **Scope, stated once**: seeded from the device walk's incoming cotangent, this tests the block's
   rows given the same input -- the same limit as the host-walk arbiter, and not a whole-walk
   statement.
