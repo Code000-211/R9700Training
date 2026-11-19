@@ -83,7 +83,7 @@ void list_matches(const rad::RadFile& f, const std::string& query, const char* e
     std::printf("  no entry named exactly '%s'\n", exact);
 }
 
-void dump_one(const rad::RadFile& f, const std::string& name, int64_t want) {
+void dump_one(const rad::RadFile& f, const std::string& name, int64_t want, bool full) {
     const RadFileEntry* e = f.find(name);
     if (e == nullptr) {
         std::printf("name=%s FOUND=0\n", name.c_str());
@@ -150,30 +150,37 @@ void dump_one(const rad::RadFile& f, const std::string& name, int64_t want) {
         const double v = element_as_double(d0.dtype, base, i);
         l1 += std::fabs(v);
         s += v;
-        if (i < want) std::printf(" %.10g", v);
+        if (full || i < want) std::printf(" %.10g", v);
     }
     std::printf("\n  l1=%.10g sum=%.10g elements=%lld\n", l1, s, (long long)numel);
 }
 
 int run(int argc, char** argv) {
-    if (argc < 3) {
+    int first_arg = 1;
+    bool full = false;
+    if (argc >= 2 && std::string(argv[1]) == "--full") {
+        full = true;
+        first_arg = 2;
+    }
+    if (argc <= first_arg + 1) {
         std::fprintf(stderr,
-                     "usage: r97train dump-weight <file.rad> <name> [<name>...]\n"
+                     "usage: r97train dump-weight [--full] <file.rad> <name> [<name>...]\n"
                      "  prints each weight's shape, encoding, planes and -- for a one-element-a-"
-                     "value plane --\n  its first 8 values plus the whole tensor's L1 and sum. A "
-                     "name that misses lists\n  the directory entries containing it.\n");
+                     "value plane --\n  its first 8 values (all of them with --full) plus the "
+                     "whole tensor's L1 and sum. A\n  name that misses lists the directory "
+                     "entries containing it.\n");
         return 2;
     }
     rad::RadFile f;
-    if (f.open(argv[1]) != RAD_OK) {
-        std::fprintf(stderr, "dump-weight: '%s' will not open\n", argv[1]);
+    if (f.open(argv[first_arg]) != RAD_OK) {
+        std::fprintf(stderr, "dump-weight: '%s' will not open\n", argv[first_arg]);
         return 1;
     }
-    for (int a = 2; a < argc; ++a) dump_one(f, argv[a], 8);
+    for (int a = first_arg + 1; a < argc; ++a) dump_one(f, argv[a], 8, full);
     f.close();
     return 0;
 }
 
 }  // namespace
 
-R97_REGISTER_COMMAND("dump-weight", "<file.rad> <name> [<name>...]", run);
+R97_REGISTER_COMMAND("dump-weight", "[--full] <file.rad> <name> [<name>...]", run);
