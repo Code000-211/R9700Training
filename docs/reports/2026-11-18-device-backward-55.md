@@ -542,25 +542,27 @@ with the loss; if it keeps growing past that bound, the reported norm cannot be 
 is a **scale check, not a correctness check**: it can refute the magnitude, it cannot confirm the
 gradient.
 
-### The scale ladder: no plateau, so no estimate
+### The scale ladder: no plateau, so no estimate -- confirmed on two runs
 
-Run on the fixed tree (grad norm 860.732 this time, the same walk). It does not plateau:
+Run on grad norm 860.732 (the scale-probe tree) and again on window27 (norm 859.419, current head
+with the writer fix + regenerated fixture). Neither run reaches a plateau:
 
-| lr | dL | abs(dL)/lr |
-|---|---|---|
-| 1e-3 | -257.8 | 2.58e5 |
-| 3e-4 | -748.0 | 2.49e6 |
-| 1e-4 | -786.6 | 7.87e6 |
-| 1e-5 | -422.0 | 4.22e7 |
-| 1e-6 | -171.4 | **1.71e8** |
-| 1e-7 | -0.519 | 5.20e6 |
+| lr | run1 dL | run1 `abs(dL)/lr` | run27 dL | run27 `abs(dL)/lr` |
+|---|---|---|---|---|
+| 1e-3 | -257.8 | 2.58e5 | -269.9 | 2.70e5 |
+| 3e-4 | -748.0 | 2.49e6 | -750.2 | 2.50e6 |
+| 1e-4 | -786.6 | 7.87e6 | -792.4 | 7.92e6 |
+| 1e-5 | -422.0 | 4.22e7 | -426.1 | 4.26e7 |
+| 1e-6 | -171.4 | **1.71e8** | -160.2 | **1.60e8** |
+| 1e-7 | -0.519 | 5.20e6 | **+10.59** | (ascent: the probe's loss goes UP) |
 
-It rises four orders and then collapses at 1e-7. No point is in the linear regime: a tenfold smaller
-step from 1e-4 loses only 1.9x of its loss change, and 1e-7 loses 330x. The reason is the same one
-that invalidates the FD -- the forward is piecewise constant, so the loss does not respond
-proportionally to the weight change -- and it is not fixable by choosing a smaller step. The ladder
-therefore cannot estimate the gradient's L1, and the `sqrt(N)*860.7` bound cannot be applied: there
-is no plateau to compare.
+Both non-monotone past 1e-6; the second crosses sign. No point is in the linear regime -- a
+tenfold smaller step from 1e-4 loses only ~1.9x of its loss change, and 1e-7 loses or *gains* by
+less than 1e-5 of it. The reason is the same one that invalidates the FD -- the forward is
+piecewise constant, so the loss does not respond proportionally to the weight change -- and it is
+not fixable by choosing a smaller step. The ladder therefore cannot estimate the gradient's L1,
+and the `sqrt(N)*~860` bound cannot be applied: there is no plateau to compare. Two runs agreeing
+on non-monotonicity makes this robust across trees rather than a single-run artifact.
 
 So **four instruments have failed to arbitrate the magnitude, each for its own reason**: the FD (a
 quantised forward), the host walk (shared machinery), the reference step (fixture-scale), and the
