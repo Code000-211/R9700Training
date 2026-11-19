@@ -249,6 +249,67 @@ That arm runs in the same window, second, from the same dump:
 `in_proj_z`, `ffn_gate_up` = `gate_proj` + `up_proj`) and prints the per-weight ratios and the
 leaf-set norms, against the walk's lines in `/tmp/r97-55-walk4096-leaves.txt`.
 
+### Block 38: the boundary gain is 1.09, so the amplification is above it too
+
+Window 40's dump of block 38 at 4096 (`/tmp/r97-55-dump-block38-4096/`, the same shape: 40
+constants 7.14 GB, boundary 811 MB, seeds 816 MB) gives both sides of block 38's boundary, and
+this comparison *is* like-for-like (L1 of a boundary cotangent against L1 of the next one):
+
+| boundary | L1 | L2 | max |
+|---|---|---|---|
+| 39 -> 38 (block 38's seeds) | 2.05964e+16 | 4.50211e+12 | 2.2019e+10 |
+| 38 -> 37 (block 37's seeds) | 2.2508e+16 | 4.88804e+12 | 3.42722e+10 |
+| **block 38's own gain** | **1.093** | **1.086** | 0.643 |
+
+So block 38 hands down very nearly what it receives, and **the growth is above block 38**.
+
+What the 1.09 gains have to explain is a gap *within this run*: the boundary the head hands the
+top block (the first line `print_boundary_scale` prints, below) against 2.25e16 at 38 -> 37. If
+every block above 38 gained 1.09, the head's boundary would have to be ~2.06e16 / 1.09^25 ~ 2.5e15
+for the chain to close; the head's own printed value settles whether that is so or whether one
+block carries the jump. The 512 and 4096 boundary cotangents are **not** the comparison here --
+those runs differ in both token count and adapter regime (see above), so their ratio is not a
+quantity any per-block factor has to reproduce.
+
+Block 37's like-for-like boundary gain is computable the same way once window 41 prints the
+37 -> 36 line, which also says whether ~1.09 holds below 38 -- nothing so far makes 38 special
+beyond being the second block measured.
+
+### Where the backward time goes
+
+The results JSON carries `row_seconds` and `pull_seconds` per op (`src/step_device.cpp:1906-1912`);
+this is the first report that reads them.
+
+| | 512 | 4096 |
+|---|---|---|
+| `backward_seconds` | 267.6 | 3326.7 |
+| `row_seconds`, all ops | 56.6 (21.2%) | 728.5 (21.9%) |
+| `pull_seconds`, all ops | 5.9 (2.2%) | 78.7 (2.4%) |
+| **neither** | **205.1 (76.6%)** | **2519.5 (75.7%)** |
+
+The proportions are the same at both token counts, so the cost is not a token-count effect. At
+4096 the largest rows are `attn_paged` (182.1 s over 16 calls), `lora_expand` (116.6 s / 288),
+`gated_had_quant_i8g` (103.2 s / 64), `lora_shrink` (85.6 s / 288), `rmsnorm_had_quant_i8g`
+(81.1 s / 128), `gdn_chunk_scan` (72.7 s / 48) and `gemm_nt_q` (69.3 s / 288); the largest pulls
+are `gemm_nt_q` (22.0 s) and `lora_expand` (18.2 s).
+
+**Three quarters of the backward is neither the rows nor the per-op pull**, and that is the
+answer to "the rows or the pull-back?" — neither. The remaining time is in the walk's own
+bookkeeping (the snapshot store, the tape's contents, the cotangent copies and the join), which
+has no counter yet; a per-phase timer there is the next step for the cost question, not a row
+optimisation.
+
+### Two instruments added from this review
+
+- **One line per block boundary** (`src/step_device.cpp`, `print_boundary_scale`): `r97: boundary
+  <from> -> <to>: entries= n= l1= l2= max=` for the head and after every block, always on. It is
+  the cheapest way to see whether the growth is one jump or a uniform per-block factor, and it
+  needs no dump, no slice and no extra window beyond the walk itself.
+- **`device_step_tape_zerob`** (`tests/gpu/device_step.cpp`): 512 tokens at the same seed-0 start
+  the 4096 ticket runs (`lora_B == 0`), which is the matched control the 512/4096 regime
+  difference needs. The 512 case above seeds both factors; this one does not.
+
+
 ## The per-block gain, against the full device walk
 
 `R97_WALK_BLOCKS` limits **the host walk only** (`src/step_device.cpp:1220-1231`, deliberate: a

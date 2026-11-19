@@ -1494,6 +1494,16 @@ R97_MODEL_TEST(device_step_seq4096) {
     device_step_case("device_step_seq4096", 4096, /*probe=*/false);
 }
 
+// The matched control for #55's token-count question: 512 tokens at the same seed-0 start the
+// 4096 ticket runs, where `lora_B` is exactly zero. The 512 case above seeds both adapter factors
+// (`seed_adapter`), so its leaves and the ticket's are in different parameter regimes; comparing
+// those two norms mixes regimes. This case is the 512 arm in the ticket's regime -- if its
+// boundary cotangent stays small, the growth depends on token count (the scan, attention, the
+// cold `kv:` reads), and if it explodes, it depends on the adapter state.
+R97_MODEL_TEST(device_step_tape_zerob) {
+    device_step_case("device_step_tape_zerob", 512, /*probe=*/false);
+}
+
 #else
 
 // A build without the patch set cannot join a step on the card. Say so by name so the tier's
@@ -1528,6 +1538,13 @@ struct DeviceStepSeq4096Skips {
         std::fflush(stdout);
     }
 } device_step_seq4096_skips;
+
+struct DeviceStepTapeZeroBSkips {
+    DeviceStepTapeZeroBSkips() {
+        std::printf("[gpu] device_step_tape_zerob ... skipped (%s)\n", device_step_skip_reason());
+        std::fflush(stdout);
+    }
+} device_step_tape_zerob_skips;
 
 }  // namespace
 

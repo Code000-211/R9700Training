@@ -1210,6 +1210,30 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             throw std::runtime_error(dbg);
         }
 
+        // The scale of one boundary's cotangent, printed once per boundary (issue #55's review:
+        // "one line per block boundary ... shows at once whether this is one jump or a uniform
+        // per-block factor"). `from` hands it down and `to` receives it, so consecutive lines
+        // differ by exactly one block's gain. Always on: an instrument that needs an env var is
+        // not there in the run that needed it.
+        auto print_boundary_scale = [](int64_t from, int64_t to,
+                                       const std::vector<IncomingCotangent>& cot) {
+            double l1 = 0.0, sq = 0.0, mx = 0.0;
+            int64_t n = 0;
+            for (const IncomingCotangent& c : cot)
+                for (double v : c.value) {
+                    const double a = std::fabs(v);
+                    l1 += a;
+                    sq += v * v;
+                    mx = std::max(mx, a);
+                    n += 1;
+                }
+            std::fprintf(stderr,
+                         "r97: boundary %lld -> %lld: entries=%zu n=%lld l1=%.6g l2=%.6g max=%.6g\n",
+                         static_cast<long long>(from), static_cast<long long>(to), cot.size(),
+                         static_cast<long long>(n), l1, std::sqrt(sq), mx);
+        };
+        print_boundary_scale(measured.layers, measured.layers - 1, incoming);
+
         auto store_boundary = [&](int64_t boundary, const std::vector<IncomingCotangent>& cot,
                                   const std::string& want) {
             if (!options.keep_boundaries) return;
@@ -1673,6 +1697,7 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 throw std::runtime_error("device step: layer " + std::to_string(layer) +
                                          " left no cotangent on its input boundary");
             store_boundary(layer, incoming, store.name(layer));
+            print_boundary_scale(layer, layer - 1, incoming);
             // R97_DUMP_BLOCK=<n> with R97_DUMP_BLOCK_DIR=<dir>: the criterion-two dump
             // (issue #55). At the named layer the walk holds exactly what the single-block
             // f64 reference needs: this block's records (the slice), the boundary forward

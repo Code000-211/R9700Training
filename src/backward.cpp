@@ -586,6 +586,15 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         // whose incoming cotangent is past the card's range falls back to it. The limit leaves
         // headroom for the row's own amplification -- the gated norm's `sc^3` term, the quant
         // row's division by the group's scale -- not just f32's 3.4e38.
+        //
+        // STOPGAP, not the fix: this keeps a walk that is handed a runaway cotangent finite, and
+        // it cannot reach a plugin-private weight (`raw != nullptr`), because the host row refuses
+        // one by name -- which is exactly where the 4096 ticket case used to fail. The cause is
+        // the cotangent's range, and the recorded fix is that row's own carry (an f64 carry or a
+        // per-row scale for the activation cotangent and the staged weight gradient). Treat a
+        // green `all_finite` as "no Inf reached a kernel", never as "the cotangent's scale is
+        // right": at 4096 the walk is finite at a grad norm of 1.26e36 and the loss rises at
+        // lr 1e-4 (issue #55's open magnitude question).
         constexpr double kDeviceCotMax = 1e30;
         if (fn && served == Side::device && options.allow_host_fallback && host_readable &&
             cot_max > kDeviceCotMax) {
