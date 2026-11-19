@@ -685,6 +685,15 @@ Everything below is an existing API except one small env-gated dump in `step_dev
      slice-serve runner emits `<bo.prefix><module>.lora_A/B`. `--prefix` must be set to
      `model.layers.37` and the module spellings verified against the walk's leaf names before
      diffing, or the leaf names will not line up even when the values do.
+   - **Runner fix that followed (commit 22ca128's sweep).** `run_forward` handed twins a
+     compacted reads vector (non-written slots only), while every registered twin indexes its
+     operands schema-positionally — the fused-norm family reads `op[0]=x`, `op[1]=residual`,
+     `op[2]=weight`, so the compaction silently reordered the schema under them and the 5120-value
+     gain reached the twin where the 2621440-value activation belonged. The fix gives the twin
+     every operand slot in schema order (written-but-not-in-place slots ride along as empty
+     `AdValue`s, dtype "invalid"), matching `src/reference_step.cpp:886-927`'s convention; both
+     slice acceptance cases pass with `in_place_passthrough` on, and the passthrough contract is
+     unchanged.
 4. **Device-side leaf gradients for the same block.** The walk stages per-leaf f32 accumulators on
    the card (`src/adjoint/device/grad_stage.{h,cpp}`); `grad_stage_flush(grads)` at
    `src/step_device.cpp:1674` materialises them into the `ParamSet` at step end, named by

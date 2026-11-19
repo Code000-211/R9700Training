@@ -329,19 +329,32 @@ inline void run_forward(const ProgramSlice& program, const SliceInput& in,
             throw std::runtime_error("slice runner: no twin for op '" + rec.op + "'" +
                                      (error.empty() ? std::string() : " (" + error + ")"));
 
+        // The twin's call carries EVERY operand slot in schema order -- the convention
+        // src/reference_step.cpp:886-927 and every registered twin are written against
+        // (the fused-norm family indexes op[0]=x, op[1]=residual, op[2]=weight by schema
+        // position, and an in-place write IS an op's input whose prior value is the read).
+        // A slot that never existed shrinks for nobody: written-but-not-in-place slots
+        // stay in their schema positions as the empty placeholder the twins skip.
         std::vector<AdValue> snapshot(rec.operands.size());
-        std::vector<AdValue> reads;  // the reads, in schema order, the twin's call
+        std::vector<AdValue> reads(rec.operands.size());
         std::vector<size_t> writes;  // the written operands' schema slots, in the writes' order
         for (size_t i = 0; i < rec.operands.size(); ++i) {
             const r97::Operand& o = rec.operands[i];
             if (!o.written) {
-                reads.push_back(operand_at(rec, o, *env, in));
-                snapshot[i] = reads.back();
+                reads[i] = operand_at(rec, o, *env, in);
+                snapshot[i] = reads[i];
                 continue;
             }
             writes.push_back(i);
-            if (r97::in_place_read(rec, i))
-                snapshot[i] = operand_at(rec, o, *env, in);  // the value the write replaces
+            if (r97::in_place_read(rec, i)) {
+                reads[i] = operand_at(rec, o, *env, in);  // the value the write replaces
+                snapshot[i] = reads[i];
+            }
+        }
+        // The empty un-filled slots: the walk's own convention for an absent value
+        // (r97/adjoint.h's AdValue with an empty value; a twin that reads one declines).
+        for (size_t i = 0; i < rec.operands.size(); ++i) {
+            if (reads[i].value.empty() && reads[i].dtype.empty()) reads[i].dtype = "invalid";
         }
 
         std::vector<AdValue> produced;
