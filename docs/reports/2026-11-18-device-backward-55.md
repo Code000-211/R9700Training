@@ -838,9 +838,16 @@ walk's incoming cotangent -- never "the walk", and never 4096's magnitude. It do
 
 ## Tests
 
-- Host tier serial (`ctest --test-dir build -L host`): **25/25**; the new
+- Host tier serial (`ctest --test-dir build -L host`): **25/25** ctest entries, 148 s, the
+  binary's own `301 tests, 0 failed`; the new
   `adjoint_registry_fills_follow_the_served_row` and the huge-norm clip check in
-  `tests/host/optim.cpp`.
+  `tests/host/optim.cpp`. One full-tier run under load failed `host_step_int8` and
+  `host_step_int8_gradient_points_the_way_bf16_does` (both at layer 0's
+  `in_proj_qkv.lora_A`); both pass isolated 5/5 and a clean full-tier rerun is green, so it is
+  recorded as a load flake, not a regression — the same shape as the earlier
+  `train_host_cli_serves_the_int8_trunk` flake.
+- The slice runner's own cases (`slice_reference_linear_scale`,
+  `slice_reference_residual_two_consumers`) run on every change to `src/slice_reference.h`.
 - GPU tier in one held window: `adjoint_in_place_rows` (4 cases), `adjoint_lora_fixture`,
   `adjoint_quant_device`, `adjoint_qk_fixture` — all pass, 27.8 s.
 
