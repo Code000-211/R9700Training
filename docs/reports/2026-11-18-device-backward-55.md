@@ -804,10 +804,27 @@ The divergence is already at op 0, whose three inputs all match the device (the 
 values, `rel=0`, and the norm weight `rel=0`): the fused norm's own quantised stream differs by
 21%. Every downstream activation inherits it, and the ~5% gradient difference is downstream of
 that. So the next step is not the adjoint at all -- it is op 0's twin against the device's
-`rmsnorm_had_quant_i8g`, on inputs that are known to be the device's own. A direct numpy
-reconstruction of the documented formula (residual add, RMS norm, `w+1`, per-128-block i8) matches
-the dumped codes only 0.7% of the time, so the twin's actual formula is the thing to read
-(`src/adjoint/host/elementwise.cpp`, the fused-norm family) rather than assume.
+`rmsnorm_had_quant_i8g`, on inputs that are known to be the device's own.
+
+Three things were checked before writing that lead down, and two of them correct it:
+
+- **A numpy reconstruction of rmsnorm + quantise reproduces 0.7% of the dumped codes -- and that
+  is a fact about the reconstruction, not the twin.** The `had` in the op's name is an
+  unnormalised Walsh-Hadamard per 128-group between the norm and the quantiser
+  (`src/adjoint/host/quant.cpp:225`, `:182`; the family is described at `:826-832`), and a
+  transform the reconstruction omits scrambles every code. Do not quote the 0.7% as evidence
+  against the twin.
+- **The tape's snapshot of the in-place residual is the post-op value** (`rmsnorm_residual`'s
+  comment, `src/adjoint/host/elementwise.cpp:470-480`), which suggested the slice's pre-write read
+  was the wrong norm input. It was tried: `reads[1] = bf16(x + h)`. It left `h.q8`'s rel at 0.207
+  and moved the residual's own match from 0 to 0.020, so the device does not accumulate that
+  operand at this op and the pre-write read is what the kernel consumed. Reverted; the trial is
+  recorded here so it is not repeated.
+- **The authoritative op-0 check already exists**: `R97_DUMP_QUANT=1` re-quantises the twin's
+  intermediate through the same Hadamard and compares it with the codes the kernel wrote
+  (`quant.cpp:1146-1230`), printing `code_err` and a code-distance histogram. It runs in the walk,
+  so it costs one window; it separates "the norm part is wrong" from "the quantiser path is
+  wrong" without either side being assumed.
 
 Two smaller corrections that came out of the same runs: `h`'s `rel=279` and `lora.t.*`'s `rel=1.3`
 are artifacts of comparing a multi-write buffer's *final* value against the dump's first-read

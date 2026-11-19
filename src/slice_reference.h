@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <fstream>
 #include <map>
@@ -201,6 +202,27 @@ struct SliceInput {
 // ------------------------------------------------------------------ the forward
 
 // The forward value of one operand of one op, in the environment as it stands when the op runs.
+// The int8 fused producers: their in-place operand is the residual accumulator the tape
+// snapshots after the op (quant.cpp:826-832 names the family).
+inline bool fused_producer_sum(const std::string& op) {
+    return op == "rmsnorm_had_quant_i8g" || op == "gated_had_quant_i8g" ||
+           op == "gate_had_quant_i8g";
+}
+
+// The kernel narrows the accumulated sum to the residual's dtype before the norm reads it
+// (libref/ref_quant.cpp's src(i)); a bf16 store rounds to nearest even.
+inline void narrow_bf16(std::vector<double>* v) {
+    for (double& d : *v) {
+        float f = static_cast<float>(d);
+        uint32_t u = 0;
+        std::memcpy(&u, &f, sizeof u);
+        u += 0x7fffu + ((u >> 16) & 1u);
+        u &= 0xffff0000u;
+        std::memcpy(&f, &u, sizeof f);
+        d = static_cast<double>(f);
+    }
+}
+
 // A raw position table the tape carries as a pointer, rebuilt the way the trainer's own
 // reference step names and fills them (src/reference_step.cpp:288-302 and :438-486): the
 // operand's schema position decides the table, and the fills are the batch's structure --
@@ -436,6 +458,12 @@ inline void run_forward(const ProgramSlice& program, const SliceInput& in,
                 continue;
             }
             writes.push_back(i);
+            // A trial of the fused producers' residual sum (`reads[1] = bf16(x + h)`, the
+            // tape's post-op snapshot) is recorded in the report: it left h.q8's rel at 0.207
+            // and moved the residual's own match from 0 to 0.020, so the device does not
+            // accumulate that operand at this op and the pre-write read is what the kernel
+            // consumed. The op-0 question is the quantiser's, checked by the walk's own
+            // R97_DUMP_QUANT re-quantisation (quant.cpp:1146-1230), not by this sum.
             if (r97::in_place_read(rec, i)) {
                 // A carried state this block has not written yet enters cold: the walk's own
                 // rule (src/step_device.cpp:1582-1588), applied to the same slice.
