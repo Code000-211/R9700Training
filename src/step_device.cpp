@@ -1353,10 +1353,24 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 return o.shape.size() == 2 && o.shape[0] == boundary_tokens &&
                        o.shape[1] == boundary_hidden;
             };
+            // R97_DUMP_BLOCK: when the replay below reaches the named layer, each record's
+            // frozen-and-not-yet-dumped read operands land in `constants_doc` as the walk's own
+            // decoded f64 view -- frozen operands from the shared store, pulled reads widened,
+            // the same snapshots the adjoint binds. An operand no f64 form exists for (a
+            // plugin-private quantised tensor: raw/enc set, value empty) is named in
+            // `refused_names` instead of fabricated.
+            const long long dump_block_layer = [] {
+                if (const char* db = std::getenv("R97_DUMP_BLOCK")) return std::atoll(db);
+                return -1LL;
+            }();
+            nlohmann::json constants_doc = nlohmann::json::object();
+            std::set<std::string> dumped_names;
+            std::vector<std::string> refused_names;
             replay.replay(layer, [&snaps, &snap_record, &note_produced, &before, &block_wrote,
                                   &covered, &same_layout, &writer_rows, &writer_view, &options,
                                   &layer, &replay, &in_boundary, &measured, boundary_bytes,
-                                  residual_lo](
+                                  residual_lo, &dump_block_layer, &constants_doc, &dumped_names,
+                                  &refused_names](
                                      const OpRecord& op,
                                      const std::vector<OperandContent>& content) {
                 // The adjoint sees the step's rows and, for attention, the q view its family
@@ -1368,6 +1382,32 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 if (options.reference_head_split) mark_join_lora(shaped);
                 SnappedRecord snapped = snap_record(shaped, content);
                 note_produced(shaped, snapped.now);
+                // Per record: every read operand neither written nor already dumped, decoded to
+                // the walk's f64 view. A frozen operand's frozen value is the walk's own answer;
+                // otherwise the pulled-and-widened one is. A plugin-private operand (no f64 form,
+                // value empty) is refused by name, never fabricated, and `dumped_names` is not
+                // grown so a later read of the same buffer records its own refusal line.
+                if (dump_block_layer == static_cast<long long>(layer)) {
+                    for (size_t j = 0; j < shaped.operands.size(); ++j) {
+                        const Operand& o = shaped.operands[j];
+                        if (o.written) continue;
+                        if (dumped_names.count(o.buffer)) continue;
+                        if (o.buffer.rfind("raw:", 0) == 0 || o.buffer.rfind("none:", 0) == 0)
+                            continue;
+                        if (o.dtype == "invalid") continue;
+                        const AdValue& v = snapped.frozen[j] ? *snapped.frozen[j] : snapped.now[j];
+                        if (v.value.empty()) {
+                            refused_names.push_back(o.buffer);
+                            continue;
+                        }
+                        nlohmann::json entry;
+                        entry["dtype"] = v.dtype;
+                        entry["shape"] = v.shape;
+                        entry["value"] = v.value;
+                        constants_doc[o.buffer] = std::move(entry);
+                        dumped_names.insert(o.buffer);
+                    }
+                }
                 for (size_t j = 0; j < shaped.operands.size(); ++j) {
                     const Operand& read = shaped.operands[j];
                     if (read.written || snapped.frozen[j]) continue;
@@ -1702,6 +1742,34 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                             v["value"] = std::move(wide);
                             doc[name] = std::move(v);
                         }
+                        // The extra boundary: the fused-norm blocks read a second copy beside
+                        // the residual -- the h stream -- and the boundary file must carry what
+                        // the block actually read. The key is the incoming entry whose buffer is
+                        // not the residual's own; if no such entry defines the name, it falls
+                        // through to the loud "h" fallback rather than silently going missing.
+                        if (store.extra_at(layer)) {
+                            std::vector<uint16_t> host2(
+                                static_cast<size_t>(tokens * meta.hidden));
+                            store.read_extra(layer, host2.data());
+                            std::vector<double> wide2;
+                            widen_bf16(host2, &wide2);
+                            nlohmann::json v2;
+                            v2["dtype"] = "f64";
+                            v2["shape"] = nlohmann::json::array({tokens, meta.hidden});
+                            v2["value"] = std::move(wide2);
+                            std::string extra_key;
+                            for (const IncomingCotangent& c : incoming)
+                                if (c.buffer != name) {
+                                    extra_key = c.buffer;
+                                    break;
+                                }
+                            if (extra_key.empty()) {
+                                extra_key = "h";
+                                std::fprintf(stderr, "BOUNDARY_EXTRA name=fallthrough-h\n");
+                                std::fflush(stderr);
+                            }
+                            doc[extra_key] = std::move(v2);
+                        }
                         std::ofstream out(base + "-boundary.json");
                         out << doc.dump(2) << "\n";
                     }
@@ -1720,8 +1788,26 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                             s["cotangent"] = std::move(cot);
                             arr.push_back(std::move(s));
                         }
-                        std::ofstream out(base + "-seeds.json");
-                        out << arr.dump(2) << "\n";
+                        std::ofstream seeds_out(base + "-seeds.json");
+                        seeds_out << arr.dump(2) << "\n";
+                    }
+                    // The constants: the per-record collection the replay callback filled in
+                    // -- the walk's own frozen snapshots, decoded f64, keyed by buffer. Written
+                    // ALWAYS, even empty: the file's existence is the signal the hook ran.
+                    {
+                        std::ofstream out(base + "-constants.json");
+                        out << constants_doc.dump(2) << "\n";
+                    }
+                    // The plugin-private operands the constants path cannot carry: their names,
+                    // so the comparison states a refusal instead of a fabricated constant.
+                    if (!refused_names.empty()) {
+                        nlohmann::json refused_arr = nlohmann::json::array();
+                        for (const std::string& name2 : refused_names)
+                            refused_arr.push_back(name2);
+                        std::ofstream out(base + "-constants-refused.json");
+                        out << refused_arr.dump(2) << "\n";
+                        std::fprintf(stderr, "CONSTANTS-REFUSED n=%zu\n", refused_names.size());
+                        std::fflush(stderr);
                     }
                     std::fprintf(stderr, "device step: dumped layer %lld's slice, boundary and "
                                          "seeds to %s\n",
