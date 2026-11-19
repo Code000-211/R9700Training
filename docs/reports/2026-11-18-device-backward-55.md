@@ -604,9 +604,16 @@ single-block f64 reference at the real container's shapes.
   than threading options through the whole-graph contract in `ReferenceStep`. As previously
   written ("two pieces"), the first GPU-window run of a filtered program would have thrown at
   `make_layout` before any comparison -- a whole window spent on an exception.
-- **Scope, stated once**: seeded from the device walk's incoming cotangent, this tests the block's
-  rows given the same input -- the same limit as the host-walk arbiter, and not a whole-walk
-  statement.
+- **Scope, stated once -- and corrected once by review**: the slice's `backward_block`
+  (`src/backward.cpp:208`) is the SAME core the reference step drives (`:1053`) AND the device walk
+  drives (`src/step_device.cpp:1170`, `:1595`). Of the three components that scoped the host-walk
+  arbiter's 0.59% (the join, the head's seeds, `src/backward.cpp`), caller-filled snapshots drop
+  the first TWO but RETAIN the third: a defect in the core's in-place serving, passthrough or slot
+  ordering reproduces identically on both sides and stays unarbitrated. So slice-vs-device agreement
+  clears that block's ROWS and rules out the join's boundary handling there -- it does NOT rule
+  out a backward-core defect. What the instrument ADDS over the walk-vs-walk arbiter is real:
+  blocks 0..62 (no `R97_WALK_BLOCKS` top-n limit), no join, no head seeds. Same discipline as the
+  0.59% scoping: the claim that survives is "the rows at that block", never "the walk".
 
 The work is a real instrument, not a rerun, and it should start in a fresh context: the four
 negative results above are the specification, and re-deriving them costs a GPU window each.
