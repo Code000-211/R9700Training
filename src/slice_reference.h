@@ -429,26 +429,28 @@ inline void norms_of(const std::vector<double>& v, double* l1, double* l2) {
 
 // `BUF <buffer> l1=<value> l2=<value>` and `LEAF <name> l1=<value> l2=<value>`: greppable,
 // unambiguous about the buffer each line describes. The comparison against the device walk's
-// dumps is later work; this print is the artifact that comparison reads.
-inline void print_report(const SliceRun& run, const SliceInput& in) {
+// dumps is later work; this print is the artifact that comparison reads. It writes through a
+// FILE* -- C stdio -- because the tool's `--out` is a file, and cout's streambuf swap does not
+// capture printf.
+inline void print_report(const SliceRun& run, const SliceInput& in, FILE* out = stdout) {
     for (const std::string& name : in.out_buffers) {
         const auto it = run.env.find(name);
         if (it == run.env.end()) continue;
         double l1 = 0.0, l2 = 0.0;
         norms_of(it->second.value.value, &l1, &l2);
-        std::printf("BUF %s l1=%.17g l2=%.17g\n", name.c_str(), l1, l2);
+        std::fprintf(out, "BUF %s l1=%.17g l2=%.17g\n", name.c_str(), l1, l2);
     }
     for (const r97::Param& p : run.grads) {
         double l1 = 0.0, l2 = 0.0;
         norms_of(std::vector<double>(p.value.begin(), p.value.end()), &l1, &l2);
-        std::printf("LEAF %s l1=%.17g l2=%.17g\n", p.name.c_str(), l1, l2);
+        std::fprintf(out, "LEAF %s l1=%.17g l2=%.17g\n", p.name.c_str(), l1, l2);
     }
     for (const std::string& name : in.leaf_buffers)
         for (const r97::InputCotangent& ic : run.walk.inputs)
             if (ic.buffer == name) {
                 double l1 = 0.0, l2 = 0.0;
                 norms_of(ic.value, &l1, &l2);
-                std::printf("BUF %s l1=%.17g l2=%.17g\n", name.c_str(), l1, l2);
+                std::fprintf(out, "BUF %s l1=%.17g l2=%.17g\n", name.c_str(), l1, l2);
             }
 }
 

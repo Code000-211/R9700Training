@@ -130,17 +130,23 @@ static int slice_serve_main(int argc, char** argv) {
     in.prefix = prefix;
     try {
         slice_input_from_files(boundary_path, seeds_path, &in);
+        // print_report iterates these two lists; with none set it prints nothing. The buffers
+        // the report cares about are the injected ones -- deterministic, and nonempty exactly
+        // when a caller asked for produced values.
+        for (const auto& [name, value] : in.boundary) {
+            in.out_buffers.push_back(name);
+            in.leaf_buffers.push_back(name);
+        }
         const slice::ProgramSlice program = slice::parse_slice(std::string(program_path));
         const slice::SliceRun got = slice::run_slice(program, in);
         if (out_path != nullptr) {
-            std::ofstream out(out_path);
+            std::FILE* out = std::fopen(out_path, "w");
             if (!out) {
                 std::cerr << "r97train slice-serve: cannot open " << out_path << " for writing\n";
                 return 2;
             }
-            std::streambuf* saved = std::cout.rdbuf(out.rdbuf());
-            slice::print_report(got, in);
-            std::cout.rdbuf(saved);
+            slice::print_report(got, in, out);
+            std::fclose(out);
         } else {
             slice::print_report(got, in);
         }
