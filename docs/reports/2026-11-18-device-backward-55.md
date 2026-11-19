@@ -604,6 +604,22 @@ single-block f64 reference at the real container's shapes.
   than threading options through the whole-graph contract in `ReferenceStep`. As previously
   written ("two pieces"), the first GPU-window run of a filtered program would have thrown at
   `make_layout` before any comparison -- a whole window spent on an exception.
+
+**The runner is landed** (`tests/host/slice_reference.cpp`, commits `d50f10d`, `0e5dff3`,
+`52ffce1`): objective-free f64 replay of a filtered r97-program slice through the registered
+twins and `backward_block`, with boundary forward values and `std::vector<r97::Seed>`
+(`SliceInput::seeds`) injected by buffer name and any other read refused by name. Both
+acceptance cases pass standalone (`R97_TEST_ONLY=... r97_host_tests`) and the `host_tests`
+ctest entry runs the binary unfiltered to exit 0. Red-run proof: with
+`options.in_place_passthrough = false`, case (b) fails on `dx`; with `true` both pass -- the
+case pins the option by construction, not by accident.
+
+**Serialization trap the harness now tests and the next step must honor:** `program_json`
+writes NO in-place field (`src/reference_step.cpp:168-173`), so a slice recorded via
+`r97train ops --record` silently loses every in-place marker and the runner would parse all
+operands `in_place=false` -- green-when-wrong at a GPU window's cost. The tape's own
+serialization carries it as `inout` (`src/tape.cpp:170`); the runner reads `inout` first. **The
+real block slice must be recorded via the tape's path**, not `program_json`.
 - **Scope, stated once -- and corrected once by review**: the slice's `backward_block`
   (`src/backward.cpp:208`) is the SAME core the reference step drives (`:1053`) AND the device walk
   drives (`src/step_device.cpp:1170`, `:1595`). Of the three components that scoped the host-walk
