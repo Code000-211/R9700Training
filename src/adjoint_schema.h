@@ -59,4 +59,38 @@ inline void prepare_adjoint_record(const OpRecord& rec, OpRecord* out) {
             }
 }
 
+
+// The observer names an unnamed operand after its position in the schema ("raw:2"), so two ops
+// can give the same name to buffers of different shapes. A raw or absent operand is per-op by
+// definition (a position table, a slot list, a token range), so give each its own name; nothing
+// reads an unnamed operand by name. (src/join_common.h:530-540 carries the walk's copy.)
+inline r97::OpRecord own_raws(r97::OpRecord rec) {
+    for (r97::Operand& o : rec.operands)
+        if (o.buffer.rfind("raw:", 0) == 0 || o.buffer.rfind("none:", 0) == 0)
+            o.buffer += "@" + std::to_string(rec.position);
+    return rec;
+}
+
+
+// The weight a lora record belongs to, from the adapter factor it names: lora.<weight>.a or .b.
+// The record names the kernel weight (`blk.3.ffn_down.weight`), while the delta's site names the
+// parameter without the container's `.weight` leaf (`blk.3.ffn_down`); drop that leaf so both
+// name the same site.
+inline std::string record_weight(const r97::OpRecord& rec) {
+    for (const r97::Operand& o : rec.operands) {
+        if (o.buffer.rfind("lora.", 0) != 0) continue;
+        const size_t dot = o.buffer.find_last_of('.');
+        if (dot == std::string::npos) continue;
+        const std::string leaf = o.buffer.substr(dot + 1);
+        if (leaf != "a" && leaf != "b") continue;
+        std::string weight = o.buffer.substr(5, dot - 5);
+        const std::string suffix = ".weight";
+        if (weight.size() > suffix.size() &&
+            weight.compare(weight.size() - suffix.size(), suffix.size(), suffix) == 0)
+            weight.resize(weight.size() - suffix.size());
+        return weight;
+    }
+    return {};
+}
+
 }  // namespace r97

@@ -425,10 +425,18 @@ void card_case(const char* test, int64_t n, bool probe) {
         for (const r97::Param& g : set)
             if (g.name.find(want) != std::string::npos && !g.value.empty()) {
                 double leaf_sq = 0.0;
-                for (float v : g.value) leaf_sq += double(v) * double(v);
+                double leaf_l1 = 0.0;
+                for (float v : g.value) {
+                    leaf_sq += double(v) * double(v);
+                    leaf_l1 += std::fabs(double(v));
+                }
                 norm_sq += leaf_sq;
                 ++n;
-                std::printf("%s: LEAF %s grad=%.9g (%s)\n", test, g.name.c_str(), g.value[0], arm);
+                // The norms beside the element: the slice runner's own report carries
+                // l1/l2/first, and one element alone cannot separate a real disagreement
+                // from a near-zero draw.
+                std::printf("%s: LEAF %s grad=%.9g l1=%.17g l2=%.17g (%s)\n", test,
+                            g.name.c_str(), g.value[0], leaf_l1, std::sqrt(leaf_sq), arm);
             }
         std::printf("%s: LEAFSET %s leaves=%lld norm=%.9g (%s)\n", test, want.c_str(),
                     (long long)n, std::sqrt(norm_sq), arm);

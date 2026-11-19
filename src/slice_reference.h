@@ -201,6 +201,65 @@ struct SliceInput {
 // ------------------------------------------------------------------ the forward
 
 // The forward value of one operand of one op, in the environment as it stands when the op runs.
+// A raw position table the tape carries as a pointer, rebuilt the way the trainer's own
+// reference step names and fills them (src/reference_step.cpp:288-302 and :438-486): the
+// operand's schema position decides the table, and the fills are the batch's structure --
+// positions 0..M-1, cu_seqlens [0, M] for one sequence, a sequence's state slot, the zero
+// [n_seq] gdn_conv_prep passes, the [[s]] arange chunk_scan passes. The lora records carry a
+// different table at position 2: the pool's row map, which a one-slot pool makes all zeros.
+inline AdValue raw_table(const r97::OpRecord& rec, const r97::Operand& o) {
+    int64_t M = 0;
+    int64_t pool = -1;
+    for (const auto& kv : rec.params) {
+        const int64_t* p = std::get_if<int64_t>(&kv.second);
+        if (p == nullptr) continue;
+        if (kv.first == "M") M = *p;
+        if (kv.first == "S") pool = *p;
+    }
+    const int64_t n = o.shape.empty() ? 0 : numel(o.shape);
+    AdValue v;
+    v.dtype = o.dtype.empty() ? std::string("i32") : o.dtype;
+    v.shape = o.shape;
+    v.value.assign(static_cast<size_t>(n), 0.0);
+    auto refuse = [&](const std::string& why) {
+        throw std::runtime_error("slice runner: op '" + rec.op + "' at position " +
+                                 std::to_string(rec.position) + " reads raw table '" +
+                                 o.buffer + "' (" + why + "), which this runner cannot derive");
+    };
+    // The lora pool's row map: one slot maps every row to it.
+    if (pool >= 0) {
+        if (pool == 1 && n > 0) return v;
+        refuse("pool S=" + std::to_string(pool));
+    }
+    std::string key = o.buffer.substr(4);
+    if (const auto at = key.find('@'); at != std::string::npos) key.resize(at);
+    const bool seq_ok = M > 0;
+    if (key == "1" && rec.op != "gather_rows") {  // positions
+        if (!seq_ok || n != M) refuse("positions of a batch this runner does not hold");
+        for (int64_t i = 0; i < n; ++i) v.value[(size_t)i] = double(i);
+        return v;
+    }
+    if (key == "3" || key == "6" || key == "7") {  // cu_seqlens
+        if (!seq_ok || n != 2) refuse("cu_seqlens of a batch this runner does not hold");
+        v.value[0] = 0.0;
+        v.value[1] = double(M);
+        return v;
+    }
+    if (key == "9") {  // the state slot each sequence owns
+        if (!seq_ok || n != 1) refuse("state index of a batch this runner does not hold");
+        return v;
+    }
+    if (key == "10") {
+        if (o.shape.size() == 2) {  // chunk_scan's [[0], [1], ...]
+            if (!seq_ok || n != 1) refuse("arange of a batch this runner does not hold");
+            return v;
+        }
+        return v;  // gdn_conv_prep's zero [n_seq]
+    }
+    refuse("unmapped position");
+    return v;  // unreachable
+}
+
 inline AdValue operand_at(const r97::OpRecord& rec, const r97::Operand& o,
                           const std::map<std::string, Buffer>& env, const SliceInput& in) {
     // The schema's absent slot (none:1, an empty shape or dtype "invalid"): one scalar, the
@@ -246,6 +305,18 @@ inline AdValue operand_at(const r97::OpRecord& rec, const r97::Operand& o,
     const auto constant = in.constants.find(o.buffer);
     if (constant != in.constants.end()) {
         const AdValue& whole = constant->second;
+        // A valueless declaration: the operand's value lives only inside the engine's joined
+        // form (a plugin-private quantisation scale the stored-weight decode folds in), and no
+        // f64 view exists. The twin that reads this record does not consume the slot on the
+        // stored path; naming it valueless keeps the refusal honest instead of fabricating.
+        // Its shape is the record's -- the walk's own plugin-private snapshot carries the shape
+        // and no value (raw/enc only), and the backward core checks shapes, not contents.
+        if (whole.value.empty()) {
+            AdValue v = whole;
+            if (v.shape.empty()) v.shape = o.shape;
+            if (!o.dtype.empty()) v.dtype = o.dtype;
+            return v;
+        }
         if (o.rows > 0) {
             if (o.row_lo < 0 || o.row_lo + o.rows > whole.shape[0])
                 throw std::runtime_error("slice runner: op '" + rec.op + "' at position " +
@@ -272,6 +343,13 @@ inline AdValue operand_at(const r97::OpRecord& rec, const r97::Operand& o,
         return v;
     }
 
+    // (2b) a raw position table: the tape carries it as a pointer, never a value. The one this
+    // slice reads is the lora pool's row map, and the record declares the pool's size (params
+    // "S"). A one-slot pool maps every row to slot 0 -- the map a full batch has. A larger pool
+    // would need the device's own table, which this runner does not have, so it refuses instead
+    // of inventing one.
+    if (o.buffer.rfind("raw:", 0) == 0) return raw_table(rec, o);
+
     // (3) the refusal: the read names a buffer no injection names, no constant declares and no
     // slice op wrote. Nothing falls through to a weight by name here.
     throw std::runtime_error("slice runner: op '" + rec.op + "' at position " +
@@ -294,6 +372,16 @@ inline void put_write(const r97::Operand& o, const AdValue& produced,
         if (!shape.empty() && o.rows > 0)
             shape[0] = std::max<int64_t>(shape[0], o.row_lo + o.rows);
         whole = make_value(o.dtype, shape, std::vector<double>(static_cast<size_t>(numel(shape)), 0.0));
+    }
+    // A write that covers the record's whole declared buffer defines it: replace it outright.
+    // A stale entry under the same name (the dump's activation leak, or a value the walk left
+    // behind) must not veto the twin's production, and the record's own shape is authoritative
+    // -- the pre-write value, when the write is in place, is already in the snapshot.
+    std::vector<int64_t> want = o.shape;
+    if (!want.empty() && o.rows > 0) want[0] = std::max<int64_t>(want[0], o.row_lo + o.rows);
+    if (!produced.shape.empty() && produced.shape == want) {
+        (*env)[o.buffer] = Buffer{produced};
+        return;
     }
     const int64_t whole_rows = whole.shape.empty() ? 0 : whole.shape[0];
     const int64_t whole_cols = whole_rows > 0 ? numel(whole.shape) / whole_rows : 0;
@@ -349,6 +437,17 @@ inline void run_forward(const ProgramSlice& program, const SliceInput& in,
             }
             writes.push_back(i);
             if (r97::in_place_read(rec, i)) {
+                // A carried state this block has not written yet enters cold: the walk's own
+                // rule (src/step_device.cpp:1582-1588), applied to the same slice.
+                if (o.buffer.rfind("kv:", 0) == 0 && env->find(o.buffer) == env->end()) {
+                    AdValue cold;
+                    cold.dtype = o.dtype.empty() ? std::string("bf16") : o.dtype;
+                    cold.shape = o.shape;
+                    cold.value.assign(static_cast<size_t>(numel(o.shape)), 0.0);
+                    reads[i] = cold;
+                    snapshot[i] = cold;
+                    continue;
+                }
                 reads[i] = operand_at(rec, o, *env, in);  // the value the write replaces
                 snapshot[i] = reads[i];
             }
@@ -359,8 +458,14 @@ inline void run_forward(const ProgramSlice& program, const SliceInput& in,
             if (reads[i].value.empty() && reads[i].dtype.empty()) reads[i].dtype = "invalid";
         }
 
+        // The twin finds its operands by schema name (a/b/a_scale/b_scale) on the linear ops;
+        // the tape's own buffer names never carry them. Same pass the joins hand their rows
+        // (prepare_adjoint_record); a twin without it reads operand_pos("b") = -1 and returns
+        // no outputs.
+        OpRecord trec;
+        prepare_adjoint_record(rec, &trec);
         std::vector<AdValue> produced;
-        twin(rec, reads, &produced);
+        twin(trec, reads, &produced);
         if (produced.size() != writes.size())
             throw std::runtime_error("slice runner: twin of '" + rec.op + "' produced " +
                                      std::to_string(produced.size()) + " outputs, the record names " +
@@ -404,8 +509,15 @@ inline SliceRun run_slice(const ProgramSlice& program, const SliceInput& in) {
     // environment holds them before the first op, so an unwritten read of one is served.
     for (const auto& [name, value] : in.boundary) run.env[name] = Buffer{value};
 
+    // One name per raw/absent operand: the observer names them by schema position, and two
+    // ops give position 10 shapes of different ranks (gdn_conv_prep's [1], chunk_scan's [1,1]).
+    // The backward core records one shape per buffer name, so each record's unnamed operands
+    // take their own (src/join_common.h:530-540, the walks' own rule).
+    ProgramSlice prog = program;
+    for (r97::OpRecord& rec : prog.ops) rec = own_raws(rec);
+
     r97::StoredSnapshots snaps;
-    run_forward(program, in, &run.env, &snaps);
+    run_forward(prog, in, &run.env, &snaps);
 
     // The boundaries a seed may name: the buffers that exist at the slice's end, whole rows --
     // the row count each buffer's own shape declares and what the seeds' rows name. ReferenceStep
@@ -475,11 +587,25 @@ inline void print_report(const SliceRun& run, const SliceInput& in, FILE* out = 
         norms_of(it->second.value.value, &l1, &l2);
         std::fprintf(out, "BUF %s l1=%.17g l2=%.17g\n", name.c_str(), l1, l2);
     }
+    // The leaf lines carry the element the walk's own report prints (`grad=%.9g` is
+    // g.value[0], tests/gpu/device_step.cpp:404-410) beside the norms, so the comparison is
+    // like for like, and the set line is the walk's LEAFSET: the L2 over every leaf whose name
+    // contains the prefix.
+    int64_t set_leaves = 0;
+    double set_norm_sq = 0.0;
     for (const r97::Param& p : run.grads) {
         double l1 = 0.0, l2 = 0.0;
         norms_of(std::vector<double>(p.value.begin(), p.value.end()), &l1, &l2);
-        std::fprintf(out, "LEAF %s l1=%.17g l2=%.17g\n", p.name.c_str(), l1, l2);
+        const double first = p.value.empty() ? 0.0 : static_cast<double>(p.value[0]);
+        std::fprintf(out, "LEAF %s l1=%.17g l2=%.17g first=%.17g\n", p.name.c_str(), l1, l2,
+                     first);
+        if (!p.value.empty() && p.name.find(in.prefix) != std::string::npos) {
+            ++set_leaves;
+            set_norm_sq += l2 * l2;
+        }
     }
+    std::fprintf(out, "LEAFSET %s leaves=%lld norm=%.9g\n", in.prefix,
+                 static_cast<long long>(set_leaves), std::sqrt(set_norm_sq));
     for (const std::string& name : in.leaf_buffers)
         for (const r97::InputCotangent& ic : run.walk.inputs)
             if (ic.buffer == name) {

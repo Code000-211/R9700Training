@@ -30,6 +30,11 @@
 #include "commands.h"
 
 #include "../src/slice_reference.h"
+#include "../src/stored_weight.h"
+#include "radfile.h"
+#include "rad_encoding.h"
+#include "../src/iqr_form.h"
+#include "../src/iqr_decode.h"
 
 #include <fstream>
 #include <iostream>
@@ -59,6 +64,65 @@ AdValue ad_value_from_json(const std::string& name, const nlohmann::json& j) {
         for (const nlohmann::json& x : j["value"])
             if (x.is_number()) v.value.push_back(x.get<double>());
     return slice::make_value(v.dtype, v.shape, v.value);
+}
+
+
+// The plugin-private operands the slice reads, widened from the container exactly as the host
+// walk's register_stored_operand does (src/step_device.cpp:817-900): a plain one-plane entry
+// becomes f64 values, a quantised one is decoded into the stored-weight table under a key this
+// tool owns. Both paths serve the twin the same arithmetic the walk's host row computes.
+struct PluginPrivateSource {
+    rad::RadFile file;
+    std::map<std::string, char> keys;  // one stable enc key per buffer name
+};
+
+bool widen_plugin_private(PluginPrivateSource& src, const std::string& name,
+                          const std::vector<int64_t>& shape, r97::AdValue* out) {
+    const RadFileEntry* e = src.file.find(name);
+    if (e == nullptr) return false;
+    int64_t rows = 0, cols = 0;
+    rad_enc_view(e->rank, e->shape, &rows, &cols);
+    if (rows <= 0 || cols <= 0) return false;
+    const RadEncoding& enc = src.file.encoding(*e);
+    if (enc.n_planes < 1 || enc.n_planes > RAD_ENC_MAX_PLANES) return false;
+    std::vector<r97::R97IqrStoredPlane> plane(static_cast<size_t>(enc.n_planes));
+    for (int32_t i = 0; i < enc.n_planes; ++i) {
+        const RadFilePlane& p = src.file.plane(*e, i);
+        plane[static_cast<size_t>(i)].data = src.file.data(p);
+        plane[static_cast<size_t>(i)].bytes = static_cast<int64_t>(p.bytes);
+    }
+    out->dtype = "plugin-private";
+    out->shape = shape;
+    if (rad_enc_is(&enc, "plain") && enc.n_planes == 1 && !enc.transform[0] &&
+        enc.plane[0].block[0] == 1 && enc.plane[0].block[1] == 1) {
+        const RadEncPlane& p = enc.plane[0];
+        const int32_t st = r97::iqr_detail::scale_type(p.dtype);
+        const int64_t n = rows * cols;
+        int64_t want = 1;
+        for (int64_t d : shape) want *= std::max<int64_t>(d, 0);
+        if (st < 0 || n != want) return false;
+        if (plane[0].data == nullptr || plane[0].bytes < rad_dtype_bytes(p.dtype, n)) return false;
+        std::vector<double> values(static_cast<size_t>(n));
+        for (int64_t i = 0; i < n; ++i)
+            values[static_cast<size_t>(i)] = r97_iqr_load_scalar(plane[0].data, st, i);
+        out->value = std::move(values);
+        return true;
+    }
+    if ((cols & 127) != 0) return false;
+    r97::R97IqrDecoded decoded;
+    if (!r97::r97_iqr_decode_planes(&enc, plane.data(), rows, cols, &decoded)) return false;
+    r97::StoredWeight w;
+    w.rows = rows;
+    w.cols = cols;
+    w.groups = cols / 128;
+    w.codes = std::move(decoded.codes);
+    w.scale = std::move(decoded.scale);
+    // The key's address is the registry key; the map's char objects are stable.
+    const void* key = &src.keys[name];
+    r97::stored_weight_put(key, std::move(w));
+    out->raw = const_cast<void*>(key);
+    out->enc = key;
+    return true;
 }
 
 void slice_input_from_files(const char* boundary_path, const char* constants_path,
@@ -114,6 +178,7 @@ static int slice_serve_main(int argc, char** argv) {
     const char* seeds_path = nullptr;
     const char* prefix = "slice";
     const char* out_path = nullptr;
+    const char* model_path = nullptr;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--program" && i + 1 < argc) {
@@ -128,6 +193,8 @@ static int slice_serve_main(int argc, char** argv) {
             prefix = argv[++i];
         } else if (arg == "--out" && i + 1 < argc) {
             out_path = argv[++i];
+        } else if (arg == "--model" && i + 1 < argc) {
+            model_path = argv[++i];
         } else {
             std::cerr << "usage: r97train slice-serve --program <slice.json> [--boundary <fwd.json>]\n"
                          "                           [--seeds <seeds.json>] [--prefix <name>]\n"
@@ -154,6 +221,32 @@ static int slice_serve_main(int argc, char** argv) {
             in.leaf_buffers.push_back(name);
         }
         const slice::ProgramSlice program = slice::parse_slice(std::string(program_path));
+        if (model_path != nullptr) {
+            PluginPrivateSource src;
+            if (src.file.open(model_path) != RAD_OK)
+                throw std::runtime_error(std::string("slice-serve: cannot open ") + model_path);
+            for (const r97::OpRecord& rec : program.ops)
+                for (const r97::Operand& o : rec.operands) {
+                    if (o.written || o.dtype != "plugin-private") continue;
+                    if (in.constants.count(o.buffer)) continue;
+                    r97::AdValue v;
+                    if (widen_plugin_private(src, o.buffer, o.shape, &v)) {
+                        in.constants[o.buffer] = std::move(v);
+                    } else {
+                        // No container entry and no decodable form: the operand's value exists
+                        // only inside the engine's joined weight (the quantisation scale the
+                        // stored decode folds in). Declare it valueless; the twin does not read
+                        // the slot on the stored path.
+                        r97::AdValue none;
+                        none.dtype = "plugin-private";
+                        // The walk's own plugin-private shape: a tape pointer and no values.
+                        // Nothing decodes it on the host rows (the stored weight carries its
+                        // own scale plane); a row that did read it refuses by name.
+                        none.raw = &src.keys[o.buffer];
+                        in.constants[o.buffer] = std::move(none);
+                    }
+                }
+        }
         const slice::SliceRun got = slice::run_slice(program, in);
         if (out_path != nullptr) {
             std::FILE* out = std::fopen(out_path, "w");

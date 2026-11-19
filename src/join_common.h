@@ -37,6 +37,11 @@
 #include "r97/params.h"
 #include "r97/tape.h"
 
+// The schema-name pass the linear rows share (src/adjoint_schema.h): extracted so the slice
+// runner's translation units -- which do not open this file's RAD_ISSUE_OBSERVER guard -- can
+// call the same pass the joins do instead of reimplementing it.
+#include "adjoint_schema.h"
+
 namespace r97 {
 
 inline int64_t numel(const std::vector<int64_t>& shape) {
@@ -526,12 +531,8 @@ inline std::vector<Seed> head_seeds(const ForwardStep& step, const Batch& batch,
 // can give the same name to buffers of different shapes. A raw or absent operand is per-op by
 // definition (a position table, a slot list, a token range), so give each its own name; nothing
 // reads an unnamed operand by name.
-inline OpRecord own_raws(OpRecord rec) {
-    for (Operand& o : rec.operands)
-        if (o.buffer.rfind("raw:", 0) == 0 || o.buffer.rfind("none:", 0) == 0)
-            o.buffer += "@" + std::to_string(rec.position);
-    return rec;
-}
+// The body lives in adjoint_schema.h, beside prepare_adjoint_record (the slice runner needs
+// it without this file's RAD_ISSUE_OBSERVER guard).
 
 // A weight that several delta sites land in is one fused adapter on the engine's side: the
 // shrink concatenates their A factors along the rank and the expand makes their B factors a
@@ -747,68 +748,8 @@ inline std::string module_leaf(const std::string& module) {
     return dot == std::string::npos ? module : module.substr(dot + 1);
 }
 
-// The family adjoints for the linear ops find their operands by the schema's names, while the
-// live tape carries the engine's buffer names. They also take `M` from the schema's parameter,
-// which the tape records as the engine's row capacity, not the rows this step used. Hand the
-// adjoint the schema's names and the step's rows; the walk keeps the tape's record for versions,
-// boundaries and snapshots.
-inline std::string linear_schema_name(const OpRecord& rec, size_t j) {
-    if (rec.op == "gemm_nt") return j == 0 ? "a" : j == 1 ? "b" : "";
-    // gemm_nt_q's schema is a, a_scale, b, b_scale: the activation's quantisation sits between
-    // the two matrix operands, unlike gemm_nt's plain a, b.
-    if (rec.op == "gemm_nt_q")
-        return j == 0 ? "a" : j == 1 ? "a_scale" : j == 2 ? "b" : j == 3 ? "b_scale" : "";
-    if (rec.op == "logits_gemm") return j == 0 ? "x" : j == 1 ? "lm_head" : "";
-    if (rec.op == "gather_rows") return j == 0 ? "x" : j == 1 ? "idx" : "";
-    if (rec.op == "embed_lookup") return j == 0 ? "tokens" : j == 1 ? "wte" : "";
-    return "";
-}
-
-inline void prepare_adjoint_record(const OpRecord& rec, OpRecord* out) {
-    *out = rec;
-    for (size_t j = 0; j < out->operands.size(); ++j) {
-        std::string name = linear_schema_name(rec, j);
-        if (!name.empty()) out->operands[j].buffer = std::move(name);
-    }
-    int64_t rows = 0;
-    for (const Operand& o : rec.operands)
-        if (o.written && !o.shape.empty()) {
-            rows = o.shape[0];
-            break;
-        }
-    if (rows <= 0)
-        for (const Operand& o : rec.operands)
-            if (!o.shape.empty()) {
-                rows = o.shape[0];
-                break;
-            }
-    if (rows > 0)
-        for (auto& [key, value] : out->params)
-            if (key == "M") {
-                if (int64_t* m = std::get_if<int64_t>(&value)) *m = rows;
-            }
-}
-
-// The weight a lora record belongs to, from the adapter factor it names: lora.<weight>.a or .b.
-// The record names the kernel weight (`blk.3.ffn_down.weight`), while the delta's site names the
-// parameter without the container's `.weight` leaf (`blk.3.ffn_down`); drop that leaf so both
-// name the same site.
-inline std::string record_weight(const OpRecord& rec) {
-    for (const Operand& o : rec.operands) {
-        if (o.buffer.rfind("lora.", 0) != 0) continue;
-        const size_t dot = o.buffer.find_last_of('.');
-        if (dot == std::string::npos) continue;
-        const std::string leaf = o.buffer.substr(dot + 1);
-        if (leaf != "a" && leaf != "b") continue;
-        std::string weight = o.buffer.substr(5, dot - 5);
-        const std::string suffix = ".weight";
-        if (weight.size() > suffix.size() &&
-            weight.compare(weight.size() - suffix.size(), suffix.size(), suffix) == 0)
-            weight.resize(weight.size() - suffix.size());
-        return weight;
-    }
-    return {};
-}
+// record_weight lives in adjoint_schema.h, beside prepare_adjoint_record (the slice runner
+// needs it without this file's RAD_ISSUE_OBSERVER guard).
 
 inline void set_error(std::string* err, const char* what) {
     if (err) *err = what;
