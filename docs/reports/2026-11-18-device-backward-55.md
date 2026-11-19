@@ -45,6 +45,20 @@ the block's stored boundary.
    that both factors move and the gradient reaches every leaf, not that every leaf moves: the
    unclipped AdamW's f32 `v = (1-b2)g^2` is Inf above |g| ~1.8e19, so the dominant leaves take no
    update at the walk's scale.
+6. **The slice instrument's forward** (`src/slice_reference.h`, the f64 reference that is the
+   magnitude arbiter). Five defects, each measured against the device's own dumped values: the
+   dump and both program writers carry the operand views (`view_shape`/`view_stride`/`view_off`,
+   the buffer's own pitch) and both parsers gather through them; the cold `kv:` rule covers a
+   plain write as well as an in-place read (the walk zeroes a written `kv:` operand's snapshot
+   when the block has not written it, `src/step_device.cpp:1590-1594`); the dump's first-read
+   rule is mirrored, so `SNAPDIFF` compares like-for-like; and the fused norm's residual input is
+   the post-update sum `bf16(x + residual_old)`. The block-37 forward now agrees to bf16 noise.
+7. **`tests/fixtures/programs/oracle.json`** regenerated through its own
+   `R97_RECORD_ORACLE_FIXTURE` gate: the program writers now emit the view fields and
+   `reference_step_program_matches_the_live_trace_without_kernels` compares the live recording
+   field-exactly, so the fixture and the writer must land together. The diff is the 8
+   view-carrying operands and nothing else.
+
 
 ## The 512-token measurement
 
@@ -120,6 +134,80 @@ question, not a new defect.
 The `gemm_nt_q` row's range remains the recorded piece for the *overflow* -- an f64 carry or a
 per-row scale for the activation cotangent and the staged weight gradient -- but the overflow no
 longer fires on this case, so that work is now about the magnitude rather than about finiteness.
+
+## The 4096 leg: the walk's own leaves, and a cotangent that arrives already amplified
+
+One held window (`/tmp/r97-55-window38.sh`, 4303.19 s, `rc=0`, `pause` verified absent after):
+
+```sh
+env R97_MODEL_DIR=/srv/models/rad/qwen3.8-27b-iq5r-s-v4.rad R97_TEST_ONLY=device_step_seq4096 \
+    R97_DUMP_LEAF=layers.37. R97_DUMP_BLOCK=37 \
+    R97_DUMP_BLOCK_DIR=/tmp/r97-55-dump-block37-4096 ctest -V -R gpu_model_tests
+```
+
+The step: loss 34,682.089 -> 19,091.980, `all_finite 1`, grad norm 1.25519e+36, 4095 scored,
+3442.9 s (fwd 106.3, bwd 3326.7, head 6.6); the ladder descends at 1e-3 (-15,590.1) and at the
+clipped 1e-3 (-25,137.1) and rises at 1e-4 and below, the same shape as the ticket case above.
+
+The dump: 40 constants (7.16 GB of JSON), the boundary 805 MB ([4096, 5120] f64, two buffers),
+the seeds 817 MB, the program 38 KB, 8 constants refused -- the plugin-private weights, the same
+set as 512. The instrument's memory at this size: nlohmann's DOM is ~3x the file transiently, then
+~2.9 GB of f64 live, and the run peaks near 29 GB of host RAM.
+
+**The walk's own block-37 leaves at 4096** (`R97_DUMP_LEAF`):
+
+| leaf | walk l2 |
+|---|---|
+| `linear_attn.in_proj_qkv.lora_B` | 1.04067e+15 |
+| `linear_attn.in_proj_z.lora_B` | 7.50543e+14 |
+| `linear_attn.out_proj.lora_B` | 5.52932e+14 |
+| `mlp.gate_proj.lora_B` | 5.34199e+14 |
+| `mlp.up_proj.lora_B` | 7.58150e+14 |
+| `mlp.down_proj.lora_B` | 3.46554e+14 |
+| all six `.lora_A` | **exactly 0** |
+| `LEAFSET layers.37.` | **1.71239755e+15** |
+
+**The zero A leaves are structural, not a defect**: `device_step_seq4096` runs the container's
+seed-0 start, where `lora_B == 0` (`tests/gpu/device_step.cpp`, `if (probe) seed_adapter(params)`
+-- only the 512 case seeds both factors), so no cotangent reaches A's factor. It also means the
+512 and 4096 walks are in **different parameter regimes** (512: seeded, both factors nonzero,
+leaf-set norm 5.16; 4096: zero-B start), so a ratio between those two norms mixes regimes and is
+not a token-count statement. The valid comparison is within each run -- slice against walk on the
+same parameters -- and a token-count claim would need a matched control (a 512 dump at the seed-0
+start, or a seeded 4096) that has not been run.
+
+**What the instrument already says at 4096.** The host re-quantisation line for the block's last
+fused producer, `DUMPQUANT side=host op=gated_had_quant_i8g pos=17`, prints the L1 sums of the
+cotangents it is handed:
+
+| | 512 | 4096 |
+|---|---|---|
+| `codes_cot` (the cotangent at the record's codes slot) | 0.841852 | **7.5478e+13** |
+| `quant_dx` (what the quantiser hands the elementwise part) | 0.972951 | 2.8899e+16 |
+| `dx` (the walk's slot after both parts) | 5.94907 | 93.5415 |
+
+`codes_cot` is the incoming cotangent the walk hands block 37, and at 4096 it is already ~7.5e13.
+The walk's 1.7e15 leaf set is therefore consistent with a ~1e14 incoming cotangent times a
+per-block transfer of ~10 -- which is to say **the amplification is upstream of block 37, not
+proven to be in block 37's rows**. The slice's 4096 arm is what decides it: if block 37's rows transfer that cotangent the way
+they do at 512 (ratio 1.0475), block 37 is cleared at 4096 too and the hunt moves to the blocks
+above it.
+
+That arm runs in the same window, second, from the same dump:
+
+```sh
+./build/r97train slice-serve \
+    --program   /tmp/r97-55-dump-block37-4096/layers.37.json \
+    --boundary  /tmp/r97-55-dump-block37-4096/layers.37-boundary.json \
+    --constants /tmp/r97-55-dump-block37-4096/layers.37-constants.json \
+    --seeds     /tmp/r97-55-dump-block37-4096/layers.37-seeds.json \
+    --model /srv/models/rad/qwen3.8-27b-iq5r-s-v4.rad --prefix model.layers.37. \
+    --out /tmp/r97-55-serve-out-4096.txt
+```
+
+`/tmp/r97-55-compare4096.py` groups both sides by weight (`ssm_inz` = `in_proj_qkv` +
+`in_proj_z`, `ffn_gate_up` = `gate_proj` + `up_proj`) and prints the per-weight ratios and the
+leaf-set norms, against the walk's lines in `/tmp/r97-55-walk4096-leaves.txt`.
 
 ## The per-block gain, against the full device walk
 
@@ -964,15 +1052,22 @@ difference at block 37 -- the same comparison that agreed to 0.59% at block 63's
 `q_proj.lora_A`. That, not the forward, is the next instrument's target.
 
 Scope, unchanged and repeated because it is the easy thing to overclaim: the slice shares
-`backward_block` with both walks, so agreement clears block 37's ROWS at 512 tokens given the
-walk's incoming cotangent -- never "the walk", and never 4096's magnitude. The forward now
-agrees; the rows do not, yet.
+`backward_block` with both walks, so agreement clears block 37's ROWS at that token count given
+the walk's incoming cotangent -- never "the walk", never another token count's magnitude. The
+forward now agrees; the rows do not, yet.
+
+The cold-`kv:`-write fix was re-measured after it landed (window 39's first arm): the 512 slice's
+`LEAF` and `LEAFSET` lines are **byte-identical** to the pre-fix run (norm 5.40682538), which is
+what the row's code predicts -- `gdn_chunk_scan`'s host adjoint reads `call.fwd` only through its
+read slots (`f[rCu]`, `f[rH0]`, `load_chunk`/`load_state`, `src/adjoint/host/gdn_scan.cpp:487-578`)
+and takes the writes' cotangents from `call.cot`, so a written slot's snapshot is inert for it. The
+fix closes a contract gap; it moves no number in this block.
 
 ## Tests
 
 - Host tier serial (`ctest --test-dir build -L host`): **25/25** ctest entries, the binary's own
-  `302 tests, 0 failed` (160 s under the 4096 walk's load; the 301-test run at 148 s predates the
-  new view case); the new
+  `303 tests, 0 failed` (150 s; the 301-test run predates the view case, the 302-test run the
+  cold-write case); the new
   `adjoint_registry_fills_follow_the_served_row` and the huge-norm clip check in
   `tests/host/optim.cpp`. One full-tier run at reduced priority (`nice -n 10`) failed
   `host_step_int8` and `host_step_int8_gradient_points_the_way_bf16_does` (both at layer 0's
@@ -981,11 +1076,15 @@ agrees; the rows do not, yet.
   earlier `train_host_cli_serves_the_int8_trunk` flake. The two runs were back to back at
   ~19:2x, after window 31 had closed and with no GPU window active.
 - The slice runner's own cases (`slice_reference_linear_scale`,
-  `slice_reference_residual_two_consumers`) and the new
-  `slice_operand_view_gathers_the_named_half` passed after every change to
-  `src/slice_reference.h` (`R97_TEST_ONLY` runs, `1 tests, 0 failed` each). The new case pins the
+  `slice_reference_residual_two_consumers`), `slice_operand_view_gathers_the_named_half` and
+  `slice_reference_cold_kv_write_zeroes_the_snapshot` pass after every change to
+  `src/slice_reference.h` (`R97_TEST_ONLY` runs, `1 tests, 0 failed` each). The view case pins the
   parser's view fields and the gather: a `[2,4]` buffer read as two `[2,2]` halves must give
-  `{0,1,4,5}` and `{2,3,6,7}`, not the whole buffer twice.
+  `{0,1,4,5}` and `{2,3,6,7}`, not the whole buffer twice. The cold-write case asserts the
+  snapshots themselves (`run_forward` + `StoredSnapshots::at`) on an `add(kv:s, b) -> kv:s`
+  record -- the shape `gdn_chunk_scan` has, where the write is plain because the record also reads
+  the buffer -- and fails on `kv:s (snapshot, cold write)` (0.1918, the production) with the
+  zeroing removed, which is the bracket that proves it pins the rule.
 - The five slice runs after the instrument fixes (windows 33-37) all returned `rc=0` and are the
   measurements quoted above; each ran in its own held window with `pause` verified absent
   afterwards.
@@ -1011,4 +1110,5 @@ runner: `src/adjoint_schema.h` (new), `src/slice_reference.h`, `tools/slice_serv
 carries `view_shape`/`view_stride`/`view_off`), `src/reference_step.cpp` (its program writer and
 parser carry the same view fields), `tools/ops.cpp` (the recorder's writer too),
 `tests/gpu/device_step.cpp` (the leaf print carries `l1`/`l2`), `tests/host/slice_reference.cpp`
-(the view round-trip case).
+(the view round-trip and cold-write cases), `tests/fixtures/programs/oracle.json` (regenerated
+with the view fields).
