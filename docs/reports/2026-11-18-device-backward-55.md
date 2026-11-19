@@ -207,22 +207,31 @@ outgoing state against the walk's cold zero).
 
 Its leaves, against the walk's, grouped the way the 512 table groups them:
 
-| weight | factor | walk l2 | slice l2 | walk / slice |
+| weight | modules in the slice's leaf | walk l2 | slice l2 | slice / walk |
 |---|---|---|---|---|
-| `ssm_inz` | B | 1.28309e+15 | 1.43157e+15 | 0.896 |
-| `ssm_out` | B | 5.52932e+14 | 5.40199e+14 | 1.024 |
-| `ffn_gate_up` | B | 9.27448e+14 | 1.22987e+15 | 0.754 |
-| `ffn_down` | B | 3.46554e+14 | 3.26531e+14 | 1.061 |
+| `ssm_out` | one (`out_proj`) | 5.52932e+14 | 5.40199e+14 | **0.977** |
+| `ffn_down` | one (`down_proj`) | 3.46554e+14 | 3.26531e+14 | **0.942** |
+| `ssm_inz` | two (`in_proj_qkv` + `in_proj_z`) | 1.28309e+15 | 1.43157e+15 | 1.116 |
+| `ffn_gate_up` | two (`gate_proj` + `up_proj`) | 9.27448e+14 | 1.22987e+15 | 1.326 |
 | all six | A | 0 | 0 | -- |
-| `LEAFSET layers.37.` | | 1.71239755e+15 | 1.99007734e+15 | **0.860** |
+| `LEAFSET layers.37.` | | 1.71239755e+15 | 1.99007734e+15 | **1.162** |
 
-So block 37's rows transfer the walk's incoming cotangent correctly at 4096 as well (0.75-1.06 per
-weight, 0.86 on the set), and **the 1.7e15 magnitude is inherited**: the seeds file hands the block
-a cotangent of L1 2.25e16 and max 3.4e10, and the block's own leaves come out *below* it. Together
-with the 512 result (ratio 1.0475) this clears block 37's rows at both token counts, each within
-its own parameter regime, and moves the hunt for the amplification to the blocks above 37 or the
-head. The next measurement is the same dump-and-slice at a higher block (the seeds at block 38's
-output are what block 37 received, so block 38 is where to look first).
+Read it the way the 512 table has to be read. The two single-module weights are like-for-like and
+land in the same 2-6% band as 512's (`ssm_out` 1.049, `ffn_down` 1.041 there; here 0.977 and
+0.942): the block's rows agree with the f64 reference to a few percent. The two two-module groups are not a pure row comparison -- the
+slice's `ssm_inz`/`ffn_gate_up` leaves are single dense-fused factors (`[N_total, R_total]`) while
+the walk's are per-module diagonal blocks (the same accounting difference the 512 table records at
+1.5-1.7), so 1.116/1.326 mix the rows with that structure. The leaf-set ratio 1.162 is the
+summary, and element-wise agreement is not established by it.
+
+**The magnitude is inherited.** The seeds file hands block 37 a cotangent whose largest value is
+3.4e10 and whose L1 is 2.25e16 (L2 4.888e12); whatever the block's rows do with it, that scale was
+created above the block. The block hands the device walk's own leaves back at 1.162 of their norm
+and the f64 slice reproduces them, so the rows are not where the amplification enters. Together
+with the 512 result (1.0475) this clears block 37's rows at both token counts, each within its own
+parameter regime, and moves the hunt to the blocks above 37 or the head. The next measurement is
+the same dump-and-slice at a higher block (the seeds at block 38's output are what block 37
+received, so block 38 is where to look first).
 
 That arm runs in the same window, second, from the same dump:
 
