@@ -951,8 +951,9 @@ agrees; the rows do not, yet.
 
 ## Tests
 
-- Host tier serial (`ctest --test-dir build -L host`): **25/25** ctest entries, 148 s, the
-  binary's own `301 tests, 0 failed`; the new
+- Host tier serial (`ctest --test-dir build -L host`): **25/25** ctest entries, the binary's own
+  `302 tests, 0 failed` (160 s under the 4096 walk's load; the 301-test run at 148 s predates the
+  new view case); the new
   `adjoint_registry_fills_follow_the_served_row` and the huge-norm clip check in
   `tests/host/optim.cpp`. One full-tier run at reduced priority (`nice -n 10`) failed
   `host_step_int8` and `host_step_int8_gradient_points_the_way_bf16_does` (both at layer 0's
@@ -969,6 +970,13 @@ agrees; the rows do not, yet.
 - The five slice runs after the instrument fixes (windows 33-37) all returned `rc=0` and are the
   measurements quoted above; each ran in its own held window with `pause` verified absent
   afterwards.
+- `tests/fixtures/programs/oracle.json` was regenerated through its own gate
+  (`R97_RECORD_ORACLE_FIXTURE`) because the program writer now emits the view fields and
+  `reference_step_program_matches_the_live_trace_without_kernels` compares the live recording
+  field-exactly. The diff is 76 added lines: the 8 view-carrying operands
+  (`view_shape`/`view_stride`/`view_off` and their arrays) and nothing else. The first full-tier
+  run after the writer change failed on that case alone — recorded here rather than passed over,
+  because it was a real regression of that comparison, not a load flake.
 - GPU tier in one held window: `adjoint_in_place_rows` (4 cases), `adjoint_lora_fixture`,
   `adjoint_quant_device`, `adjoint_qk_fixture` — all pass, 27.8 s.
 
