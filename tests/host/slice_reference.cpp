@@ -25,9 +25,12 @@
 //   a) `linear + elementwise scale + adapter pair`: y = s*(x @ W^T) + B(A x), seeded at y. Closed
 //      forms: dx = s*(dy @ W) + A^T(B^T dy), dA = (B^T dy)^T x (f32, the lora row's own
 //      accumulation), dB = t dy^T at t = A x; dW goes to nobody (the trunk linear is frozen).
-//   b) `two-consumer residual`: y = (x + a) + (x + b), seeded at y, the slice arriving through
-//      parse_slice from a written r97-program file: x's cotangent must arrive by both consumers
-//      and sum, dx = 2 dy.
+//   b) `two-consumer residual + in-place mul`: h = x + a, g = x + b, y = h + g, then the mul
+//      overwrites y in place with x * s (its record marks "inout": true, parsed via the
+//      tape's key). Seeded at y through parse_slice from a written r97-program file. Closed
+//      forms: dx = (2 + s) dyw (the add's two consumers plus the mul's read of x), da = db =
+//      dyw, ds = x dyw. The passthrough (in_place_passthrough=true) is what carries the mul's
+//      write cotangent back to the add's y version -- with it off, case (b) fails on dx.
 #include "r97/backward.h"
 #include "r97/model.h"
 #include "support/test.h"
@@ -883,8 +886,8 @@ R97_TEST(slice_reference_residual_two_consumers) {
 
     // backward, from the widened seed. The seed enters at the mul's own write (the version that
     // replaced the add's); walking back:
-    //   dx += s * dyw (the mul's read of `x`)          ds += y_in * dyw (the mul's read of
-    //   `s`, whose cotangent is the pre-write value's, elementwise.cpp:185-206)
+    //   dx += s * dyw (the mul's read of `x`)    ds += x * dyw (the mul's read of `s`;
+    //   elementwise.cpp:185-206: db += dy * fwd[a] with a = x)
     // and the passthrough (FIX 2's setting) carries the write's cotangent, unchanged, to the
     // value the mul replaced -- the add's `y`, whose adjoint routes it through BOTH of its
     // reads: the both-consumers sum at x, three routes total: dx = (2 + s) dyw, da = dyw, db = dyw.
