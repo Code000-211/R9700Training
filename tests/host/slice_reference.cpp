@@ -9,7 +9,9 @@
 // nothing here builds a layout or asks an objective for seeds.
 //
 // What a comparison on this runner carries: it clears a block's OWN rows and rules out the join's
-// boundary handling at that block (no R97_WALK_BLOCKS top-n limit on this side, no head seeds).
+// boundary handling at that block (no head seeds, no shared boundary_cotangents join; this runner
+// is an independent replay, so R97_WALK_BLOCKS' top-n limit does not apply -- nothing truncates
+// this side).
 // It does NOT rule out a defect inside backward_block itself, which is the same core the device
 // walk drives -- only the join it is fed from is different here.
 //
@@ -888,7 +890,7 @@ R97_TEST(slice_reference_residual_two_consumers) {
     // replaced the add's); walking back:
     //   dx += s * dyw (the mul's read of `x`)    ds += x * dyw (the mul's read of `s`;
     //   elementwise.cpp:185-206: db += dy * fwd[a] with a = x)
-    // and the passthrough (FIX 2's setting) carries the write's cotangent, unchanged, to the
+    // and the passthrough (options.in_place_passthrough) carries the write's cotangent, unchanged, to
     // value the mul replaced -- the add's `y`, whose adjoint routes it through BOTH of its
     // reads: the both-consumers sum at x, three routes total: dx = (2 + s) dyw, da = dyw, db = dyw.
     const std::vector<double> dyw = widened(dy);
