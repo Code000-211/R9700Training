@@ -587,10 +587,14 @@ single-block f64 reference at the real container's shapes.
   the seed half exists. It carries the same scope limit as the host-walk arbiter: it tests this
   block's rows given the same input, not the whole walk.
 - **The first slice**: one block below 63, one leaf, device vs f64. The leaf, the block's op list and
-  the seed all come from what now exists; the new code is the runner that accepts a sub-program
-  (`ReferenceStepOptions::program` is a recorded op list, so this is a filtered file plus the seed
-  injection, not a new step). That is the first comparison that covers a block *below* 63 and does
-  not share the walk's join.
+  the seed all come from what now exists. Checked what the runner actually needs: `parse_program`
+  reads a **JSON** program (`program_json(prompts, ops)`), so a block's op slice is a filtered JSON
+  file, not C++. The one remaining code change is the **seed injection**: `ReferenceStep::run` starts
+  its backward from `obj.seeds`, and a block-scale run must start from the dumped cotangent instead.
+  That is an option plus one call site, and it is the last piece.
+- **Scope, stated once**: seeded from the device walk's incoming cotangent, this tests the block's
+  rows given the same input -- the same limit as the host-walk arbiter, and not a whole-walk
+  statement.
 
 The work is a real instrument, not a rerun, and it should start in a fresh context: the four
 negative results above are the specification, and re-deriving them costs a GPU window each.
