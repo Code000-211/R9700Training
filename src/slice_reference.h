@@ -57,6 +57,8 @@
 #include "r97/backward.h"
 #include "r97/model.h"
 
+#include "adjoint_schema.h"  // prepare_adjoint_record: the schema-renaming pass the gemm rows need
+
 using json = nlohmann::json;
 
 namespace r97 {
@@ -424,7 +426,27 @@ inline SliceRun run_slice(const ProgramSlice& program, const SliceInput& in) {
     // reads (src/adjoint/host/lora.cpp:460-468) -- produces no cotangent where the walks carry
     // the write's own through. A slice comparison must not diverge from their setting.
     options.in_place_passthrough = true;
-    run.walk = r97::backward_block(program.ops, snaps, boundaries, in.seeds, {}, options);
+    // The linear rows find their operands by schema name (a/b/a_scale/b_scale); the tape's
+    // own buffer names never carry them. Both real walks set prepare_record
+    // (src/step_host.cpp:151, src/step_device.cpp:1159); a slice walk without it sends the
+    // gemm adjoints records whose operand_pos("b") is -1, and the adjoint's guard makes
+    // that a SILENT no-op -- leaf lines that land with no trunk-gemm propagation behind
+    // them. Same walk settings, same join: the comparison needs this set.
+    options.prepare_record = prepare_adjoint_record;  // adjoint_schema.h, unguarded
+    // One factor per record, not one per leaf: the engine pools a fused weight's modules into
+    // one lora record, and a slot's factor without a name of its own lands under the bare
+    // `<prefix>.lora_A` -- four records' grads summed positionally into one buffer. The walks
+    // name it from the record's own weight (src/step_device.cpp:1145-1160); the slice has no
+    // container module map, so the weight's own name is the qualifier: one leaf per weight and
+    // factor, `model.layers.37.blk.37.ssm_inz.lora_A`.
+    const std::string leaf_prefix = in.prefix;
+    options.fused_slots = true;
+    options.record_prefix = [leaf_prefix](const r97::OpRecord& rec) -> std::string {
+        const std::string weight = record_weight(rec);
+        if (weight.empty()) return leaf_prefix;
+        return leaf_prefix + weight;
+    };
+    run.walk = r97::backward_block(prog.ops, snaps, boundaries, in.seeds, {}, options);
     return run;
 }
 
