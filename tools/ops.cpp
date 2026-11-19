@@ -98,7 +98,9 @@ static nlohmann::json program_json(const r97::Tape& tape,
         for (const r97::Operand& o : rec.operands) {
             op["operands"].push_back({{"buffer", o.buffer}, {"dtype", o.dtype},
                                       {"shape", o.shape}, {"row_lo", o.row_lo},
-                                      {"rows", o.rows}, {"written", o.written}});
+                                      {"rows", o.rows}, {"written", o.written},
+                                      {"inout", o.in_place}});  // the tape's own key (src/tape.cpp:170);
+                                      // without it every recorded slice parses in_place=false
         }
         doc["ops"].push_back(op);
     }
