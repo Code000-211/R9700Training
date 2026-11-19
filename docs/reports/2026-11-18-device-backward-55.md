@@ -727,6 +727,98 @@ check `model-state/pause` by hand even on DONE rc=0 (a trap can leave it behind 
 The work is a real instrument, not a rerun, and it should start in a fresh context: the four
 negative results above are the specification, and re-deriving them costs a GPU window each.
 
+## The slice run: the instrument serves the real block, and the gap is in its forward
+
+Three windows on 2026-11-19 (29: the five-file dump, 30: the walk's per-leaf norms, 31: the same
+dump carrying the in-place `kv:` state priors) and the host-side runner now take block 37 of the
+real container end to end: `r97train slice-serve` returns `rc=0` over the block's 21 ops and walks
+them in f64, in ~160 s.
+
+**What the runner needed, in the order the refusals named it** (each is a committed fix):
+
+1. `prepare_adjoint_record` on the twin call. The gemm twin finds its operands by schema name
+   (`operand_pos(rec, "b")`), the tape names them `blk.37.ssm_inz.weight`, and the adjoint guard
+   turns the miss into a silent no-op -- zero trunk propagation with plausible-looking leaf lines.
+2. The schema-renaming pass, `own_raws` and `record_weight` moved to `src/adjoint_schema.h`,
+   unguarded: the runner's translation units never open `join_common.h`'s
+   `RAD_ISSUE_OBSERVER` guard.
+3. The raw position tables, rebuilt the way the reference step names and fills them
+   (`src/reference_step.cpp:288-302`, `:438-486`): positions `0..M-1`, `cu_seqlens` `[0, M]` for
+   one sequence, the sequence's state slot, `gdn_conv_prep`'s zero `[n_seq]`, `chunk_scan`'s
+   `[[s]]` arange -- and, on the lora records, the pool's row map (one slot: all zeros).
+4. One name per raw/absent operand (`own_raws`): position 10 is `[1]` in `gdn_conv_prep` and
+   `[1,1]` in `chunk_scan`, and the backward core records one shape per buffer name.
+5. A write that covers the record's whole buffer replaces it: the dump's activation leak puts a
+   stale same-named constant in the environment, and it must not veto the twin's production.
+6. The 8 plugin-private operands: `slice-serve --model` widens the weight from the container
+   exactly as the host walk's `register_stored_operand` does; the scale has no container entry
+   (the engine fuses it into the joined weight and `r97_iqr_decode_planes` folds it in), so it
+   becomes the walk's own valueless, shaped, pointer-carrying snapshot -- never a fabrication.
+7. One leaf per record: with `fused_slots` unset, all four lora records' factors landed under the
+   bare `<prefix>.lora_A`, summed positionally into one buffer with the first record's shape. The
+   walk names the factor from the record's weight (`src/step_device.cpp:1145-1160`); the slice has
+   no container module map, so `record_prefix` returns the record's own weight and the leaves read
+   `model.layers.37.blk.37.<weight>.lora_A`.
+8. The in-place `kv:` state: the walk's adjoint zeroes a carried state this block has not written
+   (`src/step_device.cpp:1582-1588`), but its forward values are the device's. Window 31's dump
+   carries the real prior -- `kv:3`, 30,720 values, max |44.25|, none zero -- and the runner feeds
+   the twin that value. (The zero rule moved the numbers by 1e-4: not the gap.)
+
+**The first comparison** (window 30's walk, per-module leaves grouped by weight, against the
+slice's per-weight leaves):
+
+| weight | factor | walk l2 | slice l2 | ratio |
+|---|---|---|---|---|
+| `ssm_inz` | A | 0.43418 | 0.481192 | 1.108 |
+| `ssm_inz` | B | 0.0279081 | 0.0395932 | 1.419 |
+| `ssm_out` | A | 0.386223 | 0.40887 | 1.059 |
+| `ssm_out` | B | 0.0213476 | 0.0227835 | 1.067 |
+| `ffn_gate_up` | A | 3.20103 | 3.39008 | 1.059 |
+| `ffn_gate_up` | B | 0.172384 | 0.293737 | 1.704 |
+| `ffn_down` | A | 4.00152 | 4.16907 | 1.042 |
+| `ffn_down` | B | 0.125314 | 0.130397 | 1.041 |
+
+Set norm: walk 5.16169891 (12 module leaves) against the slice's 5.4201372 (8 weight leaves),
+ratio 1.0501. The magnitudes are right everywhere -- the earlier arbiters were off by 1e33x and
+249x -- the A factors and the two *unfused* B factors agree to 4-11%, and the two *fused* B
+factors are 42-70% high: the engine's fused B is one dense `[N_total, R_total]` tensor, while the
+walk's per-module leaves are its diagonal blocks (`split_adapter_grads`), so the two sides report
+different tensors for exactly those two weights. Element-wise agreement is NOT established: the
+`first=` elements differ by factors of 0.19x to 1.0x while the norms agree.
+
+**Where the difference comes from: the slice's forward, not its adjoint.** `print_report` now
+compares the slice's own forward values against the dump's device values for every constant the
+block also writes (`CONSTDIFF <name> rel=<l2 of the difference / l2 of the device's>`):
+
+```
+CONSTDIFF h.q8 rel=0.205625338 n=2621440      (op 0's quantised output)
+CONSTDIFF gdn_q rel=0.194039072 n=1048576     (op 5)
+CONSTDIFF gdn_k rel=0.186912897 n=1048576
+CONSTDIFF gdn_v rel=0.172616862 n=3145728
+CONSTDIFF gdn_beta rel=0.548078349 n=24576
+CONSTDIFF gate_up rel=0.187712154 n=17825792  (op 16)
+CONSTDIFF gdn_o rel=1.22584308 n=3145728
+```
+
+The divergence is already at op 0, whose three inputs all match the device (the two boundary
+values, `rel=0`, and the norm weight `rel=0`): the fused norm's own quantised stream differs by
+21%. Every downstream activation inherits it, and the ~5% gradient difference is downstream of
+that. So the next step is not the adjoint at all -- it is op 0's twin against the device's
+`rmsnorm_had_quant_i8g`, on inputs that are known to be the device's own. A direct numpy
+reconstruction of the documented formula (residual add, RMS norm, `w+1`, per-128-block i8) matches
+the dumped codes only 0.7% of the time, so the twin's actual formula is the thing to read
+(`src/adjoint/host/elementwise.cpp`, the fused-norm family) rather than assume.
+
+Two smaller corrections that came out of the same runs: `h`'s `rel=279` and `lora.t.*`'s `rel=1.3`
+are artifacts of comparing a multi-write buffer's *final* value against the dump's first-read
+value, not measurements; and the run-to-run self-consistency of the walk's own set norm is
+5.16143265 (window 29) against 5.16169891 (window 30), 5e-5 relative -- the tolerance any later
+comparison must respect.
+
+Scope, unchanged and repeated because it is the easy thing to overclaim: the slice shares
+`backward_block` with both walks, so agreement clears block 37's ROWS at 512 tokens given the
+walk's incoming cotangent -- never "the walk", and never 4096's magnitude. It does not agree yet.
+
 ## Tests
 
 - Host tier serial (`ctest --test-dir build -L host`): **25/25**; the new
@@ -740,4 +832,8 @@ negative results above are the specification, and re-deriving them costs a GPU w
 `include/r97/adjoint.h`, `src/adjoint_registry.cpp`, `src/backward.cpp`, `src/optim.cpp`,
 `src/adjoint/device/{kv_store,lora,plugin}.hip`, `src/adjoint/host/{kv_store,lora}.cpp`,
 `tests/support/device_check.h`, `tests/gpu/adjoint_in_place.cpp` (new), `tests/gpu/device_step.cpp`,
-`tests/host/{adjoint_registry_precedence,optim}.cpp`, `docs/STEPS-DEVICE.md`.
+`tests/host/{adjoint_registry_precedence,optim}.cpp`, `docs/STEPS-DEVICE.md`, and for the slice
+runner: `src/adjoint_schema.h` (new), `src/slice_reference.h`, `tools/slice_serve.cpp`,
+`src/join_common.h` (its copies of the schema helpers moved out), `src/step_device.cpp` (the
+`R97_DUMP_BLOCK` constants pass now carries the in-place `kv:` priors), `tests/gpu/device_step.cpp`
+(the leaf print carries `l1`/`l2`), `tests/host/slice_reference.cpp`.

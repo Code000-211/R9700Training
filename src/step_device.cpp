@@ -1390,7 +1390,13 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 if (dump_block_layer == static_cast<long long>(layer)) {
                     for (size_t j = 0; j < shaped.operands.size(); ++j) {
                         const Operand& o = shaped.operands[j];
-                        if (o.written) continue;
+                        // An in-place written state buffer reads too: the prior value is what the
+                        // op consumed, and a slice runner replaying the forward from this dump
+                        // must feed its twin that value, not a cold stand-in. The walk's own
+                        // zeroing (this file, the kv: rule in the walk loop) applies to the
+                        // adjoint's read slot and is a separate decision.
+                        if (o.written && !(o.buffer.rfind("kv:", 0) == 0 && in_place_read(shaped, j)))
+                            continue;
                         if (dumped_names.count(o.buffer)) continue;
                         if (o.buffer.rfind("raw:", 0) == 0 || o.buffer.rfind("none:", 0) == 0)
                             continue;

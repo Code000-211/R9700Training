@@ -439,7 +439,8 @@ inline void run_forward(const ProgramSlice& program, const SliceInput& in,
             if (r97::in_place_read(rec, i)) {
                 // A carried state this block has not written yet enters cold: the walk's own
                 // rule (src/step_device.cpp:1582-1588), applied to the same slice.
-                if (o.buffer.rfind("kv:", 0) == 0 && env->find(o.buffer) == env->end()) {
+                if (o.buffer.rfind("kv:", 0) == 0 && env->find(o.buffer) == env->end() &&
+                    in.constants.find(o.buffer) == in.constants.end()) {
                     AdValue cold;
                     cold.dtype = o.dtype.empty() ? std::string("bf16") : o.dtype;
                     cold.shape = o.shape;
@@ -591,6 +592,32 @@ inline void print_report(const SliceRun& run, const SliceInput& in, FILE* out = 
     // g.value[0], tests/gpu/device_step.cpp:404-410) beside the norms, so the comparison is
     // like for like, and the set line is the walk's LEAFSET: the L2 over every leaf whose name
     // contains the prefix.
+    // The slice's own forward against the device's: for every declared constant the run also
+    // produced (a buffer the block wrote and the dump captured at a later read), the relative
+    // L2 of the difference. A twin-computed forward that disagrees here makes the adjoint's
+    // inputs differ from the walk's, and no adjoint comparison can be closer than that.
+    int64_t diff_n = 0;
+    std::map<std::string, const AdValue*> device;  // the dump's own values, by name
+    for (const auto& [name, value] : in.boundary) device[name] = &value;
+    for (const auto& [name, value] : in.constants) device[name] = &value;
+    for (const auto& [name, value] : device) {
+        const auto it = run.env.find(name);
+        if (it == run.env.end()) continue;
+        const std::vector<double>& a = it->second.value.value;
+        const std::vector<double>& b = value->value;
+        if (a.empty() || a.size() != b.size()) continue;
+        double dsq = 0.0, bsq = 0.0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            const double d = a[i] - b[i];
+            dsq += d * d;
+            bsq += b[i] * b[i];
+        }
+        ++diff_n;
+        std::fprintf(out, "CONSTDIFF %s rel=%.9g n=%zu\n", name.c_str(),
+                     bsq > 0.0 ? std::sqrt(dsq / bsq) : std::sqrt(dsq), a.size());
+    }
+    std::fprintf(out, "CONSTDIFF-COUNT n=%lld\n", static_cast<long long>(diff_n));
+
     int64_t set_leaves = 0;
     double set_norm_sq = 0.0;
     for (const r97::Param& p : run.grads) {
@@ -604,7 +631,7 @@ inline void print_report(const SliceRun& run, const SliceInput& in, FILE* out = 
             set_norm_sq += l2 * l2;
         }
     }
-    std::fprintf(out, "LEAFSET %s leaves=%lld norm=%.9g\n", in.prefix,
+    std::fprintf(out, "LEAFSET %s leaves=%lld norm=%.9g\n", in.prefix.c_str(),
                  static_cast<long long>(set_leaves), std::sqrt(set_norm_sq));
     for (const std::string& name : in.leaf_buffers)
         for (const r97::InputCotangent& ic : run.walk.inputs)
