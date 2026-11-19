@@ -764,14 +764,24 @@ them in f64, in ~160 s.
    carries the real prior -- `kv:3`, 30,720 values, max |44.25|, none zero -- and the runner feeds
    the twin that value. (The zero rule moved the numbers by 1e-4: not the gap.)
    The rule is not read-only: `:1590-1594` zeroes a **written** `kv:` operand's snapshot as well,
-   with no in-place test, which is `gdn_chunk_scan`'s plain write of `kv:2` (op 7, position 9).
-   The runner stored the twin's production there — a real difference in the block's rows (the
-   forward is unaffected: the environment still receives the production, so a later in-block read
-   of the pool sees the live state, exactly as the walk's store does). Fixed to mirror the walk
-   (`src/slice_reference.h`'s `cold_write`), and pinned by
-   `slice_reference_cold_kv_write_zeroes_the_snapshot`: `sigmoid`'s adjoint reads its own output
-   snapshot (`call.fwd[1]`), so a cold write makes its `dx` exactly zero while a warm one is
-   `dy·y·(1−y)`.
+   with no in-place test, which is `gdn_chunk_scan`'s plain write of `kv:2` (op 7, position 9 —
+   plain because the record also *reads* `kv:2`, so `r97::in_place_read` is false for that write,
+   include/r97/backward.h:42-50). The runner stored the twin's production there; it now mirrors
+   the walk (`src/slice_reference.h`'s `cold_write`) while the environment still receives the
+   production, so a later in-block read of the pool sees the live state exactly as the walk's
+   store does. **This is a contract gap closed, not a measured difference**: the host
+   `gdn_chunk_scan` row reads `call.fwd` only through its read slots (`f[rCu]`, `f[rH0]`,
+   `load_chunk`/`load_state`, src/adjoint/host/gdn_scan.cpp:487-578) and takes the writes'
+   cotangents from `call.cot`, so it never reads a written slot's snapshot — no other block-37 row
+   reads a plain `kv:` write's snapshot either, and the leaf numbers after the fix are expected to
+   be **identical**. Pinned by `slice_reference_cold_kv_write_zeroes_the_snapshot`, which asserts
+   the snapshots themselves (`run_forward` + `StoredSnapshots::at`) on an `add(kv:s, b) -> kv:s`
+   record — the cold write's snapshot is zero, the warm one is the production, and the
+   environment holds the production either way. The case has to be that shape: a `kv:` write with
+   *no* read of the same buffer is classified in-place by `in_place_read` and was already zeroed,
+   and a gradient proxy would say things this rule is not about (a plain re-write of one buffer
+   also pulls in the join's passthrough). With the zeroing removed the case fails on
+   `kv:s (snapshot, cold write)` (0.1918, the production, where it wants 0).
 
 **The first comparison** (window 30's walk, per-module leaves grouped by weight, against the
 slice's per-weight leaves):
