@@ -176,20 +176,28 @@ not a token-count statement. The valid comparison is within each run -- slice ag
 same parameters -- and a token-count claim would need a matched control (a 512 dump at the seed-0
 start, or a seeded 4096) that has not been run.
 
-**What the instrument already says at 4096.** The host re-quantisation line for the block's last
-fused producer, `DUMPQUANT side=host op=gated_had_quant_i8g pos=17`, prints the L1 sums of the
-cotangents it is handed:
+**The block-boundary cotangent is already amplified.** The cotangent the walk hands block 37 is
+the seeds file -- the cotangent at the block's two output buffers, written by the head and the
+blocks above it:
 
 | | 512 | 4096 |
 |---|---|---|
-| `codes_cot` (the cotangent at the record's codes slot) | 0.841852 | **7.5478e+13** |
-| `quant_dx` (what the quantiser hands the elementwise part) | 0.972951 | 2.8899e+16 |
-| `dx` (the walk's slot after both parts) | 5.94907 | 93.5415 |
+| seeds, L1 | 0.13915 | **2.2508e+16** |
+| seeds, L2 | 7.90011e-05 | 4.88804e+12 |
+| seeds, max | 2.90842e-07 | 3.42722e+10 |
 
-`codes_cot` is the incoming cotangent the walk hands block 37, and at 4096 it is already ~7.5e13.
-The walk's 1.7e15 leaf set is therefore consistent with a ~1e14 incoming cotangent times a
-per-block transfer of ~10 -- which is to say **the amplification is upstream of block 37, not
-proven to be in block 37's rows**. The slice's 4096 arm is what decides it: if block 37's rows transfer that cotangent the way
+At 4096 block 37 receives a cotangent whose largest value is 3.4e10 and whose L1 is 2.25e16; its
+own leaves come out at 1.71e15, i.e. the block's transfer is *below* its input, not above it.
+**The amplification is upstream of block 37** -- in the blocks above it or the head -- and the
+1.7e15 leaf set is inherited, not produced here.
+
+Do not confuse this with the host re-quantisation line, which prints a different quantity:
+`DUMPQUANT side=host op=gated_had_quant_i8g pos=17` gives `codes_cot=7.5478e+13` (512: 0.841852)
+for the cotangent at op 17's *codes slot*, one step inside the block's last op, after the
+quantiser's own codebook step. It is not the boundary cotangent and it is not a block-level
+measurement.
+
+The slice's 4096 arm is what decides block 37's own rows: if they transfer that cotangent the way
 they do at 512 (ratio 1.0475), block 37 is cleared at 4096 too and the hunt moves to the blocks
 above it.
 
