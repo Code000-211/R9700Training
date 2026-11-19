@@ -582,13 +582,15 @@ single-block f64 reference at the real container's shapes.
   only), so any block's leaves can be dumped today.
 - **Missing (3)**: the one real gap. The f64 block must start from the *device walk's* incoming
   cotangent for that block, or the comparison is confounded by every layer above it. The SPLIT
-  instrumentation prints the cotangent's L1 but not its values, so this needs a value dump -- and it
-  carries the same scope limit as the host-walk arbiter: it tests this block's rows given the same
-  input, not the whole walk.
-- **The first slice**: one block below 63, one leaf, device vs f64. The leaf and the block's op list
-  both come from what exists; the new code is the block's incoming-cotangent dump and a runner that
-  accepts a sub-program. That is the first comparison that covers a block *below* 63 and does not
-  share the walk's join.
+  instrumentation printed only the cotangent's L1; **`R97_SPLIT_VALUES=<n>` now dumps its first n
+  values at `%.17g`** (`src/adjoint/host/elementwise.cpp`, `R97_SPLIT_POS` to pick the position), so
+  the seed half exists. It carries the same scope limit as the host-walk arbiter: it tests this
+  block's rows given the same input, not the whole walk.
+- **The first slice**: one block below 63, one leaf, device vs f64. The leaf, the block's op list and
+  the seed all come from what now exists; the new code is the runner that accepts a sub-program
+  (`ReferenceStepOptions::program` is a recorded op list, so this is a filtered file plus the seed
+  injection, not a new step). That is the first comparison that covers a block *below* 63 and does
+  not share the walk's join.
 
 The work is a real instrument, not a rerun, and it should start in a fresh context: the four
 negative results above are the specification, and re-deriving them costs a GPU window each.
