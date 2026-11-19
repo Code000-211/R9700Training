@@ -1,67 +1,29 @@
-// tests/host/slice_reference.cpp -- the g1 slice runner: one block's recorded op slice, forward
-// and backward, from the registry alone.
+// tests/host/slice_reference.cpp -- the slice runner's two acceptance cases.
 //
-// The objective-free counterpart of src/reference_step.cpp (issue #55, criterion two). A slice is
-// a filtered r97-program JSON file (the format `program_json` writes); the runner injects the
-// boundary forward values and the boundary cotangents by buffer name, runs the registered twins
-// forward in f64, then walks r97::backward_block seeded ONLY from the injected cotangents. No
-// objective, no loss, no model, no container, no card: a block slice never writes logits, so
-// nothing here builds a layout or asks an objective for seeds.
-//
-// What a comparison on this runner carries: it clears a block's OWN rows and rules out the join's
-// boundary handling at that block (no head seeds, no shared boundary_cotangents join; this runner
-// is an independent replay, so R97_WALK_BLOCKS' top-n limit does not apply -- nothing truncates
-// this side).
-// It does NOT rule out a defect inside backward_block itself, which is the same core the device
-// walk drives -- only the join it is fed from is different here.
-//
-// Read resolution is this runner's own, not ReferenceStep's: (1) the live buffer by name -- the
-// injected boundary value until a slice op writes it, the production after -- (2) a constant the
-// caller declared by name (a frozen weight IS a constant here, and never a name-fallthrough to a
-// container weight), (3) nothing: a read that names a buffer no injection names, no constant
-// declares and no slice op wrote throws, naming the buffer. An activation can never silently
-// resolve to a weight of the same name.
-//
-// The two acceptance cases are synthetic, deterministic and analytic:
-//
-//   a) `linear + elementwise scale + adapter pair`: y = s*(x @ W^T) + B(A x), seeded at y. Closed
-//      forms: dx = s*(dy @ W) + A^T(B^T dy), dA = (B^T dy)^T x (f32, the lora row's own
-//      accumulation), dB = t dy^T at t = A x; dW goes to nobody (the trunk linear is frozen).
-//   b) `two-consumer residual + in-place mul`: h = x + a, g = x + b, y = h + g, then the mul
-//      overwrites y in place with x * s (its record marks "inout": true, parsed via the
-//      tape's key). Seeded at y through parse_slice from a written r97-program file. Closed
-//      forms: dx = (2 + s) dyw (the add's two consumers plus the mul's read of x), da = db =
-//      dyw, ds = x dyw. The passthrough (in_place_passthrough=true) is what carries the mul's
-//      write cotangent back to the add's y version -- with it off, case (b) fails on dx.
-#include "r97/backward.h"
-#include "r97/model.h"
+// The runner itself (namespace slice, with the reviewed scope note: what a slice-vs-device
+// comparison rules out and what it does not) is tests/support/slice_reference.h, included below
+// and shared with the `r97train` subcommand that drives it from dump files. This file holds only
+// the two synthetic, deterministic, analytic acceptance cases that comment describes, with their
+// local helpers.
+#include "support/slice_reference.h"
 #include "support/test.h"
-
-#include <nlohmann/json.hpp>
-
-#include <unistd.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <map>
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include <variant>
 #include <vector>
 
-using json = nlohmann::json;
+#include <nlohmann/json.hpp>
+
+#include <unistd.h>
 
 namespace {
-namespace slice {
 
-using r97::AdValue;
 
 // ------------------------------------------------------------------ small shared arithmetic
 
@@ -156,12 +118,11 @@ ProgramSlice parse_slice(const json& j) {
             }
         if (rec.op.empty()) throw std::runtime_error("slice runner: an op with no name");
         p.ops.push_back(std::move(rec));
-    }
     if (p.ops.empty()) throw std::runtime_error("slice runner: the slice holds no ops");
     // The snapshot store keys by the record's position: one per op, in append order.
     for (size_t i = 0; i < p.ops.size(); ++i) p.ops[i].position = static_cast<int64_t>(i);
     return p;
-}
+namespace slice = r97::slice;  // the runner, tests/support/slice_reference.h
 
 ProgramSlice parse_slice(const std::string& path) {
     std::ifstream in(path);
@@ -446,9 +407,6 @@ void print_report(const SliceRun& run, const SliceInput& in) {
                 norms_of(ic.value, &l1, &l2);
                 std::printf("BUF %s l1=%.17g l2=%.17g\n", name.c_str(), l1, l2);
             }
-}
-
-}  // namespace slice
 }  // namespace
 
 // ------------------------------------------------------------------ the cases
@@ -458,6 +416,23 @@ namespace {
 using r97::OpRecord;
 using r97::Operand;
 using r97::Seed;
+
+// Every element at 1e-12 relative or tighter, with an absolute floor for a zero both sides agree
+// on. `want` is the exact f64 closed form; the quantities compared here -- the twins' forward
+// productions and the walk's dc / InputCotangent values -- are f64 too, so the difference is
+// double arithmetic alone. Where a closed form consumes the seed it consumes the values the walk
+// holds, the f32 cotangent widened back to f64 (backward's enter, src/backward.cpp:396-398).
+void expect_exact(const char* what, const std::vector<double>& got,
+                  const std::vector<double>& want) {
+    R97_CHECK(got.size() == want.size());
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (std::fabs(got[i] - want[i]) > 1e-12 * std::max(1.0, std::fabs(want[i])))
+            throw std::runtime_error(std::string(what) + ": element " + std::to_string(i) +
+                                     " is " + std::to_string(got[i]) + ", want " +
+                                     std::to_string(want[i]));
+    }
+}
+// ------------------------------------------------------------------ the cases
 
 // Every element at 1e-12 relative or tighter, with an absolute floor for a zero both sides agree
 // on. `want` is the exact f64 closed form; the quantities compared here -- the twins' forward
