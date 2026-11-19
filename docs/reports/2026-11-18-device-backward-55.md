@@ -800,11 +800,17 @@ CONSTDIFF gate_up rel=0.187712154 n=17825792  (op 16)
 CONSTDIFF gdn_o rel=1.22584308 n=3145728
 ```
 
-The divergence is already at op 0, whose three inputs all match the device (the two boundary
-values, `rel=0`, and the norm weight `rel=0`): the fused norm's own quantised stream differs by
-21%. Every downstream activation inherits it, and the ~5% gradient difference is downstream of
-that. So the next step is not the adjoint at all -- it is op 0's twin against the device's
-`rmsnorm_had_quant_i8g`, on inputs that are known to be the device's own.
+**What that set says, and the two lines that say nothing.** The dump stores a buffer at its
+*first read* (`src/step_device.cpp:1390-1415`), so a line is a measurement only when the slice's
+final environment holds the same tensor. `h.q8`/`h.s8` are written at op 0 **and** op 13: the
+dump holds op 0's stream (first read, op 1), the slice's environment op 13's -- the 0.2056
+compares the attention norm's quantised stream against the feed-forward one and is not a
+divergence. `gdn_o` is *not* in that class, and the proof is the quantiser itself: re-running
+op 9's own Hadamard-and-quantise on the dump's `gdn_o` reproduces **99.9996%** of the dumped
+`gdn_o.q8` codes exactly (all within 1 LSB) and `s8` to 2.06e-7 relative, so the dumped value
+*is* op 8's output -- the same tensor the slice's environment holds, and `rel=1.2258` is real.
+The honest set is `gdn_q/k/v/g/beta/kkt` (0.09-0.55), `gate_up` (0.188), `ffn.q8/s8`
+(0.29/0.12), `gdn_o` (1.226) and `gdn_o.q8/s8` (1.206/0.470).
 
 Three things were checked before writing that lead down, and two of them correct it:
 
@@ -820,11 +826,13 @@ Three things were checked before writing that lead down, and two of them correct
   and moved the residual's own match from 0 to 0.020, so the device does not accumulate that
   operand at this op and the pre-write read is what the kernel consumed. Reverted; the trial is
   recorded here so it is not repeated.
-- **The authoritative op-0 check already exists**: `R97_DUMP_QUANT=1` re-quantises the twin's
-  intermediate through the same Hadamard and compares it with the codes the kernel wrote
-  (`quant.cpp:1146-1230`), printing `code_err` and a code-distance histogram. It runs in the walk,
-  so it costs one window; it separates "the norm part is wrong" from "the quantiser path is
-  wrong" without either side being assumed.
+- **The authoritative op-0 check already exists, and it runs in the slice, not the walk.**
+  `R97_DUMP_QUANT=1` re-quantises the twin's intermediate through the same Hadamard and compares
+  it with the codes the kernel wrote (`quant.cpp:1146-1230`), printing `code_err` and a
+  code-distance histogram. The diagnostic lives in the **host** fused-adjoint row, and the slice
+  walks `Side::host` (`src/slice_reference.h:561`) -- so `slice-serve` fires it in ~160 s, not
+  the ~1 h host walk (`R97_HOST_WALK_AB=2`) the earlier reading of the code implied. Window 32's
+  result is below: the twin is exact.
 
 Two smaller corrections that came out of the same runs: `h`'s `rel=279` and `lora.t.*`'s `rel=1.3`
 are artifacts of comparing a multi-write buffer's *final* value against the dump's first-read
@@ -832,9 +840,114 @@ value, not measurements; and the run-to-run self-consistency of the walk's own s
 5.16143265 (window 29) against 5.16169891 (window 30), 5e-5 relative -- the tolerance any later
 comparison must respect.
 
+### The slice is self-consistent; the dump was dropping the operand views
+
+Window 32 ran the same slice with `R97_DUMP_QUANT=1`. Every fused producer's codes came back
+identical to the twin's recomputation, and at the two norm ops the twin's intermediate matches
+the write exactly:
+
+```
+NORMTWIN pos=0 n=5120 rows=512 w=yes eps=1e-06 wadd=1 mult=1 xmax=6560 ss_mean=3.36743e+06 s=0.000544942
+DUMPTWIN pos=0  op=rmsnorm_had_quant_i8g  twin=1 codes=2621440 code_err=0 code_bad=0/2621440 scale_rel=0 act_at=5 act_err=0 act_rel=0 hist=[2621440,0,0,0,0,0,0,0,0,0]
+DUMPTWIN pos=13 op=rmsnorm_had_quant_i8g  twin=1 codes=2621440 code_err=0 code_bad=0/2621440 scale_rel=0 act_at=5 act_err=0 act_rel=0 hist=[2621440,0,0,0,0,0,0,0,0,0]
+DUMPTWIN pos=17 op=gated_had_quant_i8g    twin=1 codes=8912896 code_err=0 code_bad=0/8912896 scale_rel=0 act_at=1 act_err=1112.28 act_rel=8.75809 hist=[8912896,0,0,0,0,0,0,0,0,0]
+```
+
+`code_err=0` and one histogram bucket over 2.6 M and 8.9 M codes, `scale_rel=0`, and
+`act_at=5` = the record's `h` write, `act_err=0`. **This is a self-consistency check, not a
+device check, and the distinction matters**: the slice's forward *is* the twin chain
+(`run_forward`), so the diagnostic compares the adjoint's twin against codes that same twin
+wrote. It rules out an internal inconsistency -- the forward the adjoint differentiates is
+exactly the forward it recomputes -- and it says nothing about the device's codes. The
+twin-vs-device comparison needs the **host** walk (`R97_HOST_WALK_AB=2`, `R97_DUMP_QUANT=1`,
+`R97_WALK_BLOCKS=27`; ~1 h at the measured ~2 min/block), where the twin's recomputation meets
+the tape's own captured codes. (Op 17's `act_rel` is not a measurement even in that run: the op
+writes only `ffn.q8`/`ffn.s8`, so no operand holds its bf16 intermediate to compare against.)
+
+**The gap the dump *was* introducing is the operand view.** `snapshot` packs a narrowed read
+over its own view shape (`src/join_common.h:264-295`), and the block's fused projection is read
+three ways: `gdn_in` is `[512,16384]` (q|k|v|z) and its readers take `[512,10240]`@0 (the conv's
+q|k|v) and `[512,6144]`@10240 (the gate's z); `gdn_ab` is `[512,96]` and `gdn_conv_prep` reads
+its two halves as `[512,48]`@0 and `[512,48]`@48. The dump's own constants prove the view was
+there -- `gdn_in` was stored as `[512,10240]` against a record that declares `[512,16384]`, and
+`gdn_ab` as `[512,48]` against `[512,96]` -- but the program JSON's writer emitted only
+`buffer/dtype/shape/row_lo/rows/written/inout` (`src/step_device.cpp:1713-1721`), so the slice
+replayed the whole buffer: both `gdn_ab` reads became the same operand, and op 8's gate read
+flat across q|k|v|z. That is the mechanism behind op 5's 0.17-0.55 and, through the gate, op 8's
+`gdn_o rel=1.226` (the slice's `gdn_o` decorrelates from the device's at cos 0.268 while its norm
+is 1.026x -- the signature of a wrong gate, not a wrong scale).
+
+The fix is the round trip: the block dump and both program writers now emit
+`view_shape`/`view_stride`/`view_off`, both parsers read them, `operand_at` gathers a read
+through its view (a buffer whose numel already is the view's -- the dumped constant -- is
+returned reshaped, not gathered twice), and `print_report` gathers the slice's buffer through
+the same first-read view before `CONSTDIFF`, so the two narrowed buffers are compared instead of
+silently skipped by the size check. `tests/host/slice_reference.cpp`'s
+`slice_operand_view_gathers_the_named_half` pins the parser and the gather on a `[2,4]` buffer
+read as two `[2,2]` halves.
+
+**The last forward gap was the fused norm's residual input.** The elementwise part of
+`rmsnorm_had_quant_i8g` norms the *post-update* residual, and the tape captures that in-place
+operand after the op (`src/adjoint/host/quant.cpp:859-862`, the device's own test at `:863-869`).
+The slice fed the twin the pre-write value. An offline reconstruction of op 0 from the dump --
+`rmsnorm(h + x)` with the weight's `wadd` (`w' = w + 1`), then the per-128-group unnormalised
+Hadamard and `s = amax/127` -- reproduces **91.5% of the dumped `h.q8` codes exactly** and
+`h.s8` to 2e-3; with the residual alone it reproduces 0.9% and misses the scale by 95%. So
+`run_forward` now forms `bf16(x + residual_old)` for the fused norm's residual slot and hands it
+to the twin as the snapshot too, because the walk's own snapshot of that read is the live post-op
+pull. (The earlier trial of this rule was measured against the polluted `h.q8` line and recorded
+as refuted; that reading was wrong, and this section replaces it.)
+
+**The forward is now the device's, to bf16 noise.** Each instrument fix moved the comparison, in
+this order -- views, the cold `kv:` rule, the first-read rule, `SNAPDIFF`, the residual sum:
+
+| line | before the views | after the views | after the residual sum |
+|---|---|---|---|
+| `gdn_in` | *skipped by size* | 0.1772 | **0.00585** |
+| `gdn_q` | 0.1940 | 0.1940 | **0.00677** |
+| `gdn_k` | 0.1869 | 0.1869 | **0.00666** |
+| `gdn_v` | 0.1726 | 0.1726 | **0.00601** |
+| `gdn_beta` | 0.5481 | 0.0628 | **0.000776** |
+| `gdn_kkt` | 0.1775 | 0.0711 | **0.00257** |
+| `gdn_o` | 1.2258 | 0.2986 | **0.0110** |
+| `gdn_o.q8` | 1.2060 | 0.3420 | **0.0155** |
+| `gate_up` | 0.1877 | 0.1877 | **0.00617** |
+| `ffn.q8` | 0.2895 | 0.2895 | **0.0132** |
+| `SNAPDIFF h.q8` | -- | 0.1812 | **0.00550** |
+
+Every honest line is now at bf16's own level (the quantiser's dequantisation error alone is
+0.9%). The lines that stay large are the ones the dump's capture explains, not divergence:
+`h` (283.7) and `lora.t.*` (9.0/1.3) are same-record reads captured post-op, `gdn_o`'s snapshot
+(0.999) is op 7's output against the dump's op-8 output, and `kv:2`/`kv:3` (rel=1) are the
+slice's zeros against the dump's outgoing state.
+
+**With the forward matched, the remaining leaf gap is the ROWS.** The slice's leaf set norm moved
+5.41991 -> 5.40683 (the walk's 5.16169891: ratio 1.0475, was 1.0501) -- the forward fix moved the
+leaves by 0.2%, not 5%. Per leaf:
+
+| weight | factor | walk l2 | slice l2 | ratio |
+|---|---|---|---|---|
+| `ssm_inz` | A | 0.43418 | 0.479440 | 1.104 |
+| `ssm_inz` | B | 0.0279081 | 0.0423961 | 1.519 |
+| `ssm_out` | A | 0.386223 | 0.408531 | 1.058 |
+| `ssm_out` | B | 0.0213476 | 0.0223883 | 1.049 |
+| `ffn_gate_up` | A | 3.20103 | 3.389926 | 1.059 |
+| `ffn_gate_up` | B | 0.172384 | 0.293761 | 1.704 |
+| `ffn_down` | A | 4.00152 | 4.169112 | 1.042 |
+| `ffn_down` | B | 0.125314 | 0.130389 | 1.041 |
+
+The two A factors of the *fused* weights (`ssm_inz` = qkv+z, `ffn_gate_up` = gate+up) and the
+unfused B factors differ by 4-10%; the two fused B factors by 52-70%, which is the accounting
+difference already described (the engine's dense `[N_total, R_total]` against the walk's
+per-module diagonal blocks). The slice walks the **host** rows and the walk the **device** rows,
+over the same `backward_block` and now the same forward, so what is left is a host-vs-device row
+difference at block 37 -- the same comparison that agreed to 0.59% at block 63's
+`q_proj.lora_A`. That, not the forward, is the next instrument's target.
+
 Scope, unchanged and repeated because it is the easy thing to overclaim: the slice shares
 `backward_block` with both walks, so agreement clears block 37's ROWS at 512 tokens given the
-walk's incoming cotangent -- never "the walk", and never 4096's magnitude. It does not agree yet.
+walk's incoming cotangent -- never "the walk", and never 4096's magnitude. The forward now
+agrees; the rows do not, yet.
 
 ## Tests
 
@@ -848,9 +961,14 @@ walk's incoming cotangent -- never "the walk", and never 4096's magnitude. It do
   earlier `train_host_cli_serves_the_int8_trunk` flake. The two runs were back to back at
   ~19:2x, after window 31 had closed and with no GPU window active.
 - The slice runner's own cases (`slice_reference_linear_scale`,
-  `slice_reference_residual_two_consumers`) passed after the last change to
-  `src/slice_reference.h` (`R97_TEST_ONLY` runs, `1 tests, 0 failed` each, twice — before and
-  after the reverted residual-sum trial).
+  `slice_reference_residual_two_consumers`) and the new
+  `slice_operand_view_gathers_the_named_half` passed after every change to
+  `src/slice_reference.h` (`R97_TEST_ONLY` runs, `1 tests, 0 failed` each). The new case pins the
+  parser's view fields and the gather: a `[2,4]` buffer read as two `[2,2]` halves must give
+  `{0,1,4,5}` and `{2,3,6,7}`, not the whole buffer twice.
+- The five slice runs after the instrument fixes (windows 33-37) all returned `rc=0` and are the
+  measurements quoted above; each ran in its own held window with `pause` verified absent
+  afterwards.
 - GPU tier in one held window: `adjoint_in_place_rows` (4 cases), `adjoint_lora_fixture`,
   `adjoint_quant_device`, `adjoint_qk_fixture` — all pass, 27.8 s.
 
@@ -862,5 +980,8 @@ walk's incoming cotangent -- never "the walk", and never 4096's magnitude. It do
 `tests/host/{adjoint_registry_precedence,optim}.cpp`, `docs/STEPS-DEVICE.md`, and for the slice
 runner: `src/adjoint_schema.h` (new), `src/slice_reference.h`, `tools/slice_serve.cpp`,
 `src/join_common.h` (its copies of the schema helpers moved out), `src/step_device.cpp` (the
-`R97_DUMP_BLOCK` constants pass now carries the in-place `kv:` priors), `tests/gpu/device_step.cpp`
-(the leaf print carries `l1`/`l2`), `tests/host/slice_reference.cpp`.
+`R97_DUMP_BLOCK` constants pass now carries the in-place `kv:` priors and the program writer
+carries `view_shape`/`view_stride`/`view_off`), `src/reference_step.cpp` (its program writer and
+parser carry the same view fields), `tools/ops.cpp` (the recorder's writer too),
+`tests/gpu/device_step.cpp` (the leaf print carries `l1`/`l2`), `tests/host/slice_reference.cpp`
+(the view round-trip case).

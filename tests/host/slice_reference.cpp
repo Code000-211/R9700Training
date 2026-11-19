@@ -496,4 +496,55 @@ R97_TEST(slice_reference_residual_two_consumers) {
     R97_CHECK(got.grads.empty());
 }
 
+// ------------------------------------------------------------------ the operand view
+//
+// A narrowed read is a tensor of its own: the walk's snapshot packs it over its view shape
+// (src/join_common.h:264-295), and the gated-delta layer reads one fused buffer twice through
+// two disjoint halves (`gdn_ab`'s A|B, gdn_in's q|k|v). The dump and the parser must carry
+// view_shape/view_stride/view_off -- the real block's dump proved they do not (the constants
+// hold gdn_in [512,10240] of a [512,16384] record) -- and `operand_at` must gather the read
+// through them. Without either, the two halves become the same operand.
+R97_TEST(slice_operand_view_gathers_the_named_half) {
+    // The parser's half: the exact keys src/step_device.cpp's dump writes.
+    const nlohmann::json doc = nlohmann::json::parse(R"({
+      "format": "r97-program", "version": 1, "batch": [],
+      "ops": [{"op": "gdn_conv_prep", "block": 0, "position": 0, "n": 1, "params": {},
+               "operands": [
+                 {"buffer": "ab", "dtype": "f32", "shape": [2, 4], "row_lo": 0, "rows": 2,
+                  "written": false, "inout": false,
+                  "view_shape": [2, 2], "view_stride": [4, 1], "view_off": 0},
+                 {"buffer": "ab", "dtype": "f32", "shape": [2, 4], "row_lo": 0, "rows": 2,
+                  "written": false, "inout": false,
+                  "view_shape": [2, 2], "view_stride": [4, 1], "view_off": 2}]}]})");
+    const slice::ProgramSlice prog = slice::parse_slice(doc);
+    R97_CHECK(prog.ops.size() == 1);
+    R97_CHECK(prog.ops[0].operands.size() == 2);
+    const Operand& lo = prog.ops[0].operands[0];
+    const Operand& hi = prog.ops[0].operands[1];
+    R97_CHECK(lo.view_shape == std::vector<int64_t>({2, 2}));
+    R97_CHECK(lo.view_stride == std::vector<int64_t>({4, 1}));
+    R97_CHECK(lo.view_off == 0);
+    R97_CHECK(hi.view_off == 2);
+
+    // The gather's half: one [2,4] buffer, two [2,2] halves.
+    slice::SliceInput in;
+    const std::vector<int64_t> whole_shape{2, 4};
+    std::vector<double> whole;
+    for (int64_t i = 0; i < 8; ++i) whole.push_back(static_cast<double>(i));
+    in.boundary["ab"] = slice::make_value("f32", whole_shape, whole);
+    std::map<std::string, slice::Buffer> env;
+    for (const auto& [name, value] : in.boundary) env[name] = slice::Buffer{value};
+
+    const OpRecord& rec = prog.ops[0];
+    const slice::AdValue a = slice::operand_at(rec, lo, env, in);
+    const slice::AdValue b = slice::operand_at(rec, hi, env, in);
+    R97_CHECK(a.shape == std::vector<int64_t>({2, 2}));
+    R97_CHECK(b.shape == std::vector<int64_t>({2, 2}));
+    expect_exact("ab low half", a.value, {0.0, 1.0, 4.0, 5.0});
+    expect_exact("ab high half", b.value, {2.0, 3.0, 6.0, 7.0});
+    // The whole buffer is not the read: without the view both halves would be {0,1,2,3,4,5,6,7}
+    // and the two operands would compare equal, which is what the collapsed dump did.
+    R97_CHECK(a.value != b.value);
+}
+
 }  // namespace

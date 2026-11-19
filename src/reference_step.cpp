@@ -133,6 +133,9 @@ Program parse_program(const std::string& path) {
                 op.row_lo = x.value("row_lo", 0);
                 op.rows = x.value("rows", 0);
                 op.written = x.value("written", false);
+                if (x.contains("view_shape")) op.view_shape = ints_from_json(x["view_shape"]);
+                if (x.contains("view_stride")) op.view_stride = ints_from_json(x["view_stride"]);
+                op.view_off = x.value("view_off", 0);
                 rec.operands.push_back(std::move(op));
             }
         }
@@ -171,6 +174,13 @@ json program_json(const std::vector<std::vector<int32_t>>& batch,
             x["row_lo"] = op.row_lo;
             x["rows"] = op.rows;
             x["written"] = op.written;
+            // A narrowed/strided read is a tensor of its own (the walk's snapshot holds the
+            // view's shape, join_common.h:264-295); dropping the view replays the whole buffer.
+            if (!op.view_shape.empty()) {
+                x["view_shape"] = op.view_shape;
+                x["view_stride"] = op.view_stride;
+                x["view_off"] = op.view_off;
+            }
             operands.push_back(std::move(x));
         }
         o["operands"] = std::move(operands);

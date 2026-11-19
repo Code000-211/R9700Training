@@ -159,6 +159,17 @@ inline ProgramSlice parse_slice(const json& j) {
                 op.rows = x.value("rows", int64_t(0));
                 op.written = x.value("written", false);
                 op.in_place = x.value("inout", false) || x.value("in_place", false);
+                // The view a read names over its buffer: the walk's snapshot holds the view's
+                // own shape and values (join_common.h:264-295), and without these fields the
+                // slice replays the declared buffer instead -- two views of one buffer (the
+                // gated-delta layer's A|B halves) collapse into the same operand.
+                if (x.contains("view_shape") && x["view_shape"].is_array())
+                    for (const json& d : x["view_shape"])
+                        if (d.is_number_integer()) op.view_shape.push_back(d.get<int64_t>());
+                if (x.contains("view_stride") && x["view_stride"].is_array())
+                    for (const json& d : x["view_stride"])
+                        if (d.is_number_integer()) op.view_stride.push_back(d.get<int64_t>());
+                op.view_off = x.value("view_off", int64_t(0));
                 rec.operands.push_back(std::move(op));
             }
         if (rec.op.empty()) throw std::runtime_error("slice runner: an op with no name");
@@ -282,6 +293,51 @@ inline AdValue raw_table(const r97::OpRecord& rec, const r97::Operand& o) {
     return v;  // unreachable
 }
 
+// The view a read names over its buffer, gathered in the view's own row-major order -- the same
+// gather the walk's snapshot runs (join_common.h:264-295). A buffer whose numel already IS the
+// view's (the dump's constant for a narrowed read is the view's own packed value) is returned
+// reshaped, not gathered again; a record that carries `view_shape` with no stride takes the
+// buffer's row-major strides, which is what a narrowed last dimension means.
+inline AdValue gather_view(const AdValue& whole, const r97::Operand& o) {
+    int64_t n = 1;
+    for (int64_t d : o.view_shape) n *= std::max<int64_t>(d, 0);
+    AdValue v;
+    v.dtype = whole.dtype;
+    v.shape = o.view_shape;
+    if (n <= 0) return v;
+    if (numel(whole.shape) == n) {
+        v.value = whole.value;
+        return v;
+    }
+    v.value.assign(static_cast<size_t>(n), 0.0);
+    if (whole.value.empty()) return v;
+    std::vector<int64_t> stride = o.view_stride;
+    if (stride.size() != o.view_shape.size()) {
+        // The buffer's own row-major strides where the ranks agree: the narrowed dimension is
+        // the buffer's row pitch, not the view's.
+        const std::vector<int64_t>& from = whole.shape.size() == o.view_shape.size()
+                                               ? whole.shape
+                                               : o.view_shape;
+        stride.assign(o.view_shape.size(), 1);
+        for (size_t d = o.view_shape.size(); d-- > 1;)
+            stride[d - 1] = stride[d] * std::max<int64_t>(from[d], 0);
+    }
+    const int64_t total = numel(whole.shape);
+    int64_t idx[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const size_t rank = o.view_shape.size();
+    for (int64_t e = 0; e < n; ++e) {
+        int64_t off = o.view_off;
+        for (size_t d = 0; d < rank; ++d) off += idx[d] * stride[d];
+        if (off < 0 || off >= total) continue;  // the walk's own tolerance (join_common.h:285-288)
+        v.value[static_cast<size_t>(e)] = whole.value[static_cast<size_t>(off)];
+        for (size_t d = rank; d-- > 0;) {
+            if (++idx[d] < o.view_shape[d]) break;
+            idx[d] = 0;
+        }
+    }
+    return v;
+}
+
 inline AdValue operand_at(const r97::OpRecord& rec, const r97::Operand& o,
                           const std::map<std::string, Buffer>& env, const SliceInput& in) {
     // The schema's absent slot (none:1, an empty shape or dtype "invalid"): one scalar, the
@@ -297,6 +353,13 @@ inline AdValue operand_at(const r97::OpRecord& rec, const r97::Operand& o,
     const auto found = env.find(o.buffer);
     if (found != env.end()) {
         const AdValue& whole = found->second.value;
+        // The view wins over the row range, as it does in the walk's snapshot: a narrowed read
+        // is packed over its own shape and the declared buffer's rows are not that shape.
+        if (!o.view_shape.empty()) {
+            AdValue v = gather_view(whole, o);
+            v.dtype = o.dtype.empty() ? v.dtype : o.dtype;
+            return v;
+        }
         if (o.rows > 0) {
             if (o.row_lo < 0 || o.row_lo + o.rows > whole.shape[0])
                 throw std::runtime_error("slice runner: op '" + rec.op + "' at position " +
@@ -337,6 +400,11 @@ inline AdValue operand_at(const r97::OpRecord& rec, const r97::Operand& o,
             AdValue v = whole;
             if (v.shape.empty()) v.shape = o.shape;
             if (!o.dtype.empty()) v.dtype = o.dtype;
+            return v;
+        }
+        if (!o.view_shape.empty()) {
+            AdValue v = gather_view(whole, o);
+            v.dtype = o.dtype.empty() ? v.dtype : o.dtype;
             return v;
         }
         if (o.rows > 0) {
@@ -450,10 +518,27 @@ inline void run_forward(const ProgramSlice& program, const SliceInput& in,
         std::vector<AdValue> snapshot(rec.operands.size());
         std::vector<AdValue> reads(rec.operands.size());
         std::vector<size_t> writes;  // the written operands' schema slots, in the writes' order
+        // The walk's cold rule for a carried state no earlier slice op wrote
+        // (src/step_device.cpp:1441-1443, :1582-1588): it enters zero, and the dump does not
+        // override it. A record that reads and writes the same `kv:` buffer
+        // (`gdn_conv_prep`'s rolling conv state, `gdn_chunk_scan`'s chunk state) is captured
+        // *after* its own write, so the dump's constant is the OUTGOING state; feeding it back
+        // as the prior is the wrong direction, while the walk's adjoint differentiates that
+        // read at zero. The comparison is slice-vs-walk, so the slice takes the walk's value.
+        const auto cold_kv = [&](const r97::Operand& o) {
+            return o.buffer.rfind("kv:", 0) == 0 && env->find(o.buffer) == env->end();
+        };
+        const auto cold_value = [](const r97::Operand& o) {
+            AdValue cold;
+            cold.dtype = o.dtype.empty() ? std::string("bf16") : o.dtype;
+            cold.shape = o.shape;
+            cold.value.assign(static_cast<size_t>(numel(o.shape)), 0.0);
+            return cold;
+        };
         for (size_t i = 0; i < rec.operands.size(); ++i) {
             const r97::Operand& o = rec.operands[i];
             if (!o.written) {
-                reads[i] = operand_at(rec, o, *env, in);
+                reads[i] = cold_kv(o) ? cold_value(o) : operand_at(rec, o, *env, in);
                 snapshot[i] = reads[i];
                 continue;
             }
@@ -465,22 +550,32 @@ inline void run_forward(const ProgramSlice& program, const SliceInput& in,
             // consumed. The op-0 question is the quantiser's, checked by the walk's own
             // R97_DUMP_QUANT re-quantisation (quant.cpp:1146-1230), not by this sum.
             if (r97::in_place_read(rec, i)) {
-                // A carried state this block has not written yet enters cold: the walk's own
-                // rule (src/step_device.cpp:1582-1588), applied to the same slice.
-                if (o.buffer.rfind("kv:", 0) == 0 && env->find(o.buffer) == env->end() &&
-                    in.constants.find(o.buffer) == in.constants.end()) {
-                    AdValue cold;
-                    cold.dtype = o.dtype.empty() ? std::string("bf16") : o.dtype;
-                    cold.shape = o.shape;
-                    cold.value.assign(static_cast<size_t>(numel(o.shape)), 0.0);
-                    reads[i] = cold;
-                    snapshot[i] = cold;
-                    continue;
-                }
-                reads[i] = operand_at(rec, o, *env, in);  // the value the write replaces
+                reads[i] = cold_kv(o) ? cold_value(o)
+                                      : operand_at(rec, o, *env, in);  // the value the write replaces
                 snapshot[i] = reads[i];
             }
         }
+        // The fused norm's residual is the norm's own input, and the tape snapshots it AFTER
+        // the op: operand 1, written in place, of operand 0's shape (the device's own test,
+        // src/adjoint/host/quant.cpp:863-869) holds the post-update sum x + residual_old
+        // (quant.cpp:859-862). The slice's environment holds the PRE-write residual, so the sum
+        // is formed here, bf16-narrowed as the kernel's store rounds it. The snapshot takes the
+        // same value, because the walk's own snapshot of that read is the live post-op pull.
+        // Checked against the device's own codes: with the sum and the weight's `wadd`, a
+        // reconstruction of op 0 matches 91.5% of the dumped `h.q8` codes exactly and its
+        // `h.s8` to 2e-3 -- with the residual alone, 0.9% and 95%.
+        if (fused_producer_sum(rec.op) && rec.operands.size() > 1) {
+            const r97::Operand& res = rec.operands[1];
+            if (res.written && res.in_place && res.shape == rec.operands[0].shape &&
+                !reads[0].value.empty() && reads[0].value.size() == reads[1].value.size()) {
+                std::vector<double> sum = reads[0].value;
+                for (size_t k = 0; k < sum.size(); ++k) sum[k] += reads[1].value[k];
+                narrow_bf16(&sum);
+                reads[1].value = sum;
+                snapshot[1].value = std::move(sum);
+            }
+        }
+
         // The empty un-filled slots: the walk's own convention for an absent value
         // (r97/adjoint.h's AdValue with an empty value; a twin that reads one declines).
         for (size_t i = 0; i < rec.operands.size(); ++i) {
@@ -526,6 +621,20 @@ struct SliceRun {
     r97::ParamSet grads;                    // the trainable leaves, under the prefix the input names
     r97::BackwardResult walk;               // the inputs' cotangents, backward_block's own answer
     std::map<std::string, Buffer> env;      // the buffers as the forward left them
+    // The dump's own rule for a constant: a buffer is stored at its FIRST read
+    // (src/step_device.cpp:1390-1415), with that read's view packed into the stored shape. The
+    // comparison gathers the slice's buffer through the same view; without it a narrowed read's
+    // device value and the slice's whole buffer are different tensors and the line is skipped.
+    struct FirstRead {
+        r97::Operand operand;
+        int64_t position = -1;
+        size_t slot = 0;
+    };
+    std::map<std::string, FirstRead> first_read;
+    // The value that read consumed, straight from the snapshot store the adjoint walks: the
+    // like-for-like side of the comparison for a buffer written more than once (the dump holds
+    // its first read, the final environment its last write).
+    std::map<std::string, r97::AdValue> first_read_value;
 };
 
 // Objective-free, container-free: the backward is seeded from the injected cotangents alone
@@ -545,8 +654,27 @@ inline SliceRun run_slice(const ProgramSlice& program, const SliceInput& in) {
     ProgramSlice prog = program;
     for (r97::OpRecord& rec : prog.ops) rec = own_raws(rec);
 
+    // The constants' first reads, under the dump's own rule (src/step_device.cpp:1390-1415):
+    // reads in append order, the first one wins, and raw/absent slots are never dumped.
+    for (const r97::OpRecord& rec : prog.ops)
+        for (size_t i = 0; i < rec.operands.size(); ++i) {
+            const r97::Operand& o = rec.operands[i];
+            // Exactly the dump's rule (src/step_device.cpp:1398-1402): a written operand is
+            // skipped unless it is a `kv:` in-place read. A non-kv in-place write -- op 3's
+            // `gdn_in` -- is skipped, so the first read recorded for that buffer is op 5's
+            // narrowed view, not the write's declared shape.
+            if (o.written && !(o.buffer.rfind("kv:", 0) == 0 && r97::in_place_read(rec, i)))
+                continue;
+            if (o.buffer.rfind("raw:", 0) == 0 || o.buffer.rfind("none:", 0) == 0) continue;
+            if (o.dtype == "invalid") continue;
+            run.first_read.emplace(o.buffer, SliceRun::FirstRead{o, rec.position, i});
+        }
+
     r97::StoredSnapshots snaps;
     run_forward(prog, in, &run.env, &snaps);
+    for (const auto& [name, fr] : run.first_read)
+        if (const r97::AdValue* v = snaps.at(fr.position, fr.slot))
+            run.first_read_value[name] = *v;
 
     // The boundaries a seed may name: the buffers that exist at the slice's end, whole rows --
     // the row count each buffer's own shape declares and what the seeds' rows name. ReferenceStep
@@ -631,7 +759,15 @@ inline void print_report(const SliceRun& run, const SliceInput& in, FILE* out = 
     for (const auto& [name, value] : device) {
         const auto it = run.env.find(name);
         if (it == run.env.end()) continue;
-        const std::vector<double>& a = it->second.value.value;
+        // The device's entry is what the buffer's first read consumed; a narrowed read packed
+        // its view (join_common.h:264-295), so the slice's buffer is gathered the same way or
+        // the two sides are different tensors -- `gdn_in`'s [512,10240] q|k|v view of a
+        // [512,16384] projection, `gdn_ab`'s two [512,48] halves of one [512,96] decay buffer.
+        AdValue gathered = it->second.value;
+        if (const auto fr = run.first_read.find(name);
+            fr != run.first_read.end() && !fr->second.operand.view_shape.empty())
+            gathered = gather_view(gathered, fr->second.operand);
+        const std::vector<double>& a = gathered.value;
         const std::vector<double>& b = value->value;
         if (a.empty() || a.size() != b.size()) continue;
         double dsq = 0.0, bsq = 0.0;
@@ -645,6 +781,30 @@ inline void print_report(const SliceRun& run, const SliceInput& in, FILE* out = 
                      bsq > 0.0 ? std::sqrt(dsq / bsq) : std::sqrt(dsq), a.size());
     }
     std::fprintf(out, "CONSTDIFF-COUNT n=%lld\n", static_cast<long long>(diff_n));
+    // The same comparison against the value the FIRST READ consumed, taken from the snapshot
+    // store the adjoint walks. For a buffer written once and read later the two agree; for a
+    // buffer written again after its first read (`h.q8`/`h.s8` at op 13, `h` at every residual
+    // add) this is the like-for-like side, and for a read the same record also writes
+    // (`gdn_o` at op 8, `kv:` states) the dump's capture is the POST-op buffer while this is
+    // the pre-op value -- the two lines together say which side is which.
+    int64_t snap_n = 0;
+    for (const auto& [name, value] : device) {
+        const auto it = run.first_read_value.find(name);
+        if (it == run.first_read_value.end()) continue;
+        const std::vector<double>& a = it->second.value;
+        const std::vector<double>& b = value->value;
+        if (a.empty() || a.size() != b.size()) continue;
+        double dsq = 0.0, bsq = 0.0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            const double d = a[i] - b[i];
+            dsq += d * d;
+            bsq += b[i] * b[i];
+        }
+        ++snap_n;
+        std::fprintf(out, "SNAPDIFF %s rel=%.9g n=%zu\n", name.c_str(),
+                     bsq > 0.0 ? std::sqrt(dsq / bsq) : std::sqrt(dsq), a.size());
+    }
+    std::fprintf(out, "SNAPDIFF-COUNT n=%lld\n", static_cast<long long>(snap_n));
 
     int64_t set_leaves = 0;
     double set_norm_sq = 0.0;

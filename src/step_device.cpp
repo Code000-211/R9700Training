@@ -1711,14 +1711,30 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                             }
                             o["params"] = params;
                             nlohmann::json operands = nlohmann::json::array();
-                            for (const Operand& op : rec.operands)
-                                operands.push_back({{"buffer", op.buffer},
-                                                    {"dtype", op.dtype},
-                                                    {"shape", op.shape},
-                                                    {"row_lo", op.row_lo},
-                                                    {"rows", op.rows},
-                                                    {"written", op.written},
-                                                    {"inout", op.in_place}});
+                            for (const Operand& op : rec.operands) {
+                                nlohmann::json x{{"buffer", op.buffer},
+                                                 {"dtype", op.dtype},
+                                                 {"shape", op.shape},
+                                                 {"row_lo", op.row_lo},
+                                                 {"rows", op.rows},
+                                                 {"written", op.written},
+                                                 {"inout", op.in_place}};
+                                // A narrowed or strided read -- the gated-delta layer's q|k|v
+                                // view of the fused projection, its two A|B halves of one decay
+                                // buffer -- is a different tensor from the declared buffer, and
+                                // the walk's snapshot holds the view's own shape
+                                // (join_common.h:264-295). Dropped here, the slice's twin reads
+                                // the whole buffer and two views of one buffer become the same
+                                // operand: the dump's own constant for such a read carries the
+                                // view's shape (gdn_in [512,10240] of [512,16384]), so the loss
+                                // is visible even before it is measured.
+                                if (!op.view_shape.empty()) {
+                                    x["view_shape"] = op.view_shape;
+                                    x["view_stride"] = op.view_stride;
+                                    x["view_off"] = op.view_off;
+                                }
+                                operands.push_back(std::move(x));
+                            }
                             o["operands"] = operands;
                             ops_j.push_back(std::move(o));
                         }

@@ -96,11 +96,19 @@ static nlohmann::json program_json(const r97::Tape& tape,
         op["params"] = params;
         op["operands"] = nlohmann::json::array();
         for (const r97::Operand& o : rec.operands) {
-            op["operands"].push_back({{"buffer", o.buffer}, {"dtype", o.dtype},
-                                      {"shape", o.shape}, {"row_lo", o.row_lo},
-                                      {"rows", o.rows}, {"written", o.written},
-                                      {"inout", o.in_place}});  // the tape's own key (src/tape.cpp:170);
-                                      // without it every recorded slice parses in_place=false
+            nlohmann::json x{{"buffer", o.buffer}, {"dtype", o.dtype},
+                             {"shape", o.shape}, {"row_lo", o.row_lo},
+                             {"rows", o.rows}, {"written", o.written},
+                             {"inout", o.in_place}};  // the tape's own key (src/tape.cpp:170);
+                             // without it every recorded slice parses in_place=false
+            // A narrowed/strided read is a tensor of its own (the walk's snapshot holds the
+            // view's shape, join_common.h:264-295); dropping the view replays the whole buffer.
+            if (!o.view_shape.empty()) {
+                x["view_shape"] = o.view_shape;
+                x["view_stride"] = o.view_stride;
+                x["view_off"] = o.view_off;
+            }
+            op["operands"].push_back(std::move(x));
         }
         doc["ops"].push_back(op);
     }
