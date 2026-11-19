@@ -624,39 +624,53 @@ real block slice must be recorded via the tape's path**, not `program_json`.
 ### The remaining GPU-side run, mapped (2026-11-19, machine free after the foreign window was
 cleared on the owner's instruction at 11:38, logged in /tmp/window-handclose.log)
 
-Everything below is an existing API; no new walk code is needed to produce the three inputs:
+Everything below is an existing API except one small env-gated dump in `step_device.cpp` (item 3); no new walk code is needed beyond that:
 
 1. **The block's op slice, tape-serialized.** The walk already has the tape:
    `src/step_device.cpp:474-476` (`driver.last().tape()`, `tape.ops()`, `tape.blocks()`), and a
    block's records are `ops[blocks[layer].begin .. blocks[layer].end)` (`:1573-1575`). The
-   serialization with `inout` is the tape's own `RadIssueOp` decode at `src/tape.cpp:170`; the
-   JSON writer in `tools/ops.cpp:77-106` drops it, so do NOT use `r97train ops --record` for the
-   slice -- either dump the tape's raw records or extend that writer. Slice = one `Tape::Block`
-   range.
-2. **Boundary FORWARD values.** Already kept: the `ResidualStore` (`include/r97/replay.h:66+`)
-   holds every boundary, bf16, `tokens*hidden*2` bytes each. Host read path:
-   `store.read(boundary, host.data())` then `widen_bf16` -- exactly what `store_boundary` does at
-   `src/step_device.cpp:1231-1234` (`measured.boundary_value`). `store.name(boundary)` gives the
-   buffer name; `store.extra_at(boundary)`/`read_extra` give the second copy where the plan holds
-   one (`replay.h:94-99, 129-131`). For the slice runner's `SliceInput::boundary`, widen each
-   boundary to f64 `AdValue{buffer=name, dtype, shape={tokens,hidden}}`.
+   JSON writer in `tools/ops.cpp:77-106` omits it (`:98-102` writes buffer/dtype/shape/row_lo/
+   rows/written only -- verified), so NO in-tree writer can produce a slice the runner parses
+   with its in-place marks intact. The one-line writer fix (`"inout": o.in_place`) must land in
+   `tools/ops.cpp` BEFORE the window, or the window produces a slice that silently parses all
+   operands `in_place=false`. Slice = one `Tape::Block` range, positions re-indexed 0..n-1 on
+   dump: `parse_slice` re-indexes to append order (`tests/host/slice_reference.cpp:161-162`)
+   because the snapshot store keys on (position, operand slot), and the walk's own backward uses
+   original positions -- a dumped slice that keeps tape positions 0..1463 would mis-key every
+   snapshot against the record the walk used.
+2. **Boundary FORWARD values.** Already kept in memory under `keep_boundaries`: the report's
+   own f64 copies `measured.boundary_value` / `boundary_cotangent` / `boundary_name`
+   (`include/r97/step_device.h:126-128`), filled by `store_boundary` at
+   `src/step_device.cpp:1229-1234` from the `ResidualStore` (`include/r97/replay.h:66+`, bf16,
+   `tokens*hidden*2` bytes per boundary; host read path `store.read` + `widen_bf16`, plus
+   `name`/`extra_at`/`read_extra` for the plan's second copy, `replay.h:94-99, 129-131`). So the
+   GPU-side dump reduces to ONE env-gated disk write of those three in-memory fields at a chosen
+   block. For the slice runner's `SliceInput::boundary`, each boundary is one f64
+   `AdValue{buffer=name, dtype, shape={tokens,hidden}}`.
 3. **Boundary COTANGENTS (full-range Seed).** `boundary_cotangents(...)` at
    `src/step_device.cpp:1620-1623` produces the `std::vector<IncomingCotangent>` for each block as
    the walk descends; `store_boundary` (`:1211-1235`) already copies the selected one into
    `measured.boundary_cotangent`. To dump ALL of them per block, print each `IncomingCotangent`
    (buffer, row_lo, row_hi, value) at that call site gated on an env flag -- that is a few lines
-   in `step_device.cpp`, and it yields `std::vector<r97::Seed>` verbatim (`Seed` =
-   buffer+row_lo/row_hi+f32 cotangent, `include/r97/objective.h:21`), which is exactly
-   `SliceInput::seeds`.
+   in `step_device.cpp`. **Type note:** `IncomingCotangent::value` is f64 full-range
+   (`include/r97/backward.h:82-86`); `Seed::cotangent` is f32 (`include/r97/objective.h`), so the
+   dump must `as_f32`-cast each value -- the same conversion the harness's own cases do — to
+   yield `std::vector<r97::Seed>` for `SliceInput::seeds`.
 4. **Device-side leaf gradients for the same block.** The walk stages per-leaf f32 accumulators on
    the card (`src/adjoint/device/grad_stage.{h,cpp}`); `grad_stage_flush(grads)` at
    `src/step_device.cpp:1674` materialises them into the `ParamSet` at step end, named by
    `factor_grad_name`/`split_adapter_grads` (`:1678`). The existing `R97_DUMP_LEAF=<substring>`
    already prints them (`LEAF <name> grad=<v>`), so `R97_DUMP_LEAF=layers.N.` is the comparison
    side; no new code needed there.
-5. **The comparison itself** is host-side and needs no window: feed the dumped slice JSON +
-   boundary values + seeds into `slice::run_slice`, read its `LEAF <name> l1/l2` report, and diff
-   against the device walk's `LEAF` line for the same leaf name. One block below 63, one leaf.
+5. **The comparison itself** is host-side and needs no window. **Driver shape, decided:** a tool
+   subcommand, not a test. The runner currently lives in the test TU's anonymous namespace, so
+   lift `namespace slice` into a new header (e.g. `tests/support/slice_reference.h` or a
+   `tools/` internal header) and have both the test and the new subcommand include it. The
+   subcommand takes `--program slice.json --boundary fwd.json --seeds seeds.json --out report.txt`
+   and prints the same `BUF`/`LEAF` lines; then diff its `LEAF` line against the device walk's
+   `LEAF` line for the same leaf name. One block below 63, one leaf. (A test cannot be the driver:
+   AGENTS.md's no-skip rule blocks an env-gated test that no-ops when the dump files are absent,
+   and both existing cases are inline-synthetic.)
 
 Window discipline, unchanged: one held window per batch via local-radiance-window.sh, launch
 detached with a STARTED line and a trap-EXIT close writing a DONE marker, and after any long job
