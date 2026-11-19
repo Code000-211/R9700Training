@@ -31,6 +31,8 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <fstream>
+#include <nlohmann/json.hpp>
 #include <vector>
 
 #include "engine.h"       // the complete rad::Engine behind ForwardDriver's unique_ptr
@@ -1625,6 +1627,108 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 throw std::runtime_error("device step: layer " + std::to_string(layer) +
                                          " left no cotangent on its input boundary");
             store_boundary(layer, incoming, store.name(layer));
+            // R97_DUMP_BLOCK=<n> with R97_DUMP_BLOCK_DIR=<dir>: the criterion-two dump
+            // (issue #55). At the named layer the walk holds exactly what the single-block
+            // f64 reference needs: this block's records (the slice), the boundary forward
+            // values (the store's own bf16 read, widened, NOT the empty measured.* fields --
+            // keep_boundaries is off in this run), and the boundary cotangents just computed.
+            // Files land in the dir: slice-<layer>.json (r97-program form, positions
+            // re-indexed 0..n-1 in append order), boundary-<layer>.json ({name: {dtype,
+            // shape, value[]}}, f64), seeds-<layer>.json ([{buffer, row_lo, row_hi,
+            // cotangent[]}], f32-cast per Seed::cotangent). slice-serve --program/--boundary/
+            // --constants/--seeds consumes them; the constants file is host-side prep (the
+            // report's item 3b), not dumped here.
+            if (const char* db = std::getenv("R97_DUMP_BLOCK")) {
+                const long long want_layer = std::atoll(db);
+                if (want_layer == (long long)layer) {
+                    const char* dir_env = std::getenv("R97_DUMP_BLOCK_DIR");
+                    const std::string dir = dir_env && *dir_env ? dir_env : "/tmp";
+                    const std::string base = dir + "/layers." + std::to_string(layer);
+                    // The slice: this block's records, positions re-indexed to append order
+                    // (the runner's snapshot store keys on (position, slot)).
+                    {
+                        const Tape::Block& range = blocks[static_cast<size_t>(layer)];
+                        nlohmann::json ops_j = nlohmann::json::array();
+                        int64_t pos = 0;
+                        for (size_t r = static_cast<size_t>(range.begin);
+                             r < static_cast<size_t>(range.end); ++r, ++pos) {
+                            const OpRecord& rec = ops[r];
+                            nlohmann::json o;
+                            o["op"] = rec.op;
+                            o["block"] = rec.block;
+                            o["position"] = pos;  // re-indexed, not the tape's own position
+                            o["n"] = rec.n;
+                            nlohmann::json params = nlohmann::json::object();
+                            for (const auto& [k, v] : rec.params) {
+                                if (const auto* ip = std::get_if<int64_t>(&v)) params[k] = *ip;
+                                else params[k] = std::get<std::string>(v);
+                            }
+                            o["params"] = params;
+                            nlohmann::json operands = nlohmann::json::array();
+                            for (const Operand& op : rec.operands)
+                                operands.push_back({{"buffer", op.buffer},
+                                                    {"dtype", op.dtype},
+                                                    {"shape", op.shape},
+                                                    {"row_lo", op.row_lo},
+                                                    {"rows", op.rows},
+                                                    {"written", op.written},
+                                                    {"inout", op.in_place}});
+                            o["operands"] = operands;
+                            ops_j.push_back(std::move(o));
+                        }
+                        nlohmann::json doc;
+                        doc["format"] = "r97-program";
+                        doc["version"] = 1;
+                        doc["batch"] = nlohmann::json::array();
+                        doc["ops"] = std::move(ops_j);
+                        std::ofstream out(base + ".json");
+                        out << doc.dump(2) << "\n";
+                    }
+                    // The boundary forward values: read the store directly (keep_boundaries
+                    // is off), bf16 widened to f64, one entry per boundary this block reads.
+                    // The boundary this block ENTERS is `layer`'s own; name-shaped like the
+                    // store's own name for it.
+                    {
+                        nlohmann::json doc = nlohmann::json::object();
+                        const std::string name = store.name(layer);
+                        if (!name.empty() && store.has(layer)) {
+                            std::vector<uint16_t> host(static_cast<size_t>(tokens * meta.hidden));
+                            store.read(layer, host.data());
+                            std::vector<double> wide;
+                            widen_bf16(host, &wide);
+                            nlohmann::json v;
+                            v["dtype"] = "f64";
+                            v["shape"] = nlohmann::json::array({tokens, meta.hidden});
+                            v["value"] = std::move(wide);
+                            doc[name] = std::move(v);
+                        }
+                        std::ofstream out(base + "-boundary.json");
+                        out << doc.dump(2) << "\n";
+                    }
+                    // The boundary cotangents: the IncomingCotangents just computed for this
+                    // same block, f64 full-range, cast to Seed's f32 so slice-serve reads them
+                    // exactly as the walk hands a Seed to its rows.
+                    {
+                        nlohmann::json arr = nlohmann::json::array();
+                        for (const IncomingCotangent& c : incoming) {
+                            nlohmann::json s;
+                            s["buffer"] = c.buffer;
+                            s["row_lo"] = c.row_lo;
+                            s["row_hi"] = c.row_hi;
+                            nlohmann::json cot = nlohmann::json::array();
+                            for (double x : c.value) cot.push_back(static_cast<float>(x));
+                            s["cotangent"] = std::move(cot);
+                            arr.push_back(std::move(s));
+                        }
+                        std::ofstream out(base + "-seeds.json");
+                        out << arr.dump(2) << "\n";
+                    }
+                    std::fprintf(stderr, "device step: dumped layer %lld's slice, boundary and "
+                                         "seeds to %s\n",
+                                 (long long)layer, base.c_str());
+                    std::fflush(stderr);
+                }
+            }
             // `snaps` dies with this iteration, so the base must not outlive it: the share answers
             // a miss from `base_`, and a stale pointer there is a use-after-free waiting for the
             // first walk that asks for a key this block did not store. The head's walk clears its
