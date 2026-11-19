@@ -931,80 +931,94 @@ void card_case(const char* test, int64_t n, bool probe) {
     // direction from a step too large without paying a second backward. The ladder now runs down
     // to 1e-7: at that size AdamW's first step is ~lr*sign(g), so |dL|/lr estimates the gradient's
     // L1 directly and must stop growing as lr falls -- the scale check that needs no FD.
+    // A truncated debug walk (R97_WALK_BLOCKS_DEBUG) is not a step: every block below the cut is
+    // zero-filled, so an AdamW step off it, the post-step forward and the descent ladder would all
+    // measure a gradient this run never computed -- and the ladder's eight forward-only 4096 calls
+    // are ~15 min for numbers the parent returns before reading. Skip all three; the boundary
+    // lines in the log are the measurement.
+    const bool debug_walk = std::getenv("R97_WALK_BLOCKS_DEBUG") != nullptr;
     const r97::ParamSet before = params;
-    constexpr float kDefaultLr = 1e-3f;
-    constexpr float kProbeLrs[] = {3e-4f, 1e-4f, 1e-5f, 1e-6f, 1e-7f};
-    r97::AdamWConfig oc;
-    oc.lr = kDefaultLr;
-    r97::Optimiser opt(params, oc);
-    const bool applied = opt.step(grads);  // throws when grads do not name the optimiser's params
-    R97_CHECK(applied);
-    R97_CHECK(opt.updates_done() == 1);
     int64_t a_changed = 0, b_changed = 0;
-    for (size_t i = 0; i < params.size(); ++i) {
-        if (params[i].value == before[i].value) continue;
-        if (ends(params[i].name, "lora_A")) ++a_changed;
-        else if (ends(params[i].name, "lora_B")) ++b_changed;
-    }
-
-    // ---- the descent: a forward-only call on the updated adapter
-
-    // The step's own loss is the pre-step reference -- the same params the forward-only probe
-    // ran -- and the loss after one AdamW step must be lower: a sign or scale error in the walk
-    // would leave it up.
+    bool applied = false;
+    int64_t updates_done = 0;
     double after_seconds = 0.0;
     r97::StepResult after{0.0, 0};
-    {
-        const auto t0 = std::chrono::steady_clock::now();
-        after = step(batch, params, nullptr);
-        after_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    }
     struct LrProbe {
         float lr;
         float clip;
         double loss;
     };
-    std::vector<LrProbe> lr_probes = {{kDefaultLr, 0.0f, after.loss}};
-    for (float lr : kProbeLrs) {
-        r97::ParamSet probe = before;
-        r97::AdamWConfig poc;
-        poc.lr = lr;
-        r97::Optimiser popt(probe, poc);
-        if (!popt.step(grads) || popt.updates_done() != 1) continue;
-        lr_probes.push_back({lr, 0.0f, step(batch, probe, nullptr).loss});
+    std::vector<LrProbe> lr_probes;
+    bool after_scored_same = false, after_finite = false;
+    bool descended_default_lr = false, descended_at_a_valid_step = false;
+    if (!debug_walk) {
+        constexpr float kDefaultLr = 1e-3f;
+        constexpr float kProbeLrs[] = {3e-4f, 1e-4f, 1e-5f, 1e-6f, 1e-7f};
+        r97::AdamWConfig oc;
+        oc.lr = kDefaultLr;
+        r97::Optimiser opt(params, oc);
+        applied = opt.step(grads);  // throws when grads do not name the optimiser's params
+        updates_done = opt.updates_done();
+        R97_CHECK(applied);
+        R97_CHECK(updates_done == 1);
+        for (size_t i = 0; i < params.size(); ++i) {
+            if (params[i].value == before[i].value) continue;
+            if (ends(params[i].name, "lora_A")) ++a_changed;
+            else if (ends(params[i].name, "lora_B")) ++b_changed;
+        }
+
+        // ---- the descent: a forward-only call on the updated adapter
+
+        // The step's own loss is the pre-step reference -- the same params the forward-only probe
+        // ran -- and the loss after one AdamW step must be lower: a sign or scale error in the walk
+        // would leave it up.
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            after = step(batch, params, nullptr);
+            after_seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        }
+        lr_probes = {{kDefaultLr, 0.0f, after.loss}};
+        for (float lr : kProbeLrs) {
+            r97::ParamSet probe = before;
+            r97::AdamWConfig poc;
+            poc.lr = lr;
+            r97::Optimiser popt(probe, poc);
+            if (!popt.step(grads) || popt.updates_done() != 1) continue;
+            lr_probes.push_back({lr, 0.0f, step(batch, probe, nullptr).loss});
+        }
+        // The clipped probe: the gradient's norm was ~7.5e38 before the residual fixes, so AdamW's
+        // f32 v = (1-b2)*g^2 was Inf for every leaf above ~1.8e19 and that leaf's update was zero
+        // -- the unclipped probes then tested only the moderate leaves. The clip (norm 1, computed
+        // in double, rescaled in f32) runs before the moments, so the dominant leaves take a finite
+        // step and this descent tests their direction. Kept because it is the only probe that would
+        // still exercise those leaves if the magnitude regressed.
+        for (float lr : {kDefaultLr, 1e-4f}) {
+            r97::ParamSet probe = before;
+            r97::AdamWConfig poc;
+            poc.lr = lr;
+            poc.clip_norm = 1.0f;
+            r97::Optimiser popt(probe, poc);
+            if (popt.step(grads) && popt.updates_done() == 1)
+                lr_probes.push_back({lr, 1.0f, step(batch, probe, nullptr).loss});
+        }
+        for (const LrProbe& p : lr_probes)
+            std::printf("%s: descent lr=%.0e clip=%.0f loss %.9g (%+.6g)\n", test, p.lr, p.clip,
+                        p.loss, p.loss - result.loss);
+        // Deferred to the end of this function, after the results file and the attribution prints.
+        // A failure here must not discard them: two 90-minute 4096-token windows were spent
+        // re-learning a single line because these threw before anything was written, and the one
+        // line that says where a bad number came from was unreachable exactly when it was needed.
+        after_scored_same = after.scored == result.scored;
+        after_finite = std::isfinite(after.loss);
+        // The default-lr step is printed and carried in the JSON; the check below is the direction
+        // at a step the gradient's scale admits. On this checkpoint's current gradient (norm 858.248)
+        // the 1e-3 step descends (-257.8) and every smaller probe descends harder, so the config's
+        // lr is a training choice and the walk's direction is what these checks hold.
+        descended_default_lr = after.loss < result.loss;
+        for (const LrProbe& p : lr_probes)
+            if (p.loss < result.loss) descended_at_a_valid_step = true;
     }
-    // The clipped probe: the gradient's norm was ~7.5e38 before the residual fixes, so AdamW's f32
-    // v = (1-b2)*g^2 was Inf for every leaf above ~1.8e19 and that leaf's update was zero -- the
-    // unclipped probes then tested only the moderate leaves. The clip (norm 1, computed in double,
-    // rescaled in f32) runs before the moments, so the dominant leaves take a finite step and this
-    // descent tests their direction. Kept because it is the only probe that would still exercise
-    // those leaves if the magnitude regressed.
-    for (float lr : {kDefaultLr, 1e-4f}) {
-        r97::ParamSet probe = before;
-        r97::AdamWConfig poc;
-        poc.lr = lr;
-        poc.clip_norm = 1.0f;
-        r97::Optimiser popt(probe, poc);
-        if (popt.step(grads) && popt.updates_done() == 1)
-            lr_probes.push_back({lr, 1.0f, step(batch, probe, nullptr).loss});
-    }
-    for (const LrProbe& p : lr_probes)
-        std::printf("%s: descent lr=%.0e clip=%.0f loss %.9g (%+.6g)\n", test, p.lr, p.clip,
-                    p.loss, p.loss - result.loss);
-    // Deferred to the end of this function, after the results file and the attribution prints.
-    // A failure here must not discard them: two 90-minute 4096-token windows were spent
-    // re-learning a single line because these threw before anything was written, and the one
-    // line that says where a bad number came from was unreachable exactly when it was needed.
-    const bool after_scored_same = after.scored == result.scored;
-    const bool after_finite = std::isfinite(after.loss);
-    // The default-lr step is printed and carried in the JSON; the check below is the direction at
-    // a step the gradient's scale admits. On this checkpoint's current gradient (norm 858.248) the
-    // 1e-3 step descends (-257.8) and every smaller probe descends harder, so the config's lr is a
-    // training choice and the walk's direction is what these checks hold.
-    const bool descended_default_lr = after.loss < result.loss;
-    bool descended_at_a_valid_step = false;
-    for (const LrProbe& p : lr_probes)
-        if (p.loss < result.loss) descended_at_a_valid_step = true;
 
     // ---- the results
 
@@ -1012,16 +1026,19 @@ void card_case(const char* test, int64_t n, bool probe) {
     j["tokens"]               = n;
     j["scored"]               = result.scored;
     j["loss"]                 = result.loss;
-    j["loss_after"]           = after.loss;
-    j["loss_after_scored"]    = after.scored;
-    // The descent at the default lr and at the smaller probes: a direction error leaves every lr
-    // up, a step too large leaves only the default up.
-    j["descent_lrs"] = nlohmann::json::array();
-    for (const LrProbe& p : lr_probes)
-        j["descent_lrs"].push_back(
-            {{"lr", p.lr}, {"clip", p.clip}, {"loss", p.loss}, {"delta", p.loss - result.loss}});
-    j["descended_default_lr"] = descended_default_lr;
-    j["descended_at_a_valid_step"] = descended_at_a_valid_step;
+    j["debug_truncated_walk"] = debug_walk;
+    if (!debug_walk) {
+        j["loss_after"]           = after.loss;
+        j["loss_after_scored"]    = after.scored;
+        // The descent at the default lr and at the smaller probes: a direction error leaves every
+        // lr up, a step too large leaves only the default up.
+        j["descent_lrs"] = nlohmann::json::array();
+        for (const LrProbe& p : lr_probes)
+            j["descent_lrs"].push_back(
+                {{"lr", p.lr}, {"clip", p.clip}, {"loss", p.loss}, {"delta", p.loss - result.loss}});
+        j["descended_default_lr"] = descended_default_lr;
+        j["descended_at_a_valid_step"] = descended_at_a_valid_step;
+    }
     j["report_loss"]          = rep.loss;
     j["report_scored"]        = rep.scored;
     j["hidden"]               = rep.hidden;
@@ -1108,7 +1125,7 @@ void card_case(const char* test, int64_t n, bool probe) {
     j["n_b_finite_nonzero"]   = n_b_finite_nonzero;
     j["grad_norm"]            = std::sqrt(grad_norm_sq);
     j["opt_applied"]          = applied;
-    j["updates_done"]         = opt.updates_done();
+    j["updates_done"]         = updates_done;
     j["a_changed"]            = a_changed;
     j["b_changed"]            = b_changed;
     // The walk's split by op name: the row calls (with the bus each one owns) and the replay's
@@ -1235,9 +1252,10 @@ void card_case(const char* test, int64_t n, bool probe) {
     // forward-only call ran), and one AdamW step at the config's default lr must leave it lower.
     // A sign or scale error in the walk leaves it up, and a non-finite gradient leaves it
     // non-finite; both are named here with the numbers, after the file is on disk.
-    std::printf("%s: descent: loss %.9g -> %.9g (%+.6g) after %.1f s | scored %lld -> %lld\n", test,
-                result.loss, after.loss, after.loss - result.loss, after_seconds,
-                (long long)result.scored, (long long)after.scored);
+    if (!debug_walk)
+        std::printf("%s: descent: loss %.9g -> %.9g (%+.6g) after %.1f s | scored %lld -> %lld\n",
+                    test, result.loss, after.loss, after.loss - result.loss, after_seconds,
+                    (long long)result.scored, (long long)after.scored);
 
     // The walk served every in-place read with no earlier writer from the block's stored
     // boundary: the tape's count and the report's must agree, and the tape names at least one.
@@ -1245,14 +1263,16 @@ void card_case(const char* test, int64_t n, bool probe) {
         R97_CHECK(in_place_expected > 0);
         R97_CHECK(rep.in_place_restores == in_place_expected);
     }
-    R97_CHECK(after_scored_same);
-    // The descent and the post-step forward's finiteness ride on the walk's gradient: value
-    // checks. They hold when the gradient is finite -- that is what they assert -- so they
-    // re-arm with the walk; R97_DSTEP_ASSERT_FINITE=1 forces them (and fails) while it is not.
-    // The numbers are in the results file either way.
-    if (all_finite || assert_finite()) {
-        R97_CHECK(after_finite);
-        R97_CHECK(descended_at_a_valid_step);
+    if (!debug_walk) {
+        R97_CHECK(after_scored_same);
+        // The descent and the post-step forward's finiteness ride on the walk's gradient: value
+        // checks. They hold when the gradient is finite -- that is what they assert -- so they
+        // re-arm with the walk; R97_DSTEP_ASSERT_FINITE=1 forces them (and fails) while it is not.
+        // The numbers are in the results file either way.
+        if (all_finite || assert_finite()) {
+            R97_CHECK(after_finite);
+            R97_CHECK(descended_at_a_valid_step);
+        }
     }
 }
 
