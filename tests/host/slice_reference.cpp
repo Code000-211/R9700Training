@@ -1,11 +1,11 @@
 // tests/host/slice_reference.cpp -- the slice runner's two acceptance cases.
 //
-// The runner itself (namespace slice, with the reviewed scope note: what a slice-vs-device
-// comparison rules out and what it does not) is tests/support/slice_reference.h, included below
-// and shared with the `r97train` subcommand that drives it from dump files. This file holds only
-// the two synthetic, deterministic, analytic acceptance cases that comment describes, with their
-// local helpers.
-#include "support/slice_reference.h"
+// The runner itself (namespace r97::slice, with the reviewed scope note: what a slice-vs-device
+// comparison rules out and what it does not) is src/slice_reference.h, included below and shared
+// with the `r97train` subcommand that drives it from dump files. This file holds only the two
+// synthetic, deterministic, analytic acceptance cases that comment describes, with their local
+// helpers.
+#include "slice_reference.h"  // the runner (internal, src/), shared with the r97train subcommand
 #include "support/test.h"
 
 #include <algorithm>
@@ -24,7 +24,7 @@
 
 namespace {
 
-namespace slice = r97::slice;  // the runner, tests/support/slice_reference.h
+namespace slice = r97::slice;  // the runner, src/slice_reference.h
 
 using r97::OpRecord;
 using r97::Operand;
