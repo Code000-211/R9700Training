@@ -543,12 +543,10 @@ inline void run_forward(const ProgramSlice& program, const SliceInput& in,
                 continue;
             }
             writes.push_back(i);
-            // A trial of the fused producers' residual sum (`reads[1] = bf16(x + h)`, the
-            // tape's post-op snapshot) is recorded in the report: it left h.q8's rel at 0.207
-            // and moved the residual's own match from 0 to 0.020, so the device does not
-            // accumulate that operand at this op and the pre-write read is what the kernel
-            // consumed. The op-0 question is the quantiser's, checked by the walk's own
-            // R97_DUMP_QUANT re-quantisation (quant.cpp:1146-1230), not by this sum.
+            // An in-place write reads its own prior value. The fused norm's residual is the one
+            // case where the prior is not the operand the kernel consumed: the sum is formed
+            // below (this file's residual-sum block), and the report's withdrawn trial is why
+            // the sum is built there and not by overwriting this read.
             if (r97::in_place_read(rec, i)) {
                 reads[i] = cold_kv(o) ? cold_value(o)
                                       : operand_at(rec, o, *env, in);  // the value the write replaces
@@ -596,6 +594,16 @@ inline void run_forward(const ProgramSlice& program, const SliceInput& in,
                                      std::to_string(writes.size()) + " writes");
 
         size_t produced_i = 0;
+        // The walk's cold rule is not read-only: `src/step_device.cpp:1590-1594` zeroes the
+        // snapshot of a WRITTEN `kv:` operand this block has not written yet, with no in-place
+        // test -- `gdn_chunk_scan`'s plain write of its chunk state (op 7's `kv:2` at pos 9) is
+        // the block's instance, and the walk's adjoint differentiates that slot at zero while
+        // this file's `put_write` below hands the twin's production to the environment (which a
+        // later in-block read must see, exactly as the walk's store does). Evaluated here,
+        // before any write lands: `put_write` is the only thing that grows the environment.
+        std::vector<char> cold_write(rec.operands.size(), 0);
+        for (size_t i = 0; i < rec.operands.size(); ++i)
+            if (rec.operands[i].written) cold_write[i] = cold_kv(rec.operands[i]) ? 1 : 0;
         for (size_t i = 0; i < rec.operands.size(); ++i) {
             if (!rec.operands[i].written) continue;
             if (!r97::in_place_read(rec, i)) {
@@ -605,6 +613,8 @@ inline void run_forward(const ProgramSlice& program, const SliceInput& in,
                 if (!rec.operands[i].shape.empty() && rec.operands[i].shape != snap.shape &&
                     numel(rec.operands[i].shape) == numel(snap.shape))
                     snap.shape = rec.operands[i].shape;
+                // The walk zeroes the production in place, keeping its shape and dtype.
+                if (cold_write[i]) snap.value.assign(snap.value.size(), 0.0);
                 snapshot[i] = std::move(snap);
             }
             put_write(rec.operands[i], produced[produced_i], env);

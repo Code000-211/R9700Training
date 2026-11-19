@@ -547,4 +547,84 @@ R97_TEST(slice_operand_view_gathers_the_named_half) {
     R97_CHECK(a.value != b.value);
 }
 
+// ------------------------------------------------------------------ the cold kv write
+//
+// The walk's cold rule is not read-only (src/step_device.cpp:1590-1594, no in-place test there):
+// a written `kv:` operand this block has not written yet enters ZERO in the snapshot the adjoint
+// sees, while the environment still receives the twin's production, so a later in-block read of
+// the pool sees the live state. `gdn_chunk_scan` is the real block's instance: it READS `kv:2` at
+// position 6 and WRITES it at position 9, and that write carries no `inout` mark -- so
+// `r97::in_place_read` is false for it (include/r97/backward.h:42-50: a `kv:` write that a
+// separate read in the same record names is not an in-place read), and the rule has to come from
+// the plain-write path. Asserted on the snapshots themselves -- the exact values the adjoint
+// reads -- not through a gradient: a plain re-write of one buffer also pulls in the join's
+// passthrough, which makes a gradient proxy say things this rule is not about.
+R97_TEST(slice_reference_cold_kv_write_zeroes_the_snapshot) {
+    const int64_t M = 4;
+    const int64_t Wd = 3;
+    const std::vector<int64_t> shape{M, Wd};
+    // op 0: kv:s (cold read, zeros) + b -> kv:s, a plain write of a pool nothing wrote yet.
+    // op 1: the same record again, now warm: its read is b, its write is 2b.
+    const std::string ops = R"([
+            {"op": "add", "block": 3, "position": 0, "n": 12, "params": {},
+             "operands": [
+                {"buffer": "kv:s", "dtype": "f64", "shape": [4, 3], "row_lo": 0, "rows": 0, "written": false},
+                {"buffer": "b", "dtype": "f64", "shape": [4, 3], "row_lo": 0, "rows": 0, "written": false},
+                {"buffer": "kv:s", "dtype": "f64", "shape": [4, 3], "row_lo": 0, "rows": 0, "written": true}]},
+            {"op": "add", "block": 3, "position": 1, "n": 12, "params": {},
+             "operands": [
+                {"buffer": "kv:s", "dtype": "f64", "shape": [4, 3], "row_lo": 0, "rows": 0, "written": false},
+                {"buffer": "b", "dtype": "f64", "shape": [4, 3], "row_lo": 0, "rows": 0, "written": false},
+                {"buffer": "kv:s", "dtype": "f64", "shape": [4, 3], "row_lo": 0, "rows": 0, "written": true}]}
+    ])";
+    const nlohmann::json doc = nlohmann::json::parse(
+        R"({"format": "r97-program", "version": 1, "batch": [[1, 5, 9, 2]], "ops": )" + ops + "}");
+    const slice::ProgramSlice program = slice::parse_slice(doc);
+    R97_CHECK(program.ops.size() == 2);
+    // The premise the rule turns on: the write is not an in-place read.
+    R97_CHECK(!r97::in_place_read(program.ops[0], 2));
+    R97_CHECK(!r97::in_place_read(program.ops[1], 2));
+
+    Deterministic rng{0xc01d4b17ull};
+    std::vector<double> bv(static_cast<size_t>(M * Wd));
+    // `next()` is uniform over [-1, 4095] (the splitmix64 draw scaled by 2^-52); sin keeps the
+    // values O(1) so a zero and a production cannot be confused by rounding.
+    for (double& v : bv) v = std::sin(rng.next());
+
+    slice::SliceInput in;
+    in.boundary["b"] = slice::make_value("f64", shape, bv);
+    in.prefix = "b3coldkv";
+    in.out_buffers = {"kv:s"};
+    in.leaf_buffers = {"b"};
+
+    std::map<std::string, slice::Buffer> env;
+    for (const auto& [name, value] : in.boundary) env[name] = slice::Buffer{value};
+    r97::StoredSnapshots snaps;
+    slice::run_forward(program, in, &env, &snaps);
+
+    const std::vector<double> zeros(bv.size(), 0.0);
+    std::vector<double> twice(bv.size());
+    for (size_t i = 0; i < bv.size(); ++i) twice[i] = 2.0 * bv[i];
+    // op 0: the read is the walk's cold zero, and so is the WRITE's snapshot ...
+    const r97::AdValue* cold_read = snaps.at(0, 0);
+    R97_CHECK(cold_read != nullptr);
+    if (cold_read != nullptr) expect_exact("kv:s (snapshot, cold read)", cold_read->value, zeros);
+    const r97::AdValue* cold_write = snaps.at(0, 2);
+    R97_CHECK(cold_write != nullptr);
+    if (cold_write != nullptr) {
+        R97_CHECK(cold_write->shape == shape);
+        expect_exact("kv:s (snapshot, cold write)", cold_write->value, zeros);
+    }
+    // ... op 1 reads the production and, warm, keeps its own ...
+    const r97::AdValue* warm_read = snaps.at(1, 0);
+    R97_CHECK(warm_read != nullptr);
+    if (warm_read != nullptr) expect_exact("kv:s (snapshot, warm read)", warm_read->value, bv);
+    const r97::AdValue* warm_write = snaps.at(1, 2);
+    R97_CHECK(warm_write != nullptr);
+    if (warm_write != nullptr)
+        expect_exact("kv:s (snapshot, warm write)", warm_write->value, twice);
+    // ... and the environment holds the last production either way.
+    expect_exact("kv:s (forward)", env.at("kv:s").value.value, twice);
+}
+
 }  // namespace

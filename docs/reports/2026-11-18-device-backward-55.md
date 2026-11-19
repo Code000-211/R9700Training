@@ -763,6 +763,15 @@ them in f64, in ~160 s.
    (`src/step_device.cpp:1582-1588`), but its forward values are the device's. Window 31's dump
    carries the real prior -- `kv:3`, 30,720 values, max |44.25|, none zero -- and the runner feeds
    the twin that value. (The zero rule moved the numbers by 1e-4: not the gap.)
+   The rule is not read-only: `:1590-1594` zeroes a **written** `kv:` operand's snapshot as well,
+   with no in-place test, which is `gdn_chunk_scan`'s plain write of `kv:2` (op 7, position 9).
+   The runner stored the twin's production there — a real difference in the block's rows (the
+   forward is unaffected: the environment still receives the production, so a later in-block read
+   of the pool sees the live state, exactly as the walk's store does). Fixed to mirror the walk
+   (`src/slice_reference.h`'s `cold_write`), and pinned by
+   `slice_reference_cold_kv_write_zeroes_the_snapshot`: `sigmoid`'s adjoint reads its own output
+   snapshot (`call.fwd[1]`), so a cold write makes its `dx` exactly zero while a warm one is
+   `dy·y·(1−y)`.
 
 **The first comparison** (window 30's walk, per-module leaves grouped by weight, against the
 slice's per-weight leaves):
