@@ -620,6 +620,47 @@ writes NO in-place field (`src/reference_step.cpp:168-173`), so a slice recorded
 operands `in_place=false` -- green-when-wrong at a GPU window's cost. The tape's own
 serialization carries it as `inout` (`src/tape.cpp:170`); the runner reads `inout` first. **The
 real block slice must be recorded via the tape's path**, not `program_json`.
+
+### The remaining GPU-side run, mapped (2026-11-19, machine free after the foreign window was
+cleared on the owner's instruction at 11:38, logged in /tmp/window-handclose.log)
+
+Everything below is an existing API; no new walk code is needed to produce the three inputs:
+
+1. **The block's op slice, tape-serialized.** The walk already has the tape:
+   `src/step_device.cpp:474-476` (`driver.last().tape()`, `tape.ops()`, `tape.blocks()`), and a
+   block's records are `ops[blocks[layer].begin .. blocks[layer].end)` (`:1573-1575`). The
+   serialization with `inout` is the tape's own `RadIssueOp` decode at `src/tape.cpp:170`; the
+   JSON writer in `tools/ops.cpp:77-106` drops it, so do NOT use `r97train ops --record` for the
+   slice -- either dump the tape's raw records or extend that writer. Slice = one `Tape::Block`
+   range.
+2. **Boundary FORWARD values.** Already kept: the `ResidualStore` (`include/r97/replay.h:66+`)
+   holds every boundary, bf16, `tokens*hidden*2` bytes each. Host read path:
+   `store.read(boundary, host.data())` then `widen_bf16` -- exactly what `store_boundary` does at
+   `src/step_device.cpp:1231-1234` (`measured.boundary_value`). `store.name(boundary)` gives the
+   buffer name; `store.extra_at(boundary)`/`read_extra` give the second copy where the plan holds
+   one (`replay.h:94-99, 129-131`). For the slice runner's `SliceInput::boundary`, widen each
+   boundary to f64 `AdValue{buffer=name, dtype, shape={tokens,hidden}}`.
+3. **Boundary COTANGENTS (full-range Seed).** `boundary_cotangents(...)` at
+   `src/step_device.cpp:1620-1623` produces the `std::vector<IncomingCotangent>` for each block as
+   the walk descends; `store_boundary` (`:1211-1235`) already copies the selected one into
+   `measured.boundary_cotangent`. To dump ALL of them per block, print each `IncomingCotangent`
+   (buffer, row_lo, row_hi, value) at that call site gated on an env flag -- that is a few lines
+   in `step_device.cpp`, and it yields `std::vector<r97::Seed>` verbatim (`Seed` =
+   buffer+row_lo/row_hi+f32 cotangent, `include/r97/objective.h:21`), which is exactly
+   `SliceInput::seeds`.
+4. **Device-side leaf gradients for the same block.** The walk stages per-leaf f32 accumulators on
+   the card (`src/adjoint/device/grad_stage.{h,cpp}`); `grad_stage_flush(grads)` at
+   `src/step_device.cpp:1674` materialises them into the `ParamSet` at step end, named by
+   `factor_grad_name`/`split_adapter_grads` (`:1678`). The existing `R97_DUMP_LEAF=<substring>`
+   already prints them (`LEAF <name> grad=<v>`), so `R97_DUMP_LEAF=layers.N.` is the comparison
+   side; no new code needed there.
+5. **The comparison itself** is host-side and needs no window: feed the dumped slice JSON +
+   boundary values + seeds into `slice::run_slice`, read its `LEAF <name> l1/l2` report, and diff
+   against the device walk's `LEAF` line for the same leaf name. One block below 63, one leaf.
+
+Window discipline, unchanged: one held window per batch via local-radiance-window.sh, launch
+detached with a STARTED line and a trap-EXIT close writing a DONE marker, and after any long job
+check `model-state/pause` by hand even on DONE rc=0 (a trap can leave it behind -- seen twice).
 - **Scope, stated once -- and corrected once by review**: the slice's `backward_block`
   (`src/backward.cpp:208`) is the SAME core the reference step drives (`:1053`) AND the device walk
   drives (`src/step_device.cpp:1170`, `:1595`). Of the three components that scoped the host-walk
