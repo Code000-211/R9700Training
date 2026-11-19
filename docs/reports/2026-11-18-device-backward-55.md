@@ -659,6 +659,21 @@ Everything below is an existing API except one small env-gated dump in `step_dev
    (`include/r97/backward.h:82-86`); `Seed::cotangent` is f32 (`include/r97/objective.h`), so the
    dump must `as_f32`-cast each value -- the same conversion the harness's own cases do — to
    yield `std::vector<r97::Seed>` for `SliceInput::seeds`.
+3b. **The CONSTANTS the slice's ops read (the frozen weights).** A real block's slice reads weight
+   operands (`blk.N.attn_norm.weight`, `blk.N.ssm_in.weight`, ...) that no slice op writes, and the
+   runner refuses them by name (`src/slice_reference.h:273-277`) unless `SliceInput::constants`
+   carries them. **The names align with the container's tensor names exactly** -- verified: the
+   fixture's weight-named reads (`blk.0.attn_norm.weight` etc.) are the same strings
+   `r97train dump-weight <file.rad> <name>` resolves, and that tool reads the container via
+   `rad::RadFile` with **no card, no engine, no window** (`tools/dump_weight.cpp:18-19`). So the
+   constants file is a **host-side prep artifact, orthogonal to the window entirely**: run
+   `dump-weight` for every weight-named operand the block's slice names (43 reads on the fixture
+   slice; a 27B block's list comes from the same slice's operand list), decode each to the dtype
+   the container stores it as (`plane 0` for a value dtype, codes for a code plane --
+   `dump_weight.cpp:35-61`), and write the `{name: {dtype, shape, value[]}}` file
+   `slice-serve --constants` takes. No GPU window, no StoredSnapshots correspondence, no runner
+   code: the container is the source, the slice's operand list is the name list, and both are
+   host-side.
 4. **Device-side leaf gradients for the same block.** The walk stages per-leaf f32 accumulators on
    the card (`src/adjoint/device/grad_stage.{h,cpp}`); `grad_stage_flush(grads)` at
    `src/step_device.cpp:1674` materialises them into the `ParamSet` at step end, named by
