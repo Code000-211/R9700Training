@@ -228,13 +228,14 @@ to ask it.
 ### `slice-serve`
 
 ```text
-usage: r97train slice-serve --program <slice.json> [--boundary <fwd.json>] [--seeds <seeds.json>] [--prefix <name>] [--out <report.txt>]
+usage: r97train slice-serve --program <slice.json> [--boundary <fwd.json>] [--constants <const.json>] [--seeds <seeds.json>] [--prefix <name>] [--out <report.txt>]
 ```
 
 | flag | state | what it does |
 | --- | --- | --- |
 | `--program <slice.json>` | now | the op slice, in `r97-program` form; required |
 | `--boundary <fwd.json>` | now | the boundary forward values, as `{name: {dtype, shape, value[]}}`; absent means empty |
+| `--constants <const.json>` | now | the frozen weights the slice's ops read, as `{name: {dtype, shape, value[]}}`; absent means empty — a real block's slice refuses on the first weight read without it |
 | `--seeds <seeds.json>` | now | the boundary cotangents, as `[{buffer, row_lo, row_hi, cotangent[]}]`; absent means empty |
 | `--prefix <name>` | now | the leaf gradients' name prefix (`slice` is the default) |
 | `--out <report.txt>` | now | write the `BUF`/`LEAF` report here instead of stdout |
