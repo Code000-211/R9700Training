@@ -647,8 +647,18 @@ different regimes and must not be conflated: the 11.3x and the 1.078x block-46 f
 dump53's 308-token chat chain, the op-0 16x from the 512-synthetic cycle; the row's gain grows
 with M, which is itself the M-scaling cross-check the report records.
 
-**The row's inputs and formula match the host twin on inspection, so the next step is the
-host-vs-device A/B of the same row.** `rmsnorm_back_kernel` (src/adjoint/device/quant.hip) takes
+**The host arm reproduces the device walk exactly, so the 11.8x is in the walk's shared setup,
+not the device row.** `R97_HOST_WALK_AB=2` on the same 308-chat walk (blocks 63..47) gives boundary
+47 -> 46 `l1 = 14169.8` against the device walk's `14197.9` -- 0.2% apart -- with the same block
+gain (1198.9 -> 14169.8 = 11.8x) and the same chain shape (flat through 52 -> 51, then 7.5x at
+51 -> 50, then 11.8x at 47 -> 46). Both arms run the same `backward_block`; the slice runs it too
+and gives 1.043x on the same block and seeds. So the divergence is in what the walk feeds the
+block, not in a row: the slice seeds only the boundary-48 cotangent, the walk also runs its
+`enter` (the residual store's credit) and the objective's seeds. That is the next measurement:
+dump the walk's block-47 `enter` input and the slice's seeds and diff them.
+
+The row's inputs and formula match the host twin on inspection; the A/B above is what settled
+that the row is not the site. `rmsnorm_back_kernel` (src/adjoint/device/quant.hip) takes
 the narrowed sum's snapshot as `x` when the record has a residual (`res_at >= 0 ? call.fwd[res_at]
 : call.fwd[0]`, and the comment says so), and its body is the host twin's `dx[i] += d[i]*scale*gain;
 dx[i] -= drs*rs3*r[i]/n` term for term (`shared = mult*rs^3*t/n`). What is not yet tested is whether
