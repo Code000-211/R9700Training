@@ -706,6 +706,16 @@ inputs are the dump's boundary values with its own f64 twins for the intermediat
 measurement is therefore the intermediates: the walk's `attn_k`/`attn_q` snapshots against the
 slice's twins' own outputs (`--out-values`), with the quantiser's codebook edges counted in each.
 
+**The rows either side of the divergence are also clean.** `rope_adjoint_f64` is the transpose
+rotation and `kv_store_adjoint_f64` (src/adjoint/host/qk.cpp) is a pure scatter -- `d_k[dst+d] +=
+d_pool[base+d]`, gain one, with the pool's two lanes split back into k and v. So neither the rope
+nor the kv_store manufactures the 42x, and the k path's cotangent arrives inflated before either
+row runs. The remaining measurement is the version bookkeeping: the post-rope `attn_k` version's
+cotangent as each reader sees it (the rope writes it, the kv_store reads it), against the
+buffer's own extent -- the two l1s in the table (1899.71 at the rope, 86.985 at the kv_store's
+kv:1) are over different buffers, so the comparison needs the per-version extent before it can
+be read as a factor.
+
 The row's inputs and formula match the host twin on inspection; the A/B above is what settled
 that the row is not the site. `rmsnorm_back_kernel` (src/adjoint/device/quant.hip) takes
 the narrowed sum's snapshot as `x` when the record has a residual (`res_at >= 0 ? call.fwd[res_at]
