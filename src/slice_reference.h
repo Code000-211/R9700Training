@@ -272,6 +272,17 @@ inline AdValue raw_table(const r97::OpRecord& rec, const r97::Operand& o) {
         for (int64_t i = 0; i < n; ++i) v.value[(size_t)i] = double(i);
         return v;
     }
+    if (key == "2") {  // the attention pool's block table, [n_seq, max_blocks]
+        if (o.shape.size() != 2 || o.shape[0] != 1) refuse("a block table of a batch this runner does not hold");
+        const int64_t blocks = (M + 15) / 16;  // the op's own block_size, a prefill from 0
+        for (int64_t b = 0; b < o.shape[1]; ++b) v.value[(size_t)b] = b < blocks ? double(b) : -1.0;
+        return v;
+    }
+    if (key == "3" && rec.op.rfind("attn_", 0) == 0) {  // seqused, [n_seq]
+        if (!seq_ok || n != 1) refuse("seqused of a batch this runner does not hold");
+        v.value[0] = double(M);
+        return v;
+    }
     if (key == "3" || key == "6" || key == "7") {  // cu_seqlens
         if (!seq_ok || n != 2) refuse("cu_seqlens of a batch this runner does not hold");
         v.value[0] = 0.0;

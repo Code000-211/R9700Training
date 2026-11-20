@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -1727,6 +1728,9 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 if (want_layer == (long long)layer) {
                     const char* dir_env = std::getenv("R97_DUMP_BLOCK_DIR");
                     const std::string dir = dir_env && *dir_env ? dir_env : "/tmp";
+                    // A dump that silently writes nowhere because the directory does not exist
+                    // has burned a window; make it, and let a failure be loud.
+                    std::filesystem::create_directories(dir);
                     const std::string base = dir + "/layers." + std::to_string(layer);
                     // The slice: this block's records, positions re-indexed to append order
                     // (the runner's snapshot store keys on (position, slot)).
@@ -1736,7 +1740,13 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                         int64_t pos = 0;
                         for (size_t r = static_cast<size_t>(range.begin);
                              r < static_cast<size_t>(range.end); ++r, ++pos) {
-                            const OpRecord& rec = ops[r];
+                            // The walk's own normalisation (own_raws + tighten_rows, as the
+                            // block's records get at 1661-1665), so the slice's ops carry the
+                            // rows and views the walk actually ran -- without it a padded chat
+                            // run's program says M=512 while the boundary holds the 308 real
+                            // rows, and the runner reads past the dump.
+                            OpRecord rec = own_raws(OpRecord(ops[r]));
+                            tighten_rows(rec);
                             nlohmann::json o;
                             o["op"] = rec.op;
                             o["block"] = rec.block;
@@ -1780,6 +1790,11 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                         doc["format"] = "r97-program";
                         doc["version"] = 1;
                         doc["batch"] = nlohmann::json::array();
+                        for (const TokenSeq& seq : batch) {
+                            nlohmann::json ids = nlohmann::json::array();
+                            for (int64_t id : seq.ids) ids.push_back(id);
+                            doc["batch"].push_back(std::move(ids));
+                        }
                         doc["ops"] = std::move(ops_j);
                         std::ofstream out(base + ".json");
                         out << doc.dump(2) << "\n";
