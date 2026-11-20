@@ -313,11 +313,11 @@ int64_t read_vram_used(const std::string& card) {
 // seed is splitmix64 over each leaf's index, one draw per value, in [-1/sqrt(fan_in),
 // 1/sqrt(fan_in)]: both factors take rank inputs per output row, and every leaf is a different
 // pattern, so a step that trains the adapter moves every one of them.
-void seed_adapter(r97::ParamSet& params) {
+void seed_adapter(r97::ParamSet& params, double scale_mul = 1.0) {
     for (size_t leaf = 0; leaf < params.size(); ++leaf) {
         r97::Param& p = params[leaf];
         const int64_t fan_in = p.shape.size() >= 2 ? p.shape[1] : 1;
-        const double scale = 1.0 / std::sqrt((double)std::max<int64_t>(1, fan_in));
+        const double scale = scale_mul / std::sqrt((double)std::max<int64_t>(1, fan_in));
         uint64_t state = 0x9e3779b97f4a7c15ull * (uint64_t(leaf) + 1);
         for (float& v : p.value)
             v = float((2.0 * r97::device_check::urand(&state) - 1.0) * scale);
@@ -421,7 +421,16 @@ void card_case(const char* test, int64_t n, bool probe) {
     const bool seed_override = std::getenv("R97_SEED_ADAPTER") != nullptr &&
                                std::getenv("R97_WALK_BLOCKS_DEBUG") != nullptr;
     const bool suppress_seed = std::getenv("R97_DSTEP_NO_SEED") != nullptr;
-    if (!suppress_seed && (probe || seed_override)) seed_adapter(params);
+    if (!suppress_seed && (probe || seed_override)) {
+        // R97_SEED_ADAPTER=<x> seeds with every factor multiplied by x: a tiny nonzero B is the
+        // control for "the amplification is triggered by a cotangent that is exactly zero".
+        double mul = 1.0;
+        if (const char* sc = std::getenv("R97_SEED_ADAPTER"); sc != nullptr && *sc != '\0') {
+            const double v = std::atof(sc);
+            if (v > 0.0) mul = v;
+        }
+        seed_adapter(params, mul);
+    }
 
     // The driver for the tier: the card's library first, libr97 the plugin the device adjoints
     // load from (it serves no forward kernel; it is in the list so the engine dlopen()s it), the
@@ -1376,7 +1385,9 @@ static void device_step_case(const char* test, int64_t n, bool probe) {
     // A truncated debug walk (R97_WALK_BLOCKS_DEBUG) zero-fills every block it skipped, so its
     // gradient is not a step's: the boundary lines in the log are the measurement, and every
     // assertion below would be about a number this run never computed.
-    if (std::getenv("R97_WALK_BLOCKS_DEBUG") != nullptr) {
+    // The walk's own report, not the caller's environment: a full walk with a debug knob is a
+    // step whose checks must run, and only a walk that skipped blocks may skip them.
+    if (j.value("debug_truncated_walk", false)) {
         std::printf("%s: DEBUG-TRUNCATED walk: the `r97: boundary` lines are the measurement; the "
                     "gradient assertions are skipped\n", test);
         return;

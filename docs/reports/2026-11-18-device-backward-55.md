@@ -394,9 +394,10 @@ blocks they agree:
 | 63 -> 62 | 43.7711 (x6.708) | 43.738 (x6.703) |
 | 62 -> 61 | 52.712 (x1.204) | 52.6677 (x1.204) |
 
-So the amplification is neither the device's precision nor a device-versus-host row divergence: it
-is what the model's own Jacobian gives from the head's incoming cotangent, computed the same way
-by three implementations (device rows, host rows, and the slice that shares the host rows).
+So at 512 zero-B the amplification is not the device's precision: the f64 host rows give the same
+chain. (The host arm was run at zero-B 512 only -- there is no host arm for the seeded regime, so
+this clears precision, not the rows: the device kernels are translations of the same host rows, and
+both walks share the join, the head's seeds and `src/backward.cpp`.)
 
 Where it is *created* is the head's junction, before any block row runs: the branch cotangents into
 the head's residual add are the same size in both regimes (`gather_rows` h_out 1.712e-4 zero-B
@@ -444,6 +445,70 @@ chain is identical at 512 and 4096 tokens, and the gains are a smooth function o
 The practical consequence is the one a training step already has an answer for: **clip** -- the
 optimiser's `clip_norm` is what a per-block gain of 2-10 over sixty-four blocks needs, and the
 clipped 4096 step is the one that descends (-25,137 at 1e-3 in the 4096 ladder).
+
+### The ladder cannot arbitrate the magnitude, in either regime
+
+The prose arms ran the full descent ladder. AdamW's first step with bias correction on and decay 0
+is `lr * g / (|g| + eps)` = `lr * sign(g)` per leaf, so the first-order `dL = -lr * sum|g|` -- which
+looks like a magnitude arbiter. It is not one here, and the two regimes show why, in opposite
+directions:
+
+| lr | zero-B dL/lr (norm 2.35e14) | seeded dL/lr (norm 1.00e3) |
+|---|---|---|
+| 1e-3 | 5.4e+04 | 2.7e+05 |
+| 3e-4 | 3.2e+05 | 1.7e+06 |
+| 1e-4 | 5.6e+05 | 4.8e+06 |
+| 1e-5 | 2.8e+05 | 3.1e+07 |
+| 1e-6 | 6.2e+05 | 1.4e+08 |
+| 1e-7 | 1.3e+06 | 3.3e+08 |
+
+Neither plateaus (both grow as lr falls). The **seeded** arm's `dL/lr` reaches 3.3e8 while its
+gradient's L1 can be at most its norm, 1e3 -- a first-order violation of five orders in the
+*impossible* direction. The cause is the bf16 parameters: the loss is piecewise constant, and a
+step that crosses a rounding boundary moves it by far more than the linear term. The **zero-B**
+arm's `dL/lr` (1.3e6) sits eight orders *below* its norm, which the same piecewise constancy
+explains from the other side (most leaves never move).
+
+So the ladder measures the parameters' rounding, not the gradient's magnitude. The ceiling
+`|dL| <= lr * L1` is one-sided (an undershoot is allowed), so the zero-B arm cannot falsify its own
+norm; the seeded arm is the calibration, and its `|dL|` at 3e-4 (517) overshoots its own first-order
+ceiling (`lr * L1 <= 3e-4 * sqrt(800) * 1000.15 = 8.5`) by 61x. Even applying that 61x calibration,
+the zero-B deficit stands: at 3e-4 its claimed norm predicts `|dL| >= 7e10` and it measures 94.8,
+so the magnitudes are off by at least 1e7. **Criterion two is not met at the zero-B start.** What it does say is that the *signs* are right (every unclipped probe
+descends at every lr) and that the clipped 1e-3 step -- which moves every leaf by ~lr regardless of
+its gradient -- **raises** the loss (+149.2 zero-B, -272.1 seeded: the seeded one descends), so the
+zero-B gradient's *relative* leaf magnitudes do not support a uniform step.
+
+**Criterion two therefore stays open, with the magnitude question untouched by the ladder.** The
+next arbiter is a formula audit of the rows the amplification passes through, against
+`docs/adjoints/attention.md` and the host rows, on the block whose gain is largest.
+
+### The trigger is the activations, not the exact zero
+
+`lora_B == 0` makes `lora_expand`'s `dt` exactly zero, so a plausible trigger was a cotangent of
+exactly zero being handled differently from a tiny one. `R97_SEED_ADAPTER=1e-8` (a B small enough
+to leave the forward's loss at the zero-B value) refutes it:
+
+| boundary | prose zero-B | prose, B = 1e-8 |
+|---|---|---|
+| 64 -> 63 | 7.01671 | 7.01671 |
+| 63 -> 62 | 18.3806 | 18.3805 |
+
+Identical to five digits -- which is also what the geometry predicts (at B = 1e-8, `dt` is ~1e-8 of
+the cotangent, far below any row's contribution). So this arm refutes exactly one thing, the
+**exact-zero-slot** family (a zero cotangent mistaken for an empty slot in the join's fills or the
+in-place path), and nothing more.
+
+The dose response is the positive evidence, and it is steep: `R97_SEED_ADAPTER=1e-4` gives **grad
+norm 4.94522e+11** -- 500x below zero-B's 2.37e14 -- while the top of the boundary chain stays
+zero-B-shaped (7.00968 at the head, x2.735 at 63 -> 62 against x2.62) and the loss moves 0.2 nats.
+A 1e-4 change in B cannot move a model's true Jacobian 500x, so this is a defect's fingerprint, not
+conditioning: the backward's magnitude depends steeply on the adapter's scale, and the sweep
+1e-8 / 1e-4 / 0.03 leaves "small B triggers it" alive while "the exact zero triggers it" is dead.
+The rows are formula-correct -- `attn_paged`'s adjoint was hand-checked against
+`docs/adjoints/attention.md` line for line, and the device and host rows agree to four to five
+digits at zero-B -- so the remaining candidate is how the walk combines them, not what they
+compute.
 
 ### Where the backward time goes
 

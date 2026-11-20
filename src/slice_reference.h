@@ -746,6 +746,29 @@ inline void norms_of(const std::vector<double>& v, double* l1, double* l2) {
 // dumps is later work; this print is the artifact that comparison reads. It writes through a
 // FILE* -- C stdio -- because the tool's `--out` is a file, and cout's streambuf swap does not
 // capture printf.
+// The run's buffers as JSON, for an arm that needs the values and not just their norms -- the
+// block-local directional derivative (<g_in, J u> against <g_out, u>) is a difference of two
+// forward runs, and a difference of L2 norms cannot stand in for it.
+inline void print_values(const SliceRun& run, const SliceInput& in, FILE* out) {
+    std::fprintf(out, "{");
+    bool first = true;
+    for (const std::string& name : in.out_buffers) {
+        const auto it = run.env.find(name);
+        if (it == run.env.end()) continue;
+        const AdValue& v = it->second.value;
+        std::fprintf(out, "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[", first ? "" : ",",
+                     name.c_str(), v.dtype.c_str());
+        first = false;
+        for (size_t i = 0; i < v.shape.size(); ++i)
+            std::fprintf(out, "%s%lld", i ? "," : "", (long long)v.shape[i]);
+        std::fprintf(out, "],\"value\":[");
+        for (size_t i = 0; i < v.value.size(); ++i)
+            std::fprintf(out, "%s%.17g", i ? "," : "", v.value[i]);
+        std::fprintf(out, "]}");
+    }
+    std::fprintf(out, "}");
+}
+
 inline void print_report(const SliceRun& run, const SliceInput& in, FILE* out = stdout) {
     for (const std::string& name : in.out_buffers) {
         const auto it = run.env.find(name);

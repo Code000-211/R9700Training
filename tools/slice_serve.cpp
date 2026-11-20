@@ -178,6 +178,7 @@ static int slice_serve_main(int argc, char** argv) {
     const char* seeds_path = nullptr;
     const char* prefix = "slice";
     const char* out_path = nullptr;
+    const char* values_path = nullptr;
     const char* model_path = nullptr;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -193,6 +194,8 @@ static int slice_serve_main(int argc, char** argv) {
             prefix = argv[++i];
         } else if (arg == "--out" && i + 1 < argc) {
             out_path = argv[++i];
+        } else if (arg == "--out-values" && i + 1 < argc) {
+            values_path = argv[++i];
         } else if (arg == "--model" && i + 1 < argc) {
             model_path = argv[++i];
         } else {
@@ -256,6 +259,15 @@ static int slice_serve_main(int argc, char** argv) {
             }
             slice::print_report(got, in, out);
             std::fclose(out);
+            if (values_path != nullptr) {
+                std::FILE* vf = std::fopen(values_path, "w");
+                if (!vf) {
+                    std::cerr << "r97train slice-serve: cannot open " << values_path << "\n";
+                    return 2;
+                }
+                slice::print_values(got, in, vf);
+                std::fclose(vf);
+            }
         } else {
             slice::print_report(got, in);
         }
