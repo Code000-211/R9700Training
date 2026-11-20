@@ -635,15 +635,17 @@ amplification is not the model's Jacobian: the f64 reference on the same block a
 and the device walk's block backward multiplies the cotangent by ~11x where f64 multiplies it by
 ~1.04x. Compounded over the depth, that is the 2.35e14 norm.
 
-**The walk's own chain narrows the amplifying row to the full-attention blocks.** The block
-below 47 is 46, a gated-delta block, and its seeds are `l1 = 7656.698` per entry against 47's
-`7098.95` -- a block gain of **1.078x**, flat, while block 47's is 11.81x. Every block shares the
-walk-level bookkeeping (op 0's fills and passthrough, the boundary `enter`, the join, the x-credit
--- the gated-delta boundaries carry the same two entries at flat gain), so none of it can be the
-11.3x. The amplifying row is full-attention-specific: `attn_paged` or its rope/kv auxiliaries.
-The f64 control for block 46 is blocked by a pre-existing slice-runner gap (`gdn_conv_prep`'s twin
-produces 0 outputs where the record names 6 writes), so the comparison runs on the attention block
-only until that twin is filled in.
+**The per-op profile names the row: the fused norm's backward (`rmsnorm_had_quant_i8g`, op 0)
+amplifies on the walk and is flat in f64.** The f64 slice's op 0 receives `l1 = 613.055` and hands
+down `626.862` -- a row gain of **1.023x**. The walk's op 0 at block 47 (512-synthetic cycle,
+`R97_DUMP_COT` on the gpu model test) receives `106982` and the boundary below it carries
+`1.695e6`/entry -- **~16x through that one row**, and the same row at block 63 gains only 2.2x. So
+the divergence is inside the norm's fused adjoint (host `src/adjoint/host/quant.cpp`'s
+`fused_adjoint` or the device `plugin.hip`/`quant.hip`), not in the block's other rows: the
+slice's profile from op 27 down is smooth and its hand-down is 1.02x. Note the two chains are
+different regimes and must not be conflated: the 11.3x and the 1.078x block-46 figure come from
+dump53's 308-token chat chain, the op-0 16x from the 512-synthetic cycle; the row's gain grows
+with M, which is itself the M-scaling cross-check the report records.
 
 **The routing matrix also says the accumulator's cotangent reaches the gradient, and the forward
 says it should not.** With block 47's slice backward seeded h-only, x-only and both: hand-down
