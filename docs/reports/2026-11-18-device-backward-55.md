@@ -529,6 +529,9 @@ is K-specific: `attn_q`, sharing the same derived positions through the same rop
 `gate_up` 0.0067, `attn_out` 0.0077). So the suspect is the rope's `imrope`/`sections` twin over
 the `[308, 1024]` four-head layout, not the row counts: dump53 and dump54 give bit-identical
 `CONSTDIFF` across `M` 512 -> 308, because the twins derive their rows from the operand values.
+A truncated program splits it exactly: through the K-norm (ops 0..11) `attn_k` agrees at 0.0045,
+and adding the two rope ops (0..13) moves it to 0.224. The K-norm's twin is right and the rope's
+K path is the one op the arbiter still needs.
 The finite difference itself differences the twin against itself, so `CONSTDIFF` does not gate it --
 but a wrong K twin would make it measure the wrong `J`, and that is what stays open.
 
