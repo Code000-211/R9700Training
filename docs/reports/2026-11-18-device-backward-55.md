@@ -725,6 +725,48 @@ cotangent twice) and a crossed version id between op 11's and op 13's writes of 
 version ids the cotout line now prints (`v=`) settle which: the slice resolves op 13's write to
 v=3, op 11's to v=2, op 12's to v=1, and the walk's plan is the comparison.
 
+**The mint is found, and it is the kv slot table: every block folds the pool's *covered* rows by
+exactly the token count.** The walk's own `dc` lines settle it, block by block, once the pool's
+cotangent is split into the rows the store overwrote and the rows it left alone (`dc[3]` is the
+uncovered remainder):
+
+| block | pool l1 | uncovered | **covered** | dk+dv | ÷ covered |
+|---|---|---|---|---|---|
+| 63 | 1.8312 | 1.8051 | 0.02604 | 8.021 | **308.02** |
+| 61 | 3.4394 | 3.3559 | 0.08358 | 25.74 | **308.00** |
+| 59 | 7.0349 | 6.9556 | 0.07932 | 24.43 | **307.99** |
+| 57 | 10.718 | 9.9695 | 0.74827 | 230.5 | **308.02** |
+| 47 | 86.985 | 75.765 | 11.22 | 3455.6 | **308.00** |
+
+308 is the token count to two decimals in every block. A gain-<=1 scatter over distinct slots
+cannot fold by 308; a slot table that is all one value folds by exactly tokens. The cause is the
+walk's *served* slot operand: `snapshot()` deliberately returns zeros for an unnamed raw operand
+("the raw slot's zero is a valid slot index" -- true for a decode's one slot, fatal at 308), so
+every token scatters from pool row 0. The slice fabricates `raw:2` as the identity table
+(`src/slice_reference.h`: `v.value[i] = i`), which is the reference step's own formula
+(`src/reference_step.cpp: block*kKvBlock + p%kKvBlock` for a one-sequence batch from block 0), and
+gets 44.84. The fix serves that table in the walk: a rebuild from the batch's block size, gated to
+a one-sequence batch, refusing loudly for a multi-sequence one whose per-sequence block tables do
+not share a layout, and leaving a table the tape names and pulls whole untouched. A loud refusal
+in the kv_store rows backs it up: a constant slot table at more than one token is now an error
+naming the operand, not a silent fold.
+
+**The slice's own version resolution (with `v=` and `rd=` now printed) fixes the graph the mint
+must fit.** Block 47's attn_k has four versions: v0 the qkv gemm (op 4), v1 the LoRA expand
+(op 6), v2 the k-norm (op 11), v3 the rope (op 13). The slice resolves exactly that -- op 13
+writes v3 reading v2 (`v=3 rd=2`), op 6 writes v1 reading v0, op 12 writes v1 reading v0. So v3's
+only contributor is the kv_store (op 14), whose attn_k read maps to v3; and v3's cotangent is
+therefore the scatter's `dk` alone. Slice: 44.84, the k-lane half of the pool's 87.23 -- which is
+what a gain-<=1 scatter must emit (308*4*256 = 315,392 values from a 1,048,576-value pool whose
+whole cotangent is 87). Walk: 1899.71 on the same 315,392 values. Both the record and the slot
+geometry are identical between the dump and the walk (`op 14: block_size 16, head_dim 256,
+n_head_kv 4`; op 13 declares `n_head_kv` 0 and only passes its width check because
+`(4 + 0) * 256 = 1024` happens to equal the k tensor's width). Since the row, its input and the
+plan agree, the remaining possibility is that the walk's *other* reader of v3 -- the rope's own
+in-place read -- contributes to it a second time, or that `nv`/heads in the walk's live record
+differ from the dumped one; `R97_DUMP_DC` on `kv_store` (now in the filter) plus the walk's
+`v=`/`rd=` lines settle it in the one running window.
+
 The row's inputs and formula match the host twin on inspection; the A/B above is what settled
 that the row is not the site. `rmsnorm_back_kernel` (src/adjoint/device/quant.hip) takes
 the narrowed sum's snapshot as `x` when the record has a residual (`res_at >= 0 ? call.fwd[res_at]

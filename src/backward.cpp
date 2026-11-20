@@ -798,9 +798,13 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                     l1 += std::fabs(q);
                     sq += q * q;
                 }
-                std::fprintf(stderr, "r97: cotout %zu %s j=%zu %s v=%lld l1=%.6g l2=%.6g\n", i,
-                             rec.op.c_str(), j, rec.operands[j].buffer.c_str(),
-                             static_cast<long long>(plan.write_version[i][j]), l1, std::sqrt(sq));
+                std::fprintf(stderr, "r97: cotout %zu %s j=%zu %s v=%lld rd=%lld l1=%.6g l2=%.6g\n",
+                             i, rec.op.c_str(), j, rec.operands[j].buffer.c_str(),
+                             static_cast<long long>(plan.write_version[i][j]),
+                             static_cast<long long>(plan.read_segments[i][j].empty()
+                                                        ? -1
+                                                        : plan.read_segments[i][j][0].version),
+                             l1, std::sqrt(sq));
             }
         }
 
@@ -864,7 +868,7 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         if (const char* d = std::getenv("R97_DUMP_DC");
             d != nullptr && d[0] == '1' &&
             (rec.op == "rope" || rec.op == "lora_expand" || rec.op == "lora_shrink" ||
-             rec.op == "rmsnorm" ||
+             rec.op == "rmsnorm" || rec.op == "kv_store" || rec.op == "attn_paged" ||
              // The op the 512 case's remaining non-finite is born in, at position 1176 in block
              // 63: not an exact match for "rmsnorm", and outside the last-block window below, so
              // without this line the dump is silent about the one row it is being run for.
@@ -1076,6 +1080,21 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                 }
             }
         };
+        if (dump_cot) {
+            // What the row handed on, per operand, before it reaches any version: the number that
+            // decides whether a row's own output or the accumulation into a version is inflated.
+            for (size_t j = 0; j < rec.operands.size(); ++j) {
+                const bool in_place = in_place_read(rec, j);
+                if (rec.operands[j].written && !in_place) continue;
+                double l1 = 0.0, sq = 0.0;
+                for (double q : dc[j].value) {
+                    l1 += std::fabs(q);
+                    sq += q * q;
+                }
+                std::fprintf(stderr, "r97: cotdc %zu %s j=%zu %s l1=%.6g l2=%.6g\n", i,
+                             rec.op.c_str(), j, rec.operands[j].buffer.c_str(), l1, std::sqrt(sq));
+            }
+        }
         std::map<int64_t, std::vector<size_t>> by_buffer;
         for (size_t j = 0; j < rec.operands.size(); ++j) {
             const bool in_place = in_place_read(rec, j);
