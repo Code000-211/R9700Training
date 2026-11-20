@@ -561,9 +561,12 @@ g_out`:
 | 0.01 | 0.5926 | 0.2888 |
 | 0.02 | 0.5924 | 0.2887 |
 
-The ratio falls monotonically with `eps` and is **1.12 at the finest step** -- so the adjoint's
-identity holds to about 12% there, and the small ratios at larger `eps` are the secant averaging
-over the bf16/int8 staircase, not an adjoint error. A first reading of the four large-`eps` points
+The ratio **rises** as `eps` shrinks (0.29 at the largest step, 1.12 at the finest) -- it approaches
+1 from above -- so the adjoint's identity holds to about 12% at the finest step, and the small
+ratios at larger `eps` are the secant averaging over the bf16/int8 staircase, not an adjoint error.
+The method lesson: an inner-product plateau without a norm plateau does not certify a directional
+derivative on a piecewise-affine forward (`|J u|` collapses 5.15 -> 0.90 over the same window while
+`<g_out, J u>` looks flat), so the acceptance bar is both plateaus. A first reading of the four large-`eps` points
 alone suggested a 3.45x violation; the small-`eps` points refute it. The residual 12% is within what
 this instrument can resolve (the composition of the perturbation is the slice's own: `h` moves and
 the `x` buffer is held, while the model derives `x` from `h`; that difference is of this order).
