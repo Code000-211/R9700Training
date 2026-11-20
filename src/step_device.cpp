@@ -932,6 +932,45 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             std::vector<AdValue> now;                            // frozen entries stay empty
             std::vector<std::shared_ptr<const AdValue>> frozen;  // non-null: answered by `shared`
         };
+        // Replace a kv_store slot table the walk was not given with the batch's own layout.
+        // Returns true when it rebuilt. The rule: only a serve that carries no usable table -- an
+        // unnamed raw operand that came back empty or all one value -- is replaced, because the
+        // engine's real table is the identity map for a single sequence from block 0 and a zeroed
+        // serve is indistinguishable from pool row 0 for every token. A table with two distinct
+        // values is the tape's own and is left alone. A batch of more than one sequence allocates
+        // a different block a sequence, so it refuses rather than serving one sequence's layout.
+        const auto rebuilt_slot = [&](const OpRecord& rec, AdValue* slot) -> bool {
+            if (rec.op != "kv_store" || rec.operands.size() < 3) return false;
+            if (rec.operands[2].buffer.rfind("raw:", 0) != 0) return false;
+            const int64_t block_size = [&] {
+                for (const auto& p : rec.params)
+                    if (p.first == "block_size" && std::holds_alternative<int64_t>(p.second))
+                        return std::get<int64_t>(p.second);
+                return int64_t{16};
+            }();
+            const int64_t tokens = rec.operands[0].shape.empty() ? 0 : rec.operands[0].shape[0];
+            if (tokens <= 0 || block_size <= 0) return false;
+            const bool whole = slot->value.size() == static_cast<size_t>(tokens) && tokens > 1;
+            bool constant = whole;
+            for (size_t t = 1; whole && t < slot->value.size(); ++t)
+                if (slot->value[t] != slot->value[0]) constant = false;
+            if (whole && !constant) return false;  // the tape's own table
+            if (batch.size() != 1)
+                throw std::runtime_error(
+                    "device step: op '" + rec.op + "' at position " +
+                    std::to_string(rec.position) + ": the slot table is not the tape's (" +
+                    std::to_string(slot->value.size()) + " of " + std::to_string(tokens) +
+                    " values) and this batch has " + std::to_string(batch.size()) +
+                    " sequences, whose block tables do not share a layout; the engine's table has "
+                    "to reach the walk before this row can be differentiated");
+            slot->dtype = "i32";
+            slot->shape = {tokens};
+            slot->value.assign(static_cast<size_t>(tokens), 0.0);
+            for (int64_t t = 0; t < tokens; ++t)
+                slot->value[static_cast<size_t>(t)] =
+                    static_cast<double>((t / block_size) * block_size + t % block_size);
+            return true;
+        };
         const auto snap_record = [&](const OpRecord& rec,
                                      const std::vector<OperandContent>& content) {
             SnappedRecord out;
@@ -989,10 +1028,25 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             }
             for (size_t j = 0; j < rec.operands.size(); ++j) {
                 if (out.frozen[j]) {
-                    shared.bind(rec.position, j, out.frozen[j]);
+                    // A kv slot table the first block already froze may itself be the zeroed
+                    // serve: snapshot() returns zeros for an unnamed raw operand ("the raw slot's
+                    // zero is a valid slot index" -- true for one slot, fatal at n tokens, where
+                    // every token scatters pool row 0 and the store folds by the token count).
+                    // Rebuild it here, in the shared copy, so every block binds the batch's layout
+                    // (src/reference_step.cpp:640-647 does the same for the reference).
+                    std::shared_ptr<const AdValue> bound = out.frozen[j];
+                    if (rec.op == "kv_store" && j == 2 && rec.operands.size() >= 3 &&
+                        rec.operands[2].buffer.rfind("raw:", 0) == 0) {
+                        AdValue slot = *bound;
+                        if (rebuilt_slot(rec, &slot)) bound = std::make_shared<const AdValue>(std::move(slot));
+                    }
+                    shared.bind(rec.position, j, bound);
                     continue;
                 }
                 out.now[j] = snapshot(rec.operands[j], held[j].content, rec.op.c_str(), rec.position);
+                if (rec.op == "kv_store" && j == 2 && rec.operands.size() >= 3 &&
+                    rec.operands[2].buffer.rfind("raw:", 0) == 0)
+                    (void)rebuilt_slot(rec, &out.now[j]);
                 register_stored_operand(rec.operands[j], out.now[j]);
                 if (key[j].empty()) continue;
                 // The step's first read of a frozen operand: its one widen, which every later
@@ -1419,60 +1473,6 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 tighten_rows(shaped);
                 if (options.reference_head_split) mark_join_lora(shaped);
                 SnappedRecord snapped = snap_record(shaped, content);
-                // A raw table the tape does not name keeps zeros in snapshot(), whose comment
-                // calls a zero "a valid slot index" -- true for a decode's single slot and fatal
-                // for the kv slot list at more than one token: every token would scatter the same
-                // pool row, folding a k/v cotangent by the token count (issue #55's 42x, exactly
-                // 308x of one pool row's k-lane cot). The engine's slot table is the batch's own
-                // layout, and the reference step rebuilds it the same way
-                // (src/reference_step.cpp: block*kKvBlock + p%kKvBlock). Rebuild it here rather
-                // than serve zeros: this path knows the batch and the block size.
-                if (op.op == "kv_store" && shaped.operands.size() >= 3 &&
-                    shaped.operands[2].buffer.rfind("raw:", 0) == 0) {
-                    const int64_t block_size = [&] {
-                        for (const auto& p : op.params)
-                            if (p.first == "block_size" &&
-                                std::holds_alternative<int64_t>(p.second))
-                                return std::get<int64_t>(p.second);
-                        return int64_t{16};
-                    }();
-                    const int64_t tokens =
-                        shaped.operands[0].shape.empty() ? 0 : shaped.operands[0].shape[0];
-                    AdValue& slot = snapped.now[2];
-                    // Only a serve this path cannot trust is replaced: a table the tape named and
-                    // pulled whole is the engine's own and is left alone, so a later tape-side fix
-                    // that names the table is not silently masked here.
-                    const bool served =
-                        slot.value.size() == static_cast<size_t>(std::max<int64_t>(tokens, 0)) &&
-                        slot.value.size() > 1;
-                    bool constant = served;
-                    for (size_t t = 1; served && t < slot.value.size(); ++t)
-                        if (slot.value[t] != slot.value[0]) constant = false;
-                    if (tokens > 0 && block_size > 0 && (!served || constant) &&
-                        batch.size() == 1) {
-                        // One sequence starting at block 0, which is the chat step's shape:
-                        // slot[t] = (t / block_size) * block_size + t % block_size, the reference
-                        // step's own formula (src/reference_step.cpp:640-647) when the block table
-                        // is the identity. A multi-sequence batch allocates a different physical
-                        // block a sequence, so it is refused here rather than served one
-                        // sequence's layout: nothing silently folds two sequences into one.
-                        slot.shape = {tokens};
-                        slot.dtype = "i32";
-                        slot.value.assign(static_cast<size_t>(tokens), 0.0);
-                        for (int64_t t = 0; t < tokens; ++t)
-                            slot.value[static_cast<size_t>(t)] =
-                                static_cast<double>((t / block_size) * block_size + t % block_size);
-                    } else if (tokens > 0 && batch.size() > 1 && (!served || constant)) {
-                        throw std::runtime_error(
-                            "device step: block " + std::to_string(layer) + ": op '" + op.op +
-                            "' at position " + std::to_string(op.position) +
-                            ": the slot table is not the tape's (served=" +
-                            std::to_string(slot.value.size()) + " of " + std::to_string(tokens) +
-                            ") and this step's batch has " + std::to_string(batch.size()) +
-                            " sequences, whose block tables do not share a layout; the engine's "
-                            "table has to reach the walk before this row can be differentiated");
-                    }
-                }
                 note_produced(shaped, snapped.now);
                 // Per record: every read operand neither written nor already dumped, decoded to
                 // the walk's f64 view. A frozen operand's frozen value is the walk's own answer;

@@ -46,29 +46,6 @@ std::vector<int32_t> slots_of(const AdValue& slot) {
     return out;
 }
 
-// A record's slot table names one pool row a token. A table that is all one value cannot be one:
-// the forward writes every token's k/v into the same row, so the backward's scatter would fold
-// that row's cotangent once per token into every token's k and v -- an inflation of exactly the
-// token count, silent because the arithmetic is finite. The engine never issues one; a walk whose
-// snapshot of the table is zero, short or stale does. Refuse by name and leave the numbers to the
-// caller, as the rows do for every other shape a record cannot mean.
-void require_distinct_slots(const std::vector<int32_t>& slots, const OpRecord& rec) {
-    if (slots.size() < 2) return;
-    const int32_t first = slots[0];
-    for (size_t t = 1; t < slots.size(); ++t)
-        if (slots[t] != first) return;
-    int64_t negative = 0;
-    for (int32_t s : slots)
-        if (s < 0) ++negative;
-    if (negative == static_cast<int64_t>(slots.size())) return;  // a padded record: all -1
-    throw std::runtime_error("kv_store: op at position " + std::to_string(rec.position) +
-                             ": the slot table is constant (" + std::to_string(first) + " for all " +
-                             std::to_string(slots.size()) +
-                             " tokens), so the store would write every token into one pool row -- "
-                             "the snapshot of the slot operand ('" + rec.operands[2].buffer +
-                             "') is not the forward's table");
-}
-
 void kv_store_twin(const OpRecord& rec, const std::vector<AdValue>& reads,
                    std::vector<AdValue>* out) {
     if (reads.size() < 3) throw std::runtime_error("kv_store: missing operands");
@@ -87,7 +64,6 @@ void kv_store_twin(const OpRecord& rec, const std::vector<AdValue>& reads,
         pool.value = reads[3].value;
     const adjoint::qk::KvStoreShape shape = kv_shape(rec, reads, pool);
     const std::vector<int32_t> slot = slots_of(reads[2]);
-    require_distinct_slots(slot, rec);
     adjoint::qk::kv_store_forward_f64(reads[0].value.data(), reads[1].value.data(), slot.data(),
                                       shape, pool.value.data());
     out->push_back(std::move(pool));
@@ -101,7 +77,6 @@ void kv_store_adjoint(const AdjointCall& call) {
     const AdValue& pool = call.fwd[3];
     const adjoint::qk::KvStoreShape shape = kv_shape(call.rec, {k, v, slot}, pool);
     const std::vector<int32_t> slots = slots_of(slot);
-    require_distinct_slots(slots, call.rec);
     AdValue& dk = call.dc->at(0);
     AdValue& dv = call.dc->at(1);
     dk.dtype = k.dtype;

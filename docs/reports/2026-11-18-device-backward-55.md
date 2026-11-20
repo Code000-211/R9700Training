@@ -745,11 +745,31 @@ walk's *served* slot operand: `snapshot()` deliberately returns zeros for an unn
 every token scatters from pool row 0. The slice fabricates `raw:2` as the identity table
 (`src/slice_reference.h`: `v.value[i] = i`), which is the reference step's own formula
 (`src/reference_step.cpp: block*kKvBlock + p%kKvBlock` for a one-sequence batch from block 0), and
-gets 44.84. The fix serves that table in the walk: a rebuild from the batch's block size, gated to
-a one-sequence batch, refusing loudly for a multi-sequence one whose per-sequence block tables do
-not share a layout, and leaving a table the tape names and pulls whole untouched. A loud refusal
-in the kv_store rows backs it up: a constant slot table at more than one token is now an error
-naming the operand, not a silent fold.
+gets 44.84. **The fix, and its verification.** The walk rebuilds the table from the batch's block size,
+at the point `snap_record` serves the operand and ahead of the frozen-sharing branch (the first
+block to read it freezes the value every later block binds, so a rebuild placed after that branch
+only ever sees the shared zeroed copy -- the first attempt there did exactly nothing, and the walk
+reproduced 14169.8 unchanged). It replaces only a serve with no usable table (empty or all one
+value), leaves a tape-named table alone, and refuses loudly for a multi-sequence batch whose
+per-sequence block tables do not share a layout.
+
+Verified on the same 308-token chat walk: the kv_store row's fold is gone in **every** block --
+`(dk+dv)/pool = 1.0000` at blocks 63, 61, 59, 57 and 47, where the pre-fix values were 4.38, 7.48,
+3.47, 21.50 and 39.73 -- and the boundary chain collapses:
+
+| boundary | pre-fix | post-fix | ratio |
+|---|---|---|---|
+| 63 -> 62 | 18.358 | 13.558 | 1.35x |
+| 55 -> 54 | 87.856 | 21.966 | 4.00x |
+| 51 -> 50 | 809.14 | 29.230 | 27.7x |
+| 48 -> 47 | 1198.87 | 37.531 | 31.9x |
+| **47 -> 46** | **14169.8** | **39.571** | **358x** |
+
+The step-change at 51 -> 50 and the cliff at 47 -> 46 are both gone; the chain is monotone and
+smooth (7.0, 13.6, 14.7, 15.5, 16.7, 18.1, 19.0, 19.9, 20.9, 22.0, 23.5, 25.2, 26.8, 29.2, 32.1,
+34.5, 37.5, 39.6). Host tier 303/303 with the fix in. A loud refusal in the kv_store rows was
+tried and **removed**: `step_host_int8`'s tape legitimately carries a constant slot table on one
+record, and the guard failed two host tests (A/B: 2 failures with it, 303/303 without).
 
 **The slice's own version resolution (with `v=` and `rd=` now printed) fixes the graph the mint
 must fit.** Block 47's attn_k has four versions: v0 the qkv gemm (op 4), v1 the LoRA expand
