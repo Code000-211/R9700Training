@@ -253,10 +253,18 @@ inline AdValue raw_table(const r97::OpRecord& rec, const r97::Operand& o) {
     // engine's and a padded chat run leaves them at the padded count while the operands hold
     // the batch's rows. The first non-raw operand with a row axis is the activation.
     int64_t seq_rows = M;
-    for (const Operand& op : rec.operands) {
-        if (op.buffer.rfind("raw:", 0) == 0) continue;
-        if (!op.shape.empty() && op.shape[0] > 0) { seq_rows = op.shape[0]; break; }
+    for (const Operand& op : rec.operands) {  // the positions' own length is the token count
+        if (op.buffer.rfind("raw:", 0) != 0) continue;
+        if (numel(op.shape) > 0 && (op.buffer.substr(4, 1) == "1")) {
+            seq_rows = numel(op.shape);
+            break;
+        }
     }
+    if (seq_rows <= 0)
+        for (const Operand& op : rec.operands) {
+            if (op.buffer.rfind("raw:", 0) == 0) continue;
+            if (!op.shape.empty() && op.shape[0] > 0) { seq_rows = op.shape[0]; break; }
+        }
     const int64_t n = o.shape.empty() ? 0 : numel(o.shape);
     AdValue v;
     v.dtype = o.dtype.empty() ? std::string("i32") : o.dtype;

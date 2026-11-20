@@ -499,16 +499,18 @@ the cotangent, far below any row's contribution). So this arm refutes exactly on
 **exact-zero-slot** family (a zero cotangent mistaken for an empty slot in the join's fills or the
 in-place path), and nothing more.
 
-The dose response is the positive evidence, and it is steep: `R97_SEED_ADAPTER=1e-4` gives **grad
-norm 4.94522e+11** -- 500x below zero-B's 2.37e14 -- while the top of the boundary chain stays
-zero-B-shaped (7.00968 at the head, x2.735 at 63 -> 62 against x2.62) and the loss moves 0.2 nats.
-A 1e-4 change in B cannot move a model's true Jacobian 500x, so this is a defect's fingerprint, not
-conditioning: the backward's magnitude depends steeply on the adapter's scale, and the sweep
-1e-8 / 1e-4 / 0.03 leaves "small B triggers it" alive while "the exact zero triggers it" is dead.
-The rows are formula-correct -- `attn_paged`'s adjoint was hand-checked against
-`docs/adjoints/attention.md` line for line, and the device and host rows agree to four to five
-digits at zero-B -- so the remaining candidate is how the walk combines them, not what they
-compute.
+The dose arms do not carry the claim I first read into them. `seed_adapter`
+(tests/gpu/device_step.cpp:316-325) overwrites BOTH factors with `mul`-scaled values, and the leaves'
+geometry makes the norm scale with the seed: `dL/dB ~ A.x` and `dL/dA ~ B`, so a seed 1e4 larger
+gives leaves ~1e4 larger. The measured norms are 5.30e7 (mul 1e-8) and 4.95e11 (mul 1e-4) -- a
+ratio of 9.4e3 against a mul ratio of 1e4, textbook leaf geometry. The boundary chain, meanwhile,
+is invariant: bottom L1 4.45e15 (zero-B), 4.37e15 (1e-8), 4.08e15 (1e-4). **The Jacobian did not
+move**, so the dose arms neither convict nor clear the magnitude; what they do show is that the
+amplification is a property of the sane forward, present at every seed from 0 to 1e-4, and absent
+only in the wrecked seeded-1.0 forward. That reinforces the activation-regime reading: the chain is
+flat only when the adapter has wrecked the forward (NLL 14.56 against 2.56). Criterion two is
+therefore as open as it was before the dose arms, and the open question is exactly the x2-2.7 per
+block at the sane forward.
 
 ### Where the backward time goes
 
