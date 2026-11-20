@@ -407,9 +407,29 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             .versions[static_cast<size_t>(plan.write_version[i][j])];
     };
 
+    // R97_DUMP_COT: one line per op with the cotangent it receives (the sum over its operands'
+    // versions), so the walk and the slice can be compared op by op. Off by default.
+    const bool dump_cot = []() {
+        const char* e = std::getenv("R97_DUMP_COT");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+
     // The walk itself, latest record first.
     for (size_t i = records.size(); i-- > 0;) {
         const OpRecord& rec = records[i];
+        if (dump_cot) {
+            double l1 = 0.0, sq = 0.0;
+            for (size_t j = 0; j < rec.operands.size(); ++j) {
+                if (plan.write_version[i][j] < 0) continue;
+                const auto& v = version_at(i, j);
+                for (double q : v.cot) {
+                    l1 += std::fabs(q);
+                    sq += q * q;
+                }
+            }
+            std::fprintf(stderr, "r97: cot %zu %s pos=%lld l1=%.6g l2=%.6g\n", i, rec.op.c_str(),
+                         static_cast<long long>(rec.position), l1, std::sqrt(sq));
+        }
 
         bool on_path = false;
         for (size_t j = 0; j < rec.operands.size(); ++j) {
