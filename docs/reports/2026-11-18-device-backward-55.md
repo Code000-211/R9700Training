@@ -611,11 +611,17 @@ the gated-delta boundaries carry the same two entries (`25 -> 24: entries=2 n=31
 per-block gains are 1.02, and since the chain's gain ratios are taken on already-doubled L1s, a
 uniform duplicate cancels out of them. Even if all sixteen full-attention blocks folded the
 duplicate, that is 2^16 = 6.6e4 -- taking the zero-B norm from 2.35e14 to 3.6e9, still more than
-1e2 above the ladder's between-regime estimate. So the duplicate is a contributing factor at most,
-not the cause of criterion two, and the decisive check is the slice's own backward: run block 47
-with the dump's seeds and diff its 47 -> 46 hand-down against `layers.47-seeds` -- `x`'s entry
-should be ~0 (the native composed run proved it dead) and `h`'s ratio to the walk's entry names the
-fold directly. The fix has two candidate sites, and the second is the one the evidence points at:
+1e2 above the ladder's between-regime estimate. So the duplicate is a contributing factor at most, not the cause of criterion two.
+
+**The decisive check localises the duplicate to the shared backward core, not the join.** Running
+block 47's slice backward with the dump's seeds, its 47 -> 46 hand-down is `h` `l1 = 7196.9458
+l2 = 7.60695` and `x` `l1 = 7196.9458 l2 = 7.60695` -- **identical to four digits, and matching the
+walk's own seeds (`7102.289` / `7.49899`) to 1.3%**, the difference being the chain the dump was
+taken on. So the block's own backward mints the same cotangent for the residual and for the fused
+producer's in-place accumulator; the join only carries it. That is the fused norm's passthrough
+semantics (`h_new = h_old + norm`, and the accumulator's old value is an input), so whether it is a
+defect or the model's running sum is the next question -- and it is a question about the norm's
+backward, not the join. The fix has two candidate sites, and the second is the one the evidence points at:
 
 1. `boundary_cotangents` (src/join_common.h) not handing down a buffer the block below only
    writes. The broad form of this -- skip any write-never-read entry -- **breaks
