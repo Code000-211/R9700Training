@@ -224,6 +224,12 @@ static int slice_serve_main(int argc, char** argv) {
             in.leaf_buffers.push_back(name);
         }
         const slice::ProgramSlice program = slice::parse_slice(std::string(program_path));
+        // The buffers the block itself writes are outputs too: a composed finite difference needs
+        // a value the twin derived from the boundary (op 0's normed copy), and with only the
+        // boundary's names in out_buffers that value never reaches --out-values.
+        for (const r97::OpRecord& rec : program.ops)
+            for (const r97::Operand& o : rec.operands)
+                if (o.written) in.out_buffers.push_back(o.buffer);
         if (model_path != nullptr) {
             PluginPrivateSource src;
             if (src.file.open(model_path) != RAD_OK)

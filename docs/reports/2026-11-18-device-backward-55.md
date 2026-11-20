@@ -591,6 +591,24 @@ remaining candidates are the join (the block-to-block boundary bookkeeping), the
 zero-fill below block 0, or a many-direction effect. The composed ratio is dominated by the 7.92
 term, so its discriminating power is in the *difference* from 1.025, not the value itself.
 
+### The dead boundary buffer: a per-block double count candidate
+
+The composed-path experiment turned up the first concrete candidate for the x2 gain. In blocks 46,
+47 and 48 the fused producer's normed copy `x` is **written by op 0 and read by nobody** (the
+program's reads name `h`, `h.q8`, `h.s8` and the projections' buffers, never `x`), yet the walk's
+boundary cotangents carry an `x` entry that is **exactly the residual's** (`max|g_h - g_x| = 0.0`
+over 1.58M values). Perturbing the boundary along the composed path -- `x` dropped, so the twin
+derives it -- changes the forward response by nothing at the finest step (`rhs` 2.3011, identical to
+the hold-`x` value), which confirms `x` is dead: it cannot contribute to the block's output.
+
+A cotangent on a dead buffer that the block's backward folds into the residual's gradient would be
+a per-block double count. The obvious fix -- skip the entry in `boundary_cotangents`
+(src/join_common.h) when the block below writes and never reads the buffer -- **breaks the host
+fixture's gradient cosine (0.8)**, so the entry is load-bearing there and the defect, if it is one,
+is upstream: the walk's `add_input_full` mints the entry for op 0's in-place write. That is the next
+measurement: instrument `add_input_full` for `x` and see whether the in-place write is what makes a
+dead buffer an input, before touching the join again.
+
 ### Where the backward time goes
 
 The results JSON carries `row_seconds` and `pull_seconds` per op (`src/step_device.cpp:1906-1912`);
