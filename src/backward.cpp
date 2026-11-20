@@ -798,8 +798,9 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                     l1 += std::fabs(q);
                     sq += q * q;
                 }
-                std::fprintf(stderr, "r97: cotout %zu %s j=%zu %s l1=%.6g l2=%.6g\n", i,
-                             rec.op.c_str(), j, rec.operands[j].buffer.c_str(), l1, std::sqrt(sq));
+                std::fprintf(stderr, "r97: cotout %zu %s j=%zu %s v=%lld l1=%.6g l2=%.6g\n", i,
+                             rec.op.c_str(), j, rec.operands[j].buffer.c_str(),
+                             static_cast<long long>(plan.write_version[i][j]), l1, std::sqrt(sq));
             }
         }
 
