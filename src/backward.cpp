@@ -94,22 +94,6 @@ struct Segment {
     int64_t row_hi = 0;
 };
 
-// A written operand that is also the op's input, though no separate read names it: rope's
-// in-place write and the recurrent/conv state buffers. The prior version is the read. The issue
-// record marks such an operand (`Operand::in_place`, a RAD_OPD_INOUT operand); a record built from
-// a program instead of the live tape may not carry the mark, so the two shapes the ops always
-// have -- rope's operand 0, and a `kv:` buffer no separate read names -- are recognised here too.
-bool in_place_read(const OpRecord& rec, size_t j) {
-    const Operand& o = rec.operands[j];
-    if (!o.written) return false;
-    if (o.in_place) return true;
-    if (rec.op == "rope" && j == 0) return true;
-    if (o.buffer.rfind("kv:", 0) != 0) return false;
-    for (size_t k = 0; k < rec.operands.size(); ++k)
-        if (k != j && !rec.operands[k].written && rec.operands[k].buffer == o.buffer) return false;
-    return true;
-}
-
 struct Plan {
     std::vector<Buffer> buffers;
     std::map<std::string, int64_t> by_name;
@@ -423,9 +407,29 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             .versions[static_cast<size_t>(plan.write_version[i][j])];
     };
 
+    // R97_DUMP_COT: one line per op with the cotangent it receives (the sum over its operands'
+    // versions), so the walk and the slice can be compared op by op. Off by default.
+    const bool dump_cot = []() {
+        const char* e = std::getenv("R97_DUMP_COT");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+
     // The walk itself, latest record first.
     for (size_t i = records.size(); i-- > 0;) {
         const OpRecord& rec = records[i];
+        if (dump_cot) {
+            double l1 = 0.0, sq = 0.0;
+            for (size_t j = 0; j < rec.operands.size(); ++j) {
+                if (plan.write_version[i][j] < 0) continue;
+                const auto& v = version_at(i, j);
+                for (double q : v.cot) {
+                    l1 += std::fabs(q);
+                    sq += q * q;
+                }
+            }
+            std::fprintf(stderr, "r97: cot %zu %s pos=%lld l1=%.6g l2=%.6g\n", i, rec.op.c_str(),
+                         static_cast<long long>(rec.position), l1, std::sqrt(sq));
+        }
 
         bool on_path = false;
         for (size_t j = 0; j < rec.operands.size(); ++j) {
@@ -547,6 +551,25 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             cot_non_finite[k] = first_non_finite(c.value);
         });
 
+        // The largest finite magnitude the row is handed, over every written operand's
+        // cotangent. The device rows take their operands in f32 and write the cotangent back
+        // through the record's dtype; the cotangent is the one value they cannot widen.
+        double cot_max = 0.0;
+        for (const AdValue& c : cot)
+            for (double q : c.value) {
+                const double a = std::fabs(q);
+                if (std::isfinite(a) && a > cot_max) cot_max = a;
+            }
+        // A host row cannot read a weight the tape carries behind `raw` (the engine's private
+        // encoding): it refuses by name, and the device row is the only side that decodes it. So
+        // the range fallback below asks only for records whose forward the host row can read.
+        bool host_readable = true;
+        for (const AdValue& v : fwd)
+            if (v.raw != nullptr) {
+                host_readable = false;
+                break;
+            }
+
         // The adjoint sees the record the caller prepared when it wants one: the join may hand it
         // names and rows that differ from the tape's, while the walk keeps the tape's record for
         // its versions, boundaries and snapshots. The row is resolved from the prepared record's
@@ -568,6 +591,33 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             // f64, and the caller asked for the fallback. `err` keeps the requested side's
             // message, so a missing row on both sides still refuses with the one that was asked
             // for.
+            std::string host_err;
+            AdjointFn host_fn = adjoint_find(adjoint_rec->op, Side::host, adjoint_rec->params,
+                                             &host_err);
+            if (host_fn) {
+                fn = host_fn;
+                served = Side::host;
+            }
+        }
+        // A device row computes in f32 (its kernels' operands) and writes the cotangent back
+        // through the record's dtype, which the tape holds at 16 bits. A cotangent it is handed
+        // outside that range is not representable there: the row's arithmetic overflows and every
+        // row below it inherits the Inf. The host row is the same arithmetic in f64, so a record
+        // whose incoming cotangent is past the card's range falls back to it. The limit leaves
+        // headroom for the row's own amplification -- the gated norm's `sc^3` term, the quant
+        // row's division by the group's scale -- not just f32's 3.4e38.
+        //
+        // STOPGAP, not the fix: this keeps a walk that is handed a runaway cotangent finite, and
+        // it cannot reach a plugin-private weight (`raw != nullptr`), because the host row refuses
+        // one by name -- which is exactly where the 4096 ticket case used to fail. The cause is
+        // the cotangent's range, and the recorded fix is that row's own carry (an f64 carry or a
+        // per-row scale for the activation cotangent and the staged weight gradient). Treat a
+        // green `all_finite` as "no Inf reached a kernel", never as "the cotangent's scale is
+        // right": at 4096 the walk is finite at a grad norm of 1.26e36 and the loss rises at
+        // lr 1e-4 (issue #55's open magnitude question).
+        constexpr double kDeviceCotMax = 1e30;
+        if (fn && served == Side::device && options.allow_host_fallback && host_readable &&
+            cot_max > kDeviceCotMax) {
             std::string host_err;
             AdjointFn host_fn = adjoint_find(adjoint_rec->op, Side::host, adjoint_rec->params,
                                              &host_err);
@@ -643,6 +693,7 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         // the call -- resolved before the slots are sized: the walk does not ask a row for its
         // frozen operands, and a row that served must not write them anyway.
         const std::vector<int> frozen = adjoint_frozen(adjoint_rec->op, served, adjoint_rec->params);
+        const FillsFn fills = adjoint_fills(adjoint_rec->op, served, adjoint_rec->params);
         const std::set<size_t> frozen_at(frozen.begin(), frozen.end());
 
         // dc: one slot per operand, in schema order. A slot the row may add to -- a read, or an
@@ -736,11 +787,37 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         }
         account(std::chrono::duration<double>(Clock::now() - row_begin).count());
 
+        if (dump_cot) {
+            // Post-row: what the row left in each operand's written version, per operand, so a
+            // row that inflates one version can be named.
+            for (size_t j = 0; j < rec.operands.size(); ++j) {
+                if (!rec.operands[j].written || plan.write_version[i][j] < 0) continue;
+                const auto& v = version_at(i, j);
+                double l1 = 0.0, sq = 0.0;
+                for (double q : v.cot) {
+                    l1 += std::fabs(q);
+                    sq += q * q;
+                }
+                std::fprintf(stderr, "r97: cotout %zu %s j=%zu %s v=%lld rd=%lld l1=%.6g l2=%.6g\n",
+                             i, rec.op.c_str(), j, rec.operands[j].buffer.c_str(),
+                             static_cast<long long>(plan.write_version[i][j]),
+                             static_cast<long long>(plan.read_segments[i][j].empty()
+                                                        ? -1
+                                                        : plan.read_segments[i][j][0].version),
+                             l1, std::sqrt(sq));
+            }
+        }
+
         if (options.in_place_passthrough) {
             // An adjoint either describes what a read takes or leaves the slot it would write empty.
             // An empty slot on an in-place operand is the op's direct path: the value the write
             // replaced carries the write's cotangent unchanged (an expand adds its branch to y
             // without touching the read's slot; a mul, a rope or a state update fill theirs).
+            //
+            // A row that registered a fills predicate owns the slot: a zero there is the row's
+            // answer (kv_store's uncovered pool rows are unread in a single-pass store, so the
+            // row's correct fill is all zero), and passing the cotangent through would add the
+            // covered rows' cotangent a second time.
             //
             // The direct path is only the answer when no *separate* read of the same buffer
             // already answered it. A record with `read x, write x` gives the row the read's slot to
@@ -762,6 +839,7 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                 // A slot the walk did not size is not the row's to fill: it is frozen, and the
                 // sum below would read it as "untouched" and copy the read's cotangent in.
                 if (!sized[j]) continue;
+                if (fills && fills(call.rec, j)) continue;
                 double written = 0.0;
                 for (double v : dc[j].value) written += std::fabs(v);
                 if (written == 0.0 && !read_answered(j))
@@ -790,7 +868,7 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         if (const char* d = std::getenv("R97_DUMP_DC");
             d != nullptr && d[0] == '1' &&
             (rec.op == "rope" || rec.op == "lora_expand" || rec.op == "lora_shrink" ||
-             rec.op == "rmsnorm" ||
+             rec.op == "rmsnorm" || rec.op == "kv_store" || rec.op == "attn_paged" ||
              // The op the 512 case's remaining non-finite is born in, at position 1176 in block
              // 63: not an exact match for "rmsnorm", and outside the last-block window below, so
              // without this line the dump is silent about the one row it is being run for.
@@ -1002,6 +1080,21 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                 }
             }
         };
+        if (dump_cot) {
+            // What the row handed on, per operand, before it reaches any version: the number that
+            // decides whether a row's own output or the accumulation into a version is inflated.
+            for (size_t j = 0; j < rec.operands.size(); ++j) {
+                const bool in_place = in_place_read(rec, j);
+                if (rec.operands[j].written && !in_place) continue;
+                double l1 = 0.0, sq = 0.0;
+                for (double q : dc[j].value) {
+                    l1 += std::fabs(q);
+                    sq += q * q;
+                }
+                std::fprintf(stderr, "r97: cotdc %zu %s j=%zu %s l1=%.6g l2=%.6g\n", i,
+                             rec.op.c_str(), j, rec.operands[j].buffer.c_str(), l1, std::sqrt(sq));
+            }
+        }
         std::map<int64_t, std::vector<size_t>> by_buffer;
         for (size_t j = 0; j < rec.operands.size(); ++j) {
             const bool in_place = in_place_read(rec, j);

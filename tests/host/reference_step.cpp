@@ -423,6 +423,12 @@ R97_TEST(reference_step_program_matches_the_live_trace_without_kernels) {
         std::ifstream in2(program_file());
         in2 >> checked;
     }
+    // R97_RECORD_ORACLE_FIXTURE=<path>: keep the child's recording. The comparison may still
+    // throw underneath it, but the recording is the artifact a fixture update is made from.
+    if (const char* keep = std::getenv("R97_RECORD_ORACLE_FIXTURE")) {
+        std::error_code cec;
+        fs::copy_file(recorded, keep, fs::copy_options::overwrite_existing, cec);
+    }
     fs::remove(recorded, ec);
     if (live_ops.at("batch") != checked.at("batch") ||
         live_ops.at("ops") != checked.at("ops"))
