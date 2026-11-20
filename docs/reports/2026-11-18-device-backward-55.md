@@ -635,6 +635,16 @@ amplification is not the model's Jacobian: the f64 reference on the same block a
 and the device walk's block backward multiplies the cotangent by ~11x where f64 multiplies it by
 ~1.04x. Compounded over the depth, that is the 2.35e14 norm.
 
+**The walk's own chain narrows the amplifying row to the full-attention blocks.** The block
+below 47 is 46, a gated-delta block, and its seeds are `l1 = 7656.698` per entry against 47's
+`7098.95` -- a block gain of **1.078x**, flat, while block 47's is 11.81x. Every block shares the
+walk-level bookkeeping (op 0's fills and passthrough, the boundary `enter`, the join, the x-credit
+-- the gated-delta boundaries carry the same two entries at flat gain), so none of it can be the
+11.3x. The amplifying row is full-attention-specific: `attn_paged` or its rope/kv auxiliaries.
+The f64 control for block 46 is blocked by a pre-existing slice-runner gap (`gdn_conv_prep`'s twin
+produces 0 outputs where the record names 6 writes), so the comparison runs on the attention block
+only until that twin is filled in.
+
 **The routing matrix also says the accumulator's cotangent reaches the gradient, and the forward
 says it should not.** With block 47's slice backward seeded h-only, x-only and both: hand-down
 `265.307`, `619.541`, `626.862` -- both is 2.36x h-only, so the x slot's cotangent routes into the
