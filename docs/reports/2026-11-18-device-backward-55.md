@@ -605,14 +605,35 @@ the hold-`x` value), which confirms `x` is dead: it cannot contribute to the blo
 `r97: boundary 47 -> 46: entries=2 n=3153920 l1=14197.9 l2=10.6004` sums two entries, and the dump's
 `layers.47-seeds.json` gives `l1(g_h) = l1(g_x) = 7102.289` and `l2 = 7.49899` for each: `14197.9 =
 2 x 7102.289` and `10.6004 = sqrt(2) x 7.49899`, the sum of two *identical* vectors. So the walk
-hands the residual's cotangent down twice at every block boundary, and the block below folds both
-into the residual's gradient -- **a x2 per block**, which is the floor under the x2.6-at-the-top and
-x7-12-in-the-middle gains. The obvious fix -- skip the entry in `boundary_cotangents`
-(src/join_common.h) when the block below writes and never reads the buffer -- **breaks the host
-fixture's gradient cosine (0.8)**, so the entry is load-bearing there and the defect, if it is one,
-is upstream: the walk's `add_input_full` mints the entry for op 0's in-place write. That is the next
-measurement: instrument `add_input_full` for `x` and see whether the in-place write is what makes a
-dead buffer an input, before touching the join again.
+hands the residual's cotangent down twice at every block boundary. **That the block below folds
+both into the residual's gradient is not yet proven, and two of the walk's own numbers bound it:**
+the gated-delta boundaries carry the same two entries (`25 -> 24: entries=2 n=3153920`) yet their
+per-block gains are 1.02, and since the chain's gain ratios are taken on already-doubled L1s, a
+uniform duplicate cancels out of them. Even if all sixteen full-attention blocks folded the
+duplicate, that is 2^16 = 6.6e4 -- taking the zero-B norm from 2.35e14 to 3.6e9, still more than
+1e2 above the ladder's between-regime estimate. So the duplicate is a contributing factor at most,
+not the cause of criterion two, and the decisive check is the slice's own backward: run block 47
+with the dump's seeds and diff its 47 -> 46 hand-down against `layers.47-seeds` -- `x`'s entry
+should be ~0 (the native composed run proved it dead) and `h`'s ratio to the walk's entry names the
+fold directly. The fix has two candidate sites, and the second is the one the evidence points at:
+
+1. `boundary_cotangents` (src/join_common.h) not handing down a buffer the block below only
+   writes. The broad form of this -- skip any write-never-read entry -- **breaks
+   `step_host_int8`'s whole-model cosine (0.8)** against the bf16 container, so the rule must be
+   narrow: the accumulator that is written in place by the block's own fused producer AND read by
+   nothing else. Note the scope of "read": `x` is read by nothing *in the block's op list*, but the
+   residual store's `enter` does credit it at the boundary ("the branch's entry the mlp's write",
+   src/join_common.h:378), so whether the fold is credited there or by the block's own backward is
+   the first thing to instrument (`add_input_full`, src/backward.cpp).
+2. The walk's `add_input_full` (src/backward.cpp) minting an input cotangent for op 0's in-place
+   write in the first place. `add_input_full` accumulates (`at[k] += src[k]`), so a cotangent that
+   enters twice sums -- which is right for two *readers* of one buffer and wrong for one buffer
+   that is only written.
+
+The verification is one device run: the per-block boundary gains should fall toward ~1 (the top
+block's x2.6 -> ~1.3) and the gradient norm should fall by roughly the product of the removed
+factors (2.4e14 -> a scale the ladder can test). `step_host_oracle` is the CPU gate for the rule,
+because its reference is independent of the walk.
 
 ### Where the backward time goes
 
