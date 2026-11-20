@@ -771,6 +771,17 @@ smooth (7.0, 13.6, 14.7, 15.5, 16.7, 18.1, 19.0, 19.9, 20.9, 22.0, 23.5, 25.2, 2
 tried and **removed**: `step_host_int8`'s tape legitimately carries a constant slot table on one
 record, and the guard failed two host tests (A/B: 2 failures with it, 303/303 without).
 
+**Both device gates pass with the fix in.** 512 tokens (`device_step_tape`, 307 s): `all_finite 1`,
+63/63 in-place restores, no zero-gradient leaf, and the step descends -- loss 7371.591 -> 6940.169
+(-431.4) after one AdamW step, **grad norm 515.7** where the pre-fix arm carried 2.35e14. 4096 tokens
+(`device_step_seq4096`, 3057 s): `all_finite 1`, loss 34682.089 -> 5390.062 (-29292), grad norm
+**766.7**, and the step's loss matches the forward's recorded 34682.089228 for this batch. The 4096
+case's `zero-gradient leaves: lora_A model.layers.0.linear_attn.in_proj_qkv.lora_A (400 of 400)` is
+the zero-B start's *expected* state (`a_all_zero` is what that case asserts), not a missing
+gradient. The boundary chains are finite and monotone at both lengths: 512 runs 0.028 -> 10.65 down
+to the embedding's own 226952, and 4096 runs 67 -> 1.4e3 -> 3.4e5 -> 3.3e6 at the embedding, where
+the pre-fix 4096 walk was non-finite by block 51.
+
 **The slice's own version resolution (with `v=` and `rd=` now printed) fixes the graph the mint
 must fit.** Block 47's attn_k has four versions: v0 the qkv gemm (op 4), v1 the LoRA expand
 (op 6), v2 the k-norm (op 11), v3 the rope (op 13). The slice resolves exactly that -- op 13
