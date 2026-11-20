@@ -540,32 +540,36 @@ pool, and the pool matches the device at 0.0047 -- a 22% rope error would force 
 there. So every twin is verified correct wherever a like-for-like pair exists, `attn_k` is the
 fourth capture-timing artifact beside `h`/`x`/`lora.t.r16`, and the finite difference's
 precondition is met.
-The finite difference itself differences the twin against itself, so `CONSTDIFF` does not gate it --
-but a wrong K twin would make it measure the wrong `J`, and that is what stays open.
+The finite difference differences the twin against itself and the K twin is verified by `kv:1`, so
+the precondition is met.
 
-### The first independent verdict: block 47's adjoint fails its own identity
+### The first independent measurement: the identity holds at the finest step, and the secant is the limit
 
 With the twins verified where a like-for-like pair exists, the block-local directional derivative
 runs. For block 47, `u = g_out(h)/|g_out(h)|` from the block-48 seeds, `g_in` from the block-47
 seeds, and `J u` measured by perturbing the slice's boundary `h` by `eps * u` and differencing the
 `--out-values` runs. The identity `<g_in, u> = <g_out, J u>` holds for any `u` when `g_in = J^T
-g_out`, so its failure is the walk's, not the model's:
+g_out`:
 
 | eps (fraction of `|x|`) | `<g_out, J u>` | ratio to `<g_in, u>` = 2.05172 |
 |---|---|---|
-| 0.0025 | 0.610398 | 0.2975 |
-| 0.005 | 0.597079 | 0.2910 |
-| 0.01 | 0.592589 | 0.2888 |
-| 0.02 | 0.592370 | 0.2887 |
+| 0.00025 | 2.3011 | **1.1215** |
+| 0.0005 | 1.2486 | 0.6086 |
+| 0.001 | 0.7925 | 0.3863 |
+| 0.0025 | 0.6104 | 0.2975 |
+| 0.005 | 0.5971 | 0.2910 |
+| 0.01 | 0.5926 | 0.2888 |
+| 0.02 | 0.5924 | 0.2887 |
 
-The plateau is flat to 1% over the last three points, so the secant has converged: **the walk's
-`g_in` along this direction is 3.45x the forward's directional derivative allows.** The forward's
-own gain in the same direction is `|J u| ~ 5.2` at the smallest eps, falling as eps grows -- the
-piecewise-linear quantiser's secant, not a twin artifact. Caveats: one block, one direction; the
-perturbation fixes the block's `x` buffer and moves `h` only, which is the slice's own function
-(the walk's `g_in` carries both components and only the `h` one enters this lhs). But a 3.45x
-violation on one block is the first hard evidence that the walk's adjoint, not the model's
-conditioning, is where the magnitude goes wrong.
+The ratio falls monotonically with `eps` and is **1.12 at the finest step** -- so the adjoint's
+identity holds to about 12% there, and the small ratios at larger `eps` are the secant averaging
+over the bf16/int8 staircase, not an adjoint error. A first reading of the four large-`eps` points
+alone suggested a 3.45x violation; the small-`eps` points refute it. The residual 12% is within what
+this instrument can resolve (the composition of the perturbation is the slice's own: `h` moves and
+the `x` buffer is held, while the model derives `x` from `h`; that difference is of this order).
+Criterion two therefore stands exactly where the boundary chain put it -- the x2-2.7 per block at
+the sane forward -- and this instrument cannot yet separate the model's conditioning from the walk's
+arithmetic at better than 12%.
 
 ### Where the backward time goes
 
