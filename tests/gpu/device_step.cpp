@@ -102,6 +102,7 @@
 // block (0102) and the context stream (0122) the store keeps its boundaries on; a serving build
 // applies none of the set, so the cases compile to nothing there and say so by name instead.
 #include "support/gpu_guard.h"
+#include "r97/chatdata.h"
 #include "support/model_case.h"
 #include "support/model_dir.h"
 #include "support/test.h"
@@ -368,6 +369,26 @@ void card_case(const char* test, int64_t n, bool probe) {
     seq.score[0] = 0;
     Batch batch;
     batch.push_back(std::move(seq));
+    // R97_STEP_CHAT=1 steps a real conversation instead of the synthetic cycle. The cycle is a
+    // modular repeat of 299 ids -- far out of distribution -- and the walk's conditioning is a
+    // property of the activations, so the same case on real text is what says whether a huge
+    // gradient is the input or the walk. Debug-gated with the truncation flag.
+    if (std::getenv("R97_STEP_CHAT") != nullptr &&
+        std::getenv("R97_WALK_BLOCKS_DEBUG") != nullptr) {
+        r97::ChatData chat;
+        if (!chat.open(container))
+            throw std::runtime_error(std::string(test) + ": chat-data: " + chat.error());
+        Batch real;
+        r97::ChatDataStats stats;
+        const std::string path =
+            (std::filesystem::path(__FILE__).parent_path().parent_path() / "fixtures" /
+             "chat_small.jsonl").string();
+        if (!chat.read_file(path, (int)n, &real, &stats) || real.empty())
+            throw std::runtime_error(std::string(test) + ": the chat fixture tokenised to nothing");
+        batch = std::move(real);
+        std::printf("%s: STEP-CHAT %lld sequence(s), %lld tokens, %lld scored\n", test,
+                    (long long)batch.size(), (long long)stats.tokens, (long long)stats.scored);
+    }
 
     // The model and its adapter, rank 16, alpha 32. The 4096 case starts where init leaves the
     // adapter -- lora_B exactly zero, lora_A random at 1/sqrt(fan_in) -- so the step's loss is
@@ -383,11 +404,19 @@ void card_case(const char* test, int64_t n, bool probe) {
     const r97::Model model = r97::make_model(mc);
     r97::ParamSet params = model.delta->init(meta, mc.delta, /*seed=*/0);
     R97_CHECK(!params.empty());
-    // R97_DSTEP_NO_SEED=1 leaves the factors as init left them (lora_B exactly zero), so the
+    // Two independent controls, and both are needed:
+    //   R97_DSTEP_NO_SEED=1 leaves the factors as init left them (lora_B exactly zero), so the
     // forward is the base container's: #149's reference comparison needs the GDN branch without
     // the seed's delta over in_proj_qkv/in_proj_z, which the seed makes 4-9x the stored weights.
-    if (probe && std::getenv("R97_DSTEP_NO_SEED") == nullptr)
-        seed_adapter(params);
+    //   R97_SEED_ADAPTER=1 seeds the adapter in a case that normally starts at zero-B (the 4096
+    // ticket), so the token count and the adapter state can be varied independently. It needs the
+    // truncation debug flag: the pair is a debug run, not a step.
+    // The suppression wins: a run that asked for the base container's forward must not be seeded
+    // by the override.
+    const bool seed_override = std::getenv("R97_SEED_ADAPTER") != nullptr &&
+                               std::getenv("R97_WALK_BLOCKS_DEBUG") != nullptr;
+    const bool suppress_seed = std::getenv("R97_DSTEP_NO_SEED") != nullptr;
+    if (!suppress_seed && (probe || seed_override)) seed_adapter(params);
 
     // The driver for the tier: the card's library first, libr97 the plugin the device adjoints
     // load from (it serves no forward kernel; it is in the list so the engine dlopen()s it), the
@@ -931,6 +960,14 @@ void card_case(const char* test, int64_t n, bool probe) {
     // direction from a step too large without paying a second backward. The ladder now runs down
     // to 1e-7: at that size AdamW's first step is ~lr*sign(g), so |dL|/lr estimates the gradient's
     // L1 directly and must stop growing as lr falls -- the scale check that needs no FD.
+    // The debug walk's own line: the parent returns before parsing, so the forward's loss -- the
+    // number a length ladder reads -- must be printed here.
+    if (std::getenv("R97_WALK_BLOCKS_DEBUG") != nullptr)
+        std::printf("%s: DEBUG-WALK tokens %lld scored %lld loss %.9g (mean NLL %.6g) "
+                    "grad_norm %.6g leaves %lld all_finite %d\n", test, (long long)n,
+                    (long long)result.scored, result.loss,
+                    result.scored > 0 ? result.loss / (double)result.scored : 0.0,
+                    std::sqrt(grad_norm_sq), (long long)grads.size(), static_cast<int>(all_finite));
     // A truncated debug walk (R97_WALK_BLOCKS_DEBUG) is not a step: every block below the cut is
     // zero-filled, so an AdamW step off it, the post-step forward and the descent ladder would all
     // measure a gradient this run never computed -- and the ladder's eight forward-only 4096 calls
@@ -1284,6 +1321,14 @@ void card_case(const char* test, int64_t n, bool probe) {
 // container's shape from its metadata (no card) so its expected values carry their own
 // provenance: the store's plan, the head's rows and its chunks, the brackets' count.
 static void device_step_case(const char* test, int64_t n, bool probe) {
+    // R97_STEP_TOKENS=<n> runs the case at another token count, for the length ladder that says
+    // where a forward breaks. It changes what the case measures, so it needs the truncation debug
+    // flag too -- the pair is a debug run, never a step.
+    if (const char* st = std::getenv("R97_STEP_TOKENS");
+        st != nullptr && *st != '\0' && std::getenv("R97_WALK_BLOCKS_DEBUG") != nullptr) {
+        const int64_t overridden = std::strtoll(st, nullptr, 10);
+        if (overridden > 0) n = overridden;
+    }
 #ifdef R97_MODEL_RAD
     const std::string container = r97test::container_or_skip(R97_MODEL_RAD);
 #else

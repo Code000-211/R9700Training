@@ -1165,6 +1165,12 @@ what the row's code predicts -- `gdn_chunk_scan`'s host adjoint reads `call.fwd`
 read slots (`f[rCu]`, `f[rH0]`, `load_chunk`/`load_state`, `src/adjoint/host/gdn_scan.cpp:487-578`)
 and takes the writes' cotangents from `call.cot`, so a written slot's snapshot is inert for it. The
 fix closes a contract gap; it moves no number in this block.
+**The magnitude does not.** `grad norm 1.25528e+36` -- the #145 growth artifact at 4096's larger
+cotangent -- and the descent ladder says so directly: lr=1e-3 gives -15,527.6 and lr=3e-4 gives
+-12,840.1, but lr=1e-4 gives **+2,913.2** and clipped lr=1e-4 gives **+1,437.9**. A gradient at 1e36
+is not a direction the loss can follow at any step; a smaller step going *up* while a larger one goes
+down is what a meaningless magnitude looks like. This is the 4096 face of the open magnitude
+question, not a new defect.
 
 ## Tests
 
