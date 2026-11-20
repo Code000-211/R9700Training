@@ -613,15 +613,18 @@ uniform duplicate cancels out of them. Even if all sixteen full-attention blocks
 duplicate, that is 2^16 = 6.6e4 -- taking the zero-B norm from 2.35e14 to 3.6e9, still more than
 1e2 above the ladder's between-regime estimate. So the duplicate is a contributing factor at most, not the cause of criterion two.
 
-**The decisive check localises the duplicate to the shared backward core, not the join.** Running
-block 47's slice backward with the dump's seeds, its 47 -> 46 hand-down is `h` `l1 = 7196.9458
-l2 = 7.60695` and `x` `l1 = 7196.9458 l2 = 7.60695` -- **identical to four digits, and matching the
-walk's own seeds (`7102.289` / `7.49899`) to 1.3%**, the difference being the chain the dump was
-taken on. So the block's own backward mints the same cotangent for the residual and for the fused
-producer's in-place accumulator; the join only carries it. That is the fused norm's passthrough
-semantics (`h_new = h_old + norm`, and the accumulator's old value is an input), so whether it is a
-defect or the model's running sum is the next question -- and it is a question about the norm's
-backward, not the join. The fix has two candidate sites, and the second is the one the evidence points at:
+**The decisive check overturns the duplicate reading: the two entries are the same cotangent
+because that is the row's rule, and the boundary line's x2 is the sum of two identical, correct
+entries.** The seeds' `h` and `x` entries are elementwise identical (1.5M values, `max|g_h - g_x| =
+0.0`) while the boundary *values* differ (`max|diff| = 253.2`), so the residual and the accumulator
+are different buffers that the norm's backward gives the same cotangent. Block 47's slice routing
+matrix confirms it is the row, not the join: seeds h-only -> hand-down `h = x = 265.307`, seeds
+x-only -> `h = x = 619.541`, both -> `h = x = 626.862` -- **identical on both slots under every
+seed**, which is `adjoint_rmsnorm_residual`'s `add` rule (`dv + g_r` on each summand), pinned there
+at rel 1e-5 against a finite difference of the same decomposition. So the boundary line's `l1 =
+14197.9 = 2 x 7102.289` is two identical entries summed, **not a doubled gradient: the per-block
+gain is 1.33x, not 2.6x.** The gain chain is still the defect, but the duplicate is not its
+mechanism and no fix to the norm's row or the join is warranted by this evidence. The fix has two candidate sites, and the second is the one the evidence points at:
 
 1. `boundary_cotangents` (src/join_common.h) not handing down a buffer the block below only
    writes. The broad form of this -- skip any write-never-read entry -- **breaks
