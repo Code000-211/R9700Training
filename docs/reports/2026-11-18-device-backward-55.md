@@ -710,16 +710,20 @@ slice's twins' own outputs (`--out-values`), with the quantiser's codebook edges
 rotation and `kv_store_adjoint_f64` (src/adjoint/host/qk.cpp) is a pure scatter -- `d_k[dst+d] +=
 d_pool[base+d]`, gain one, with the pool's two lanes split back into k and v. So neither the rope
 nor the kv_store manufactures the 42x, and the k path's cotangent arrives inflated before either
-row runs. **The post-row dump moves the site one step deeper: the quantised codes' cotangent.** With
-`R97_DUMP_COT` printing each written operand's post-row l1, the walk's block 47 against the
-slice's same rows: the kv_store's kv:1 agrees (86.98 vs 87.23), the q path agrees (69.54 vs
-69.81 at the rope and the q-norm, 128.05 vs 128.44 at the qkv LoRA), and the k path is 42.4x at
-the rope and the k-norm -- but the *entry point* is op 0's `h.q8`: the walk writes **169.28**
-into the quantised codes where the slice writes **4.15** (40.8x), while the same row's `x`
-agrees (607.45 vs 608.90) and `h`'s own slot is zero in both. So the inflation enters at the
-`gemm_nt_q` row's A-side backward (the codes' cotangent), which then reaches the k path's
-versions through the rows above. That is the site the fix targets, and it is a row, not the
-walk's setup.
+row runs. **The post-row dump brackets the mint between op 14 and op 13, and corrects the earlier reading
+of `h.q8`.** A row never mutates its own *write* version -- it writes into the versions its
+read_segments name -- so the cotout line's `v=` is the input's version, and `h.q8`'s 169.28 is a
+downstream carrier of the already-inflated k path, not the mint. The bracket the data does
+support: op 14's kv_store pre-row is 86.98 in the walk against the slice's 87.23 (the whole pool
+version, k and v lanes), and op 13's rope pre-row is 1899.71 against 44.84 -- measured before any
+qkv-gemm row has run, since the walk runs 27 down to 0. The kv_store's scatter is gain <= 1 and
+the slot table is the same on both sides, so a second writer feeds the post-rope `attn_k`
+version (or the walk's plan resolves op 13's read to a different version). The prime suspects are
+the `in_place_passthrough`/FillsFn bookkeeping on that chain (a correct all-zero fill is
+indistinguishable from an empty slot, and passthrough firing where the row owns the slot adds the
+cotangent twice) and a crossed version id between op 11's and op 13's writes of `attn_k`. The
+version ids the cotout line now prints (`v=`) settle which: the slice resolves op 13's write to
+v=3, op 11's to v=2, op 12's to v=1, and the walk's plan is the comparison.
 
 The row's inputs and formula match the host twin on inspection; the A/B above is what settled
 that the row is not the site. `rmsnorm_back_kernel` (src/adjoint/device/quant.hip) takes
