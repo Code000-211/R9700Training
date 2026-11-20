@@ -773,14 +773,28 @@ record, and the guard failed two host tests (A/B: 2 failures with it, 303/303 wi
 
 **Both device gates pass with the fix in.** 512 tokens (`device_step_tape`, 307 s): `all_finite 1`,
 63/63 in-place restores, no zero-gradient leaf, and the step descends -- loss 7371.591 -> 6940.169
-(-431.4) after one AdamW step, **grad norm 515.7** where the pre-fix arm carried 2.35e14. 4096 tokens
+(-431.4) after one AdamW step, **grad norm 515.7** (no like-for-like pre-fix norm exists for this config:
+the 2.35e14 figure in the sections above is the 308-token zero-B chain at a different loss). 4096 tokens
 (`device_step_seq4096`, 3057 s): `all_finite 1`, loss 34682.089 -> 5390.062 (-29292), grad norm
 **766.7**, and the step's loss matches the forward's recorded 34682.089228 for this batch. The 4096
 case's `zero-gradient leaves: lora_A model.layers.0.linear_attn.in_proj_qkv.lora_A (400 of 400)` is
-the zero-B start's *expected* state (`a_all_zero` is what that case asserts), not a missing
-gradient. The boundary chains are finite and monotone at both lengths: 512 runs 0.028 -> 10.65 down
+the zero-B start's *expected* state, not a missing gradient: that case seeds `lora_B` at exactly
+zero, `dL/dA` is proportional to `B`, and the counter (`n_zero_a` of `n_a`, tests/gpu/device_step.cpp)
+counts whole-leaf gradients, so all 400 `lora_A` leaves are exactly zero by construction -- which is
+why the case asserts `a_all_zero`. `dL/dB` is non-zero, which is why the loss still falls by 29292. The boundary chains are finite and monotone at both lengths: 512 runs 0.028 -> 10.65 down
 to the embedding's own 226952, and 4096 runs 67 -> 1.4e3 -> 3.4e5 -> 3.3e6 at the embedding, where
-the pre-fix 4096 walk was non-finite by block 51.
+the pre-fix 4096 walk was non-finite by block 51. Block 47's own gain is the magnitude arbiter: the
+f64 slice gains 626.862/600.796 = 1.0434 through it, the fixed walk 39.5708/37.531 = 1.0543 (1.1%
+apart), where the pre-fix walk gained 11.82.
+
+Two limits of the fix, stated rather than hidden: the rebuild serves a **one-sequence** batch (a
+multi-sequence batch allocates a different block a sequence, so `snap_record` throws a named error
+instead of serving one sequence's layout, and no gated case exercises that path); and it is a
+walk-side reconstruction, so a table the tape names and delivers whole is left untouched.
+
+The lr ladder and the seeded length-invariance run were measured on the **earlier** tree and are not
+re-established on this one (the pre-fix 4096 ladder's lr = 1e-4 arm rose); the gates above are what
+the fixed tree establishes.
 
 **The slice's own version resolution (with `v=` and `rd=` now printed) fixes the graph the mint
 must fit.** Block 47's attn_k has four versions: v0 the qkv gemm (op 4), v1 the LoRA expand
