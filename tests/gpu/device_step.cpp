@@ -381,11 +381,16 @@ void card_case(const char* test, int64_t n, bool probe) {
         Batch real;
         r97::ChatDataStats stats;
         const std::string path =
-            (std::filesystem::path(__FILE__).parent_path().parent_path() / "fixtures" /
-             "chat_small.jsonl").string();
+            std::getenv("R97_STEP_CHAT") != nullptr && std::string(std::getenv("R97_STEP_CHAT")) != "1"
+                ? std::string(std::getenv("R97_STEP_CHAT"))
+                : (std::filesystem::path(__FILE__).parent_path().parent_path() / "fixtures" /
+                   "chat_small.jsonl").string();
         if (!chat.read_file(path, (int)n, &real, &stats) || real.empty())
             throw std::runtime_error(std::string(test) + ": the chat fixture tokenised to nothing");
-        batch = std::move(real);
+        // One step holds one sequence (the container's KV pool is sized for one), and the
+        // fixture's first conversation is the one to step.
+        batch.clear();
+        batch.push_back(std::move(real.front()));
         std::printf("%s: STEP-CHAT %lld sequence(s), %lld tokens, %lld scored\n", test,
                     (long long)batch.size(), (long long)stats.tokens, (long long)stats.scored);
     }
@@ -973,7 +978,12 @@ void card_case(const char* test, int64_t n, bool probe) {
     // measure a gradient this run never computed -- and the ladder's eight forward-only 4096 calls
     // are ~15 min for numbers the parent returns before reading. Skip all three; the boundary
     // lines in the log are the measurement.
-    const bool debug_walk = std::getenv("R97_WALK_BLOCKS_DEBUG") != nullptr;
+    // Truncation, not the debug flag alone: a full walk with a debug knob (a chat input, a seeded
+    // adapter) is still a step and its ladder is the measurement. Only a walk that skipped blocks
+    // -- whose gradient is zero-filled below the cut -- has no step to test.
+    const char* wb_env = std::getenv("R97_WALK_BLOCKS");
+    const bool debug_walk = wb_env != nullptr && std::strtoll(wb_env, nullptr, 10) > 0 &&
+                            std::getenv("R97_WALK_BLOCKS_DEBUG") != nullptr;
     const r97::ParamSet before = params;
     int64_t a_changed = 0, b_changed = 0;
     bool applied = false;

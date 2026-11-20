@@ -275,6 +275,176 @@ Block 37's like-for-like boundary gain is computable the same way once window 41
 37 -> 36 line, which also says whether ~1.09 holds below 38 -- nothing so far makes 38 special
 beyond being the second block measured.
 
+### The amplification is the full-attention blocks: ~70x each, every fourth block
+
+Window 42's per-block boundary line (`print_boundary_scale`) over the top of the 4096 walk, head
+down. The container is Qwen3.8-27B with `full_attention_interval 4` (`docs/ARCHITECTURES.md`):
+layers 3, 7, ..., 63 are the 16 gated-attention layers, the other 48 the gated delta net.
+
+| boundary | L1 | L2 | max | L1 gain |
+|---|---|---|---|---|
+| 64 -> 63 (the head's hand-off) | 12.4045 | 0.00441766 | 1.24574e-05 | -- |
+| 63 -> 62 (**full attention**) | 963.78 | 0.216353 | 0.000579399 | **77.7** |
+| 62 -> 61 (delta net) | 1335.05 | 0.34031 | 0.0043915 | 1.385 |
+| 61 -> 60 (delta net) | 1472.57 | 0.385137 | 0.00471636 | 1.103 |
+| 60 -> 59 (delta net) | 1601.22 | 0.423023 | 0.00532786 | 1.087 |
+| 59 -> 58 (**full attention**) | 113815 | 24.456 | 0.0555127 | **71.1** |
+| 58 -> 57 (delta net) | 118535 | 25.2687 | 0.0583533 | 1.041 |
+| 57 -> 56 (delta net) | 123534 | 26.2228 | 0.0708623 | 1.042 |
+| 56 -> 55 (delta net) | 132522 | 30.1493 | 0.352937 | 1.073 |
+| 55 -> 54 (**full attention**) | 8.17566e+06 | 1660.79 | 2.36872 | **61.7** |
+| 54 -> 53 (delta net) | 8.37739e+06 | 1707.35 | 8.08446 | 1.025 |
+| 53 -> 52 (delta net) | 8.72841e+06 | 1825.24 | 15.8091 | 1.042 |
+
+The pattern is exact, not statistical: **every full-attention block amplifies its incoming
+cotangent by ~60-80x in both L1 and L2, and the delta-net blocks pass it through at ~1.04-1.10**.
+The L1 and L2 columns agree, so this is not a sign-cancelling structure hiding inside an L1
+summary. Three jumps in eleven blocks, at 63, 59 and 55 -- the layers `layer % 4 == 3`.
+
+This is where the 1e36 comes from, and it is **not** a uniform per-block factor: it is one kind of
+block, repeated sixteen times. The next question is whether that gain is the model's own Jacobian
+at 4096 tokens or the attention row's defect, and the 512 arms in the same window answer it: the
+same lines at 512 (both regimes) put the same boundaries against a 512-token chain.
+
+### The matched control: 512 zero-B against 4096 zero-B
+
+`device_step_tape_zerob` runs 512 tokens at the same seed-0 start the 4096 ticket runs, so the
+two are the same adapter regime and the only difference is the token count. The batch is
+`1 + (i*7) % 299` (`tests/gpu/device_step.cpp:366`), so the 512 sequence is a strict prefix of the
+4096 one and per-position difficulty is stationary.
+
+| case | loss | mean NLL | grad norm | step |
+|---|---|---|---|---|
+| 512 zero-B | 3585.32 | 7.016 | **8.26632e+21** | 318.4 s |
+| 4096 zero-B | 34682.09 | 8.469 | **1.27995e+36** | 3393.5 s |
+
+The forward moves by 1.45 nats for eight times the context, while the gradient's norm moves by
+**1.5e14**. The forward is therefore roughly stationary with length and the amplification is the
+walk's: per full-attention block the boundary gain is ~7-25 at 512 and ~39-326 at 4096, i.e.
+roughly proportional to the token count, and sixteen of those give the n^16-ish growth in the
+norm. That is the shape to explain -- and the per-record dump (`R97_DUMP_POS=all`) names the op
+inside block 63 that does it.
+
+### The amplification is the zero-B start, not the token count
+
+Three runs, one container, one build, the same 512 tokens; only the adapter's state differs
+(`seed_adapter` seeds both factors for the 512 ticket, the 4096 ticket and `device_step_tape_zerob`
+start where init leaves them, `lora_B` exactly zero):
+
+| boundary | 512 seeded | 512 zero-B |
+|---|---|---|
+| 64 -> 63 (the head's hand-off) | 0.0284541 | 6.52524 |
+| 63 -> 62 | 0.0586117 (x2.06) | 43.7711 (**x6.71**) |
+| 62 -> 61 | 0.060787 (x1.04) | 52.712 (x1.20) |
+| 59 -> 58 | 0.0694519 (x1.05) | 1519.45 (**x24.5**) |
+| 55 -> 54 | 0.0821795 (x1.03) | 14785.5 (**x9.0**) |
+| 51 -> 50 | -- (flat) | 106905 (**x7.1**) |
+| 37 -> 36 | **0.13915** (the block-37 dump's seeds) | **6.34723e+09** |
+
+The seeded chain is flat: every boundary passes its cotangent through at 1.03-1.05, the top block
+at 2.06, and block 37's boundary is 0.139. The zero-B chain starts 229x higher at the head and
+multiplies by 7-35 at each full-attention block, reaching 6.3e9 at the same boundary -- **a factor
+of 4.6e10 between two runs that differ only in `lora_B == 0`**.
+
+That is the whole defect, and it also explains why the 4096 norm is 1.28e36: the 4096 ticket runs
+the zero-B start too. The per-attention-block gain grows with the token count (~7-25 at 512,
+~39-326 at 4096) and sixteen of them carry the norm from O(1) to 1e21-1e36.
+
+`lora_B == 0` makes `lora_expand`'s `dt = sum_n cot y * scale * B` exactly zero, so the adapter
+contributes no term to the hidden state's cotangent -- the zero-B walk is the trunk's path alone.
+That is not by itself a mechanism: removing a term from a sum cannot multiply the sum by 1e10. What
+differs between the two runs is therefore the **forward's activations** (the seeded adapter
+perturbs every block's output), and the cotangent's conditioning against them -- the block's
+boundary is a difference of terms ~1e4 larger than itself (block 63's seeded intermediates reach
+2.5e-3 while its boundary max is 1.2e-7), which is the regime in which the device's f32 arithmetic
+and the host's f64 diverge. The one-knob control -- `device_step_tape_zerob` with
+`R97_SEED_ADAPTER=1`, the same case, tokens and probe setting -- separates the two.
+
+### The seeded chain is length-invariant; the zero-B chain is not
+
+`R97_SEED_ADAPTER=1` seeds the 4096 ticket's adapter (a debug knob, gated on the truncation flag),
+so the two axes -- token count and adapter state -- are separable. With the adapter seeded, the
+4096 chain is **the same chain as the 512 one**:
+
+| boundary | 512 seeded | 4096 seeded |
+|---|---|---|
+| 64 -> 63 | 0.0284541 | 0.0284606 |
+| 63 -> 62 | 0.0586117 (x2.06) | 0.0586442 (x2.06) |
+| 62 -> 61 | 0.060787 (x1.04) | 0.0607953 (x1.04) |
+| 61 -> 60 | 0.0635817 (x1.05) | 0.0635051 (x1.04) |
+| 60 -> 59 | 0.0662389 (x1.04) | 0.0661487 (x1.04) |
+
+Four to five digits on every line, at eight times the tokens. **The backward is length-invariant
+when the adapter is seeded** -- the rows handle 4096 correctly, and the attention-block amplification
+does not exist in that regime at either length.
+
+The zero-B chain is the one that amplifies, at both lengths (x6.7-35 at 512, x39-326 at 4096), so
+the defect lives in the zero-B start's own cotangent, not in the token count and not in the rows'
+length handling. `device_step_tape_zerob` with `R97_SEED_ADAPTER=1` is the one-knob control (the
+same case, the same tokens, the same probe setting, the adapter seeded) that isolates it.
+
+### The host rows (f64) give the same zero-B chain as the device (f32)
+
+The device walk's cotangents are f32; the host walk's are f64. At 512 zero-B over the top two
+blocks they agree:
+
+| boundary | device (f32) | host (f64) |
+|---|---|---|
+| 64 -> 63 | 6.52524 | 6.52526 |
+| 63 -> 62 | 43.7711 (x6.708) | 43.738 (x6.703) |
+| 62 -> 61 | 52.712 (x1.204) | 52.6677 (x1.204) |
+
+So the amplification is neither the device's precision nor a device-versus-host row divergence: it
+is what the model's own Jacobian gives from the head's incoming cotangent, computed the same way
+by three implementations (device rows, host rows, and the slice that shares the host rows).
+
+Where it is *created* is the head's junction, before any block row runs: the branch cotangents into
+the head's residual add are the same size in both regimes (`gather_rows` h_out 1.712e-4 zero-B
+versus 1.860e-4 seeded), while the add's own output -- the 64 -> 63 boundary -- is 4.053e-5 versus
+1.313e-7. The boundary is a difference of terms ~1e4 larger than itself, and the seeded start sits
+much closer to the cancellation than the zero-B one. That difference then rides down the chain.
+
+### Real text: the same split, and the shape of a power iteration
+
+`R97_STEP_CHAT=<jsonl>` steps a real conversation instead of the synthetic cycle (the container's
+own tokeniser, `tests/fixtures/`-style JSONL). On a 308-token prose conversation the base model
+scores **mean NLL 2.563** -- in distribution -- and the two regimes separate exactly as before:
+
+| case | mean NLL | grad norm |
+|---|---|---|
+| prose, zero-B | 2.563 | **2.35124e+14** |
+| prose, seeded | 14.559 | **1001.86** |
+
+So the synthetic 299-id cycle is not the driver: it makes the top blocks worse (x6.7 against prose's
+x2.6) but the zero-B amplification is there on in-distribution text too, at 1e14. The chain's shape
+is the informative part:
+
+| boundary | prose zero-B | prose seeded |
+|---|---|---|
+| 64 -> 63 | 7.01671 | 0.025778 |
+| 63 -> 62 | 18.3806 (x2.62) | 0.0532303 (x2.07) |
+| 51 -> 50 | 811.232 (**x7.49**) | flat (x1.03-1.05) |
+| 47 -> 46 | 14200.5 (**x11.81**) | flat |
+| 31 -> 30 | 7.12126e+07 (**x10.57**) | flat |
+| 15 -> 14 | 4.62652e+12 (**x8.78**) | flat |
+| 3 -> 2 | 2.50267e+15 (**x4.52**) | 3.29762 (x1.48) |
+
+Every full-attention block jumps, the delta-net blocks pass through at 1.0-1.2, and **the jump
+grows with depth** (x2.6 at the top, x7-12 in the middle, x4.5 at the bottom). That is the shape of
+a **power iteration**: the walk applies each block's transposed Jacobian to the cotangent, the
+cotangent's direction converges onto that block's dominant singular vector, and the per-boundary
+gain converges to the block's largest singular value. The zero-B start's seed has a component
+along those directions; the seeded start's seed -- which its own head attenuates by ~x270, the RMS
+norm's projection removing a cotangent nearly parallel to its input -- does not, and its chain stays
+at 1.04.
+
+Under that reading the numbers are the model's own backward conditioning, not a row's error: the
+device f32 rows and the host f64 rows agree to four to five digits on both regimes, the seeded
+chain is identical at 512 and 4096 tokens, and the gains are a smooth function of the activations.
+The practical consequence is the one a training step already has an answer for: **clip** -- the
+optimiser's `clip_norm` is what a per-block gain of 2-10 over sixty-four blocks needs, and the
+clipped 4096 step is the one that descends (-25,137 at 1e-3 in the 4096 ladder).
+
 ### Where the backward time goes
 
 The results JSON carries `row_seconds` and `pull_seconds` per op (`src/step_device.cpp:1906-1912`);
@@ -1165,12 +1335,6 @@ what the row's code predicts -- `gdn_chunk_scan`'s host adjoint reads `call.fwd`
 read slots (`f[rCu]`, `f[rH0]`, `load_chunk`/`load_state`, `src/adjoint/host/gdn_scan.cpp:487-578`)
 and takes the writes' cotangents from `call.cot`, so a written slot's snapshot is inert for it. The
 fix closes a contract gap; it moves no number in this block.
-**The magnitude does not.** `grad norm 1.25528e+36` -- the #145 growth artifact at 4096's larger
-cotangent -- and the descent ladder says so directly: lr=1e-3 gives -15,527.6 and lr=3e-4 gives
--12,840.1, but lr=1e-4 gives **+2,913.2** and clipped lr=1e-4 gives **+1,437.9**. A gradient at 1e36
-is not a direction the loss can follow at any step; a smaller step going *up* while a larger one goes
-down is what a meaningless magnitude looks like. This is the 4096 face of the open magnitude
-question, not a new defect.
 
 ## Tests
 
