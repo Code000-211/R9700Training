@@ -529,11 +529,43 @@ is K-specific: `attn_q`, sharing the same derived positions through the same rop
 `gate_up` 0.0067, `attn_out` 0.0077). So the suspect is the rope's `imrope`/`sections` twin over
 the `[308, 1024]` four-head layout, not the row counts: dump53 and dump54 give bit-identical
 `CONSTDIFF` across `M` 512 -> 308, because the twins derive their rows from the operand values.
-A truncated program splits it exactly: through the K-norm (ops 0..11) `attn_k` agrees at 0.0045,
-and adding the two rope ops (0..13) moves it to 0.224. The K-norm's twin is right and the rope's
-K path is the one op the arbiter still needs.
+A truncated program splits it exactly, and the split is a capture-timing ladder, not a twin error:
+through the K-norm (ops 0..11) `attn_k` agrees at 0.0045; adding the two rope ops (0..13) moves it
+to 0.224. The capture for `attn_k` is the K-norm record's own write, so each cut measures the op in
+between -- cut 9's 0.341 is the norm's rescale against the pre-norm capture (`SNAPDIFF attn_k`
+0.340910749 is the same number), cut 11's 0.0045 is post-norm against post-norm, and cut 13's 0.224
+is post-rope against the pre-rope capture, the rotation's own footprint on 64 of 256 lanes. The
+like-for-like pair that settles it is `kv:1`: `kv_store` copies the twin's POST-rope K into the
+pool, and the pool matches the device at 0.0047 -- a 22% rope error would force at least 0.12
+there. So every twin is verified correct wherever a like-for-like pair exists, `attn_k` is the
+fourth capture-timing artifact beside `h`/`x`/`lora.t.r16`, and the finite difference's
+precondition is met.
 The finite difference itself differences the twin against itself, so `CONSTDIFF` does not gate it --
 but a wrong K twin would make it measure the wrong `J`, and that is what stays open.
+
+### The first independent verdict: block 47's adjoint fails its own identity
+
+With the twins verified where a like-for-like pair exists, the block-local directional derivative
+runs. For block 47, `u = g_out(h)/|g_out(h)|` from the block-48 seeds, `g_in` from the block-47
+seeds, and `J u` measured by perturbing the slice's boundary `h` by `eps * u` and differencing the
+`--out-values` runs. The identity `<g_in, u> = <g_out, J u>` holds for any `u` when `g_in = J^T
+g_out`, so its failure is the walk's, not the model's:
+
+| eps (fraction of `|x|`) | `<g_out, J u>` | ratio to `<g_in, u>` = 2.05172 |
+|---|---|---|
+| 0.0025 | 0.610398 | 0.2975 |
+| 0.005 | 0.597079 | 0.2910 |
+| 0.01 | 0.592589 | 0.2888 |
+| 0.02 | 0.592370 | 0.2887 |
+
+The plateau is flat to 1% over the last three points, so the secant has converged: **the walk's
+`g_in` along this direction is 3.45x the forward's directional derivative allows.** The forward's
+own gain in the same direction is `|J u| ~ 5.2` at the smallest eps, falling as eps grows -- the
+piecewise-linear quantiser's secant, not a twin artifact. Caveats: one block, one direction; the
+perturbation fixes the block's `x` buffer and moves `h` only, which is the slice's own function
+(the walk's `g_in` carries both components and only the `h` one enters this lhs). But a 3.45x
+violation on one block is the first hard evidence that the walk's adjoint, not the model's
+conditioning, is where the magnitude goes wrong.
 
 ### Where the backward time goes
 
