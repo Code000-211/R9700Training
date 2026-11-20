@@ -657,6 +657,37 @@ block, not in a row: the slice seeds only the boundary-48 cotangent, the walk al
 `enter` (the residual store's credit) and the objective's seeds. That is the next measurement:
 dump the walk's block-47 `enter` input and the slice's seeds and diff them.
 
+**The per-op diff exists now and names the op: the QK-norm/rope pair (ops 13 and 11), 42.4x.**
+Extracting block 47's cot lines from the host-arm log between `boundary 48 -> 47` and
+`boundary 47 -> 46` and putting them against the slice's file:
+
+| op | name | slice l1 | walk l1 | ratio |
+|---|---|---|---|---|
+| 27 | lora_expand | 600.796 | 599.435 | 1.00 |
+| 24 | gated_had_quant_i8g | 6.909 | 6.894 | 1.00 |
+| 20 | rmsnorm_had_quant_i8g | 606.376 | 604.996 | 1.00 |
+| 16 | gate_had_quant_i8g | 2.633 | 2.627 | 1.00 |
+| 15 | attn_paged | 173.398 | 172.882 | 1.00 |
+| 14 | kv_store | 87.231 | 86.985 | 1.00 |
+| **13** | **rope** | **44.840** | **1899.71** | **42.4x** |
+| 12 | rope | 69.807 | 69.541 | 1.00 |
+| **11** | **rmsnorm** | **44.845** | **1899.71** | **42.4x** |
+| 10 | rmsnorm | 69.715 | 69.541 | 1.00 |
+| **9** | **lora_expand** | **42.391** | **1555.88** | **36.7x** |
+| 7 | gemm_nt_q | 42.391 | 1555.88 | 36.7x |
+| **6** | **lora_expand** | **41.712** | **1996.63** | **47.9x** |
+| 4 | gemm_nt_q | 41.712 | 1996.63 | 47.9x |
+| 3 | lora_expand | 128.436 | 128.046 | 1.00 |
+| 1 | gemm_nt_q | 128.436 | 128.046 | 1.00 |
+| 0 | rmsnorm_had_quant_i8g | 613.055 | 776.733 | 1.27 |
+
+So the fused norm's row is nearly right (1.00 at op 20, 1.27 at op 0), and the divergence is the
+**QK-norm and rope pair** -- ops 13 and 11, 42.4x each -- which then propagates into the qkv
+LoRAs' expansions below them (ops 9, 6). That is where the fix goes, and it is a row or a pair of
+rows, not the walk's setup. The two chains' op 13/11 values are identical in the slice (44.84 for
+both) and identical in the walk (1899.71 for both), so the pair shares one input: the walk's
+`kv_store`/`rope` path carries a cotangent 42x the slice's into the same two rows.
+
 The row's inputs and formula match the host twin on inspection; the A/B above is what settled
 that the row is not the site. `rmsnorm_back_kernel` (src/adjoint/device/quant.hip) takes
 the narrowed sum's snapshot as `x` when the record has a residual (`res_at >= 0 ? call.fwd[res_at]
