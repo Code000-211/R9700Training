@@ -688,6 +688,13 @@ rows, not the walk's setup. The two chains' op 13/11 values are identical in the
 both) and identical in the walk (1899.71 for both), so the pair shares one input: the walk's
 `kv_store`/`rope` path carries a cotangent 42x the slice's into the same two rows.
 
+The rope's row itself is a correct inverse rotation (`rope_adjoint_f64`, src/adjoint/host/qk.cpp:
+the transpose `[[c, -s], [s, c]]`, norm-preserving), so the row is not manufacturing the 42x. One
+caveat on the table: the per-op line sums only the operands the record *writes* (the dump skips a
+read operand's version), so `rope`'s 1899.71 is the post-rope `attn_k` version's cotangent, the
+same version the `kv_store` reads. The next measurement is that reconciliation: dump the post-rope
+`attn_k` version's cotangent at each reader and compare it with the attention's output.
+
 The row's inputs and formula match the host twin on inspection; the A/B above is what settled
 that the row is not the site. `rmsnorm_back_kernel` (src/adjoint/device/quant.hip) takes
 the narrowed sum's snapshot as `x` when the record has a residual (`res_at >= 0 ? call.fwd[res_at]
