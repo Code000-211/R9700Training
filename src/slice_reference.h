@@ -249,6 +249,14 @@ inline AdValue raw_table(const r97::OpRecord& rec, const r97::Operand& o) {
         if (kv.first == "M") M = *p;
         if (kv.first == "S") pool = *p;
     }
+    // The prefill length: the record's own activation rows, not its `M` -- the params are the
+    // engine's and a padded chat run leaves them at the padded count while the operands hold
+    // the batch's rows. The first non-raw operand with a row axis is the activation.
+    int64_t seq_rows = M;
+    for (const Operand& op : rec.operands) {
+        if (op.buffer.rfind("raw:", 0) == 0) continue;
+        if (!op.shape.empty() && op.shape[0] > 0) { seq_rows = op.shape[0]; break; }
+    }
     const int64_t n = o.shape.empty() ? 0 : numel(o.shape);
     AdValue v;
     v.dtype = o.dtype.empty() ? std::string("i32") : o.dtype;
@@ -266,27 +274,35 @@ inline AdValue raw_table(const r97::OpRecord& rec, const r97::Operand& o) {
     }
     std::string key = o.buffer.substr(4);
     if (const auto at = key.find('@'); at != std::string::npos) key.resize(at);
-    const bool seq_ok = M > 0;
+    // attn_paged carries q_len, not M, so the row count comes from seq_rows (the activation's
+    // own rows) and M is only the fallback.
+    const bool seq_ok = seq_rows > 0;
     if (key == "1" && rec.op != "gather_rows") {  // positions
-        if (!seq_ok || n != M) refuse("positions of a batch this runner does not hold");
+        if (!seq_ok || n != seq_rows) refuse("positions of a batch this runner does not hold");
         for (int64_t i = 0; i < n; ++i) v.value[(size_t)i] = double(i);
         return v;
     }
-    if (key == "2") {  // the attention pool's block table, [n_seq, max_blocks]
+    if (key == "2") {  // the attention pool's block table or kv_store's per-token slot
+        // kv_store reads [tokens] slots (the identity mapping the block table below gives);
+        // attn_paged reads [n_seq, max_blocks] of block ids.
+        if (o.shape.size() == 1 && o.shape[0] == seq_rows) {
+            for (int64_t i = 0; i < o.shape[0]; ++i) v.value[(size_t)i] = double(i);
+            return v;
+        }
         if (o.shape.size() != 2 || o.shape[0] != 1) refuse("a block table of a batch this runner does not hold");
-        const int64_t blocks = (M + 15) / 16;  // the op's own block_size, a prefill from 0
+        const int64_t blocks = (seq_rows + 15) / 16;  // the op's own block_size, a prefill from 0
         for (int64_t b = 0; b < o.shape[1]; ++b) v.value[(size_t)b] = b < blocks ? double(b) : -1.0;
         return v;
     }
     if (key == "3" && rec.op.rfind("attn_", 0) == 0) {  // seqused, [n_seq]
         if (!seq_ok || n != 1) refuse("seqused of a batch this runner does not hold");
-        v.value[0] = double(M);
+        v.value[0] = double(seq_rows);
         return v;
     }
     if (key == "3" || key == "6" || key == "7") {  // cu_seqlens
         if (!seq_ok || n != 2) refuse("cu_seqlens of a batch this runner does not hold");
         v.value[0] = 0.0;
-        v.value[1] = double(M);
+        v.value[1] = double(seq_rows);
         return v;
     }
     if (key == "9") {  // the state slot each sequence owns

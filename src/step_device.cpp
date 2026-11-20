@@ -1747,6 +1747,15 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                             // rows, and the runner reads past the dump.
                             OpRecord rec = own_raws(OpRecord(ops[r]));
                             tighten_rows(rec);
+                            // The params are the engine's, written for the padded rows; a
+                            // padded chat run's tape carries M=512 while the store -- and so
+                            // the boundary, the constants and the operands -- holds the
+                            // batch's own rows. Rewrite the row-count params to the tightened
+                            // rows, or the slice's twin computes 512 rows against 308-row
+                            // activations and its raw tables refuse (n != M).
+                            for (auto& [k, v] : rec.params)
+                                if ((k == "M" || k == "q_len") && std::holds_alternative<int64_t>(v))
+                                    v = tokens;
                             nlohmann::json o;
                             o["op"] = rec.op;
                             o["block"] = rec.block;
