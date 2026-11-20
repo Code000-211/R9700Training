@@ -624,7 +624,28 @@ seed**, which is `adjoint_rmsnorm_residual`'s `add` rule (`dv + g_r` on each sum
 at rel 1e-5 against a finite difference of the same decomposition. So the boundary line's `l1 =
 14197.9 = 2 x 7102.289` is two identical entries summed, **not a doubled gradient: the per-block
 gain is 1.33x, not 2.6x.** The gain chain is still the defect, but the duplicate is not its
-mechanism and no fix to the norm's row or the join is warranted by this evidence. The fix has two candidate sites, and the second is the one the evidence points at:
+mechanism and no fix to the norm's row or the join is warranted by this evidence.
+
+**The first same-block, same-seed comparison separates the walk's backward from the f64
+reference, and the walk over-amplifies by 11.3x.** Feeding block 47's slice backward the walk's own
+boundary-48 cotangent (`l1 = 600.796`) gives a 47 -> 46 hand-down of `l1 = 626.862` -- a block gain
+of **1.043x** in f64. The walk's own chain over the same boundary pair is `600.796 -> 7098.95` --
+**11.81x**, and the boundary lines' x7-12 per-block gains are the same number. So the per-block
+amplification is not the model's Jacobian: the f64 reference on the same block and seeds is flat,
+and the device walk's block backward multiplies the cotangent by ~11x where f64 multiplies it by
+~1.04x. Compounded over the depth, that is the 2.35e14 norm.
+
+**The routing matrix also says the accumulator's cotangent reaches the gradient, and the forward
+says it should not.** With block 47's slice backward seeded h-only, x-only and both: hand-down
+`265.307`, `619.541`, `626.862` -- both is 2.36x h-only, so the x slot's cotangent routes into the
+block's input cotangent; the leaves move 87.57 -> 80.50 -> 112.59. Yet the native composed run
+(without `x`) reproduces the forward's `rhs` exactly, so the forward does not read `x`. A backward
+that credits a forward-unread input is the defect, confirmed at one block. The next measurement is
+inside the block: which op's row multiplies by ~11x on the device but not in the f64 slice (the arbiter's
+finest-eps ratio of 1.12 says the block's Jacobian is right in the *directional-derivative*
+sense at that point, so the suspect is a row whose contribution is small for the probe's direction
+but large for the walk's actual cotangent -- the fused norm's `dv + g_r` split and the
+quantised paths' straight-through terms are the first two). The fix has two candidate sites, and the second is the one the evidence points at:
 
 1. `boundary_cotangents` (src/join_common.h) not handing down a buffer the block below only
    writes. The broad form of this -- skip any write-never-read entry -- **breaks
