@@ -695,6 +695,17 @@ read operand's version), so `rope`'s 1899.71 is the post-rope `attn_k` version's
 same version the `kv_store` reads. The next measurement is that reconciliation: dump the post-rope
 `attn_k` version's cotangent at each reader and compare it with the attention's output.
 
+**Two candidate mechanisms were checked against the records and cleared.** The device row's
+`mult` (`param_num(call.rec, "mult", 1.0)`, src/adjoint/device/quant.hip) is 1.0 -- op 0's params
+on the real container are `M=308, eps, group=128, n=5120, wadd=1` with no `mult` -- so the device
+row's outer `mult` is not a scale the host lacks. And the host A/B does not separate the row from
+the walk's bookkeeping: both arms run the same `src/backward.cpp` rows, so their 0.2% agreement
+confirms the rows are backend-independent, which was never in doubt. What the slice's 1.023x
+versus the walk's 16x does establish is that the row plus its *inputs* differ, and the slice's
+inputs are the dump's boundary values with its own f64 twins for the intermediates. The next
+measurement is therefore the intermediates: the walk's `attn_k`/`attn_q` snapshots against the
+slice's twins' own outputs (`--out-values`), with the quantiser's codebook edges counted in each.
+
 The row's inputs and formula match the host twin on inspection; the A/B above is what settled
 that the row is not the site. `rmsnorm_back_kernel` (src/adjoint/device/quant.hip) takes
 the narrowed sum's snapshot as `x` when the record has a residual (`res_at >= 0 ? call.fwd[res_at]
