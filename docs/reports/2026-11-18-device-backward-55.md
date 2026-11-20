@@ -512,6 +512,26 @@ flat only when the adapter has wrecked the forward (NLL 14.56 against 2.56). Cri
 therefore as open as it was before the dose arms, and the open question is exactly the x2-2.7 per
 block at the sane forward.
 
+### The arbiter's tooling, and what its self-check does and does not say
+
+The block-local directional-derivative arbiter needs the slice's twin to run a block's forward, and
+the block-47 slice now does: the dump tightens its records (`own_raws`, `tighten_rows`) and rewrites
+`M`/`q_len` to the batch's own token count, carries the batch ids, and the runner derives the
+attention raw tables (positions, block table, seqused, cu_seqlens) from the operands' own rows.
+`slice-serve --out-values` writes the buffers the finite difference needs.
+
+The base run's `CONSTDIFF` lines compare the twin's final environment against each buffer's
+first-read capture, so they are not all twin error: `h` (1.07) is the block's own residual update,
+`x` (0.21) is the caller's normed copy overwritten in place at op 0, and `lora.t.r16.lane0` (1.02)
+is one projection's `t` against another's. The one unclassified outlier is `attn_k` at 0.22, and it
+is K-specific: `attn_q`, sharing the same derived positions through the same rope twin, agrees at
+0.005, and the rest of the block sits at quantisation noise (`attn_v` 0.005, `kv:1` 0.0047,
+`gate_up` 0.0067, `attn_out` 0.0077). So the suspect is the rope's `imrope`/`sections` twin over
+the `[308, 1024]` four-head layout, not the row counts: dump53 and dump54 give bit-identical
+`CONSTDIFF` across `M` 512 -> 308, because the twins derive their rows from the operand values.
+The finite difference itself differences the twin against itself, so `CONSTDIFF` does not gate it --
+but a wrong K twin would make it measure the wrong `J`, and that is what stays open.
+
 ### Where the backward time goes
 
 The results JSON carries `row_seconds` and `pull_seconds` per op (`src/step_device.cpp:1906-1912`);
