@@ -647,6 +647,16 @@ different regimes and must not be conflated: the 11.3x and the 1.078x block-46 f
 dump53's 308-token chat chain, the op-0 16x from the 512-synthetic cycle; the row's gain grows
 with M, which is itself the M-scaling cross-check the report records.
 
+**The row's inputs and formula match the host twin on inspection, so the next step is the
+host-vs-device A/B of the same row.** `rmsnorm_back_kernel` (src/adjoint/device/quant.hip) takes
+the narrowed sum's snapshot as `x` when the record has a residual (`res_at >= 0 ? call.fwd[res_at]
+: call.fwd[0]`, and the comment says so), and its body is the host twin's `dx[i] += d[i]*scale*gain;
+dx[i] -= drs*rs3*r[i]/n` term for term (`shared = mult*rs^3*t/n`). What is not yet tested is whether
+the *host arm* of the same walk gives the slice's 1.02x at op 0: `R97_HOST_WALK_AB=2` with
+`R97_DUMP_COT` on the same block separates "the device row is the defect" (host arm 1.02x) from
+"the walk's op-0 handling is" (host arm also 16x). One window, the same test, and it is the
+measurement the fix should wait on.
+
 **The routing matrix also says the accumulator's cotangent reaches the gradient, and the forward
 says it should not.** With block 47's slice backward seeded h-only, x-only and both: hand-down
 `265.307`, `619.541`, `626.862` -- both is 2.36x h-only, so the x slot's cotangent routes into the
