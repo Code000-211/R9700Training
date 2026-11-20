@@ -787,6 +787,22 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         }
         account(std::chrono::duration<double>(Clock::now() - row_begin).count());
 
+        if (dump_cot) {
+            // Post-row: what the row left in each operand's written version, per operand, so a
+            // row that inflates one version can be named.
+            for (size_t j = 0; j < rec.operands.size(); ++j) {
+                if (!rec.operands[j].written || plan.write_version[i][j] < 0) continue;
+                const auto& v = version_at(i, j);
+                double l1 = 0.0, sq = 0.0;
+                for (double q : v.cot) {
+                    l1 += std::fabs(q);
+                    sq += q * q;
+                }
+                std::fprintf(stderr, "r97: cotout %zu %s j=%zu %s l1=%.6g l2=%.6g\n", i,
+                             rec.op.c_str(), j, rec.operands[j].buffer.c_str(), l1, std::sqrt(sq));
+            }
+        }
+
         if (options.in_place_passthrough) {
             // An adjoint either describes what a read takes or leaves the slot it would write empty.
             // An empty slot on an in-place operand is the op's direct path: the value the write
