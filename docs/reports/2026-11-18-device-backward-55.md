@@ -570,9 +570,26 @@ derivative on a piecewise-affine forward (`|J u|` collapses 5.15 -> 0.90 over th
 alone suggested a 3.45x violation; the small-`eps` points refute it. The residual 12% is within what
 this instrument can resolve (the composition of the perturbation is the slice's own: `h` moves and
 the `x` buffer is held, while the model derives `x` from `h`; that difference is of this order).
-Criterion two therefore stands exactly where the boundary chain put it -- the x2-2.7 per block at
-the sane forward -- and this instrument cannot yet separate the model's conditioning from the walk's
-arithmetic at better than 12%.
+The composed path closes the gap. The walk's boundary cotangent hands the *same* vector to `h` and
+to `x` (`max|g_h - g_x| = 0.0`), so a perturbation of `h` in the model's own function moves `x`
+through the norm's Jacobian, and the composed lhs is `<g_in, u + J_norm u>`. With the gain from the
+dump's `blk.47.attn_norm.weight` (`x_i = (h_i/rms)(1+w_i)`, eps 1e-6), that term is 7.9239, and the
+composed ratio is `(rhs_hold + 7.9239)/(2.0517 + 7.9239)`:
+
+| eps (fraction of `|x|`) | composed rhs | ratio |
+|---|---|---|
+| 0.00025 | 10.225 | **1.0250** |
+| 0.0005 | 9.1725 | 0.9195 |
+| 0.001 | 8.7164 | 0.8738 |
+| 0.0025 | 8.5343 | 0.8555 |
+| 0.02 | 8.5163 | 0.8537 |
+
+**The identity holds to 2.5% at the finest step on the composed path**, and the residual decline
+with eps is the same staircase. So block 47's adjoint passes this instrument at f64 resolution
+along this direction: the x2-2.7 per block is not a per-block adjoint error of this size, and the
+remaining candidates are the join (the block-to-block boundary bookkeeping), the truncated walk's
+zero-fill below block 0, or a many-direction effect. The composed ratio is dominated by the 7.92
+term, so its discriminating power is in the *difference* from 1.025, not the value itself.
 
 ### Where the backward time goes
 
