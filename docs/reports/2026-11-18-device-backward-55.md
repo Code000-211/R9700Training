@@ -601,8 +601,13 @@ over 1.58M values). Perturbing the boundary along the composed path -- `x` dropp
 derives it -- changes the forward response by nothing at the finest step (`rhs` 2.3011, identical to
 the hold-`x` value), which confirms `x` is dead: it cannot contribute to the block's output.
 
-A cotangent on a dead buffer that the block's backward folds into the residual's gradient would be
-a per-block double count. The obvious fix -- skip the entry in `boundary_cotangents`
+**It is a per-block double count, and the walk's own boundary line proves it.** The line
+`r97: boundary 47 -> 46: entries=2 n=3153920 l1=14197.9 l2=10.6004` sums two entries, and the dump's
+`layers.47-seeds.json` gives `l1(g_h) = l1(g_x) = 7102.289` and `l2 = 7.49899` for each: `14197.9 =
+2 x 7102.289` and `10.6004 = sqrt(2) x 7.49899`, the sum of two *identical* vectors. So the walk
+hands the residual's cotangent down twice at every block boundary, and the block below folds both
+into the residual's gradient -- **a x2 per block**, which is the floor under the x2.6-at-the-top and
+x7-12-in-the-middle gains. The obvious fix -- skip the entry in `boundary_cotangents`
 (src/join_common.h) when the block below writes and never reads the buffer -- **breaks the host
 fixture's gradient cosine (0.8)**, so the entry is load-bearing there and the defect, if it is one,
 is upstream: the walk's `add_input_full` mints the entry for op 0's in-place write. That is the next
