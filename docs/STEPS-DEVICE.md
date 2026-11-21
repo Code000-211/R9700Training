@@ -167,21 +167,23 @@ the JSON carries it as `non_finite.forward_op`.
 Both cases assert the contract issue #146 asks: the `StepFn` runs, the returned `ParamSet` has
 the params' names and shapes, the forward is finite, and the optimiser applied one update. The
 checks on the gradient's values — `all_finite`, the zero / non-zero split, the descent — are
-printed always and asserted when the walk's gradient is finite, so they re-arm the moment it
-becomes one. On the current tree the **512-token** walk's cotangent is finite: #157's in-place
-restore serves the 63 reads with no earlier writer from the block's stored boundary, and a
-record handed a cotangent past f32's range falls back to its host row (the same arithmetic in
-f64; see [`reports/2026-11-18-device-backward-55.md`](reports/2026-11-18-device-backward-55.md)).
-The **4096-token** case is still non-finite, at `gemm_nt_q`'s `gdn_o.q8`: that weight is
-plugin-private, the host row refuses it by name, so the fallback cannot serve the record and the
-device row's f32 output overflows. The walk's norm is ~1e38, but the same-tree FD measures the
-true leaf gradients at O(1)..O(150) mean-loss (block 63: 1.86, block 0: −145.5) against the
-walk's 0.0074 and −6.7e35 — the last layer 250x too small, the bottom 4.6e33x too large — so the
-norm is the walk's per-block amplification (#145), not the checkpoint's. The descent is therefore
-held only as a **direction** check — the unclipped 1e-4/3e-4 probes or a clipped step — while the
-config's 1e-3 is printed and reported, not asserted. The magnitude is still wrong and #55 stays
-open.
-`R97_DSTEP_ASSERT_FINITE=1` forces the value checks.
+printed always and asserted always. On the current tree the walk's gradient is finite at **512**
+and at **4096** tokens (grad norm 515.7 and 766.7; see
+[`reports/2026-11-18-device-backward-55.md`](reports/2026-11-18-device-backward-55.md)), so a
+non-finite gradient fails the case. Finite is not sufficient: the readable-host range fallback in
+`src/backward.cpp` (a record handed a cotangent past 1e30 falls back to its host row, the same
+arithmetic in f64) once kept a 1.26e36 gradient finite, so the cases also hold the norm under
+`kMaxGradNorm` (1e6). The descent is held at a step the gradient's scale admits: the config's
+1e-3, a smaller probe, or a clipped step.
+
+What made the walk finite is the `kv_store` slot table. The tape does not name that operand, the
+snapshot of an unnamed raw operand is zeros, and a zeroed table scatters every token from pool
+row 0 — the store then folds a k/v cotangent by the token count. The walk rebuilds the table as
+the identity `slot[t] = t`, which holds under two assumptions the walk does not check beyond the
+batch's size: the batch is **one sequence**, occupying the pool contiguously from block 0, and
+one `kv_store` record writes all of its tokens from position 0. A batch of more than one sequence
+is refused by name, and no case exercises that refusal yet. A table the tape delivers whole is
+left untouched, so a tape-side fix is not masked.
 
 The 512-token case's row coverage is a separate check, because a device row is an optimisation
 and the walk falls back to the host row where `libr97` has none (`allow_host_fallback` in

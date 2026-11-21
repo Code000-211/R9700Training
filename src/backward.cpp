@@ -613,8 +613,10 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         // the cotangent's range, and the recorded fix is that row's own carry (an f64 carry or a
         // per-row scale for the activation cotangent and the staged weight gradient). Treat a
         // green `all_finite` as "no Inf reached a kernel", never as "the cotangent's scale is
-        // right": at 4096 the walk is finite at a grad norm of 1.26e36 and the loss rises at
-        // lr 1e-4 (issue #55's open magnitude question).
+        // right": before the kv_store slot table was the batch's own layout, this fallback kept
+        // the 4096 walk finite at a grad norm of 1.26e36 with the loss rising at lr 1e-4. On the
+        // fixed tree the norm is 766.7 and the fallback is not expected to fire; the model cases
+        // bound the norm (tests/gpu/device_step.cpp's kMaxGradNorm) so it cannot hide a runaway.
         constexpr double kDeviceCotMax = 1e30;
         if (fn && served == Side::device && options.allow_host_fallback && host_readable &&
             cot_max > kDeviceCotMax) {

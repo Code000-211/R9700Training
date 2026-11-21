@@ -92,8 +92,11 @@ void kv_store_adjoint(const AdjointCall& call) {
     // of the old pool are dead and their cotangent is the k's and v's -- dk and dv above. Only
     // the pool the write leaves alone carries the pool's cotangent on. The rows the write
     // covers, by the same (block, offset) arithmetic the forward scatters with.
+    // The operands are the walk's own in-place reads (`in_place_read`), not the mark alone: a
+    // `kv:` pool a program-built record leaves unmarked is passed through by the walk just the
+    // same, and `fills_in_place_slots` tells the walk this row owns that slot.
     for (size_t j = 0; j < call.rec.operands.size(); ++j)
-        if (call.rec.operands[j].written && call.rec.operands[j].in_place) {
+        if (in_place_read(call.rec, j) && j < call.dc->size()) {
             AdValue& dp = call.dc->at(j);
             if (dp.value.size() != call.cot[0].value.size()) continue;
             const int64_t pool_rows = shape.n_blocks * shape.block_size;

@@ -597,6 +597,27 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
     // place, then the elementwise output the quantiser rotates.
     const AdValue& dy = call.cot.back();
     const AdValue* cot_res = (res_at >= 0 && call.cot.size() >= 2) ? &call.cot.front() : nullptr;
+    // The loop below indexes every element of the input. No consumers (empty) or the engine's
+    // no-value placeholder (one value) is a residual cotangent with nothing to add; any other
+    // size, and a short `dy` or residual slot, is refused by name rather than read past its end.
+    if (cot_res != nullptr && cot_res->value.size() <= 1) cot_res = nullptr;
+    const auto sized_like_input = [&](const char* what, size_t got) {
+        if (got != x.value.size())
+            throw std::runtime_error("r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +
+                                     std::to_string(call.rec.position) + ": " + what + " has " +
+                                     std::to_string(got) + " values, the input " +
+                                     std::to_string(x.value.size()));
+    };
+    if (res_at >= 0) {
+        sized_like_input("the intermediate's cotangent", dy.value.size());
+        if (cot_res != nullptr) sized_like_input("the residual's cotangent", cot_res->value.size());
+        if (call.dc->size() <= (size_t)res_at)
+            throw std::runtime_error("r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +
+                                     std::to_string(call.rec.position) +
+                                     " declares a residual the walk gave no gradient slot for");
+        sized_like_input("the input's gradient slot", call.dc->at(0).value.size());
+        sized_like_input("the residual's gradient slot", call.dc->at((size_t)res_at).value.size());
+    }
     const int64_t n = width_of(call.rec, x.shape);
     const AdValue* w = norm_gain(call.rec, call.fwd, n, "adjoint");
     // R97_GAIN_POS=1: which snapshot the *adjoint* took. `GAINPOS` shows two at the same position --

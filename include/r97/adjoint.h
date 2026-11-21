@@ -31,6 +31,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -157,10 +158,30 @@ using ParamPred = bool (*)(const std::vector<OpParam>& params);
 // passthrough.
 using FillsFn = bool (*)(const OpRecord& rec, size_t operand);
 
-// The fills predicate a row registers when it fills every slot the record marks in place: the
-// direct path, where the value a write replaced carries the write's cotangent.
+// A written operand that is also the op's input, though no separate read names it: rope's
+// in-place write and the recurrent/conv state buffers. The prior version is the read. The issue
+// record marks such an operand (`Operand::in_place`, a RAD_OPD_INOUT operand); a record built from
+// a program instead of the live tape may not carry the mark, so the two shapes the ops always
+// have -- rope's operand 0, and a `kv:` buffer no separate read names -- are recognised here too.
+// The walk's version graph, the join's boundary pick and `fills_in_place_slots` below all derive
+// their in-place reads from this one rule.
+inline bool in_place_read(const OpRecord& rec, size_t j) {
+    const Operand& o = rec.operands[j];
+    if (!o.written) return false;
+    if (o.in_place) return true;
+    if (rec.op == "rope" && j == 0) return true;
+    if (o.buffer.rfind("kv:", 0) != 0) return false;
+    for (size_t k = 0; k < rec.operands.size(); ++k)
+        if (k != j && !rec.operands[k].written && rec.operands[k].buffer == o.buffer) return false;
+    return true;
+}
+
+// The fills predicate a row registers when it fills every slot the walk reads in place: the
+// direct path, where the value a write replaced carries the write's cotangent. It is the walk's
+// own rule (`in_place_read`), not the mark alone: a `kv:` pool a program-built record leaves
+// unmarked is passed through by the walk exactly as a marked one is, so the row must own it too.
 inline bool fills_in_place_slots(const OpRecord& rec, size_t operand) {
-    return operand < rec.operands.size() && rec.operands[operand].in_place;
+    return operand < rec.operands.size() && in_place_read(rec, operand);
 }
 
 // -- registry ----------------------------------------------------------------

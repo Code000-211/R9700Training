@@ -65,6 +65,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <variant>
 #include <vector>
@@ -510,27 +511,31 @@ void lora_shrink_device_adjoint(const AdjointCall& call) {
 
 // The expand's adjoint: the cotangent of t over the projection's columns, and dB over the tokens.
 void lora_expand_device_adjoint(const AdjointCall& call) {
-    Expand ex;
-    if (!expand_layout(call.fwd.data(), call.fwd.size(), &ex)) return;
     if (call.cot.empty() || !call.dc || call.dc->empty()) return;
     const AdValue& y_cot = call.cot[0];
+    // The direct path of an in-place write, as the host row fills it (src/adjoint/host/lora.cpp):
+    // the buffer the write replaces reads its own cotangent back, unchanged. It runs before every
+    // exit below, because the row registers `fills_in_place_slots` and the walk therefore never
+    // passes this slot through itself: a return ahead of the fill would drop the buffer's
+    // cotangent for every block below. A slot of another size is refused by name.
+    for (size_t i = 0; i < call.rec.operands.size(); ++i) {
+        if (!fills_in_place_slots(call.rec, i) || i >= call.dc->size()) continue;
+        AdValue& d_base = call.dc->at(i);
+        if (d_base.value.empty()) continue;  // a slot the caller did not size is not ours
+        if (d_base.value.size() != y_cot.value.size())
+            throw std::runtime_error("r97: lora_expand adjoint: op '" + call.rec.op + "' at " +
+                                     std::to_string(call.rec.position) +
+                                     ": the in-place slot has " +
+                                     std::to_string(d_base.value.size()) +
+                                     " values, the write's cotangent " +
+                                     std::to_string(y_cot.value.size()));
+        for (size_t e = 0; e < y_cot.value.size(); ++e) d_base.value[e] += y_cot.value[e];
+    }
+    Expand ex;
+    if (!expand_layout(call.fwd.data(), call.fwd.size(), &ex)) return;
     if ((int64_t)y_cot.value.size() != ex.M * ex.N) return;
     AdValue& t_cot = call.dc->at(0);
     if ((int64_t)t_cot.value.size() != ex.M * ex.R) return;
-
-    // The direct path of an in-place write, as the host row fills it (src/adjoint/host/lora.cpp):
-    // the buffer the write replaces reads its own cotangent back, unchanged. The walk's passthrough
-    // fills an empty slot with the same value, so this changes nothing in a walk -- it makes the
-    // row say the same thing when a check calls it without one, which is how the aliased records
-    // are held to a finite difference.
-    for (size_t i = 0; i < call.rec.operands.size(); ++i) {
-        const Operand& o = call.rec.operands[i];
-        if (!o.written || !o.in_place) continue;
-        if (i >= call.dc->size()) continue;
-        AdValue& d_base = call.dc->at(i);
-        if (d_base.value.size() == y_cot.value.size())
-            for (size_t e = 0; e < y_cot.value.size(); ++e) d_base.value[e] += y_cot.value[e];
-    }
 
     RadStream stream = adjoint_stream();
     if (!stream) return;

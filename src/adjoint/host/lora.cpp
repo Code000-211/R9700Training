@@ -449,24 +449,33 @@ void lora_expand_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
  * writes y, and a write's slot in `dc` is not one an adjoint fills.
  */
 void lora_expand_host_adjoint(const AdjointCall& call) {
-    Expand ex;
-    if (!expand_layout(call.rec, call.fwd.data(), call.fwd.size(), &ex)) return;
     if (call.cot.empty()) return;
     const AdValue& y_cot = call.cot[0];
+    // The direct path of the in-place write: the buffer the write replaces reads its own
+    // cotangent back, unchanged. It runs before every exit below, because the row registers
+    // `fills_in_place_slots` and the walk therefore never passes this slot through itself: a
+    // return ahead of the fill would drop the buffer's cotangent for every block below. The
+    // direct path needs nothing the adapter's layout decides, so a record whose layout the row
+    // cannot serve still hands the write's cotangent on. A slot of another size is refused by
+    // name rather than left empty.
+    for (size_t i = 0; i < call.rec.operands.size(); ++i)
+        if (fills_in_place_slots(call.rec, i) && i < call.dc->size()) {
+            AdValue& d_base = call.dc->at(i);
+            if (d_base.value.empty()) continue;  // a slot the caller did not size is not ours
+            if (d_base.value.size() != y_cot.value.size())
+                throw std::runtime_error("r97: lora_expand adjoint: op '" + call.rec.op + "' at " +
+                                         std::to_string(call.rec.position) +
+                                         ": the in-place slot has " +
+                                         std::to_string(d_base.value.size()) +
+                                         " values, the write's cotangent " +
+                                         std::to_string(y_cot.value.size()));
+            for (size_t e = 0; e < y_cot.value.size(); ++e) d_base.value[e] += y_cot.value[e];
+        }
+    Expand ex;
+    if (!expand_layout(call.rec, call.fwd.data(), call.fwd.size(), &ex)) return;
     if ((int64_t)y_cot.value.size() != ex.M * ex.N) return;
     AdValue& t_cot = call.dc->at(0);
     if ((int64_t)t_cot.value.size() != ex.M * ex.R) return;
-
-    // The direct path of the in-place write: the buffer the write replaces reads its own
-    // cotangent back, unchanged. The walk passes it on when the row leaves the slot empty,
-    // so filling it here says the same thing the passthrough would -- and a check that calls
-    // the row without the walk, as the finite differences do, sees it either way.
-    for (size_t i = 0; i < call.rec.operands.size(); ++i)
-        if (call.rec.operands[i].written && call.rec.operands[i].in_place) {
-            AdValue& d_base = call.dc->at(i);
-            if (d_base.value.size() == y_cot.value.size())
-                for (size_t e = 0; e < y_cot.value.size(); ++e) d_base.value[e] += y_cot.value[e];
-        }
 
     const auto db_for = [&](int64_t s) -> Param* {
         const std::vector<int64_t> shape =

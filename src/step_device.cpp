@@ -59,6 +59,29 @@
 namespace r97 {
 namespace {
 
+// R97_DUMP_BLOCK names one layer. Unset, empty or anything that is not a whole non-negative
+// number is "no dump" (-1): a loose parse reads an empty value as layer 0 and writes several GB.
+long long dump_block_layer_env() {
+    const char* db = std::getenv("R97_DUMP_BLOCK");
+    if (db == nullptr || *db == '\0') return -1;
+    char* end = nullptr;
+    const long long v = std::strtoll(db, &end, 10);
+    if (end == db || *end != '\0' || v < 0) {
+        std::fprintf(stderr, "r97: R97_DUMP_BLOCK='%s' is not a layer number; no dump\n", db);
+        return -1;
+    }
+    return v;
+}
+
+// One dump file, written and checked: a dump that ends short (a full disk, a missing directory)
+// is a failure by name, not a file the next step reads as the walk's own.
+void write_dump_file(const std::string& path, const nlohmann::json& doc) {
+    std::ofstream out(path);
+    out << doc.dump(2) << "\n";
+    out.flush();
+    if (!out.good()) throw std::runtime_error("device step: R97_DUMP_BLOCK could not write " + path);
+}
+
 using Clock = std::chrono::steady_clock;
 
 double seconds_since(const Clock::time_point& t0) {
@@ -1268,10 +1291,13 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         // The scale of one boundary's cotangent, printed once per boundary (issue #55's review:
         // "one line per block boundary ... shows at once whether this is one jump or a uniform
         // per-block factor"). `from` hands it down and `to` receives it, so consecutive lines
-        // differ by exactly one block's gain. Always on: an instrument that needs an env var is
-        // not there in the run that needed it.
-        auto print_boundary_scale = [](int64_t from, int64_t to,
-                                       const std::vector<IncomingCotangent>& cot) {
+        // differ by exactly one block's gain. On under DeviceStepOptions::print_boundary_scale,
+        // which every model case sets -- so the instrument is there in the run that needs it --
+        // and off for a training loop, where it is 65 lines and a pass over every boundary's
+        // cotangent per step.
+        auto print_boundary_scale = [&options](int64_t from, int64_t to,
+                                               const std::vector<IncomingCotangent>& cot) {
+            if (!options.print_boundary_scale) return;
             double l1 = 0.0, sq = 0.0, mx = 0.0;
             int64_t n = 0;
             for (const IncomingCotangent& c : cot)
@@ -1451,10 +1477,7 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             // the same snapshots the adjoint binds. An operand no f64 form exists for (a
             // plugin-private quantised tensor: raw/enc set, value empty) is named in
             // `refused_names` instead of fabricated.
-            const long long dump_block_layer = [] {
-                if (const char* db = std::getenv("R97_DUMP_BLOCK")) return std::atoll(db);
-                return -1LL;
-            }();
+            const long long dump_block_layer = dump_block_layer_env();
             nlohmann::json constants_doc = nlohmann::json::object();
             std::set<std::string> dumped_names;
             std::vector<std::string> refused_names;
@@ -1777,9 +1800,8 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             // cotangent[]}], f32-cast per Seed::cotangent). slice-serve --program/--boundary/
             // --constants/--seeds consumes them; the constants file is host-side prep (the
             // report's item 3b), not dumped here.
-            if (const char* db = std::getenv("R97_DUMP_BLOCK")) {
-                const long long want_layer = std::atoll(db);
-                if (want_layer == (long long)layer) {
+            {
+                if (dump_block_layer == (long long)layer) {
                     const char* dir_env = std::getenv("R97_DUMP_BLOCK_DIR");
                     const std::string dir = dir_env && *dir_env ? dir_env : "/tmp";
                     // A dump that silently writes nowhere because the directory does not exist
@@ -1859,8 +1881,7 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                             doc["batch"].push_back(std::move(ids));
                         }
                         doc["ops"] = std::move(ops_j);
-                        std::ofstream out(base + ".json");
-                        out << doc.dump(2) << "\n";
+                        write_dump_file(base + ".json", doc);
                     }
                     // The boundary forward values: read the store directly (keep_boundaries
                     // is off), bf16 widened to f64, one entry per boundary this block reads.
@@ -1908,8 +1929,7 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                             }
                             doc[extra_key] = std::move(v2);
                         }
-                        std::ofstream out(base + "-boundary.json");
-                        out << doc.dump(2) << "\n";
+                        write_dump_file(base + "-boundary.json", doc);
                     }
                     // The boundary cotangents: the IncomingCotangents just computed for this
                     // same block, f64 full-range, cast to Seed's f32 so slice-serve reads them
@@ -1926,15 +1946,13 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                             s["cotangent"] = std::move(cot);
                             arr.push_back(std::move(s));
                         }
-                        std::ofstream seeds_out(base + "-seeds.json");
-                        seeds_out << arr.dump(2) << "\n";
+                        write_dump_file(base + "-seeds.json", arr);
                     }
                     // The constants: the per-record collection the replay callback filled in
                     // -- the walk's own frozen snapshots, decoded f64, keyed by buffer. Written
                     // ALWAYS, even empty: the file's existence is the signal the hook ran.
                     {
-                        std::ofstream out(base + "-constants.json");
-                        out << constants_doc.dump(2) << "\n";
+                        write_dump_file(base + "-constants.json", constants_doc);
                     }
                     // The plugin-private operands the constants path cannot carry: their names,
                     // so the comparison states a refusal instead of a fabricated constant.
@@ -1942,8 +1960,7 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                         nlohmann::json refused_arr = nlohmann::json::array();
                         for (const std::string& name2 : refused_names)
                             refused_arr.push_back(name2);
-                        std::ofstream out(base + "-constants-refused.json");
-                        out << refused_arr.dump(2) << "\n";
+                        write_dump_file(base + "-constants-refused.json", refused_arr);
                         std::fprintf(stderr, "CONSTANTS-REFUSED n=%zu\n", refused_names.size());
                         std::fflush(stderr);
                     }

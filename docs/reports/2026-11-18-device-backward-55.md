@@ -1,4 +1,4 @@
-# Device backward: the walk is finite at 512 and 4096 with the right sign; the magnitude is still wrong at `gemm_nt_q`
+# Device backward: the walk is finite at 512 and 4096, and the fold in the magnitude was the `kv_store` slot table
 
 `2026-11-18`, issue #55.
 

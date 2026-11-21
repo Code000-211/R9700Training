@@ -1006,6 +1006,15 @@ void quant_adjoint(const AdjointCall& call, Part part) {
         const int64_t res_cot_at = cot_slot(call.rec, res_at);
         if (res_cot_at >= 0 && (size_t)res_cot_at < call.cot.size()) {
             const AdValue& gr = call.cot[(size_t)res_cot_at];
+            // No consumers (empty) or the engine's no-value placeholder (one value) is nothing to
+            // add, as the host row reads it; any other size is a cotangent the row cannot place,
+            // and skipping it would drop the residual's consumers silently.
+            if (gr.value.size() > 1 && (int64_t)gr.value.size() != total)
+                throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "' at " +
+                                         std::to_string(call.rec.position) +
+                                         ": the residual's cotangent has " +
+                                         std::to_string(gr.value.size()) + " values, the row needs " +
+                                         std::to_string(total));
             if ((int64_t)gr.value.size() == total)
                 // Both summands carry v's full cotangent, and the finite difference of v = x +
                 // residual_old is what proves it: with `g_r` on the residual slot alone the x slot
