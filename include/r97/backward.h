@@ -17,6 +17,7 @@
 // the version that was live before it, and its adjoint receives that version's cotangent.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -31,6 +32,8 @@
 #include "r97/params.h"
 
 namespace r97 {
+// `in_place_read`, the one rule the walk's version graph, the join's boundary pick and the rows'
+// `fills` predicate derive their in-place reads from, lives in r97/adjoint.h (included above).
 
 // The forward value of one operand of one op, as the op saw it. A buffer the block writes twice
 // has two values, so the provider answers by the op's position in the step and the operand's index

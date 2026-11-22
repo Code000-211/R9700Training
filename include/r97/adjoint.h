@@ -31,6 +31,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -150,12 +151,44 @@ using TwinFn = void (*)(const OpRecord& rec, const std::vector<AdValue>& operand
 using AdjointFn = void (*)(const AdjointCall& call);
 // A predicate on the op's parameters, for example the dtype; null accepts every record.
 using ParamPred = bool (*)(const std::vector<OpParam>& params);
+// Whether the adjoint row fills one operand's dc slot itself, for the records the walk marks in
+// place. A row that answers an in-place write -- the value it replaced carries the write's
+// cotangent -- registers one: the walk then knows a zero slot is the row's answer, not an empty
+// slot to pass the cotangent through. Null (the default) is a row that leaves the slot to the
+// passthrough.
+using FillsFn = bool (*)(const OpRecord& rec, size_t operand);
+
+// A written operand that is also the op's input, though no separate read names it: rope's
+// in-place write and the recurrent/conv state buffers. The prior version is the read. The issue
+// record marks such an operand (`Operand::in_place`, a RAD_OPD_INOUT operand); a record built from
+// a program instead of the live tape may not carry the mark, so the two shapes the ops always
+// have -- rope's operand 0, and a `kv:` buffer no separate read names -- are recognised here too.
+// The walk's version graph, the join's boundary pick and `fills_in_place_slots` below all derive
+// their in-place reads from this one rule.
+inline bool in_place_read(const OpRecord& rec, size_t j) {
+    const Operand& o = rec.operands[j];
+    if (!o.written) return false;
+    if (o.in_place) return true;
+    if (rec.op == "rope" && j == 0) return true;
+    if (o.buffer.rfind("kv:", 0) != 0) return false;
+    for (size_t k = 0; k < rec.operands.size(); ++k)
+        if (k != j && !rec.operands[k].written && rec.operands[k].buffer == o.buffer) return false;
+    return true;
+}
+
+// The fills predicate a row registers when it fills every slot the walk reads in place: the
+// direct path, where the value a write replaced carries the write's cotangent. It is the walk's
+// own rule (`in_place_read`), not the mark alone: a `kv:` pool a program-built record leaves
+// unmarked is passed through by the walk exactly as a marked one is, so the row must own it too.
+inline bool fills_in_place_slots(const OpRecord& rec, size_t operand) {
+    return operand < rec.operands.size() && in_place_read(rec, operand);
+}
 
 // -- registry ----------------------------------------------------------------
 
 void twin_register(const char* op, TwinFn fn, ParamPred pred);
 void adjoint_register(const char* op, Side side, AdjointFn fn, const std::vector<int>& frozen,
-                      ParamPred pred);
+                      ParamPred pred, FillsFn fills = nullptr);
 
 // Lookup applies the first row of that side whose predicate accepts the parameters. Rows for one
 // op are tried in registration order, which across translation units the link order decides, so
@@ -167,6 +200,10 @@ AdjointFn adjoint_find(const std::string& op, Side side, const std::vector<OpPar
 
 // The frozen operand positions of the adjoint row that serves the op; empty when nothing does.
 std::vector<int> adjoint_frozen(const std::string& op, Side side, const std::vector<OpParam>& params);
+
+// The fills predicate of the adjoint row that serves the op; null when nothing does or the row
+// leaves its in-place slots to the walk's passthrough.
+FillsFn adjoint_fills(const std::string& op, Side side, const std::vector<OpParam>& params);
 
 // Every op with at least one row, sorted.
 std::vector<std::string> ops_registered();
@@ -196,11 +233,12 @@ struct AdjointRow {
     AdjointFn fn;
     std::vector<int> frozen;
     ParamPred pred;
+    FillsFn fills = nullptr;
 };
 struct Registrar {
     explicit Registrar(const TwinRow& r) { twin_register(r.op, r.fn, r.pred); }
     explicit Registrar(const AdjointRow& r) {
-        adjoint_register(r.op, r.side, r.fn, r.frozen, r.pred);
+        adjoint_register(r.op, r.side, r.fn, r.frozen, r.pred, r.fills);
     }
 };
 
@@ -232,6 +270,12 @@ struct Registrar {
 #define R97_REGISTER_ADJOINT_IF_F(op, side, fn, pred, ...) \
     static ::r97::Registrar R97_REG_NAME(r97_reg_adj_, __LINE__) { \
         ::r97::AdjointRow{op, ::r97::Side::side, fn, {__VA_ARGS__}, pred} \
+    };
+// A row that fills the in-place slots its `fills` predicate names. The walk then treats a zero
+// slot as the row's answer instead of passing the incoming cotangent through it.
+#define R97_REGISTER_ADJOINT_FF(op, side, fn, fills, ...) \
+    static ::r97::Registrar R97_REG_NAME(r97_reg_adj_, __LINE__) { \
+        ::r97::AdjointRow{op, ::r97::Side::side, fn, {__VA_ARGS__}, nullptr, fills} \
     };
 
 }  // namespace r97

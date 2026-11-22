@@ -261,6 +261,7 @@
         {
           "buffer": "raw:0",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -271,6 +272,7 @@
         {
           "buffer": "token_embd.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -282,6 +284,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -308,6 +311,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -319,6 +323,7 @@
         {
           "buffer": "blk.0.attn_norm.weight",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -329,6 +334,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -355,6 +361,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -366,6 +373,7 @@
         {
           "buffer": "blk.0.ssm_in.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -377,6 +385,7 @@
         {
           "buffer": "gdn_in",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -402,6 +411,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -413,6 +423,7 @@
         {
           "buffer": "blk.0.ssm_z.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -424,6 +435,7 @@
         {
           "buffer": "gdn_z",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -449,6 +461,7 @@
         {
           "buffer": "gdn_in",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -460,6 +473,7 @@
         {
           "buffer": "blk.0.ssm_conv1d.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -471,6 +485,7 @@
         {
           "buffer": "none:2",
           "dtype": "invalid",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [],
@@ -479,6 +494,7 @@
         {
           "buffer": "blk.0.ssm_a_log",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -489,6 +505,7 @@
         {
           "buffer": "blk.0.ssm_dt.bias",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -499,6 +516,7 @@
         {
           "buffer": "kv:3",
           "dtype": "bf16",
+          "inout": true,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -511,6 +529,7 @@
         {
           "buffer": "raw:6",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 4,
           "shape": [
@@ -521,28 +540,49 @@
         {
           "buffer": "gdn_in",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
             512,
             136
+          ],
+          "view_off": 128,
+          "view_shape": [
+            244,
+            4
+          ],
+          "view_stride": [
+            136,
+            1
           ],
           "written": false
         },
         {
           "buffer": "gdn_in",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
             512,
             136
           ],
+          "view_off": 132,
+          "view_shape": [
+            244,
+            4
+          ],
+          "view_stride": [
+            136,
+            1
+          ],
           "written": false
         },
         {
           "buffer": "raw:9",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 3,
           "shape": [
@@ -553,6 +593,7 @@
         {
           "buffer": "raw:10",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 3,
           "shape": [
@@ -563,6 +604,7 @@
         {
           "buffer": "gdn_q",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -575,6 +617,7 @@
         {
           "buffer": "gdn_k",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -587,6 +630,7 @@
         {
           "buffer": "gdn_v",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -599,6 +643,7 @@
         {
           "buffer": "gdn_g",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -610,6 +655,7 @@
         {
           "buffer": "gdn_beta",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -636,6 +682,7 @@
         {
           "buffer": "gdn_k",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -648,6 +695,7 @@
         {
           "buffer": "gdn_beta",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -659,6 +707,7 @@
         {
           "buffer": "gdn_g",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -670,6 +719,7 @@
         {
           "buffer": "raw:3",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 4,
           "shape": [
@@ -680,6 +730,7 @@
         {
           "buffer": "gdn_kkt",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -704,6 +755,7 @@
         {
           "buffer": "gdn_q",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -716,6 +768,7 @@
         {
           "buffer": "gdn_k",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -728,6 +781,7 @@
         {
           "buffer": "gdn_v",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -740,6 +794,7 @@
         {
           "buffer": "gdn_kkt",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -752,6 +807,7 @@
         {
           "buffer": "gdn_g",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -763,6 +819,7 @@
         {
           "buffer": "gdn_beta",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -774,6 +831,7 @@
         {
           "buffer": "kv:2",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -787,6 +845,7 @@
         {
           "buffer": "raw:7",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 4,
           "shape": [
@@ -797,6 +856,7 @@
         {
           "buffer": "gdn_o",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -809,6 +869,7 @@
         {
           "buffer": "kv:2",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -822,6 +883,7 @@
         {
           "buffer": "raw:10",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 3,
           "shape": [
@@ -847,6 +909,7 @@
         {
           "buffer": "gdn_o",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -859,6 +922,7 @@
         {
           "buffer": "gdn_z",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -870,6 +934,7 @@
         {
           "buffer": "blk.0.ssm_norm.weight",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -880,6 +945,7 @@
         {
           "buffer": "gdn_o",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -906,6 +972,7 @@
         {
           "buffer": "gdn_o",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -918,6 +985,7 @@
         {
           "buffer": "blk.0.ssm_out.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -929,6 +997,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -954,6 +1023,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -965,6 +1035,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -976,6 +1047,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1000,6 +1072,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1011,6 +1084,7 @@
         {
           "buffer": "blk.0.ffn_norm.weight",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1021,6 +1095,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1047,6 +1122,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1058,6 +1134,7 @@
         {
           "buffer": "blk.0.ffn_gate_up.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1069,6 +1146,7 @@
         {
           "buffer": "gate_up",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1094,6 +1172,7 @@
         {
           "buffer": "gate_up",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1105,6 +1184,7 @@
         {
           "buffer": "ffn",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1129,6 +1209,7 @@
         {
           "buffer": "ffn",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1140,6 +1221,7 @@
         {
           "buffer": "blk.0.ffn_down.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1151,6 +1233,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1176,6 +1259,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1187,6 +1271,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1198,6 +1283,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1222,6 +1308,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1233,6 +1320,7 @@
         {
           "buffer": "blk.1.attn_norm.weight",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1243,6 +1331,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1269,6 +1358,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1280,6 +1370,7 @@
         {
           "buffer": "blk.1.ssm_in.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1291,6 +1382,7 @@
         {
           "buffer": "gdn_in",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1316,6 +1408,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1327,6 +1420,7 @@
         {
           "buffer": "blk.1.ssm_z.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1338,6 +1432,7 @@
         {
           "buffer": "gdn_z",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1363,6 +1458,7 @@
         {
           "buffer": "gdn_in",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1374,6 +1470,7 @@
         {
           "buffer": "blk.1.ssm_conv1d.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1385,6 +1482,7 @@
         {
           "buffer": "none:2",
           "dtype": "invalid",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [],
@@ -1393,6 +1491,7 @@
         {
           "buffer": "blk.1.ssm_a_log",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1403,6 +1502,7 @@
         {
           "buffer": "blk.1.ssm_dt.bias",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1413,6 +1513,7 @@
         {
           "buffer": "kv:3",
           "dtype": "bf16",
+          "inout": true,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1425,6 +1526,7 @@
         {
           "buffer": "raw:6",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 4,
           "shape": [
@@ -1435,28 +1537,49 @@
         {
           "buffer": "gdn_in",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
             512,
             136
+          ],
+          "view_off": 128,
+          "view_shape": [
+            244,
+            4
+          ],
+          "view_stride": [
+            136,
+            1
           ],
           "written": false
         },
         {
           "buffer": "gdn_in",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
             512,
             136
           ],
+          "view_off": 132,
+          "view_shape": [
+            244,
+            4
+          ],
+          "view_stride": [
+            136,
+            1
+          ],
           "written": false
         },
         {
           "buffer": "raw:9",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 3,
           "shape": [
@@ -1467,6 +1590,7 @@
         {
           "buffer": "raw:10",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 3,
           "shape": [
@@ -1477,6 +1601,7 @@
         {
           "buffer": "gdn_q",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1489,6 +1614,7 @@
         {
           "buffer": "gdn_k",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1501,6 +1627,7 @@
         {
           "buffer": "gdn_v",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1513,6 +1640,7 @@
         {
           "buffer": "gdn_g",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1524,6 +1652,7 @@
         {
           "buffer": "gdn_beta",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1550,6 +1679,7 @@
         {
           "buffer": "gdn_k",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1562,6 +1692,7 @@
         {
           "buffer": "gdn_beta",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1573,6 +1704,7 @@
         {
           "buffer": "gdn_g",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1584,6 +1716,7 @@
         {
           "buffer": "raw:3",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 4,
           "shape": [
@@ -1594,6 +1727,7 @@
         {
           "buffer": "gdn_kkt",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1618,6 +1752,7 @@
         {
           "buffer": "gdn_q",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1630,6 +1765,7 @@
         {
           "buffer": "gdn_k",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1642,6 +1778,7 @@
         {
           "buffer": "gdn_v",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1654,6 +1791,7 @@
         {
           "buffer": "gdn_kkt",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1666,6 +1804,7 @@
         {
           "buffer": "gdn_g",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1677,6 +1816,7 @@
         {
           "buffer": "gdn_beta",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1688,6 +1828,7 @@
         {
           "buffer": "kv:2",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1701,6 +1842,7 @@
         {
           "buffer": "raw:7",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 4,
           "shape": [
@@ -1711,6 +1853,7 @@
         {
           "buffer": "gdn_o",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1723,6 +1866,7 @@
         {
           "buffer": "kv:2",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1736,6 +1880,7 @@
         {
           "buffer": "raw:10",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 3,
           "shape": [
@@ -1761,6 +1906,7 @@
         {
           "buffer": "gdn_o",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1773,6 +1919,7 @@
         {
           "buffer": "gdn_z",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1784,6 +1931,7 @@
         {
           "buffer": "blk.1.ssm_norm.weight",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1794,6 +1942,7 @@
         {
           "buffer": "gdn_o",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1820,6 +1969,7 @@
         {
           "buffer": "gdn_o",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1832,6 +1982,7 @@
         {
           "buffer": "blk.1.ssm_out.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1843,6 +1994,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1868,6 +2020,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1879,6 +2032,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1890,6 +2044,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1914,6 +2069,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1925,6 +2081,7 @@
         {
           "buffer": "blk.1.ffn_norm.weight",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1935,6 +2092,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1961,6 +2119,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -1972,6 +2131,7 @@
         {
           "buffer": "blk.1.ffn_gate_up.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -1983,6 +2143,7 @@
         {
           "buffer": "gate_up",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2008,6 +2169,7 @@
         {
           "buffer": "gate_up",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2019,6 +2181,7 @@
         {
           "buffer": "ffn",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2043,6 +2206,7 @@
         {
           "buffer": "ffn",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2054,6 +2218,7 @@
         {
           "buffer": "blk.1.ffn_down.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -2065,6 +2230,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2090,6 +2256,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2101,6 +2268,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2112,6 +2280,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2136,6 +2305,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2147,6 +2317,7 @@
         {
           "buffer": "blk.2.attn_norm.weight",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -2157,6 +2328,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2183,6 +2355,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2194,6 +2367,7 @@
         {
           "buffer": "blk.2.ssm_in.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -2205,6 +2379,7 @@
         {
           "buffer": "gdn_in",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2230,6 +2405,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2241,6 +2417,7 @@
         {
           "buffer": "blk.2.ssm_z.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -2252,6 +2429,7 @@
         {
           "buffer": "gdn_z",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2277,6 +2455,7 @@
         {
           "buffer": "gdn_in",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2288,6 +2467,7 @@
         {
           "buffer": "blk.2.ssm_conv1d.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -2299,6 +2479,7 @@
         {
           "buffer": "none:2",
           "dtype": "invalid",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [],
@@ -2307,6 +2488,7 @@
         {
           "buffer": "blk.2.ssm_a_log",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -2317,6 +2499,7 @@
         {
           "buffer": "blk.2.ssm_dt.bias",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -2327,6 +2510,7 @@
         {
           "buffer": "kv:3",
           "dtype": "bf16",
+          "inout": true,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -2339,6 +2523,7 @@
         {
           "buffer": "raw:6",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 4,
           "shape": [
@@ -2349,28 +2534,49 @@
         {
           "buffer": "gdn_in",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
             512,
             136
+          ],
+          "view_off": 128,
+          "view_shape": [
+            244,
+            4
+          ],
+          "view_stride": [
+            136,
+            1
           ],
           "written": false
         },
         {
           "buffer": "gdn_in",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
             512,
             136
           ],
+          "view_off": 132,
+          "view_shape": [
+            244,
+            4
+          ],
+          "view_stride": [
+            136,
+            1
+          ],
           "written": false
         },
         {
           "buffer": "raw:9",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 3,
           "shape": [
@@ -2381,6 +2587,7 @@
         {
           "buffer": "raw:10",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 3,
           "shape": [
@@ -2391,6 +2598,7 @@
         {
           "buffer": "gdn_q",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2403,6 +2611,7 @@
         {
           "buffer": "gdn_k",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2415,6 +2624,7 @@
         {
           "buffer": "gdn_v",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2427,6 +2637,7 @@
         {
           "buffer": "gdn_g",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2438,6 +2649,7 @@
         {
           "buffer": "gdn_beta",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2464,6 +2676,7 @@
         {
           "buffer": "gdn_k",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2476,6 +2689,7 @@
         {
           "buffer": "gdn_beta",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2487,6 +2701,7 @@
         {
           "buffer": "gdn_g",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2498,6 +2713,7 @@
         {
           "buffer": "raw:3",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 4,
           "shape": [
@@ -2508,6 +2724,7 @@
         {
           "buffer": "gdn_kkt",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2532,6 +2749,7 @@
         {
           "buffer": "gdn_q",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2544,6 +2762,7 @@
         {
           "buffer": "gdn_k",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2556,6 +2775,7 @@
         {
           "buffer": "gdn_v",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2568,6 +2788,7 @@
         {
           "buffer": "gdn_kkt",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2580,6 +2801,7 @@
         {
           "buffer": "gdn_g",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2591,6 +2813,7 @@
         {
           "buffer": "gdn_beta",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2602,6 +2825,7 @@
         {
           "buffer": "kv:2",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -2615,6 +2839,7 @@
         {
           "buffer": "raw:7",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 4,
           "shape": [
@@ -2625,6 +2850,7 @@
         {
           "buffer": "gdn_o",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2637,6 +2863,7 @@
         {
           "buffer": "kv:2",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -2650,6 +2877,7 @@
         {
           "buffer": "raw:10",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 3,
           "shape": [
@@ -2675,6 +2903,7 @@
         {
           "buffer": "gdn_o",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2687,6 +2916,7 @@
         {
           "buffer": "gdn_z",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2698,6 +2928,7 @@
         {
           "buffer": "blk.2.ssm_norm.weight",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -2708,6 +2939,7 @@
         {
           "buffer": "gdn_o",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2734,6 +2966,7 @@
         {
           "buffer": "gdn_o",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2746,6 +2979,7 @@
         {
           "buffer": "blk.2.ssm_out.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -2757,6 +2991,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2782,6 +3017,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2793,6 +3029,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2804,6 +3041,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2828,6 +3066,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2839,6 +3078,7 @@
         {
           "buffer": "blk.2.ffn_norm.weight",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -2849,6 +3089,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2875,6 +3116,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2886,6 +3128,7 @@
         {
           "buffer": "blk.2.ffn_gate_up.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -2897,6 +3140,7 @@
         {
           "buffer": "gate_up",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2922,6 +3166,7 @@
         {
           "buffer": "gate_up",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2933,6 +3178,7 @@
         {
           "buffer": "ffn",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2957,6 +3203,7 @@
         {
           "buffer": "ffn",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -2968,6 +3215,7 @@
         {
           "buffer": "blk.2.ffn_down.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -2979,6 +3227,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3004,6 +3253,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3015,6 +3265,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3026,6 +3277,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3050,6 +3302,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3061,6 +3314,7 @@
         {
           "buffer": "blk.3.attn_norm.weight",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -3071,6 +3325,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3097,6 +3352,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3108,6 +3364,7 @@
         {
           "buffer": "blk.3.attn_qg.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -3119,6 +3376,7 @@
         {
           "buffer": "attn_qg",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3145,6 +3403,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3156,6 +3415,7 @@
         {
           "buffer": "blk.3.attn_k.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -3167,6 +3427,7 @@
         {
           "buffer": "attn_k",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3192,6 +3453,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3203,6 +3465,7 @@
         {
           "buffer": "blk.3.attn_v.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -3214,6 +3477,7 @@
         {
           "buffer": "attn_v",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3239,6 +3503,7 @@
         {
           "buffer": "attn_qg",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3246,11 +3511,23 @@
             4,
             64
           ],
+          "view_off": 0,
+          "view_shape": [
+            244,
+            4,
+            32
+          ],
+          "view_stride": [
+            256,
+            64,
+            1
+          ],
           "written": false
         },
         {
           "buffer": "blk.3.attn_q_norm.weight",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -3261,6 +3538,7 @@
         {
           "buffer": "attn_q",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3287,6 +3565,7 @@
         {
           "buffer": "attn_k",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3298,6 +3577,7 @@
         {
           "buffer": "blk.3.attn_k_norm.weight",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -3308,6 +3588,7 @@
         {
           "buffer": "attn_k",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3334,6 +3615,7 @@
         {
           "buffer": "attn_q",
           "dtype": "bf16",
+          "inout": true,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3345,6 +3627,7 @@
         {
           "buffer": "raw:1",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3373,6 +3656,7 @@
         {
           "buffer": "attn_k",
           "dtype": "bf16",
+          "inout": true,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3384,6 +3668,7 @@
         {
           "buffer": "raw:1",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3412,6 +3697,7 @@
         {
           "buffer": "attn_k",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3423,6 +3709,7 @@
         {
           "buffer": "attn_v",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3434,6 +3721,7 @@
         {
           "buffer": "raw:2",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3444,6 +3732,7 @@
         {
           "buffer": "kv:1",
           "dtype": "bf16",
+          "inout": true,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -3472,6 +3761,7 @@
         {
           "buffer": "attn_q",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3483,6 +3773,7 @@
         {
           "buffer": "kv:1",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -3496,6 +3787,7 @@
         {
           "buffer": "raw:2",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 3,
           "shape": [
@@ -3507,6 +3799,7 @@
         {
           "buffer": "raw:3",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 3,
           "shape": [
@@ -3517,6 +3810,7 @@
         {
           "buffer": "none:4",
           "dtype": "invalid",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [],
@@ -3525,6 +3819,7 @@
         {
           "buffer": "none:5",
           "dtype": "invalid",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [],
@@ -3533,6 +3828,7 @@
         {
           "buffer": "raw:6",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 4,
           "shape": [
@@ -3543,6 +3839,7 @@
         {
           "buffer": "attn_out",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3575,6 +3872,7 @@
         {
           "buffer": "attn_qg",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3582,11 +3880,23 @@
             4,
             64
           ],
+          "view_off": 32,
+          "view_shape": [
+            244,
+            4,
+            32
+          ],
+          "view_stride": [
+            256,
+            64,
+            1
+          ],
           "written": false
         },
         {
           "buffer": "attn_gate",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3611,6 +3921,7 @@
         {
           "buffer": "attn_out",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3622,6 +3933,7 @@
         {
           "buffer": "attn_gate",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3633,6 +3945,7 @@
         {
           "buffer": "attn_out",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3657,6 +3970,7 @@
         {
           "buffer": "attn_out",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3668,6 +3982,7 @@
         {
           "buffer": "blk.3.attn_output.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -3679,6 +3994,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3704,6 +4020,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3715,6 +4032,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3726,6 +4044,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3750,6 +4069,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3761,6 +4081,7 @@
         {
           "buffer": "blk.3.ffn_norm.weight",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -3771,6 +4092,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3797,6 +4119,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3808,6 +4131,7 @@
         {
           "buffer": "blk.3.ffn_gate_up.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -3819,6 +4143,7 @@
         {
           "buffer": "gate_up",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3844,6 +4169,7 @@
         {
           "buffer": "gate_up",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3855,6 +4181,7 @@
         {
           "buffer": "ffn",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3879,6 +4206,7 @@
         {
           "buffer": "ffn",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3890,6 +4218,7 @@
         {
           "buffer": "blk.3.ffn_down.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -3901,6 +4230,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3926,6 +4256,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3937,6 +4268,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3948,6 +4280,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3972,6 +4305,7 @@
         {
           "buffer": "x",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -3983,6 +4317,7 @@
         {
           "buffer": "output_norm.weight",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -3993,6 +4328,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -4019,6 +4355,7 @@
         {
           "buffer": "h",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 244,
           "shape": [
@@ -4030,6 +4367,7 @@
         {
           "buffer": "raw:1",
           "dtype": "i32",
+          "inout": false,
           "row_lo": 0,
           "rows": 247,
           "shape": [
@@ -4040,6 +4378,7 @@
         {
           "buffer": "h_out",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 247,
           "shape": [
@@ -4064,6 +4403,7 @@
         {
           "buffer": "h_out",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 247,
           "shape": [
@@ -4075,6 +4415,7 @@
         {
           "buffer": "output.weight",
           "dtype": "bf16",
+          "inout": false,
           "row_lo": 0,
           "rows": 0,
           "shape": [
@@ -4086,6 +4427,7 @@
         {
           "buffer": "logits",
           "dtype": "f32",
+          "inout": false,
           "row_lo": 0,
           "rows": 247,
           "shape": [

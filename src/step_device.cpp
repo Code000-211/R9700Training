@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -31,6 +32,8 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <fstream>
+#include <nlohmann/json.hpp>
 #include <vector>
 
 #include "engine.h"       // the complete rad::Engine behind ForwardDriver's unique_ptr
@@ -55,6 +58,29 @@
 
 namespace r97 {
 namespace {
+
+// R97_DUMP_BLOCK names one layer. Unset, empty or anything that is not a whole non-negative
+// number is "no dump" (-1): a loose parse reads an empty value as layer 0 and writes several GB.
+long long dump_block_layer_env() {
+    const char* db = std::getenv("R97_DUMP_BLOCK");
+    if (db == nullptr || *db == '\0') return -1;
+    char* end = nullptr;
+    const long long v = std::strtoll(db, &end, 10);
+    if (end == db || *end != '\0' || v < 0) {
+        std::fprintf(stderr, "r97: R97_DUMP_BLOCK='%s' is not a layer number; no dump\n", db);
+        return -1;
+    }
+    return v;
+}
+
+// One dump file, written and checked: a dump that ends short (a full disk, a missing directory)
+// is a failure by name, not a file the next step reads as the walk's own.
+void write_dump_file(const std::string& path, const nlohmann::json& doc) {
+    std::ofstream out(path);
+    out << doc.dump(2) << "\n";
+    out.flush();
+    if (!out.good()) throw std::runtime_error("device step: R97_DUMP_BLOCK could not write " + path);
+}
 
 using Clock = std::chrono::steady_clock;
 
@@ -929,6 +955,45 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             std::vector<AdValue> now;                            // frozen entries stay empty
             std::vector<std::shared_ptr<const AdValue>> frozen;  // non-null: answered by `shared`
         };
+        // Replace a kv_store slot table the walk was not given with the batch's own layout.
+        // Returns true when it rebuilt. The rule: only a serve that carries no usable table -- an
+        // unnamed raw operand that came back empty or all one value -- is replaced, because the
+        // engine's real table is the identity map for a single sequence from block 0 and a zeroed
+        // serve is indistinguishable from pool row 0 for every token. A table with two distinct
+        // values is the tape's own and is left alone. A batch of more than one sequence allocates
+        // a different block a sequence, so it refuses rather than serving one sequence's layout.
+        const auto rebuilt_slot = [&](const OpRecord& rec, AdValue* slot) -> bool {
+            if (rec.op != "kv_store" || rec.operands.size() < 3) return false;
+            if (rec.operands[2].buffer.rfind("raw:", 0) != 0) return false;
+            const int64_t block_size = [&] {
+                for (const auto& p : rec.params)
+                    if (p.first == "block_size" && std::holds_alternative<int64_t>(p.second))
+                        return std::get<int64_t>(p.second);
+                return int64_t{16};
+            }();
+            const int64_t tokens = rec.operands[0].shape.empty() ? 0 : rec.operands[0].shape[0];
+            if (tokens <= 0 || block_size <= 0) return false;
+            const bool whole = slot->value.size() == static_cast<size_t>(tokens) && tokens > 1;
+            bool constant = whole;
+            for (size_t t = 1; whole && t < slot->value.size(); ++t)
+                if (slot->value[t] != slot->value[0]) constant = false;
+            if (whole && !constant) return false;  // the tape's own table
+            if (batch.size() != 1)
+                throw std::runtime_error(
+                    "device step: op '" + rec.op + "' at position " +
+                    std::to_string(rec.position) + ": the slot table is not the tape's (" +
+                    std::to_string(slot->value.size()) + " of " + std::to_string(tokens) +
+                    " values) and this batch has " + std::to_string(batch.size()) +
+                    " sequences, whose block tables do not share a layout; the engine's table has "
+                    "to reach the walk before this row can be differentiated");
+            slot->dtype = "i32";
+            slot->shape = {tokens};
+            slot->value.assign(static_cast<size_t>(tokens), 0.0);
+            for (int64_t t = 0; t < tokens; ++t)
+                slot->value[static_cast<size_t>(t)] =
+                    static_cast<double>((t / block_size) * block_size + t % block_size);
+            return true;
+        };
         const auto snap_record = [&](const OpRecord& rec,
                                      const std::vector<OperandContent>& content) {
             SnappedRecord out;
@@ -986,10 +1051,25 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             }
             for (size_t j = 0; j < rec.operands.size(); ++j) {
                 if (out.frozen[j]) {
-                    shared.bind(rec.position, j, out.frozen[j]);
+                    // A kv slot table the first block already froze may itself be the zeroed
+                    // serve: snapshot() returns zeros for an unnamed raw operand ("the raw slot's
+                    // zero is a valid slot index" -- true for one slot, fatal at n tokens, where
+                    // every token scatters pool row 0 and the store folds by the token count).
+                    // Rebuild it here, in the shared copy, so every block binds the batch's layout
+                    // (src/reference_step.cpp:640-647 does the same for the reference).
+                    std::shared_ptr<const AdValue> bound = out.frozen[j];
+                    if (rec.op == "kv_store" && j == 2 && rec.operands.size() >= 3 &&
+                        rec.operands[2].buffer.rfind("raw:", 0) == 0) {
+                        AdValue slot = *bound;
+                        if (rebuilt_slot(rec, &slot)) bound = std::make_shared<const AdValue>(std::move(slot));
+                    }
+                    shared.bind(rec.position, j, bound);
                     continue;
                 }
                 out.now[j] = snapshot(rec.operands[j], held[j].content, rec.op.c_str(), rec.position);
+                if (rec.op == "kv_store" && j == 2 && rec.operands.size() >= 3 &&
+                    rec.operands[2].buffer.rfind("raw:", 0) == 0)
+                    (void)rebuilt_slot(rec, &out.now[j]);
                 register_stored_operand(rec.operands[j], out.now[j]);
                 if (key[j].empty()) continue;
                 // The step's first read of a frozen operand: its one widen, which every later
@@ -1183,8 +1263,14 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
         int64_t head_input_bytes = 0;
         for (const InputCotangent& in : head.inputs) head_input_bytes += value_bytes(in.value);
 
-        const InputCotangent* above = pick_boundary(head.inputs, tokens, meta.hidden);
-        if (!above) {
+        // Every buffer the head left on the boundary, as its own entry: the top block reads the
+        // residual in place and the branch as a plain read, and both cross the boundary, so both
+        // enter the top block at the version its last write produced.
+        std::vector<IncomingCotangent> incoming =
+            boundary_cotangents(head.inputs, ops,
+                                &blocks[static_cast<size_t>(measured.layers - 1)], tokens,
+                                meta.hidden);
+        if (incoming.empty()) {
             std::string dbg = "device step: the head walk left no cotangent on the final hidden; "
                               "blocks=" +
                               std::to_string(blocks.size()) + " head_records=" +
@@ -1202,8 +1288,51 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             throw std::runtime_error(dbg);
         }
 
-        auto store_boundary = [&](int64_t boundary, const InputCotangent* in) {
-            if (!options.keep_boundaries || !in) return;
+        // The scale of one boundary's cotangent, printed once per boundary (issue #55's review:
+        // "one line per block boundary ... shows at once whether this is one jump or a uniform
+        // per-block factor"). `from` hands it down and `to` receives it, so consecutive lines
+        // differ by exactly one block's gain. On under DeviceStepOptions::print_boundary_scale,
+        // which every model case sets -- so the instrument is there in the run that needs it --
+        // and off for a training loop, where it is 65 lines and a pass over every boundary's
+        // cotangent per step.
+        auto print_boundary_scale = [&options](int64_t from, int64_t to,
+                                               const std::vector<IncomingCotangent>& cot) {
+            if (!options.print_boundary_scale) return;
+            double l1 = 0.0, sq = 0.0, mx = 0.0;
+            int64_t n = 0;
+            for (const IncomingCotangent& c : cot)
+                for (double v : c.value) {
+                    const double a = std::fabs(v);
+                    l1 += a;
+                    sq += v * v;
+                    mx = std::max(mx, a);
+                    n += 1;
+                }
+            std::fprintf(stderr,
+                         "r97: boundary %lld -> %lld: entries=%zu n=%lld l1=%.6g l2=%.6g max=%.6g\n",
+                         static_cast<long long>(from), static_cast<long long>(to), cot.size(),
+                         static_cast<long long>(n), l1, std::sqrt(sq), mx);
+        };
+        print_boundary_scale(measured.layers, measured.layers - 1, incoming);
+
+        auto store_boundary = [&](int64_t boundary, const std::vector<IncomingCotangent>& cot,
+                                  const std::string& want) {
+            if (!options.keep_boundaries) return;
+            // The store holds the residual, and the report's boundary cotangent is that buffer's:
+            // the host tier FD-checks it against residual perturbations and the oracle matches it
+            // to the residual's gradient. Select the entry the block below reads in place, not
+            // whichever entry the walk listed first -- that is the branch as often as not.
+            const IncomingCotangent* in = nullptr;
+            if (!want.empty()) {
+                for (const IncomingCotangent& c : cot)
+                    if (c.buffer == want) in = &c;
+                if (!in)
+                    throw std::runtime_error("r97: the join: the boundary store holds '" + want +
+                                             "' but the walk left no cotangent for it");
+            } else if (!cot.empty()) {
+                in = &cot.front();
+            }
+            if (!in) return;
             measured.boundary_name[static_cast<size_t>(boundary)] = in->buffer;
             measured.boundary_cotangent[static_cast<size_t>(boundary)] = in->value;
             if (!store.has(boundary)) return;
@@ -1212,23 +1341,34 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
             widen_bf16(host, &measured.boundary_value[static_cast<size_t>(boundary)]);
         };
 
-        store_boundary(measured.layers, above);
-        IncomingCotangent incoming{above->buffer, 0, tokens,
-                                   first_rows(*above, tokens, meta.hidden)};
+        store_boundary(measured.layers, incoming, store.name(measured.layers));
 
         LayerReplay replay(*engine, driver.tape(), store);
-        // R97_WALK_BLOCKS=<n> walks only the top n blocks, and only for the host walk. A host walk
-        // holds each block's decoded weights for the length of that block's walk, and a step's
-        // worth on the real container is more than this host has: the limit is what makes the A/B
-        // measurable here at all, and the top transitions already separate a growing cotangent
-        // from a flat one. The device walk is never limited: the A/B runs only when the device
-        // walk's gradient is not finite, and a truncated walk zero-fills the blocks it skipped --
-        // a finite gradient that would silence the very measurement this exists for. Unset, the
-        // host walk is the whole step too.
+        // R97_WALK_BLOCKS=<n> walks only the top n blocks. A host walk holds each block's decoded
+        // weights for the length of that block's walk, and a step's worth on the real container is
+        // more than this host has: the limit is what makes the A/B measurable here at all, and the
+        // top transitions already separate a growing cotangent from a flat one.
+        //
+        // The device walk is limited only under R97_WALK_BLOCKS_DEBUG=1, and then it is not a
+        // step: a truncated walk zero-fills the blocks it skipped, so its gradient must never be
+        // read as one. What it is for is the boundary chain -- one `r97: boundary` line per walked
+        // block, each a real cotangent -- which is how issue #55 localises the growth: the top
+        // sixteen blocks cost ~15 min instead of the whole step's ~58. The model cases skip their
+        // gradient assertions when the debug flag is set, so a truncated walk cannot pass as a
+        // step by accident.
         int64_t walk_blocks = 0;
+        const bool truncated_device_walk =
+            !options.host_walk && std::getenv("R97_WALK_BLOCKS_DEBUG") != nullptr;
         if (const char* wb = std::getenv("R97_WALK_BLOCKS");
-            wb != nullptr && *wb != '\0' && options.host_walk)
+            wb != nullptr && *wb != '\0' && (options.host_walk || truncated_device_walk))
             walk_blocks = std::strtoll(wb, nullptr, 10);
+        if (truncated_device_walk && walk_blocks > 0)
+            std::fprintf(stderr,
+                         "r97: WALK-BLOCKS-DEBUG: the device walk covers blocks %lld..%lld only; "
+                         "blocks below %lld are zero-filled and this gradient is NOT a step's\n",
+                         static_cast<long long>(measured.layers - walk_blocks),
+                         static_cast<long long>(measured.layers - 1),
+                         static_cast<long long>(measured.layers - walk_blocks));
         const int64_t first_layer = walk_blocks > 0 ? std::max<int64_t>(0, measured.layers - walk_blocks)
                                                     : 0;
         for (int64_t layer = measured.layers - 1; layer >= first_layer; --layer) {
@@ -1331,10 +1471,21 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 return o.shape.size() == 2 && o.shape[0] == boundary_tokens &&
                        o.shape[1] == boundary_hidden;
             };
-            replay.replay(layer, [&snaps, &snap_record, &note_produced, &before, &block_wrote,
+            // R97_DUMP_BLOCK: when the replay below reaches the named layer, each record's
+            // frozen-and-not-yet-dumped read operands land in `constants_doc` as the walk's own
+            // decoded f64 view -- frozen operands from the shared store, pulled reads widened,
+            // the same snapshots the adjoint binds. An operand no f64 form exists for (a
+            // plugin-private quantised tensor: raw/enc set, value empty) is named in
+            // `refused_names` instead of fabricated.
+            const long long dump_block_layer = dump_block_layer_env();
+            nlohmann::json constants_doc = nlohmann::json::object();
+            std::set<std::string> dumped_names;
+            std::vector<std::string> refused_names;
+            replay.replay(layer, [&snaps, &snap_record, &note_produced, &before, &block_wrote, &batch,
                                   &covered, &same_layout, &writer_rows, &writer_view, &options,
                                   &layer, &replay, &in_boundary, &measured, boundary_bytes,
-                                  residual_lo](
+                                  residual_lo, &dump_block_layer, &constants_doc, &dumped_names,
+                                  &refused_names](
                                      const OpRecord& op,
                                      const std::vector<OperandContent>& content) {
                 // The adjoint sees the step's rows and, for attention, the q view its family
@@ -1346,6 +1497,38 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 if (options.reference_head_split) mark_join_lora(shaped);
                 SnappedRecord snapped = snap_record(shaped, content);
                 note_produced(shaped, snapped.now);
+                // Per record: every read operand neither written nor already dumped, decoded to
+                // the walk's f64 view. A frozen operand's frozen value is the walk's own answer;
+                // otherwise the pulled-and-widened one is. A plugin-private operand (no f64 form,
+                // value empty) is refused by name, never fabricated, and `dumped_names` is not
+                // grown so a later read of the same buffer records its own refusal line.
+                if (dump_block_layer == static_cast<long long>(layer)) {
+                    for (size_t j = 0; j < shaped.operands.size(); ++j) {
+                        const Operand& o = shaped.operands[j];
+                        // An in-place written state buffer reads too: the prior value is what the
+                        // op consumed, and a slice runner replaying the forward from this dump
+                        // must feed its twin that value, not a cold stand-in. The walk's own
+                        // zeroing (this file, the kv: rule in the walk loop) applies to the
+                        // adjoint's read slot and is a separate decision.
+                        if (o.written && !(o.buffer.rfind("kv:", 0) == 0 && in_place_read(shaped, j)))
+                            continue;
+                        if (dumped_names.count(o.buffer)) continue;
+                        if (o.buffer.rfind("raw:", 0) == 0 || o.buffer.rfind("none:", 0) == 0)
+                            continue;
+                        if (o.dtype == "invalid") continue;
+                        const AdValue& v = snapped.frozen[j] ? *snapped.frozen[j] : snapped.now[j];
+                        if (v.value.empty()) {
+                            refused_names.push_back(o.buffer);
+                            continue;
+                        }
+                        nlohmann::json entry;
+                        entry["dtype"] = v.dtype;
+                        entry["shape"] = v.shape;
+                        entry["value"] = v.value;
+                        constants_doc[o.buffer] = std::move(entry);
+                        dumped_names.insert(o.buffer);
+                    }
+                }
                 for (size_t j = 0; j < shaped.operands.size(); ++j) {
                     const Operand& read = shaped.operands[j];
                     if (read.written || snapped.frozen[j]) continue;
@@ -1559,16 +1742,20 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 if (options.reference_head_split) mark_join_lora(rec);
             }
             BoundaryNames block_names;
-            block_names.add(incoming.buffer, 0, tokens);
+            std::set<std::string> external;
+            for (const IncomingCotangent& in : incoming) {
+                block_names.add(in.buffer, 0, tokens);
+                external.insert(in.buffer);
+            }
             // This block's own read sets, from the whole tape: a consumer in a later block is
             // found in `ops`, and the block's input boundary is read outside the tape. Every block
             // record's consumer is a GEMM or a norm, so none is proven and every one keeps the
             // loud refusal -- the map is built anyway so the rule lives in one place.
             const std::map<int64_t, std::vector<int64_t>> block_reads =
-                derive_read_sets(records, ops, shared, {incoming.buffer});
+                derive_read_sets(records, ops, shared, external);
             bo.read_rows = &block_reads;
             const BackwardResult walked =
-                backward_block(records, shared, block_names, {}, {incoming}, bo);
+                backward_block(records, shared, block_names, {}, incoming, bo);
             merge_ops(row_time, walked.report.ops);
             merge_finiteness(walked.report);
             // The join holds the whole block's snapshots while the walk copies one op out of
@@ -1585,18 +1772,204 @@ StepFn device_step(ForwardDriver& driver, const Model& model, const DeviceStepOp
                 measured.peak_snapshot_store_bytes = store_bytes;
                 measured.peak_snapshot_op_bytes = op_bytes;
             }
+            int64_t incoming_bytes = 0;
+            for (const IncomingCotangent& in : incoming) incoming_bytes += value_bytes(in.value);
             measured.peak_cotangent_bytes = std::max(
                 measured.peak_cotangent_bytes,
-                head_input_bytes + value_bytes(incoming.value) +
-                    walked.report.peak_cotangent_bytes);
+                head_input_bytes + incoming_bytes + walked.report.peak_cotangent_bytes);
 
-            const InputCotangent* below = pick_boundary(walked.inputs, tokens, meta.hidden);
-            if (!below)
+            // Every buffer the walk left on the boundary, as its own entry for the block below;
+            // null at the bottom block, which has no consumer below it.
+            incoming = boundary_cotangents(
+                walked.inputs, ops,
+                layer > 0 ? &blocks[static_cast<size_t>(layer - 1)] : nullptr, tokens,
+                meta.hidden);
+            if (incoming.empty())
                 throw std::runtime_error("device step: layer " + std::to_string(layer) +
                                          " left no cotangent on its input boundary");
-            store_boundary(layer, below);
-            incoming = IncomingCotangent{below->buffer, 0, tokens,
-                                         first_rows(*below, tokens, meta.hidden)};
+            store_boundary(layer, incoming, store.name(layer));
+            print_boundary_scale(layer, layer - 1, incoming);
+            // R97_DUMP_BLOCK=<n> with R97_DUMP_BLOCK_DIR=<dir>: the criterion-two dump
+            // (issue #55). At the named layer the walk holds exactly what the single-block
+            // f64 reference needs: this block's records (the slice), the boundary forward
+            // values (the store's own bf16 read, widened, NOT the empty measured.* fields --
+            // keep_boundaries is off in this run), and the boundary cotangents just computed.
+            // Files land in the dir: slice-<layer>.json (r97-program form, positions
+            // re-indexed 0..n-1 in append order), boundary-<layer>.json ({name: {dtype,
+            // shape, value[]}}, f64), seeds-<layer>.json ([{buffer, row_lo, row_hi,
+            // cotangent[]}], f32-cast per Seed::cotangent). slice-serve --program/--boundary/
+            // --constants/--seeds consumes them; the constants file is host-side prep (the
+            // report's item 3b), not dumped here.
+            {
+                if (dump_block_layer == (long long)layer) {
+                    const char* dir_env = std::getenv("R97_DUMP_BLOCK_DIR");
+                    const std::string dir = dir_env && *dir_env ? dir_env : "/tmp";
+                    // A dump that silently writes nowhere because the directory does not exist
+                    // has burned a window; make it, and let a failure be loud.
+                    std::filesystem::create_directories(dir);
+                    const std::string base = dir + "/layers." + std::to_string(layer);
+                    // The slice: this block's records, positions re-indexed to append order
+                    // (the runner's snapshot store keys on (position, slot)).
+                    {
+                        const Tape::Block& range = blocks[static_cast<size_t>(layer)];
+                        nlohmann::json ops_j = nlohmann::json::array();
+                        int64_t pos = 0;
+                        for (size_t r = static_cast<size_t>(range.begin);
+                             r < static_cast<size_t>(range.end); ++r, ++pos) {
+                            // The walk's own normalisation (own_raws + tighten_rows, as the
+                            // block's records get at 1661-1665), so the slice's ops carry the
+                            // rows and views the walk actually ran -- without it a padded chat
+                            // run's program says M=512 while the boundary holds the 308 real
+                            // rows, and the runner reads past the dump.
+                            OpRecord rec = own_raws(OpRecord(ops[r]));
+                            tighten_rows(rec);
+                            // The params are the engine's, written for the padded rows; a
+                            // padded chat run's tape carries M=512 while the store -- and so
+                            // the boundary, the constants and the operands -- holds the
+                            // batch's own rows. Rewrite the row-count params to the tightened
+                            // rows, or the slice's twin computes 512 rows against 308-row
+                            // activations and its raw tables refuse (n != M).
+                            for (auto& [k, v] : rec.params)
+                                if ((k == "M" || k == "q_len") && std::holds_alternative<int64_t>(v))
+                                    v = tokens;
+                            nlohmann::json o;
+                            o["op"] = rec.op;
+                            o["block"] = rec.block;
+                            o["position"] = pos;  // re-indexed, not the tape's own position
+                            o["n"] = rec.n;
+                            nlohmann::json params = nlohmann::json::object();
+                            for (const auto& [k, v] : rec.params) {
+                                if (const auto* ip = std::get_if<int64_t>(&v)) params[k] = *ip;
+                                else params[k] = std::get<std::string>(v);
+                            }
+                            o["params"] = params;
+                            nlohmann::json operands = nlohmann::json::array();
+                            for (const Operand& op : rec.operands) {
+                                nlohmann::json x{{"buffer", op.buffer},
+                                                 {"dtype", op.dtype},
+                                                 {"shape", op.shape},
+                                                 {"row_lo", op.row_lo},
+                                                 {"rows", op.rows},
+                                                 {"written", op.written},
+                                                 {"inout", op.in_place}};
+                                // A narrowed or strided read -- the gated-delta layer's q|k|v
+                                // view of the fused projection, its two A|B halves of one decay
+                                // buffer -- is a different tensor from the declared buffer, and
+                                // the walk's snapshot holds the view's own shape
+                                // (join_common.h:264-295). Dropped here, the slice's twin reads
+                                // the whole buffer and two views of one buffer become the same
+                                // operand: the dump's own constant for such a read carries the
+                                // view's shape (gdn_in [512,10240] of [512,16384]), so the loss
+                                // is visible even before it is measured.
+                                if (!op.view_shape.empty()) {
+                                    x["view_shape"] = op.view_shape;
+                                    x["view_stride"] = op.view_stride;
+                                    x["view_off"] = op.view_off;
+                                }
+                                operands.push_back(std::move(x));
+                            }
+                            o["operands"] = operands;
+                            ops_j.push_back(std::move(o));
+                        }
+                        nlohmann::json doc;
+                        doc["format"] = "r97-program";
+                        doc["version"] = 1;
+                        doc["batch"] = nlohmann::json::array();
+                        for (const TokenSeq& seq : batch) {
+                            nlohmann::json ids = nlohmann::json::array();
+                            for (int64_t id : seq.ids) ids.push_back(id);
+                            doc["batch"].push_back(std::move(ids));
+                        }
+                        doc["ops"] = std::move(ops_j);
+                        write_dump_file(base + ".json", doc);
+                    }
+                    // The boundary forward values: read the store directly (keep_boundaries
+                    // is off), bf16 widened to f64, one entry per boundary this block reads.
+                    // The boundary this block ENTERS is `layer`'s own; name-shaped like the
+                    // store's own name for it.
+                    {
+                        nlohmann::json doc = nlohmann::json::object();
+                        const std::string name = store.name(layer);
+                        if (!name.empty() && store.has(layer)) {
+                            std::vector<uint16_t> host(static_cast<size_t>(tokens * meta.hidden));
+                            store.read(layer, host.data());
+                            std::vector<double> wide;
+                            widen_bf16(host, &wide);
+                            nlohmann::json v;
+                            v["dtype"] = "f64";
+                            v["shape"] = nlohmann::json::array({tokens, meta.hidden});
+                            v["value"] = std::move(wide);
+                            doc[name] = std::move(v);
+                        }
+                        // The extra boundary: the fused-norm blocks read a second copy beside
+                        // the residual -- the h stream -- and the boundary file must carry what
+                        // the block actually read. The key is the incoming entry whose buffer is
+                        // not the residual's own; if no such entry defines the name, it falls
+                        // through to the loud "h" fallback rather than silently going missing.
+                        if (store.extra_at(layer)) {
+                            std::vector<uint16_t> host2(
+                                static_cast<size_t>(tokens * meta.hidden));
+                            store.read_extra(layer, host2.data());
+                            std::vector<double> wide2;
+                            widen_bf16(host2, &wide2);
+                            nlohmann::json v2;
+                            v2["dtype"] = "f64";
+                            v2["shape"] = nlohmann::json::array({tokens, meta.hidden});
+                            v2["value"] = std::move(wide2);
+                            std::string extra_key;
+                            for (const IncomingCotangent& c : incoming)
+                                if (c.buffer != name) {
+                                    extra_key = c.buffer;
+                                    break;
+                                }
+                            if (extra_key.empty()) {
+                                extra_key = "h";
+                                std::fprintf(stderr, "BOUNDARY_EXTRA name=fallthrough-h\n");
+                                std::fflush(stderr);
+                            }
+                            doc[extra_key] = std::move(v2);
+                        }
+                        write_dump_file(base + "-boundary.json", doc);
+                    }
+                    // The boundary cotangents: the IncomingCotangents just computed for this
+                    // same block, f64 full-range, cast to Seed's f32 so slice-serve reads them
+                    // exactly as the walk hands a Seed to its rows.
+                    {
+                        nlohmann::json arr = nlohmann::json::array();
+                        for (const IncomingCotangent& c : incoming) {
+                            nlohmann::json s;
+                            s["buffer"] = c.buffer;
+                            s["row_lo"] = c.row_lo;
+                            s["row_hi"] = c.row_hi;
+                            nlohmann::json cot = nlohmann::json::array();
+                            for (double x : c.value) cot.push_back(static_cast<float>(x));
+                            s["cotangent"] = std::move(cot);
+                            arr.push_back(std::move(s));
+                        }
+                        write_dump_file(base + "-seeds.json", arr);
+                    }
+                    // The constants: the per-record collection the replay callback filled in
+                    // -- the walk's own frozen snapshots, decoded f64, keyed by buffer. Written
+                    // ALWAYS, even empty: the file's existence is the signal the hook ran.
+                    {
+                        write_dump_file(base + "-constants.json", constants_doc);
+                    }
+                    // The plugin-private operands the constants path cannot carry: their names,
+                    // so the comparison states a refusal instead of a fabricated constant.
+                    if (!refused_names.empty()) {
+                        nlohmann::json refused_arr = nlohmann::json::array();
+                        for (const std::string& name2 : refused_names)
+                            refused_arr.push_back(name2);
+                        write_dump_file(base + "-constants-refused.json", refused_arr);
+                        std::fprintf(stderr, "CONSTANTS-REFUSED n=%zu\n", refused_names.size());
+                        std::fflush(stderr);
+                    }
+                    std::fprintf(stderr, "device step: dumped layer %lld's slice, boundary and "
+                                         "seeds to %s\n",
+                                 (long long)layer, base.c_str());
+                    std::fflush(stderr);
+                }
+            }
             // `snaps` dies with this iteration, so the base must not outlive it: the share answers
             // a miss from `base_`, and a stale pointer there is a use-after-free waiting for the
             // first walk that asks for a key this block did not store. The head's walk clears its

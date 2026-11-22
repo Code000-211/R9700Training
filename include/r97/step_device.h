@@ -54,6 +54,11 @@ struct DeviceStepOptions {
     // the walk costs whatever the host's f64 arithmetic costs -- hours, not minutes, on the real
     // container. A check runs it only when the device walk's gradient was not finite.
     bool host_walk = false;
+    // Print one `r97: boundary <from> -> <to>` line per block boundary to stderr: the L1, L2 and
+    // max of the cotangent the walk hands down, so consecutive lines differ by one block's gain
+    // (issue #55's instrument). Off by default -- a training loop pays a pass over every
+    // boundary's cotangent and 65 lines a step for it; the model cases turn it on.
+    bool print_boundary_scale = false;
 };
 
 struct DeviceStepReport {
