@@ -167,6 +167,7 @@ struct StepPacker {
     const std::vector<int64_t>& lens;
     int64_t budget;
     int devices;
+    int64_t max_seqs;  // sequences one sub-batch may hold; 0 = uncapped
     Subs subs;
     std::vector<int64_t> loads;
     std::vector<char> sealed;  // occupied by an earlier bucket; the current bucket may not add
@@ -175,9 +176,10 @@ struct StepPacker {
     PlannedSteps steps;
     static constexpr size_t kNone = (size_t)-1;
 
-    StepPacker(const std::vector<int64_t>& lens_, int64_t budget_, int devices_)
-        : lens(lens_), budget(budget_), devices(devices_), subs((size_t)devices_),
-          loads((size_t)devices_, 0), sealed((size_t)devices_, 0),
+    StepPacker(const std::vector<int64_t>& lens_, int64_t budget_, int devices_,
+               int64_t max_seqs_)
+        : lens(lens_), budget(budget_), devices(devices_), max_seqs(max_seqs_),
+          subs((size_t)devices_), loads((size_t)devices_, 0), sealed((size_t)devices_, 0),
           classes((size_t)devices_, -1) {}
 
     void reset() {
@@ -273,6 +275,7 @@ struct StepPacker {
         for (size_t k = 0; k < (size_t)devices; ++k) {
             if (sealed[k]) continue;
             if (!subs[k].empty() && classes[k] != cls) continue;
+            if (max_seqs > 0 && (int64_t)subs[k].size() >= max_seqs) continue;
             if (loads[k] + lens[s] > budget) continue;
             if (!keeps_spread(s, k, cls, run, next)) continue;
             if (best == kNone || loads[k] < loads[best]) best = k;
@@ -319,10 +322,14 @@ struct StepPacker {
 // run of 101 at four per device on three devices ends on five, which no balanced step can hand
 // out), so the sizes are chosen here to spend the budget on the fewest steps that fit those rules.
 PlannedSteps plan_equal_run(const std::vector<size_t>& run, int64_t len, int64_t budget,
-                            int devices) {
+                            int devices, int64_t max_seqs) {
     const int64_t n = (int64_t)run.size();
     const int64_t d = devices;
-    const int64_t cap = std::min<int64_t>(budget / len, n);
+    // The per-sub-batch capacity in sequences: the budget's `budget / len`, the run's own `n`,
+    // and `max_seqs` where it caps the sub-batch (0 = uncapped) -- the smallest of the three, so
+    // the fast path never packs past the cap.
+    const int64_t cap =
+        std::min<int64_t>(std::min<int64_t>(budget / len, n), max_seqs > 0 ? max_seqs : n);
     auto tail_size = [&](int64_t p, int64_t& q_out) {
         if (p <= 0) return false;
         for (int64_t q = d; q >= 1; --q)
@@ -437,13 +444,13 @@ const Batcher::EpochPlan& Batcher::plan(int64_t epoch) const {
         });
     EpochPlan p;
     if (one_length) {
-        p.steps =
-            plan_equal_run(runs[0], lens[runs[0][0]], config_.token_budget, config_.devices);
+        p.steps = plan_equal_run(runs[0], lens[runs[0][0]], config_.token_budget, config_.devices,
+                                 config_.max_seqs);
     } else {
         // A step normally never crosses a run edge, so classes do not meet in one sub-batch. The
         // exception is a run that ends with fewer sequences than devices: those sequences carry
         // forward to fill the next run's step instead of leaving empty devices behind.
-        StepPacker packer(lens, config_.token_budget, config_.devices);
+        StepPacker packer(lens, config_.token_budget, config_.devices, config_.max_seqs);
         for (size_t i = 0; i < runs.size(); ++i)
             packer.pack_bucket(runs[i], i + 1 < runs.size());
         p.steps = std::move(packer.steps);

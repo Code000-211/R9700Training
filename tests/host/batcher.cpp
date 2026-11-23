@@ -850,6 +850,58 @@ R97_TEST(batcher_reset_and_config_errors) {
             R97_CHECK(step[d][i].ids == again[0][d][i].ids);
 }
 
+// The cap the device's training step needs: max_seqs = 1 holds every sub-batch to one sequence,
+// over the uniform-length fast path (plan_equal_run) and over the packer, and 0 leaves the
+// uncapped plan -- which does emit multi-sequence batches on the same data, so a cap that did
+// nothing fails the case.
+R97_TEST(batcher_caps_a_sub_batch_at_one_sequence) {
+    // Far larger than the data: nothing but the cap (or the one-class rule) splits a sub-batch.
+    const int64_t budget = 1000000;
+
+    auto epoch_shape = [&](const std::vector<int64_t>& lens, int64_t max_seqs, bool* any_multi) {
+        auto seqs = make_sequences(lens);
+        r97::BatcherConfig cfg;
+        cfg.token_budget = budget;
+        cfg.devices = 1;
+        cfg.seed = 7;
+        cfg.max_seqs = max_seqs;
+        Batcher b(seqs, cfg);
+        auto run = run_epoch(b);
+        *any_multi = false;
+        size_t seen = 0;
+        for (const auto& step : run) {
+            R97_CHECK(!step.empty());
+            R97_CHECK((int)step.size() <= cfg.devices);
+            for (const Batch& sub : step) {
+                R97_CHECK(!sub.empty());
+                if (sub.size() > 1) *any_multi = true;
+                seen += sub.size();
+            }
+        }
+        R97_CHECK(seen == seqs.size());  // every sequence appears once in the epoch
+    };
+
+    // One length throughout is the plan_equal_run fast path.
+    const std::vector<int64_t> uniform(64, 128);
+    // A uniform-length run beside two other length classes is the packer.
+    std::vector<int64_t> mixed;
+    for (int i = 0; i < 64; ++i) mixed.push_back(128);
+    for (int i = 0; i < 32; ++i) mixed.push_back(300);
+    for (int i = 0; i < 16; ++i) mixed.push_back(40);
+
+    bool multi = false;
+    epoch_shape(uniform, 1, &multi);
+    R97_CHECK(!multi);
+    epoch_shape(mixed, 1, &multi);
+    R97_CHECK(!multi);
+
+    // The same data uncapped still packs multi-sequence sub-batches: the cap is doing work.
+    epoch_shape(uniform, 0, &multi);
+    R97_CHECK(multi);
+    epoch_shape(mixed, 0, &multi);
+    R97_CHECK(multi);
+}
+
 // A short tail of a length bucket -- fewer sequences than devices -- must not be handed out as
 // an empty sub-batch. It carries into the next bucket to fill the idle devices; the last tail of
 // an epoch, with nothing left to carry into, hands out fewer sub-batches rather than an empty

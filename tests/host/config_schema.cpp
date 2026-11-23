@@ -31,7 +31,8 @@ bool same(const Config& a, const Config& b) {
            a.objective == b.objective && a.base_id == b.base_id && a.delta.kind == b.delta.kind &&
            a.delta.rank == b.delta.rank && a.delta.alpha == b.delta.alpha &&
            a.delta.targets == b.delta.targets && a.delta.gate == b.delta.gate && a.lr == b.lr &&
-           a.weight_decay == b.weight_decay && a.warmup_steps == b.warmup_steps &&
+           a.weight_decay == b.weight_decay && a.clip_norm == b.clip_norm &&
+           a.warmup_steps == b.warmup_steps &&
            a.token_budget == b.token_budget && a.accumulation == b.accumulation &&
            a.steps == b.steps && a.epochs == b.epochs && a.seed == b.seed &&
            a.eval_every == b.eval_every && a.checkpoint_every == b.checkpoint_every;
@@ -110,6 +111,7 @@ R97_TEST(config_schema_keys_set_their_field) {
         {"delta.gate", "true", [](const Config& c) { return c.delta.gate; }},
         {"lr", "2.5e-5", [](const Config& c) { return c.lr == 2.5e-5; }},
         {"weight_decay", "0.25", [](const Config& c) { return c.weight_decay == 0.25; }},
+        {"clip_norm", "0.75", [](const Config& c) { return c.clip_norm == 0.75; }},
         {"warmup_steps", "3", [](const Config& c) { return c.warmup_steps == 3; }},
         {"token_budget", "1024", [](const Config& c) { return c.token_budget == 1024; }},
         {"accumulation", "4", [](const Config& c) { return c.accumulation == 4; }},
@@ -186,6 +188,7 @@ R97_TEST(config_values_text_round_trips) {
     config.delta.gate = true;
     config.lr = 1e-4;
     config.weight_decay = 0.01;
+    config.clip_norm = 1.0;
     config.warmup_steps = 20;
     config.token_budget = 4096;
     config.accumulation = 2;

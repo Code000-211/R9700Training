@@ -25,7 +25,8 @@
 // next bucket to fill the idle devices, which is how a short tail fills a device a long sequence
 // left idle; the buckets' classes never meet inside one sub-batch. A step never hands out an empty
 // sub-batch. The budget is per sub-batch, so a step may spend up to `devices * token_budget`
-// tokens. A sequence longer than the budget is reported (in `skipped()`) and never batched. A
+// tokens; `max_seqs` caps each sub-batch's sequence count, and 0 keeps the uncapped plan. A
+// sequence longer than the budget is reported (in `skipped()`) and never batched. A
 // sub-batch holds its sequences in the planned order, which the seed and the epoch choose both
 // through the bucket order and through the shuffle inside a bucket.
 //
@@ -47,6 +48,8 @@ struct BatcherConfig {
     int64_t token_budget = 0;  // tokens per sub-batch, not per step
     int devices = 1;           // sub-batches per step
     uint64_t seed = 0;         // the shuffle's seed; same seed, same batches
+    // Appended last so every positional `BatcherConfig{a, b, c}` keeps its meaning.
+    int64_t max_seqs = 0;      // sequences one sub-batch may hold; 0 = uncapped
 };
 
 class Batcher {

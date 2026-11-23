@@ -57,7 +57,13 @@ An epoch is planned on demand from `(seed, epoch)` and cached (`Batcher::plan`):
    occupied sub-batch and mix classes inside one `Batch`; every sub-batch still holds sequences of
    one length class, while a step may hold two classes in different sub-batches. The budget is per
    sub-batch, not per step: every `Batch` stays under `token_budget`, so a step may spend up to
-   `devices * token_budget` tokens. The packing keeps each sub-batch in the planned order; it does
+   `devices * token_budget` tokens. `max_seqs` (default 0, uncapped) caps how many sequences one
+   sub-batch may hold: the packer skips a sub-batch that already holds `max_seqs` sequences, and a
+   uniform-length plan folds the cap into its per-sub-batch capacity, so neither path packs past it.
+   The device's training step (`r97train train --device`) sets it to 1: the device join keeps one
+   key-value pool block per sequence and refuses a multi-sequence training batch, so one sequence
+   per step is its shape (`src/step_device.cpp`'s `rebuilt_slot`). 0 reproduces the old plans
+   exactly. The packing keeps each sub-batch in the planned order; it does
    not re-sort it afterwards.
 4. **Balance devices.** The spread is a property of the step the reader receives, not of every
    intermediate add. Walking a fixed-length run from one sequence per device to four of the same
@@ -171,6 +177,10 @@ over ordinary data and not over the shapes a test happens to pick, a few hundred
 classes) compare four epochs each against the epoch before, and check each step on the way for the
 budget, the spread, the one-class sub-batches and the filled devices; and over sixty datasets
 spread across eight length classes or more, three seeds must give three different first epochs.
+`batcher_caps_a_sub_batch_at_one_sequence` holds `max_seqs` to its word: with the cap at 1, every
+sub-batch of an epoch over a uniform-length run (the `plan_equal_run` path) and over mixed lengths
+(the packer) holds exactly one sequence, and the same data uncapped still emits a multi-sequence
+batch, so a cap that did nothing fails the case.
 `tests/headers/hdr_batcher.cpp` is the standalone-compile check of the header.
 
 The host test binary has a single `main`, in `tests/host/vector_tape.cpp`; a second one cannot link.
