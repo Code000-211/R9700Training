@@ -25,6 +25,7 @@ struct Config {
     // The optimiser and the loop.
     double   lr = 0.0;
     double   weight_decay = 0.0;
+    double   clip_norm = 0.0;       // global-norm clip before the moments; 0 disables
     int64_t  warmup_steps = 0;
     int64_t  token_budget = 0;
     int64_t  accumulation = 0;

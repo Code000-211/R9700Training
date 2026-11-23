@@ -124,6 +124,8 @@ void set_key(Config& config, const std::string& key, const std::string& value,
         config.lr = parse_real(key, value, where);
     } else if (key == "weight_decay") {
         config.weight_decay = parse_real(key, value, where);
+    } else if (key == "clip_norm") {
+        config.clip_norm = parse_real(key, value, where);
     } else if (key == "warmup_steps") {
         config.warmup_steps = parse_integer(key, value, where);
     } else if (key == "token_budget") {
@@ -421,6 +423,8 @@ void validate_config(const Config& config) {
             "must be a finite value > 0 (got " + number(config.lr) + ")");
     require(std::isfinite(config.weight_decay) && config.weight_decay >= 0.0, "weight_decay",
             "must be a finite value >= 0 (got " + number(config.weight_decay) + ")");
+    require(std::isfinite(config.clip_norm) && config.clip_norm >= 0.0, "clip_norm",
+            "must be a finite value >= 0 (got " + number(config.clip_norm) + ")");
     require(config.warmup_steps >= 0, "warmup_steps",
             "must be >= 0 (got " + std::to_string(config.warmup_steps) + ")");
     require(config.token_budget > 0, "token_budget",
@@ -457,6 +461,7 @@ AdamWConfig optimiser_config(const Config& config) {
     AdamWConfig adamw;
     adamw.lr = static_cast<float>(config.lr);
     adamw.weight_decay = static_cast<float>(config.weight_decay);
+    adamw.clip_norm = static_cast<float>(config.clip_norm);
     adamw.warmup_steps = static_cast<int>(config.warmup_steps);
     adamw.accum_steps = static_cast<int>(config.accumulation);
     // A run measured in epochs has no known horizon, so the cosine schedule holds after warm-up.
@@ -665,6 +670,7 @@ struct Trainer::Impl {
         json << "]"
              << ",\"delta.gate\":" << (config.delta.gate ? "true" : "false")
              << ",\"lr\":" << number(config.lr)
+             << ",\"clip_norm\":" << number(config.clip_norm)
              << ",\"weight_decay\":" << number(config.weight_decay)
              << ",\"warmup_steps\":" << config.warmup_steps
              << ",\"token_budget\":" << config.token_budget

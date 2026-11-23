@@ -431,6 +431,7 @@ def main():
         print("+", " ".join(cmd), flush=True)
         subprocess.run(cmd, check=True)
 
+    converted = []
     for out_name, pattern in SPLITS:
         if os.path.exists(out_name):
             print(f"{out_name}: {count_lines(out_name)} conversations (cached)")
@@ -439,14 +440,24 @@ def main():
         if not shards:
             raise ParquetError(f"no shards found for {pattern}")
         total = 0
-        with open(out_name, "w", encoding="utf-8") as out:
+        # Convert to a temporary file and rename into place only once every shard has been
+        # written: an interrupted or failed conversion must not leave a short file that a re-run
+        # reads as a cached, complete split.
+        temporary = out_name + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as out:
             for shard in shards:
                 n = convert_shard(shard, out)
                 total += n
+                converted.append(shard)
                 print(f"  {os.path.basename(shard)}: {n} conversations",
                       flush=True)
-                os.remove(shard)
+        if count_lines(temporary) != total:
+            os.remove(temporary)
+            raise ParquetError(f"{out_name}: wrote {count_lines(temporary)} lines, not {total}")
+        os.replace(temporary, out_name)
         print(f"{out_name}: {total} conversations")
+    for shard in converted:
+        os.remove(shard)
     try:
         os.rmdir(RAW_DIR)
     except OSError:  # still holds files of the other split

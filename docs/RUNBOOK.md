@@ -83,6 +83,11 @@ set -o pipefail
 : "${RADIANCE_HOME:=$R97_BUILD/radiance-build/radiance_home}" # the build's plugins
 : "${R97_MODEL:=$R97_BUILD/fixture/tiny_qwen35_w8a8.rad}"     # the int8 fixture the host tier converted
 r97="$R97_BUILD/r97train"
+# The card selector `train --device` takes: empty on the smoke run, so the host job below is
+# exactly the one this file has always run. A real run sets R97_DEVICE and every job that can run
+# on the card is handed it; a job that cannot (the serve) says so in its own section.
+card_args=
+[ -z "$R97_DEVICE" ] || card_args="--device $R97_DEVICE"
 
 [ -e "$R97_MODEL" ] || {
     echo "runbook: no tiny container at $R97_MODEL;" \
@@ -186,7 +191,7 @@ grep -qx "steps = $R97_STEPS" "$R97_RUN.resolved" || {
     exit 1
 }
 
-"$r97" train --dry-run --config "$R97_RUN.conf"
+"$r97" train --dry-run --config "$R97_RUN.conf" $card_args
 [ ! -e "$R97_RUN" ] || {
     echo "runbook: the dry run wrote $R97_RUN;" \
          "a run's directory must not exist before it starts" >&2
@@ -204,7 +209,7 @@ lines — in a host-only build a `host-backend` warning that the engine is on th
 horizon, and `train.jsonl` the same numbers as fields.
 
 ```sh
-"$r97" train --config "$R97_RUN.conf" 2>&1 | tee "$R97_RUN.console.log" || {
+"$r97" train --config "$R97_RUN.conf" $card_args 2>&1 | tee "$R97_RUN.console.log" || {
     echo "runbook: the run of $R97_STEPS steps on $R97_MODEL failed;" \
          "section 9 has the frequent ones" >&2
     exit 1
@@ -241,7 +246,7 @@ a resume that changes either is accepted and continues a run the checkpoint does
 half=$((R97_STEPS / 2))
 "$r97" train --config "$R97_RUN.conf" \
     --resume "$R97_RUN/checkpoint-$(printf %09d "$half")" \
-    --out "$R97_RUN-resumed" 2>&1 | tee "$R97_RUN-resumed.console.log" || {
+    --out "$R97_RUN-resumed" $card_args 2>&1 | tee "$R97_RUN-resumed.console.log" || {
     echo "runbook: the resume of $R97_MODEL failed; docs/CHECKPOINT.md has the refusals" >&2
     exit 1
 }
@@ -280,8 +285,17 @@ the smoke run checks it. It must be the held-out loss the resumed run reported i
 
 ```sh
 adapter="$R97_RUN-resumed/checkpoint-$(printf %09d "$R97_STEPS")/adapter"
-trainer_loss=$("$r97" loss --model "$R97_MODEL" --data "$R97_HELDOUT" --lora "$adapter" |
-               sed -n 's/^loss: //p')
+# The trainer's own number for the adapter, on the tier the run trained on: a host run's loss is
+# the host tier's, and a card run's is `loss --device`, which names libr4d, libavx and libref and
+# puts the card in ROCR_VISIBLE_DEVICES (tools/loss.cpp). A container the host tier cannot declare
+# -- the 27B is one -- has no host number to print, so the card's is the run's number there.
+if [ -n "$R97_DEVICE" ]; then
+    trainer_loss=$("$r97" loss --device "$R97_DEVICE" --model "$R97_MODEL" \
+                       --data "$R97_HELDOUT" --lora "$adapter" | sed -n 's/^loss: //p')
+else
+    trainer_loss=$("$r97" loss --model "$R97_MODEL" --data "$R97_HELDOUT" --lora "$adapter" |
+                   sed -n 's/^loss: //p')
+fi
 [ -n "$trainer_loss" ] || {
     echo "runbook: loss printed no loss line for $adapter" >&2
     exit 1
@@ -312,10 +326,20 @@ server="$serving/radiance-build/bin/radiance"
 serving_home="$serving/radiance-build/radiance_home"
 served=
 
+# A card run serves with the card's kernels and the card named the way the trainer names it (the
+# server has no --device of its own); a host run serves as it always has. R97_DEVICE is section
+# 2's selector, so a serve and the inventory cannot disagree about the card.
 if [ -x "$server" ]; then
-    "$server" --model "$R97_MODEL" --radiance-home "$serving_home" \
-              --lora trained="$adapter" --host 127.0.0.1 --port 8099 \
-              > "$R97_RUN-resumed/serve.log" 2>&1 &
+    if [ -n "$R97_DEVICE" ]; then
+        ROCR_VISIBLE_DEVICES="$R97_DEVICE" "$server" --model "$R97_MODEL" \
+                  --radiance-home "$serving_home" --kernels libr4d,libavx,libref \
+                  --lora trained="$adapter" --host 127.0.0.1 --port 8099 \
+                  > "$R97_RUN-resumed/serve.log" 2>&1 &
+    else
+        "$server" --model "$R97_MODEL" --radiance-home "$serving_home" \
+                  --lora trained="$adapter" --host 127.0.0.1 --port 8099 \
+                  > "$R97_RUN-resumed/serve.log" 2>&1 &
+    fi
     server_pid=$!
     reply=
     for attempt in $(seq 1 60); do
@@ -359,9 +383,16 @@ mkdir -p "$kld"
 "$r97" data --model "$R97_MODEL" --data "$R97_HELDOUT" --kld-corpus "$kld/heldout.jsonl"
 
 if [ -x "$server" ]; then
-    "$server" --model "$R97_MODEL" --radiance-home "$serving_home" \
-              --lora trained="$adapter" --kld-lora trained \
-              --kld-corpus "$kld/heldout.jsonl" --kld-record "$kld/served"
+    if [ -n "$R97_DEVICE" ]; then
+        ROCR_VISIBLE_DEVICES="$R97_DEVICE" "$server" --model "$R97_MODEL" \
+                  --radiance-home "$serving_home" --kernels libr4d,libavx,libref \
+                  --lora trained="$adapter" --kld-lora trained \
+                  --kld-corpus "$kld/heldout.jsonl" --kld-record "$kld/served"
+    else
+        "$server" --model "$R97_MODEL" --radiance-home "$serving_home" \
+                  --lora trained="$adapter" --kld-lora trained \
+                  --kld-corpus "$kld/heldout.jsonl" --kld-record "$kld/served"
+    fi
     served=$(python3 tools/kld_loss.py "$kld/served" | sed -n 's/^loss: //p')
     [ -n "$served" ] || {
         echo "runbook: tools/kld_loss.py printed no loss for $kld/served" >&2
@@ -527,7 +558,16 @@ The same script with seven variables set, and the fetched data in place:
 | `R97_RUN` | `runs/lora-v1` |
 | `R97_STEPS` | `1000` |
 | `R97_SERVING_BUILD` | `build-serving` (section 0's serving-only build, for section 7) |
-| `R97_DEVICE` | `0`: the card section 2's inventory is taken on (`--device "$R97_DEVICE"`); empty keeps the host branch and the card stays unchecked |
+| `R97_DEVICE` | `0`: the card section 2's inventory is taken on, and every job that takes it (`--device "$R97_DEVICE"` on the dry run, the run, the resume and the trainer's loss); empty keeps the host branch and the card stays unchecked |
+
+A card run also sets two things the host run does not: the run's `clip_norm` and the container the
+card declares, since the host tier declares this one not at all
+(`docs/reports/2026-11-12-device-forward.md`). `clip_norm` is **caution, not a workaround**: the
+device walk's gradient is finite and well-scaled since #55 closed (grad norms 515.7 at 512 tokens
+and 766.7 at 4096, `docs/reports/2026-11-18-device-backward-55.md`), and AdamW normalises each
+element's step anyway, so clipping changes the direction little. Set it when a run's `lr` is
+unproven for its data and leave it at the default `0` otherwise. The 27B also needs its limits
+named on the serve, which section 7's card block does.
 
 Then the blocks of sections 1 to 8 run as they stand — the dry run on the container and the two
 files, the run to its horizon, the resume from whatever checkpoint survived, the serve and the

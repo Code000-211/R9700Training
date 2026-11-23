@@ -254,7 +254,7 @@ the `LEAF` lines against the walk's own.
 ### `train`
 
 ```text
-usage: r97train train --model <file.rad> --out <dir> [--data <file.jsonl>] [--heldout <file.jsonl>] [--steps N] [--reference] [--dry-run] [--resume <dir>] [--program <file>] [--config <file>] [--config-file <file>] [configuration keys as flags]
+usage: r97train train --model <file.rad> --out <dir> [--data <file.jsonl>] [--heldout <file.jsonl>] [--steps N] [--reference] [--device N] [--dry-run] [--resume <dir>] [--program <file>] [--config <file>] [--config-file <file>] [configuration keys as flags]
 ```
 
 | flag | state | what it does |
@@ -265,6 +265,7 @@ usage: r97train train --model <file.rad> --out <dir> [--data <file.jsonl>] [--he
 | `--heldout <file.jsonl>` | now | the `heldout` key: what `eval_every` scores |
 | `--steps N` | now | the `steps` key: the run's horizon |
 | `--reference` | now | the reference step instead of the host step: the op graph in `f64`, no card, slower |
+| `--device N` | now | train on the card: set `ROCR_VISIBLE_DEVICES` before any engine call, and build the device step (kernels `libr4d,libr97,libavx,libref`); one sequence per training step |
 | `--dry-run` | now | resolve everything to the first step, print the settings and the first step's shape, write nothing |
 | `--resume <dir>` | now | continue from a checkpoint directory, at the horizon the configuration names |
 | `--program <file>` | now | the op program a reference step replays |
@@ -283,7 +284,13 @@ The step is the ordinary host step: the engine's forward on the host kernels and
 it with the container's op graph replayed in `f64` from the engine's twins and the host adjoints,
 with the `libavx` and `libref` kernel libraries: no card, slower, and the same loop, checkpoint and
 resume. A build without radiance's forward tier has only the reference step, and `train` without
-`--reference` stops and says so.
+`--reference` stops and says so. `--device N` replaces it with the device join
+(`docs/STEPS-DEVICE.md`): the engine's forward and the backward's walk on the card's kernels, with
+the driver's tier `libr4d`, `libr97`, `libavx` and `libref`, after `ROCR_VISIBLE_DEVICES` is set
+before the model or any engine opens. Its join keeps one key-value pool block per sequence and
+refuses a training batch of more than one, so the batcher's `max_seqs = 1` holds every training step
+to one sequence; the held-out evaluation is forward-only and walks nothing, so it keeps the
+multi-sequence chunks it cuts.
 
 Every configuration key is accepted as a flag too, as `--key value`. The file is read first and a
 flag overrides it. Without `--data` the sequences are `tests/fixtures/chat_small.jsonl`, relative to
@@ -327,6 +334,7 @@ line's own flag, not a configuration key.
 | `delta.gate` | boolean | false | `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`): a gate beside the sites; no delta builds one yet |
 | `lr` | number | 0 | **finite, > 0**: the peak learning rate; must be set |
 | `weight_decay` | number | 0 | finite, >= 0: the optimiser's weight decay |
+| `clip_norm` | number | 0 | finite, >= 0: global-norm clip before the optimiser's moments; 0 disables |
 | `warmup_steps` | integer | 0 | >= 0, counted in optimiser updates |
 | `token_budget` | integer | 0 | **> 0**: the batcher's tokens per sub-batch; must be set |
 | `accumulation` | integer | 0 | **>= 1**: micro-steps per optimiser update; must be set |
@@ -445,7 +453,8 @@ reads and what the serving side loads. `docs/CHECKPOINT.md` says what the state 
   host commands.
 - A build without radiance's forward tier has no ordinary host step; `train` without `--reference`
   stops with `train: this build has no forward driver; use --reference with the host step`. The
-  device step is a later issue's; `docs/PLAN.md` says which.
+  device step is `--device N`'s, above; a build without the training patch set refuses the flag by
+  name.
 - `loss` and `grad` need a build with radiance's forward tier, and a plugin home; a build without it
   does not register them. `train` and `loss` find the plugin home from `RADIANCE_HOME` or the one
   the build keeps beside the binary.

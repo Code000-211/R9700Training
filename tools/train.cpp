@@ -3,6 +3,7 @@
 //   r97train train --model tiny.rad --out DIR [--data chat.jsonl] [--heldout eval.jsonl]
 //                   [--steps N]
 //   r97train train --reference --model tiny.rad --out DIR
+//   r97train train --device 0 --config runs/run.conf
 //   r97train train --dry-run --config runs/run.conf
 //
 // The run's base_id is the container's SHA-256, so a resume against a different container is
@@ -15,8 +16,11 @@
 //
 // This is the ordinary training loop over the host step: ForwardDriver and the live adapter on
 // radiance's host kernels. With --reference the step is make_reference_step(): the fixture's op
-// graph in f64 from the twins and host adjoints, no card and no kernel library. The loop, the
-// checkpoint and the resume are the same either way.
+// graph in f64 from the twins and host adjoints, no card and no kernel library. With --device N
+// the run trains on the card: ROCR_VISIBLE_DEVICES is set before the model or any engine opens,
+// the driver's tier names the card's kernels and libr97, the step is the device join, and the
+// batcher's max_seqs = 1 holds every training step to one sequence. The loop, the checkpoint and
+// the resume are the same either way.
 #include "commands.h"
 
 #include "r97/adapter_io.h"
@@ -29,6 +33,7 @@
 #include "r97/model.h"
 #include "r97/reference_step.h"
 #include "r97/sha256.h"
+#include "r97/step_device.h"
 #include "r97/step_host.h"
 #include "r97/trainer.h"
 
@@ -67,13 +72,14 @@ std::string radiance_home() {
 // string, so `r97train train --help` and a bad argument cannot disagree.
 constexpr const char* kUsage =
     "--model <file.rad> --out <dir> [--data <file.jsonl>] [--heldout <file.jsonl>] [--steps N] "
-    "[--reference] [--dry-run] [--resume <dir>] [--program <file>] [--config <file>] "
+    "[--reference] [--device N] [--dry-run] [--resume <dir>] [--program <file>] [--config <file>] "
     "[--config-file <file>] [configuration keys as flags]";
 
 int train_main(int argc, char** argv) {
     std::string config_path;
     std::vector<std::string> flags;
     bool reference = false;
+    int device = -1;  // < 0: the host tier; >= 0: ROCR_VISIBLE_DEVICES and the device join
     std::string resume;
     std::string program;
     bool dry_run = false;
@@ -81,6 +87,22 @@ int train_main(int argc, char** argv) {
         const std::string arg = argv[i];
         if (arg == "--reference") {
             reference = true;
+        } else if (arg == "--device") {
+            if (++i >= argc) {
+                std::cerr << "usage: r97train train " << kUsage << "\n";
+                return 2;
+            }
+            std::string n = argv[i];
+            try {
+                device = std::stoi(n);
+            } catch (...) {
+                std::cerr << "usage: r97train train " << kUsage << "\n";
+                return 2;
+            }
+            if (device < 0) {
+                std::cerr << "usage: r97train train " << kUsage << "\n";
+                return 2;
+            }
         } else if (arg == "--dry-run") {
             dry_run = true;
         } else if (arg == "--program") {
@@ -106,7 +128,28 @@ int train_main(int argc, char** argv) {
         }
     }
 
+    if (device >= 0 && reference) {
+        std::cerr << "usage: r97train train " << kUsage << "\n";
+        return 2;
+    }
+    // --device N: ROCR reads ROCR_VISIBLE_DEVICES once, at init, so it is set before the model
+    // or any engine opens -- the same rule as `r97train loss`'s flag. The device tier is chosen
+    // when the driver opens, below.
+    if (device >= 0 && ::setenv("ROCR_VISIBLE_DEVICES", std::to_string(device).c_str(), 1) != 0) {
+        std::cerr << "r97train train: cannot set ROCR_VISIBLE_DEVICES=" << device << "\n";
+        return 3;
+    }
+
     try {
+        // A --device run needs the device join: a build without the training patch set has no
+        // r97::device_step to build the loop on, so it refuses the flag by name before it opens
+        // the configuration, the data or the tokenizer.
+#if !R97_FORWARD || !R97_DEVICE_STEP
+        if (device >= 0)
+            throw std::runtime_error(
+                "train: this build has no device step (needs the training patch set); "
+                "--device needs a default build");
+#endif
         // A dry run stops before the Trainer, and it is the Trainer that reads the checkpoint: a
         // run that would have resumed is not the run a dry run describes, so say so rather than
         // report a configuration whose first step this flag will not take.
@@ -176,8 +219,8 @@ int train_main(int argc, char** argv) {
         const r97::ModelMeta meta = r97::read_model_meta(cfg.model);
         r97::ParamSet params = model.delta->init(meta, cfg.delta, uint64_t(cfg.seed));
 
-        // The forward driver the host step runs its engines through. It must outlive the step,
-        // because the step keeps a reference to it across the loop.
+        // The forward driver the step's engines run through. It must outlive the step, because the
+        // step keeps a reference to it across the loop.
         std::unique_ptr<r97::ForwardDriver> driver;
         r97::StepFn step;
         if (reference) {
@@ -203,20 +246,38 @@ int train_main(int argc, char** argv) {
                 throw std::runtime_error("train: no radiance home: set RADIANCE_HOME to the "
                                          "directory holding architectures/, kernels/ and "
                                          "quantizers/");
+#if R97_DEVICE_STEP
+            // The device join's tier: the card's library, then libr97 -- the plugin its device
+            // adjoints load from -- with the host tier as the per-op fallback
+            // (tests/gpu/device_step.cpp).
+            if (device >= 0) fwd.kernels = {"libr4d", "libr97", "libavx", "libref"};
+#endif
             fwd.max_tok = budget;
             fwd.max_ctx = budget;
             std::string err;
             driver = r97::ForwardDriver::open(fwd, &err);
             if (!driver) throw std::runtime_error("train: " + err);
-            // The loop keeps no boundary values; the backward walks one block at a time.
-            r97::HostStepOptions opts;
-            opts.keep_boundaries = false;
-            opts.reference_head_split = false;
-            step = r97::host_step(*driver, model, opts);
+#if R97_DEVICE_STEP
+            // A device step keeps one sequence's tape: the batcher's cap below holds every
+            // training batch to one sequence, and a forward-only call (the evaluation) walks
+            // nothing, so its multi-sequence chunks are fine.
+            if (device >= 0) step = r97::device_step(*driver, model, r97::DeviceStepOptions{});
+#endif
+            if (device < 0) {
+                // The loop keeps no boundary values; the backward walks one block at a time.
+                r97::HostStepOptions opts;
+                opts.keep_boundaries = false;
+                opts.reference_head_split = false;
+                step = r97::host_step(*driver, model, opts);
+            }
 #endif
         }
 
-        r97::Batcher batcher(sequences, {cfg.token_budget, 1, uint64_t(cfg.seed)});
+        r97::BatcherConfig batcher_config{cfg.token_budget, 1, uint64_t(cfg.seed)};
+        // The device join keeps one key-value pool block per sequence and refuses a
+        // multi-sequence training batch, so a device step trains one sequence at a time.
+        if (device >= 0) batcher_config.max_seqs = 1;
+        r97::Batcher batcher(sequences, batcher_config);
         r97::Optimiser optimiser(params, r97::optimiser_config(cfg));
         r97::AdapterConfig adapter;
         adapter.base_model = cfg.model;
@@ -241,7 +302,8 @@ int train_main(int argc, char** argv) {
             std::cout << r97::config_values_text(cfg)
                       << "# dry run: " << batcher.sequences().size() << " sequences, "
                       << options.heldout.size() << " held-out batches, "
-                      << (reference ? "reference" : "host") << " step, nothing written\n";
+                      << (reference ? "reference" : (device >= 0 ? "device" : "host"))
+                      << " step, nothing written\n";
             return 0;
         }
 
