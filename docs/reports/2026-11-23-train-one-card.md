@@ -128,23 +128,25 @@ rc=0
 | 2 | 1194.69 | 1.5617 | 765 | 3.04 | 667 | 9.14e-4 |
 | 3 | 955.68 | 1.4909 | 641 | 144.29 | 666 | 8.15e-4 |
 | 4 | 6027.31 | 8.5737 | 703 | 230.76 | 660 | 6.89e-4 |
+| 5 | 701.48 | 1.7987 | 390 | 19.47 | 650 | 5.50e-4 |
 
 **Read the loss column carefully.** A device training step holds **one** sequence, so each step
-scores a *different* conversation (721, 765, 641, 703 tokens). The per-step loss is therefore not a
-trend across steps and must not be quoted as one. The run's held-out measurement is the `eval` line
-`eval_every = 10` writes, and whether the loss falls is a property of the data and `lr`, not of the
-feature this issue lands.
+scores a *different* conversation (721, 765, 641, 703, 390 tokens). The per-step loss is therefore
+not a trend across steps and must not be quoted as one. The run's held-out measurement is the
+`eval` line `eval_every = 10` writes, and whether the loss falls is a property of the data and
+`lr`, not of the feature this issue lands.
 
-**Step 4's 8.5737 mean NLL has two readings and the run does not distinguish them**: either that
-conversation is genuinely hard (one sample; UltraChat contains long technical answers), or the
-adapter began to degrade at lr 6.9e-4. What *is* settled is that nothing failed catastrophically —
-`grad_norm` stayed finite, and `clip_norm = 1` bounds each update. Step 5 discriminates, and its
-number is recorded below.
+**Step 4's 8.5737 mean NLL was a hard conversation, not divergence — step 5 settles it.** The
+run's next forward, with the adapter as four AdamW updates left it, scored 1.7987 with
+`grad_norm` 19.47, back in the range of steps 1-3; a damaged adapter would score high on every
+conversation after it, and this one did not. `clip_norm = 1` bounded each update throughout and
+`grad_norm` was finite at every step (peak 230.76, against the 1e6 bound).
 
-`grad_norm` is finite at every step: 31.68, 3.04, 144.29, 230.76. These are **well under** the
-`kMaxGradNorm` 1e6 bound `docs/STEPS-DEVICE.md:176` names, and an order of magnitude or more
-**below** the 515.7 / 766.7 that `docs/reports/2026-11-18-device-backward-55.md` measured at 512 and
-4096 tokens — not "consistent with" those, which are different inputs and a different step size.
+The `grad_norm` series over the whole run — 31.68, 3.04, 144.29, 230.76, 19.47 — stays well under
+the `kMaxGradNorm` 1e6 bound `docs/STEPS-DEVICE.md:176` names, and an order of magnitude or more
+**below** the 515.7 / 766.7 that `docs/reports/2026-11-18-device-backward-55.md` measured at
+512 and 4096 tokens — not "consistent with" those, which are different inputs and a different
+step size.
 
 Step 1's mean NLL of 1.3547 is a **sanity signal, not a reproduced number**: the 1.3763 in
 `docs/reports/2026-11-13-serving-card.md` was measured on a *different container file*

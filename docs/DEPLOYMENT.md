@@ -191,10 +191,12 @@ loss are measured here, and the card's adapter path is `tests/gpu/serving_contai
 the model label (the base container's prefill, then the same prefill through the adapter, and the
 two must differ). `tests/model/serving_container.cpp` checks the real container's serving
 handshake on the host: its arch, its basis, and that the adapter's targets are among its
-targetable linears. The card's *trained* number is the real run's (`docs/RUNBOOK.md` section 7's
-card block, `loss --device` against the served record). `r97train train --device N` is how that
-run reaches the card: the flag sets `ROCR_VISIBLE_DEVICES` before any engine call and builds the
-device join (`r97::device_step`) over the card's kernel tier, which is the only tier this
+targetable linears. The card's *trained* number is a real run's, and a card has now taken it
+(`docs/reports/2026-11-23-train-one-card.md`: a 5-step run on card 0 wrote the adapter, and the
+serving build's KL record matched the trainer's `loss --device` at 1.7e-11 relative over the same
+18,141 scored positions). `r97train train --device N` is how that run reaches the card: the flag
+sets `ROCR_VISIBLE_DEVICES` before any engine call and builds the device join (`r97::device_step`)
+over the card's kernel tier, which is the only tier this
 container declares on (`docs/reports/2026-11-12-device-forward.md`). A card training step holds
 one sequence (`src/step_device.cpp`'s slot-table rule), which the trainer's batcher is capped to
 on that tier; held-out evaluation is forward-only and keeps its multi-sequence chunks. Section 7's
